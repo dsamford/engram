@@ -80,7 +80,7 @@ be combined with `--data-dir`, and the server refuses at startup if you try.
 - **Not a Neo4j drop-in**, despite the wire compatibility. The driver
   compatibility matrix is open, not closed — see [Connecting](./using/connecting.md).
 
-The conformance number is the useful counterweight to this list: 3,771 of 3,772
+The conformance number is the useful counterweight to this list: 3,772 of 3,773
 evaluated openCypher TCK scenarios pass, and the single failure is a time-zone
 database expectation where this engine is arguably the more correct of the two.
 Broad coverage and specific sharp edges are both true.

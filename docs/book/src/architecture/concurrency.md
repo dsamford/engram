@@ -22,6 +22,30 @@ All in `engram-server`, the only crate carrying
 | maintenance | 1 |
 | counters | 1 |
 
+```mermaid
+flowchart TB
+    subgraph one["engram-server — every thread in the process starts here"]
+        A["accept loop<br/><i>the main thread</i>"]
+        R["reader x N<br/><i>one per connection</i>"]
+        Wr["writer x N<br/><i>one per connection</i>"]
+        W["engine worker x --workers<br/><i>owns its sessions</i>"]
+        M["maintenance<br/><i>compact, spill, refresh</i>"]
+        C["counters<br/><i>30 s, on change only</i>"]
+    end
+    subgraph engine["the engine crates — NEVER spawn"]
+        G["engram-graph"]
+        S["engram-store<br/><i>Send + Sync</i>"]
+    end
+    A -->|pin by id % workers| W
+    R --> W
+    W --> Wr
+    W --> G
+    M --> G
+    G --> S
+    W -. "ScopedExec, opt-in" .-> P["morsel pool"]
+    P --> G
+```
+
 `std::thread::spawn` is denied workspace-wide by `clippy.toml`. The adapter is
 where the real world is allowed to exist, and it is one file deep.
 

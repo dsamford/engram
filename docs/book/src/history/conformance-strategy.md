@@ -1,7 +1,7 @@
 # openCypher conformance strategy
 
 > **Historical — written 2026-08-27**, when conformance was **unmeasured**. The
-> programme it proposed produced the 3,771-of-3,772 figure quoted throughout
+> programme it proposed produced the 3,772-of-3,773 figure quoted throughout
 > this book.
 
 ## The thesis
@@ -86,7 +86,7 @@ decision rather than a preference.
 
 ## Where it landed
 
-**3,771 of 3,772 evaluated scenarios**, 99.97%, CI-ratcheted.
+**3,772 of 3,773 evaluated scenarios**, 99.97%, CI-ratcheted.
 
 The single failure is a time-zone-database expectation where this engine is
 arguably the more correct of the two — which is the kind of residual a

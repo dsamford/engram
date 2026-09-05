@@ -57,6 +57,12 @@ fn server_bin() -> PathBuf {
 
 /// Start a durable server on `port` over `dir`, waiting until it accepts.
 fn start(dir: &Path, port: u16) -> Option<Child> {
+    start_with(dir, port, "--data-dir")
+}
+
+/// [`start`] with the storage mode chosen: `--data-dir` (resident + WAL) or
+/// `--paged-dir` (paged segments + the WAL that fronts their tail).
+fn start_with(dir: &Path, port: u16, mode: &str) -> Option<Child> {
     let bin = server_bin();
     if !bin.exists() {
         // The server binary is built by `cargo test` only if it is a dependency
@@ -83,7 +89,7 @@ fn start(dir: &Path, port: u16) -> Option<Child> {
     let _ = std::fs::remove_file(dir.join(engram_store::dirlock::LOCK_FILE));
     let mut child = Command::new(&bin)
         .arg(format!("127.0.0.1:{port}"))
-        .arg("--data-dir")
+        .arg(mode)
         .arg(dir)
         .spawn()
         .expect("spawn server");
@@ -142,6 +148,55 @@ fn acknowledged_writes_survive_kill_9() {
         got.contains("50"),
         "50 acknowledged writes must survive a kill -9; recovered: {got}"
     );
+}
+
+/// The same promise in PAGED mode. A paged server used to be durable only at
+/// seal boundaries — these 50 writes sat in the unsealed tail and a kill -9
+/// lost every one of them, acknowledged or not — while the WAL belonged to
+/// `--data-dir` alone. The WAL now fronts the paged tail: the writes are in
+/// `paged/engram.wal` before they are acknowledged, and the restart replays
+/// them onto the segments. The second restart checks the replay is
+/// idempotent (the first restart's replayed tail is still the tail).
+#[test]
+fn acknowledged_writes_survive_kill_9_in_paged_mode() {
+    let dir = scratch("ack-paged");
+    let port = 7756;
+    let Some(child) = start_with(&dir, port, "--paged-dir") else {
+        return;
+    };
+
+    let mut c = Client::connect(format!("127.0.0.1:{port}")).expect("connect");
+    for i in 0..50 {
+        c.run(&format!("CREATE (:Durable {{k: {i}}})"))
+            .unwrap_or_else(|e| panic!("write {i} was not acknowledged: {e}"));
+    }
+    drop(c);
+    hard_kill(child);
+    assert!(
+        dir.join("engram.wal").exists(),
+        "the paged directory carries its WAL"
+    );
+
+    let mut got = Vec::new();
+    for round in 0..2 {
+        let Some(child2) = start_with(&dir, port, "--paged-dir") else {
+            return;
+        };
+        let mut c2 = Client::connect(format!("127.0.0.1:{port}")).expect("reconnect");
+        let rows = c2
+            .query("MATCH (n:Durable) RETURN count(n) AS c")
+            .unwrap_or_else(|e| panic!("count after restart {round}: {e}"));
+        got.push(format!("{rows:?}"));
+        drop(c2);
+        hard_kill(child2);
+    }
+    for (round, g) in got.iter().enumerate() {
+        assert!(
+            g.contains("50"),
+            "50 acknowledged writes must survive a kill -9 in paged mode (restart {round}); \
+             recovered: {g}"
+        );
+    }
 }
 
 /// A transaction is all-or-nothing across a kill.

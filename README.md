@@ -16,7 +16,7 @@ drivers connect to.
 
 | | |
 |---|---|
-| **openCypher conformance** | **3,771 of 3,772** evaluated TCK scenarios (99.97%), CI-ratcheted |
+| **openCypher conformance** | **3,772 of 3,773** evaluated TCK scenarios (99.97%), CI-ratcheted |
 | **`unsafe` code** | none — 13 crates `#![forbid(unsafe_code)]`, the workspace denies it |
 | **Third-party crates** | 39, every one permissively licensed, no copyleft anywhere |
 | **Reproducibility** | two processes, one seed, one identical trace digest — enforced as a gate |

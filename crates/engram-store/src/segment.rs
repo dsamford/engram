@@ -89,6 +89,12 @@ pub struct Segment {
     tombstones: u64,
     /// Total versions across row chains and column blocks — the denominator.
     versions: u64,
+    /// The commit log's next sequence at the SEAL that made this segment:
+    /// every logged record below it is in this segment or an older one. A
+    /// spill that puts the segment on disk may checkpoint the WAL below it
+    /// (`Store::checkpoint_wal`). Zero for a compaction-built segment, which
+    /// never bounds a checkpoint on its own.
+    log_upto: u64,
 }
 
 /// `(tombstones, versions)` across row chains and column blocks.
@@ -175,7 +181,19 @@ impl Segment {
             max_commit_ts,
             tombstones,
             versions,
+            log_upto: 0,
         }
+    }
+
+    /// Record the commit-log boundary of the seal that made this segment.
+    pub(crate) fn with_log_upto(mut self, log_upto: u64) -> Self {
+        self.log_upto = log_upto;
+        self
+    }
+
+    /// The commit-log boundary recorded at seal (0 when unknown).
+    pub(crate) fn log_upto(&self) -> u64 {
+        self.log_upto
     }
 
     pub(crate) fn with_blocks(
@@ -201,6 +219,7 @@ impl Segment {
             max_commit_ts,
             tombstones,
             versions,
+            log_upto: 0,
         }
     }
 

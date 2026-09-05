@@ -1,7 +1,7 @@
 # Cypher support
 
 Engram implements **openCypher**, and the honest headline is the conformance
-number: **3,771 of 3,772 evaluated TCK scenarios pass** — 99.97%. That number
+number: **3,772 of 3,773 evaluated TCK scenarios pass** — 99.97%. That number
 is ratcheted in CI so it cannot quietly fall, and the single failure is a
 time-zone-database expectation where this engine is arguably the more correct
 of the two.

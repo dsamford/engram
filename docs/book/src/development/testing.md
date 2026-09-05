@@ -101,7 +101,7 @@ the feature did not exist. Now it names a live process.
 cargo test --release -p engram-tck --test baseline -- --nocapture
 ```
 
-**3,771 of 3,772 evaluated scenarios pass** — 99.97%.
+**3,772 of 3,773 evaluated scenarios pass** — 99.97%.
 
 Each scenario runs in its own thread with a 5-second timeout, against a fresh
 graph. The fixture uses a fixed wall clock so temporal scenarios are
@@ -134,6 +134,28 @@ arguably the more correct of the two.
 A second arm runs with `ENGRAM_TCK_PRECISION_LOCKING=1`, since that flag changes
 which statements commit.
 
+## The book's claims are tested
+
+Three examples under `crates/engram-graph/examples/` assert what the
+documentation says, so a page that goes stale fails a build rather than a
+reader:
+
+| example | asserts |
+|---|---|
+| `first_graph` | every result the tutorial page prints, including that `DISTINCT` collapses the two routes and `count(r)` gives 0 for a node with no matches |
+| `documented_gaps` | every documented refusal still refuses — `=~`, `UNION` in `CALL {}`, the standalone `CALL` that yields nothing, and null-versus-absent |
+| `row_budget_and_folds` | that 2,500 rows are refused under a 100-row budget and `count(*)` answers them anyway |
+
+`documented_gaps` is the one worth understanding. A **gap** page rots in the
+more embarrassing direction: a limitation quietly fixed leaves the
+documentation telling people not to use something that works. So the refusals
+are asserted as refusals, and each failure message names the pages to update.
+
+Each example carries a `#[test]` that calls its own body, because
+`cargo test --examples` **compiles** an example without running its `main` —
+which would prove the snippet type-checks and nothing about whether it still
+answers.
+
 ## The simulation sweep
 
 ```sh
@@ -164,8 +186,8 @@ Stated as absences:
 
 - **No fuzzing** of the wire protocol or the parser.
 - **No property-based testing** — no `proptest`, no `quickcheck`.
-- **No `examples/`** — every snippet in this book was run by hand rather than by
-  `cargo test --examples`, which is a gap worth closing.
+- **No fuzz or property testing of the examples** — they assert fixed shapes,
+  not generated ones.
 - **No multi-node testing**, because there is no multi-node.
 - **No performance assertion in the test suite.** Deliberate: timing in a unit
   test is flaky, and performance belongs to the measurement lane where the

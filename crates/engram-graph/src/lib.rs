@@ -951,6 +951,11 @@ type AdjTables = BTreeMap<(u8, Vec<u32>), std::sync::Arc<Slot<AdjTable>>>;
 /// The MERGE race-window hook — see [`Graph::set_merge_race_hook_for_test`].
 pub type MergeRaceHook = std::sync::Arc<dyn Fn(&Graph) + Send + Sync>;
 
+/// Fix 75: how many `yield_now`s `Graph::settle_in_flight_writers` spends
+/// behind writers that are between their publish and their log record —
+/// a few milliseconds at most, against a window measured in microseconds.
+const SETTLE_SPINS: usize = 4_096;
+
 /// What the derived structures hold — see [`Graph::memory_report`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MemoryReport {
@@ -1693,6 +1698,11 @@ pub struct Graph {
     /// folds into its projection as `sum(COUNT { <chain> })`. Default on;
     /// off keeps the clause, for the differential test.
     chain_count_fold: BoolCell,
+    /// Fix 76: a subquery body (a pattern comprehension, an EXISTS / COUNT
+    /// pattern body) is seeded with every bound NODE trimmed to what the
+    /// body reads of it, instead of a whole copy of the outer row. Default
+    /// on; see `set_lean_subquery_seed`.
+    lean_subquery_seed: BoolCell,
     /// Whether a MULTI-KEY pattern map may seek a declared index instead of
     /// falling to a label scan. See `set_pattern_map_seek`.
     pattern_map_seek: BoolCell,
@@ -2335,6 +2345,14 @@ thread_local! {
     /// because the store's transaction knows nothing of graph tokens.
     static TXN_TOUCHED: std::cell::RefCell<Option<TxnTouched>> =
         const { std::cell::RefCell::new(None) };
+
+    /// Fix 75: the entity a uniqueness refusal named — `(is_rel, id)` — set
+    /// by the constraint check on THIS thread and taken by the MERGE that
+    /// lost its create race, so the loser binds the winner BY ID instead of
+    /// re-matching through a derived structure that may not have ingested
+    /// the winner's commit yet (see `Graph::settle_in_flight_writers`).
+    static LAST_UNIQUE_REFUSAL: std::cell::Cell<Option<(bool, u64)>> =
+        const { std::cell::Cell::new(None) };
 
     /// The adjacency tables this thread has resolved recently — see
     /// [`Graph::adj_snap_memo_get`].
@@ -3014,6 +3032,7 @@ impl Graph {
             frontier_expand: BoolCell::new(true),
             property_seek: BoolCell::new(true),
             chain_count_fold: BoolCell::new(true),
+            lean_subquery_seed: BoolCell::new(true),
             pattern_map_seek: BoolCell::new(true),
             detach_via_rel_ids: BoolCell::new(true),
             label_epoch_atomics: BoolCell::new(true),
@@ -3365,6 +3384,52 @@ impl Graph {
     /// See [`Graph::set_merge_race_hook_for_test`].
     pub(crate) fn take_merge_race_hook(&self) -> Option<MergeRaceHook> {
         self.merge_race_hook.write().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    /// Fix 75: record the entity a uniqueness refusal named (the constraint
+    /// check calls this right before it returns the violation).
+    pub(crate) fn note_unique_refusal(is_rel: bool, id: u64) {
+        LAST_UNIQUE_REFUSAL.with(|c| c.set(Some((is_rel, id))));
+    }
+
+    /// Fix 75: take (and clear) the entity the last uniqueness refusal on
+    /// this thread named.
+    pub(crate) fn take_unique_refusal(&self) -> Option<(bool, u64)> {
+        LAST_UNIQUE_REFUSAL.with(std::cell::Cell::take)
+    }
+
+    /// Fix 75: wait, bounded, until no writer is between its publish and
+    /// the recording of its log entries.
+    ///
+    /// A commit publishes its rows and THEN records the change-log entries
+    /// that advance the property and label epochs (`touch_after_commit`),
+    /// holding the write fence across both. A reader in that window sees
+    /// the rows through a record read but judges its cached index "still
+    /// current" (`snap.at >= prop_epoch`) and misses them. A MERGE that lost
+    /// its create race is exactly that reader: its create met the winner's
+    /// uniqueness marker (a record read proved the winner live), and its
+    /// re-match through the scoped index found nothing — so the violation
+    /// surfaced as genuine, about 1–3 % of the racing-merge test's runs.
+    /// Every in-flight writer drops its fence within microseconds of
+    /// publishing; the bound is a guard against a stalled one, not a wait
+    /// anyone is expected to hit.
+    pub(crate) fn settle_in_flight_writers(&self) {
+        let mut waited = false;
+        for _ in 0..SETTLE_SPINS {
+            let busy = !self
+                .inflight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty();
+            if !busy {
+                return;
+            }
+            if !waited {
+                counted!("graph.merge settled behind an in-flight writer");
+                waited = true;
+            }
+            std::thread::yield_now();
+        }
     }
 
     /// Install what `CALL engram.checkpoint()` runs: seal the unsealed tail
@@ -4930,7 +4995,13 @@ impl Graph {
 
     /// Set how many column entries the columnar aggregate scan may read
     /// per member of the scanned label before declining to the per-id
-    /// path (default 4). `usize::MAX` never declines.
+    /// path (default **8**). `usize::MAX` never declines.
+    ///
+    /// It was 4, and this doc said so for longer than the value did. A range
+    /// scan entry is ~10x cheaper than a scattered point-get, so a range scan
+    /// over ~8x the member count still beats gathering members one by one; at
+    /// 4 the scan declined on dense-label columns a range read loads far more
+    /// cheaply. See `Graph::new`.
     pub fn set_columnar_column_budget_factor(&self, factor: usize) {
         self.columnar_column_budget_factor.set(factor.max(1));
     }
@@ -5477,6 +5548,21 @@ impl Graph {
     /// Whether the count-over-chain fold is on.
     pub fn chain_count_fold_enabled(&self) -> bool {
         self.chain_count_fold.get()
+    }
+
+    /// Fix 76: whether a subquery body's seed row carries each bound node
+    /// trimmed to the properties the body reads (the general matcher clones
+    /// the seed row several times per evaluation, and a fat outer node made
+    /// every pattern comprehension of the KM work-item listing cost its
+    /// property count: 22 of the listing's 34 ms on the mirror). Default
+    /// on; off seeds the whole row, for the differential test.
+    pub fn set_lean_subquery_seed(&self, on: bool) {
+        self.lean_subquery_seed.set(on);
+    }
+
+    /// Whether the lean subquery seed is on.
+    pub fn lean_subquery_seed_enabled(&self) -> bool {
+        self.lean_subquery_seed.get()
     }
 
     /// Whether a MULTI-KEY pattern map may seek a DECLARED index.
@@ -11557,6 +11643,13 @@ impl Subsystem for GraphLayer {
             .counter("interp.matcher bound a hop end from the resolved end set")
             .counter("interp.matcher bound a lean relationship")
             .counter("interp.matcher rejected a non-member hop end from membership")
+            .counter("interp.merge converged on the refusing node by id")
+            .counter("interp.subquery seeded with a lean row")
+            .counter("interp.columnar population read its label whole to keep the columns")
+            .counter("interp.subquery hop loaded its far end's column whole")
+            .counter("interp.breaker bound a bare group key lean for the RETURN after its aggregation")
+            .counter("interp.columnar whole-label read for a population declined")
+            .counter("graph.merge settled behind an in-flight writer")
             .counter("interp.matcher reused the bound start")
             .counter("interp.columnar column read served from the property-column cache")
             .counter("interp.columnar cached column restricted to the population")

@@ -20,7 +20,7 @@ every connection.
 - **Writes.** The storage engine is an append-only MVCC log with adjacency held
   as a derived structure, so relationship creation, hub writes and delete churn
   are where the largest margins are.
-- **Standard Cypher.** 3,771 of 3,772 evaluated openCypher TCK scenarios pass,
+- **Standard Cypher.** 3,772 of 3,773 evaluated openCypher TCK scenarios pass,
   and the number is ratcheted in CI so it cannot quietly fall. See
   [Cypher support](../using/cypher-support.md).
 - **Graphs larger than memory.** [Paged mode](../architecture/paged-mode.md)

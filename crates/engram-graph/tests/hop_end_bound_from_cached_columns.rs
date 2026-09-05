@@ -41,11 +41,11 @@ fn count_of(c: &BTreeMap<String, u64>, key: &str) -> u64 {
     c.get(key).copied().unwrap_or(0)
 }
 
-const DEMAND: &str = "interp.matcher bound a hop end to its demand";
 const COLUMNS: &str = "interp.matcher bound a hop end from the label's cached columns";
 const PROJECTED: &str = "store.projected gets";
 const FULL: &str = "graph.nodes materialised in full";
 const VECTORISED: &str = "interp.subquery hop evaluated column-at-a-time";
+const LOADED: &str = "interp.subquery hop loaded its far end's column whole";
 
 /// 60 projects, 6,000 work items (100 per project) with a 2 KB body and a
 /// status in {open, done, blocked}; one stray `Note` per project hangs off
@@ -93,9 +93,15 @@ fn corpus() -> Graph {
 /// column, keeping nothing.)
 fn warm_status(g: &Graph) {
     let (_, c) = traced(g, "MATCH (w:KMWorkItem) RETURN w.status AS s, count(*) AS n ORDER BY s");
+    // Kept by this walk — or already kept (fix 79 loads a subquery's far-end
+    // column whole on first use, so a dashboard run before this warm-up has
+    // filed it) and served back.
     assert!(
-        count_of(&c, "graph.property column kept") + count_of(&c, "graph.property column kept aligned") > 0,
-        "the warm-up keeps the status column: {c:?}"
+        count_of(&c, "graph.property column kept")
+            + count_of(&c, "graph.property column kept aligned")
+            + count_of(&c, "graph.property column served")
+            > 0,
+        "the warm-up keeps (or finds kept) the status column: {c:?}"
     );
 }
 
@@ -112,15 +118,20 @@ fn a_count_subquery_binds_its_hop_end_from_the_cached_status_column() {
     assert_eq!(want.len(), 60);
     assert_eq!(want[0][1], Value::Int(40), "open per project");
     assert_eq!(want[0][2], Value::Int(20), "blocked per project");
-    // Before the column is cached: the projected read per end, as before.
+    // Before the column is cached: fix 79 loads it WHOLE on the first body
+    // that reads it (once, not per body or per project) and answers every
+    // body column-at-a-time from then on — where this used to be a
+    // projected get per end (12,000 of them) until something else happened
+    // to walk the label.
     let (cold, c) = traced(&g, DASHBOARD);
     assert_eq!(cold, want);
-    assert!(count_of(&c, DEMAND) > 0, "{c:?}");
-    assert_eq!(count_of(&c, COLUMNS), 0, "nothing cached yet: {c:?}");
-    assert!(count_of(&c, PROJECTED) >= 12_000, "a projected get per end: {c:?}");
-    // With it cached: no store read for the ends. (Fix 70 answers these
-    // one-hop bodies column-at-a-time from the same cached column — 60
-    // rows × 2 counts — before the matcher would have bound each end.)
+    assert_eq!(count_of(&c, LOADED), 1, "{c:?}");
+    assert_eq!(count_of(&c, VECTORISED), 120, "{c:?}");
+    assert_eq!(count_of(&c, COLUMNS), 0, "the matcher never binds an end here: {c:?}");
+    assert!(count_of(&c, PROJECTED) <= 200, "no projected get per end: {c:?}");
+    // With it cached by a whole-label walk too: the same answer, no load.
+    // (Fix 70 answers these one-hop bodies column-at-a-time from the cached
+    // column — 60 rows × 2 counts — before the matcher would bind an end.)
     warm_status(&g);
     let (warm, c) = traced(&g, DASHBOARD);
     assert_eq!(warm, want);

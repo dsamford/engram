@@ -174,16 +174,30 @@ fn a_lean_carry_across_two_topks_is_hydrated_once_at_the_end() {
     assert_eq!(count_of(&c, FULL), 10, "{c:?}");
 }
 
-/// CONTROLS: no LIMIT, a whole-entity use (`labels(p)`), DISTINCT, and an
-/// ORDER BY on the node itself all keep the full carry — and agree.
+/// Fix 80: NO LIMIT after the aggregation is inside the class — every
+/// output row is a group, hydrated once each, and the rows agree.
+#[test]
+fn a_return_without_a_limit_hydrates_every_group() {
+    let g = corpus();
+    let src = "MATCH (p:Proposal) WHERE p.status = $s \
+         OPTIONAL MATCH (p)-[:HAS_ARTIFACT]->(a:Artifact) \
+         WITH p, collect(DISTINCT a.id) AS ids \
+         RETURN p, ids ORDER BY p.priority DESC, p.proposedAt DESC";
+    let want = eager(&g, src);
+    assert!(!want.is_empty());
+    let (got, c) = traced(&g, src);
+    assert_eq!(got, want);
+    assert_eq!(count_of(&c, LEAN), 0, "not a top-k: {c:?}");
+    assert_eq!(count_of(&c, HYDRATED), want.len() as u64, "{c:?}");
+    assert_eq!(count_of(&c, FULL), want.len() as u64, "{c:?}");
+}
+
+/// CONTROLS: a whole-entity use (`labels(p)`), DISTINCT, and an ORDER BY
+/// on the node itself all keep the full carry — and agree.
 #[test]
 fn shapes_outside_the_late_full_class_keep_the_full_carry() {
     let g = corpus();
     for src in [
-        "MATCH (p:Proposal) WHERE p.status = $s \
-         OPTIONAL MATCH (p)-[:HAS_ARTIFACT]->(a:Artifact) \
-         WITH p, collect(DISTINCT a.id) AS ids \
-         RETURN p, ids ORDER BY p.priority DESC, p.proposedAt DESC",
         "MATCH (p:Proposal) WHERE p.status = $s \
          OPTIONAL MATCH (p)-[:HAS_ARTIFACT]->(a:Artifact) \
          WITH p, collect(DISTINCT a.id) AS ids \

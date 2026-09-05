@@ -41,9 +41,12 @@ OPTIONS:
     -d, --data-dir DIR      Store data durably in DIR. Without this the server
                             is IN-MEMORY and a restart loses everything.
         --paged-dir DIR     Serve PAGED from seg files in DIR (bigger-than-RAM):
-                            sealed segments spill to disk; durability is at seal
-                            boundaries ONLY — a crash LOSES the unsealed tail.
-                            Mutually exclusive with --data-dir.
+                            sealed segments spill to disk, and DIR/engram.wal
+                            fronts the unsealed tail — every acknowledged write
+                            is fsync'd before it is acknowledged and replayed on
+                            open, exactly as under --data-dir; a spill checkpoints
+                            the WAL behind the segments it wrote. Mutually
+                            exclusive with --data-dir (two layouts, one durability).
         --paged-cache-mb N  Block-cache budget for --paged-dir, MiB [default: 4096]
         --workers N         Engine worker threads    [default: 1]
         --max-connections N Concurrent connections   [default: 512]
@@ -501,21 +504,33 @@ fn main() -> std::io::Result<()> {
         // Opened HERE, not in `make_store`: the server needs the SAME cache
         // handle the store reads through, so every later spill shares the one
         // budget rather than minting its own.
-        let (store, cache) = match Store::open_paged_dir(&dir, paged_cache_mb << 20) {
-            Ok(v) => v,
-            Err(e) => panic!(
-                "cannot open the paged directory: {e}\n\
-                 Refusing to start empty over a paged directory that was requested — \
-                 starting empty here would look like an empty database rather than a \
-                 failed open."
-            ),
-        };
+        //
+        // WITH ITS WAL. A paged store used to be durable only at seal
+        // boundaries — the unsealed tail died with the process, and the
+        // pod's preStop checkpoint was the only thing standing between an
+        // acknowledged write and its loss — while the WAL lived in the
+        // resident `--data-dir` mode alone: capacity and durability were
+        // two modes. `DIR/engram.wal` now fronts the tail: replayed on open,
+        // appended and fsync'd before every acknowledgement, checkpointed
+        // behind every spill.
+        let wal = dir.join("engram.wal");
+        let (store, cache) =
+            match Store::open_paged_dir_with_wal(&dir, paged_cache_mb << 20, &wal) {
+                Ok(v) => v,
+                Err(e) => panic!(
+                    "cannot open the paged directory: {e}\n\
+                     Refusing to start empty over a paged directory that was requested — \
+                     starting empty here would look like an empty database rather than a \
+                     failed open."
+                ),
+            };
         eprintln!(
-            "[engram-server] paged: {} — cache {paged_cache_mb} MiB, {} segment(s) on disk. \
-             Durability at seal boundaries — the unsealed tail is LOST on crash; not the \
-             durable mode.",
+            "[engram-server] paged: {} — cache {paged_cache_mb} MiB, {} segment(s) on disk; \
+             durable: {} fronts the tail ({} version(s) replayed).",
             dir.display(),
-            store.segment_count()
+            store.segment_count(),
+            wal.display(),
+            store.tail_versions()
         );
         cfg.paged_dir = Some(dir);
         cfg.paged_spill_cache = Some(cache);

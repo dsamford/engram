@@ -575,10 +575,21 @@ impl std::error::Error for ReadFileError {}
 /// half-written, hash-failing segment — the durable analogue of the sealed
 /// segment's immutability.
 pub fn write_segment_file(seg: &Segment, path: &std::path::Path) -> std::io::Result<()> {
+    use std::io::Write;
     let bytes = write_segment(seg);
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, &bytes)?;
-    std::fs::rename(&tmp, path)
+    // `fsync` the bytes BEFORE the rename and the directory AFTER it: a
+    // segment file is the durable home of every row the WAL checkpoint
+    // drops behind it, so it must be on the platter — not merely in the
+    // page cache — before that checkpoint can run. `fs::write` + `rename`
+    // alone survived a process crash but not a power loss.
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    engram_log::sync_parent_dir(path)
 }
 
 /// Read and fully verify a segment written by [`write_segment_file`]. M0

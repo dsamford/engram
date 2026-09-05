@@ -141,14 +141,28 @@ fn aggregate_and_distinct_tails_hydrate_their_survivors() {
     }
 }
 
-/// CONTROLS: no LIMIT, a whole-entity read, a post-WHERE over the bare var,
-/// and a DISTINCT RETURN keep the full carry — and agree.
+/// Fix 80: a RETURN with NO LIMIT after the aggregation is inside the class
+/// too — every output row is a group, hydrated once each (the full read
+/// per group the seed used to pay), and the rows agree.
+#[test]
+fn a_return_without_a_limit_hydrates_every_group() {
+    let g = corpus();
+    let src = "MATCH (p:Proposal)-[:HAS_ARTIFACT]->(a:Artifact) \
+         WITH p, count(a) AS n RETURN p, n ORDER BY n DESC, p.priority DESC";
+    let want = general(&g, src);
+    assert!(!want.is_empty());
+    let (got, c) = traced(&g, src);
+    assert_eq!(got, want);
+    assert_eq!(count_of(&c, HYDRATED), want.len() as u64, "{c:?}");
+    assert_eq!(count_of(&c, FULL), want.len() as u64, "{c:?}");
+}
+
+/// CONTROLS: a whole-entity read, a post-WHERE over the bare var, and a
+/// DISTINCT RETURN keep the full carry — and agree.
 #[test]
 fn shapes_outside_the_class_keep_the_full_carry_and_agree() {
     let g = corpus();
     for src in [
-        "MATCH (p:Proposal)-[:HAS_ARTIFACT]->(a:Artifact) \
-         WITH p, count(a) AS n RETURN p, n ORDER BY n DESC, p.priority DESC",
         "MATCH (p:Proposal)-[:HAS_ARTIFACT]->(a:Artifact) \
          WITH p, count(a) AS n RETURN labels(p) AS l, p.title AS t, n ORDER BY n DESC, p.priority DESC LIMIT 5",
         "MATCH (p:Proposal)-[:HAS_ARTIFACT]->(a:Artifact) \

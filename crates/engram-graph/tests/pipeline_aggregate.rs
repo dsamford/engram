@@ -407,15 +407,20 @@ fn whole_node_carry_still_materialises() {
         0,
         "'WITH b … RETURN b.bk' no longer materialises the node"
     );
-    // CONTROL: a later BARE use keeps the full-node materialisation.
+    // A later BARE use: fix 80 carries the key lean (its ORDER BY key
+    // gathered like any property read) and hydrates the node once per
+    // group at the RETURN — the full reads stay, one per group.
     let bare = "MATCH (a:Ag)-[:R]->(b:Bg) WITH b, count(*) AS c \
                 RETURN b, c ORDER BY c DESC, b.bk ASC";
     let (on, off) = both(&g, bare, BTreeMap::new());
     assert_eq!(on, off, "bare later use ON must equal OFF");
-    assert_eq!(counter(&g, bare, "interp.agg group-key props gathered"), 0);
+    assert!(
+        counter(&g, bare, "interp.agg group-key props gathered") > 0,
+        "the ORDER BY key is gathered for the lean carry"
+    );
     assert!(
         counter(&g, bare, "graph.nodes materialised in full") > 0,
-        "'RETURN b' keeps the per-group full-node materialisation"
+        "'RETURN b' hydrates each group's node in full"
     );
 }
 

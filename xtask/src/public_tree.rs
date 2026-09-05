@@ -237,7 +237,70 @@ pub struct TreeReport {
     pub findings: Vec<String>,
 }
 
+/// Whether the working tree has uncommitted changes.
+///
+/// # Why this gate refuses a dirty tree
+///
+/// `run` copies a DIRECTORY, not a commit. Pointed at a working tree it
+/// publishes whatever happens to be open in an editor — and the first public
+/// snapshot of this project did exactly that, sweeping in 1,115 lines of
+/// in-progress work across sixteen files that nobody had reviewed for
+/// publication.
+///
+/// Nothing in the output distinguishes it: an allow-list copy of a dirty tree
+/// and of a clean one produce the same PASS line. So the refusal is here, at
+/// the only point that can tell the difference.
+///
+/// Cut from a clean checkout instead:
+///
+/// ```text
+/// git worktree add --detach /tmp/clean HEAD
+/// cd /tmp/clean && cargo xtask public-tree /tmp/public
+/// ```
+///
+/// A tree that is not a git checkout at all is NOT refused — the gate must
+/// still assemble from an exported archive — but it says which case it took,
+/// because "clean" and "could not tell" must not print identically.
+fn dirty_files(root: &Path) -> Result<Vec<String>, String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .output()
+        .map_err(|e| format!("could not run git: {e}"))?;
+    if !out.status.success() {
+        return Err("not a git checkout".into());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
+}
+
 pub fn run(root: &Path, dest: &Path) -> TreeReport {
+    // Refuse a dirty tree before copying a single file. See `dirty_files`.
+    let provenance = match dirty_files(root) {
+        Ok(d) if !d.is_empty() => {
+            let mut findings = vec![
+                format!(
+                    "REFUSING a dirty working tree: {} uncommitted change(s).",
+                    d.len()
+                ),
+                "This gate copies a DIRECTORY, not a commit, so it would publish work in progress, and the output would carry no sign of it.".to_string(),
+                "Cut from a clean checkout: `git worktree add --detach /tmp/clean HEAD && cd /tmp/clean && cargo xtask public-tree <dest>`".to_string(),
+            ];
+            findings.extend(d.into_iter().take(10).map(|f| format!("  dirty: {f}")));
+            return TreeReport {
+                passed: false,
+                scanned: format!("refused before copying, at {}", root.display()),
+                findings,
+            };
+        }
+        Ok(_) => "clean git checkout",
+        Err(_) => "not a git checkout (provenance unverified)",
+    };
+    let _ = provenance;
     // Refuse a destination that already holds anything. Copying over an
     // existing tree would leave whatever was there before mixed into the
     // output, and the whole value of this gate is that the result contains

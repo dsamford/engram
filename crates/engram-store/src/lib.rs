@@ -340,6 +340,34 @@ impl From<engram_log::WalError> for OpenWalError {
     }
 }
 
+/// Why a paged directory could not be opened WITH its WAL
+/// ([`Store::open_paged_dir_with_wal`]).
+#[derive(Debug)]
+pub enum OpenPagedWalError {
+    /// The segment directory could not be read or a segment file refused.
+    Paged(std::io::Error),
+    /// The WAL could not be opened, or its records did not replay.
+    Wal(OpenWalError),
+}
+
+impl std::fmt::Display for OpenPagedWalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OpenPagedWalError::Paged(e) => write!(f, "paged directory: {e}"),
+            OpenPagedWalError::Wal(e) => write!(f, "paged WAL: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for OpenPagedWalError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            OpenPagedWalError::Paged(e) => Some(e),
+            OpenPagedWalError::Wal(e) => Some(e),
+        }
+    }
+}
+
 impl std::fmt::Display for OpenWalError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1450,8 +1478,12 @@ impl Store {
         // the segment — the "tail is strictly newer than every segment" fence
         // readers stop on would be false, and compaction would then retire
         // the newer version. Lock order: log → shard latches → sealed_swap.
-        let _lg = self.log_mut();
+        let lg = self.log_mut();
         self.wait_for_allocated_to_publish();
+        // The commit log's next sequence, read under the log latch: every
+        // record below it is in the tail being sealed or an older segment,
+        // so a spill of this segment may checkpoint the WAL below it.
+        let log_upto = lg.log.len();
         // Every shard's write latch, held across the publish. While they are
         // held no version enters or leaves the tail, and a reader blocked on
         // a shard latch finds, when it gets in, either the tail as it was or
@@ -1476,15 +1508,16 @@ impl Store {
             .next_segment_seq
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let mut segments = self.sealed().segments.clone();
-        segments.push(std::sync::Arc::new(SealedSegment::Resident(Segment::new(
-            seq, entries,
-        ))));
+        segments.push(std::sync::Arc::new(SealedSegment::Resident(
+            Segment::new(seq, entries).with_log_upto(log_upto),
+        )));
         self.inner
             .sealed
             .store(std::sync::Arc::new(Sealed { segments }));
         self.tail_cleared();
         drop(swap);
         drop(all);
+        drop(lg);
         counted!("store.seals");
         sometimes!("store.sealed a segment", true);
         Some(seq)
@@ -1654,6 +1687,19 @@ impl Store {
         dir: &std::path::Path,
         cache: &std::sync::Arc<crate::paged::BlockCache>,
     ) -> std::io::Result<usize> {
+        self.spill_sealed_into_reporting(dir, cache).map(|(n, _)| n)
+    }
+
+    /// [`Store::spill_sealed_into`], also reporting the commit-log boundary
+    /// the spill made durable: the greatest `log_upto` among the segments it
+    /// wrote (every logged record below it now lives in a segment file), or
+    /// `None` when nothing was converted or no converted segment carried one.
+    /// The caller may [`Store::checkpoint_wal`] below that boundary.
+    pub fn spill_sealed_into_reporting(
+        &self,
+        dir: &std::path::Path,
+        cache: &std::sync::Arc<crate::paged::BlockCache>,
+    ) -> std::io::Result<(usize, Option<u64>)> {
         // Under the swap latch: a seal completing between this load and the
         // store below would otherwise be dropped from the set.
         let _swap = self
@@ -1665,6 +1711,7 @@ impl Store {
         let mut new_segs: Vec<std::sync::Arc<SealedSegment>> =
             Vec::with_capacity(sealed.segments.len());
         let mut converted = 0usize;
+        let mut durable_below: Option<u64> = None;
         for seg in &sealed.segments {
             match seg.as_resident() {
                 Some(resident) => {
@@ -1674,6 +1721,11 @@ impl Store {
                         .map_err(|e| std::io::Error::other(format!("{e}")))?;
                     new_segs.push(std::sync::Arc::new(paged));
                     converted += 1;
+                    if resident.log_upto() > 0 {
+                        durable_below = Some(durable_below.map_or(resident.log_upto(), |d| {
+                            d.max(resident.log_upto())
+                        }));
+                    }
                 }
                 // Already paged (an earlier spill): keep the existing backing.
                 None => new_segs.push(std::sync::Arc::clone(seg)),
@@ -1688,7 +1740,155 @@ impl Store {
                 .store(std::sync::Arc::new(Sealed { segments: new_segs }));
             counted!("store.spilled sealed to paged");
         }
-        Ok(converted)
+        Ok((converted, durable_below))
+    }
+
+    /// CHECKPOINT the WAL below `seq`: every logged record below it is in a
+    /// sealed segment ON DISK (the caller took `seq` from
+    /// [`Store::spill_sealed_into_reporting`]), so the WAL file is rotated
+    /// to hold only the records from `seq` on, anchored at the chain hash
+    /// before it, and the retained entries below `seq` are dropped from
+    /// memory. A store with no WAL only drops the retained entries. Returns
+    /// the entries dropped.
+    ///
+    /// Taken in the group-commit order (the group mutex, then the log
+    /// latch), so the fsync handle is swapped to the new file in the same
+    /// critical section as the sink: a group commit that races this either
+    /// fsyncs the old file before the rotation (its records are in the
+    /// successor too) or the new file after it — never the old handle for
+    /// records that only the new file holds.
+    pub fn checkpoint_wal(&self, seq: u64) -> std::io::Result<u64> {
+        let mut g = self
+            .inner
+            .group
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut lg = self.log_mut();
+        let dropped = lg.log.rotate_sink_below(seq)?;
+        if let Some(handle) = lg.log.sync_handle() {
+            g.file = Some(handle?);
+        }
+        drop(lg);
+        drop(g);
+        counted!("store.wal checkpointed");
+        Ok(dropped)
+    }
+
+    /// Whether this store's commit log has a durable sink (a WAL).
+    pub fn has_wal(&self) -> bool {
+        self.log_mut().log.has_sink()
+    }
+
+    /// [`Store::open_paged_dir`] with a WAL FRONTING THE TAIL — the durable
+    /// paged open. The sealed segments come from `dir` as before; the WAL at
+    /// `wal_path` (created if absent) holds every acknowledged write since
+    /// the last checkpoint and is replayed into the tail, then attached so
+    /// every later logged write is appended and `fsync`'d before it is
+    /// acknowledged. Bigger-than-RAM AND durable, which the two open paths
+    /// used to trade against each other: a paged store lost its unsealed
+    /// tail on every crash, and a WAL-backed store had to hold its whole
+    /// history resident.
+    ///
+    /// Replay is ANCHORED: a rotated WAL's records verify against the
+    /// header's `(first_seq, prev_hash)`, and the commit log resumes its
+    /// sequence there. A record whose commit timestamp is at or below the
+    /// segments' newest is already in a segment (a crash landed between a
+    /// spill and its checkpoint) and is appended to the log for the chain but
+    /// not to the tail.
+    pub fn open_paged_dir_with_wal(
+        dir: &std::path::Path,
+        cache_bytes: usize,
+        wal_path: &std::path::Path,
+    ) -> Result<(Store, std::sync::Arc<crate::paged::BlockCache>), OpenPagedWalError> {
+        let (store, cache) = Self::open_paged_dir(dir, cache_bytes).map_err(OpenPagedWalError::Paged)?;
+        let (anchor, entries, wal) =
+            Wal::open_anchored(wal_path).map_err(|e| OpenPagedWalError::Wal(e.into()))?;
+        match CommitLog::verify_entries_from(anchor, &entries) {
+            engram_log::ChainVerify::Intact { .. } => {}
+            engram_log::ChainVerify::Broken { seq } => {
+                return Err(OpenPagedWalError::Wal(OpenWalError::Recover(
+                    RecoverError::BrokenChain { seq },
+                )));
+            }
+            engram_log::ChainVerify::SequenceGap { expected, found } => {
+                return Err(OpenPagedWalError::Wal(OpenWalError::Recover(
+                    RecoverError::SequenceGap { expected, found },
+                )));
+            }
+        }
+        let sealed_upto = store
+            .sealed()
+            .segments
+            .iter()
+            .map(|s| s.max_commit_ts())
+            .max()
+            .unwrap_or(0);
+        let mut replayed = 0usize;
+        let mut skipped = 0usize;
+        {
+            let mut lg = store.log_mut();
+            lg.log.seed_anchor(anchor);
+            let mut newest = 0u64;
+            for e in &entries {
+                let (body, value) = Self::decode_log_payload(&e.payload).ok_or(
+                    OpenPagedWalError::Wal(OpenWalError::Recover(RecoverError::MalformedPayload {
+                        seq: e.seq,
+                    })),
+                )?;
+                let prefix = KeyPrefix {
+                    realm: e.header.realm,
+                    namespace: e.header.namespace,
+                    kind: e.header.kind,
+                    partition: e.header.partition,
+                };
+                let key = Self::logical_key(&prefix, body);
+                let ts = e.header.commit_ts;
+                // The chain continues through every record, replayed or not.
+                lg.log.append(e.header, e.payload.clone());
+                if ts <= sealed_upto && sealed_upto > 0 {
+                    skipped += 1;
+                    continue;
+                }
+                store.advance_ts_to(ts + 1);
+                let version = match e.header.op {
+                    Op::Put => Version {
+                        commit_ts: ts,
+                        value: Some(value.into()),
+                        sealed: prefix.kind.is_protected(),
+                    },
+                    Op::Delete => Version {
+                        commit_ts: ts,
+                        value: None,
+                        sealed: false,
+                    },
+                };
+                store.inner.tail.insert_ordered(key, version);
+                store.tail_added();
+                newest = newest.max(ts);
+                replayed += 1;
+            }
+            if newest > 0 {
+                store.advance_visible_to(newest);
+            }
+            lg.log.attach_sink(wal);
+            let handle = lg.log.sync_handle();
+            if let Some(handle) = handle {
+                let file = handle.map_err(|e| OpenPagedWalError::Wal(OpenWalError::Io(e)))?;
+                store
+                    .inner
+                    .group
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .file = Some(file);
+            }
+        }
+        if replayed > 0 {
+            counted!("store.paged open replayed the WAL into the tail");
+        }
+        if skipped > 0 {
+            counted!("store.paged open skipped WAL records a segment already holds");
+        }
+        Ok((store, cache))
     }
 
     /// Open a store whose sealed segments are read PAGED from the `seg-<seq>.seg`

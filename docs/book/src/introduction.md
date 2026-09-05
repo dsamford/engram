@@ -14,7 +14,7 @@ drivers connect to.
 |  |  |
 |---|---|
 | **Measured standing** | ahead of Neo4j 5.26-community on **all 19 workloads** measured at LDBC SNB SF1 — LSQB 9/9 and the stress suite's 20 levels, same-window pairs |
-| **openCypher conformance** | 3,771 of 3,772 evaluated TCK scenarios (99.97%), CI-ratcheted |
+| **openCypher conformance** | 3,772 of 3,773 evaluated TCK scenarios (99.97%), CI-ratcheted |
 | **`unsafe` code** | none — the workspace denies it outright |
 | **Third-party crates** | 39, every one permissively licensed, no copyleft |
 | **Reproducibility** | two processes, one seed, one identical trace digest — enforced as a gate |

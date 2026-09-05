@@ -418,6 +418,91 @@ impl CommitLog {
         self.sink = Some(wal);
     }
 
+    /// Whether a durable sink is attached.
+    pub fn has_sink(&self) -> bool {
+        self.sink.is_some()
+    }
+
+    /// Start an EMPTY log at a rotated WAL's anchor: the next sequence is
+    /// `first_seq` and the head is `prev_hash`, exactly as if the records
+    /// below the anchor had been appended and then truncated. The replayed
+    /// suffix then verifies and extends the chain the file carries.
+    pub fn seed_anchor(&mut self, anchor: WalAnchor) {
+        assert!(self.entries.is_empty() && self.truncated == 0, "seed_anchor on a used log");
+        if anchor.first_seq > 0 {
+            self.truncated = anchor.first_seq;
+            self.truncated_head = Some(anchor.prev_hash);
+        }
+    }
+
+    /// [`CommitLog::verify_entries`] against an anchor instead of genesis —
+    /// the check a rotated WAL's records get on replay.
+    pub fn verify_entries_from(anchor: WalAnchor, entries: &[Entry]) -> ChainVerify {
+        let mut prev = anchor.prev_hash;
+        for (i, e) in entries.iter().enumerate() {
+            let expected_seq = anchor.first_seq + i as u64;
+            if e.seq != expected_seq {
+                return ChainVerify::SequenceGap {
+                    expected: expected_seq,
+                    found: e.seq,
+                };
+            }
+            let want = entry_hash(&prev, e.seq, &e.header, &payload_digest(&e.payload));
+            if want != e.hash {
+                return ChainVerify::Broken { seq: e.seq };
+            }
+            prev = e.hash;
+        }
+        ChainVerify::Intact {
+            len: anchor.first_seq + entries.len() as u64,
+            head: prev,
+        }
+    }
+
+    /// CHECKPOINT the durable sink below `seq`: rotate the WAL file to one
+    /// holding only the records at or after `seq`, anchored at the hash before
+    /// it, and drop the retained entries below `seq` from memory. `seq` must
+    /// be within the retained range (`truncated..=len`): the anchor hash of a
+    /// boundary whose predecessor was already dropped is unknown. Returns the
+    /// entries dropped; a log with no sink only truncates.
+    ///
+    /// The caller holds whatever latch guards this log across the call, so no
+    /// append lands between the successor's write and the sink swap — the
+    /// successor is complete for the chain it anchors.
+    pub fn rotate_sink_below(&mut self, seq: u64) -> std::io::Result<u64> {
+        if seq < self.truncated || seq > self.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "checkpoint boundary {seq} outside the retained range {}..={}",
+                    self.truncated,
+                    self.len()
+                ),
+            ));
+        }
+        if self.sink.is_some() {
+            let prev_hash = if seq == self.truncated {
+                self.truncated_head.unwrap_or_else(genesis_hash)
+            } else {
+                self.entries[(seq - self.truncated - 1) as usize].hash
+            };
+            let anchor = WalAnchor {
+                first_seq: seq,
+                prev_hash,
+            };
+            // Owned: the rotation borrows the sink mutably while it copies
+            // the kept records; a checkpoint keeps only the records since
+            // the last seal, so the copy is small.
+            let keep: Vec<Entry> = self.tail(seq).to_vec();
+            if let Some(sink) = self.sink.as_mut() {
+                // A failure leaves the old file and the old sink in place —
+                // the log stays durable, the checkpoint simply did not happen.
+                sink.rotate(anchor, &keep)?;
+            }
+        }
+        Ok(self.truncate_below(seq))
+    }
+
     /// The entries, for a CDC tail or a replayer.
     pub fn entries(&self) -> &[Entry] {
         &self.entries
@@ -555,6 +640,35 @@ impl Subsystem for CommitLog {
 #[derive(Debug)]
 pub struct Wal {
     w: std::io::BufWriter<std::fs::File>,
+    /// Where the file lives — a rotation writes the successor beside it and
+    /// renames over it.
+    path: std::path::PathBuf,
+}
+
+/// Where a WAL file's chain starts: the sequence of its first record and the
+/// chain hash immediately before it — genesis and zero for a file that was
+/// never rotated, the checkpoint boundary for one that was.
+///
+/// A rotated file verifies its records against THIS anchor instead of
+/// genesis, which is what lets a checkpoint drop a durable prefix (the rows
+/// are in a sealed segment on disk) without breaking chain verification —
+/// the two were mutually exclusive while `Wal::open` assumed genesis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalAnchor {
+    /// The sequence of the first record in the file.
+    pub first_seq: u64,
+    /// The chain hash before `first_seq`.
+    pub prev_hash: [u8; 32],
+}
+
+impl WalAnchor {
+    /// The anchor of a never-rotated file.
+    pub fn genesis() -> Self {
+        WalAnchor {
+            first_seq: 0,
+            prev_hash: genesis_hash(),
+        }
+    }
 }
 
 /// Process-wide count of real `fsync` calls made by every [`Wal`].
@@ -628,6 +742,14 @@ pub enum WalError {
         /// Bytes present.
         len: usize,
     },
+    /// The file was ROTATED (its chain starts at `first_seq`, not genesis) and
+    /// the caller asked for a from-genesis log. A rotated WAL belongs to a
+    /// paged store whose earlier records live in sealed segments; opening it
+    /// as a whole-history log would replay a suffix as the database.
+    Rotated {
+        /// The sequence the file's chain starts at.
+        first_seq: u64,
+    },
     /// Underlying I/O.
     Io(std::io::Error),
 }
@@ -649,6 +771,11 @@ impl std::fmt::Display for WalError {
             WalError::ShortHeader { len } => write!(
                 f,
                 "WAL header truncated at {len} bytes (needs {WAL_HEADER_LEN})"
+            ),
+            WalError::Rotated { first_seq } => write!(
+                f,
+                "WAL was rotated (its chain starts at seq {first_seq}, not genesis): it fronts a \
+                 paged store's sealed segments and cannot be opened as a whole-history log"
             ),
             WalError::Io(e) => write!(f, "{e}"),
         }
@@ -673,7 +800,24 @@ impl Wal {
     /// — is discarded, and only because the commit that wrote it was never
     /// `fsync`'d, so losing it is correct.
     pub fn open(path: &std::path::Path) -> Result<(Vec<Entry>, Wal), WalError> {
-        use std::io::{Read, Seek, SeekFrom, Write};
+        let (anchor, entries, wal) = Self::open_anchored(path)?;
+        if anchor.first_seq != 0 {
+            return Err(WalError::Rotated {
+                first_seq: anchor.first_seq,
+            });
+        }
+        Ok((entries, wal))
+    }
+
+    /// [`Wal::open`] for a file that may have been ROTATED: the records are
+    /// verified against the header's anchor (`first_seq`, `prev_hash`) rather
+    /// than genesis, and the anchor comes back so the caller can seed its
+    /// commit log's sequence and head from it. A never-rotated file anchors
+    /// at genesis and behaves exactly as `open`.
+    pub fn open_anchored(
+        path: &std::path::Path,
+    ) -> Result<(WalAnchor, Vec<Entry>, Wal), WalError> {
+        use std::io::{Read, Seek, SeekFrom};
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false) // open-or-create; NEVER discard an existing log
@@ -686,19 +830,15 @@ impl Wal {
         // ── Header: identify the file BEFORE parsing or truncating anything ──
         if buf.is_empty() {
             // A fresh file: write the header and start empty.
-            let mut hdr = Vec::with_capacity(WAL_HEADER_LEN);
-            hdr.extend_from_slice(&WAL_MAGIC);
-            hdr.extend_from_slice(&WAL_FORMAT_VERSION.to_be_bytes());
-            hdr.extend_from_slice(&0u64.to_be_bytes()); // first_seq
-            hdr.extend_from_slice(&genesis_hash()); // prev_hash anchor
-            hdr.extend_from_slice(&[0u8; 12]); // reserved
-            debug_assert_eq!(hdr.len(), WAL_HEADER_LEN);
-            file.write_all(&hdr)?;
+            let anchor = WalAnchor::genesis();
+            Self::write_header(&mut file, &anchor)?;
             file.sync_all()?;
             return Ok((
+                anchor,
                 Vec::new(),
                 Wal {
                     w: std::io::BufWriter::new(file),
+                    path: path.to_path_buf(),
                 },
             ));
         }
@@ -717,6 +857,13 @@ impl Wal {
                 supported: WAL_FORMAT_VERSION,
             });
         }
+        let first_seq = u64::from_be_bytes(buf[12..20].try_into().expect("8"));
+        let mut prev_hash = [0u8; 32];
+        prev_hash.copy_from_slice(&buf[20..52]);
+        let anchor = WalAnchor {
+            first_seq,
+            prev_hash,
+        };
 
         let mut entries: Vec<Entry> = Vec::new();
         // The valid prefix INCLUDES the header, so a torn-tail truncation can
@@ -739,8 +886,15 @@ impl Wal {
             let payload = buf[pay_at..pay_at + plen].to_vec();
             let mut hash = [0u8; 32];
             hash.copy_from_slice(&buf[pay_at + plen..end]);
-            let prev = entries.last().map(|e| e.hash).unwrap_or_else(genesis_hash);
-            if hash != entry_hash(&prev, seq, &header, &payload_digest(&payload)) {
+            // The chain anchors at the header, not at genesis: a rotated
+            // file's first record extends the hash the checkpoint recorded.
+            let (prev, expected_seq) = match entries.last() {
+                Some(e) => (e.hash, e.seq + 1),
+                None => (anchor.prev_hash, anchor.first_seq),
+            };
+            if seq != expected_seq
+                || hash != entry_hash(&prev, seq, &header, &payload_digest(&payload))
+            {
                 break; // torn / bit-flipped tail
             }
             entries.push(Entry {
@@ -757,11 +911,96 @@ impl Wal {
         }
         file.seek(SeekFrom::Start(good as u64))?;
         Ok((
+            anchor,
             entries,
             Wal {
                 w: std::io::BufWriter::new(file),
+                path: path.to_path_buf(),
             },
         ))
+    }
+
+    /// The anchor recorded in `path`'s header — `None` for a file that is
+    /// absent, empty, or not a WAL. A read of the header alone, for a test or
+    /// an operator asking "where does this file's chain start".
+    pub fn read_anchor(path: &std::path::Path) -> Option<WalAnchor> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path).ok()?;
+        let mut hdr = [0u8; WAL_HEADER_LEN];
+        file.read_exact(&mut hdr).ok()?;
+        if hdr[..8] != WAL_MAGIC {
+            return None;
+        }
+        let first_seq = u64::from_be_bytes(hdr[12..20].try_into().ok()?);
+        let mut prev_hash = [0u8; 32];
+        prev_hash.copy_from_slice(&hdr[20..52]);
+        Some(WalAnchor {
+            first_seq,
+            prev_hash,
+        })
+    }
+
+    fn write_header(file: &mut std::fs::File, anchor: &WalAnchor) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut hdr = Vec::with_capacity(WAL_HEADER_LEN);
+        hdr.extend_from_slice(&WAL_MAGIC);
+        hdr.extend_from_slice(&WAL_FORMAT_VERSION.to_be_bytes());
+        hdr.extend_from_slice(&anchor.first_seq.to_be_bytes());
+        hdr.extend_from_slice(&anchor.prev_hash);
+        hdr.extend_from_slice(&[0u8; 12]); // reserved
+        debug_assert_eq!(hdr.len(), WAL_HEADER_LEN);
+        file.write_all(&hdr)
+    }
+
+    /// ROTATE the file at `self.path`: write a successor holding only the
+    /// records at or after `anchor.first_seq` (`keep`, which the caller took
+    /// from its commit log), anchored at the checkpoint boundary; `fsync` it;
+    /// rename it over the old file; `fsync` the directory. The successor is
+    /// complete before the rename, so a crash at any point leaves either the
+    /// whole old file or the whole new one — never a torn checkpoint. The
+    /// old handle is dropped with `self`; the returned sink appends to the
+    /// new file after its last record.
+    ///
+    /// The prefix dropped is the checkpoint's retention statement: every
+    /// record below `first_seq` is in a sealed segment on disk. Recovery of
+    /// those rows is the segment's job now, and the new header's anchor is
+    /// what lets the suffix still verify.
+    pub fn rotate(&mut self, anchor: WalAnchor, keep: &[Entry]) -> std::io::Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+        let path = self.path.clone();
+        let successor = path.with_extension("wal.rotating");
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&successor)?;
+            Self::write_header(&mut file, &anchor)?;
+            let mut w = std::io::BufWriter::new(file);
+            for e in keep {
+                debug_assert!(e.seq >= anchor.first_seq, "a kept record precedes the anchor");
+                w.write_all(&e.seq.to_be_bytes())?;
+                w.write_all(&e.header.encode())?;
+                w.write_all(&(e.payload.len() as u32).to_be_bytes())?;
+                w.write_all(&e.payload)?;
+                w.write_all(&e.hash)?;
+            }
+            w.flush()?;
+            w.get_ref().sync_all()?;
+        }
+        // Everything above left `self` untouched: a failure there keeps the
+        // old file and the old sink, and the caller's log is still durable.
+        // The old handle is flushed before the swap so a failed rename leaves
+        // nothing of it unwritten either.
+        self.w.flush()?;
+        std::fs::rename(&successor, &path)?;
+        sync_parent_dir(&path)?;
+        let mut file = std::fs::OpenOptions::new().read(true).write(true).open(&path)?;
+        file.seek(SeekFrom::End(0))?;
+        self.w = std::io::BufWriter::new(file);
+        counted!("wal.rotated");
+        Ok(())
     }
 
     fn write_entry(&mut self, e: &Entry) -> std::io::Result<()> {
@@ -780,4 +1019,22 @@ impl Wal {
         FSYNCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.w.get_ref().sync_all()
     }
+}
+
+/// `fsync` the directory holding `path`, so a rename in it is durable. A
+/// no-op where the platform cannot open a directory for syncing (Windows
+/// commits renames through the filesystem's own journal).
+pub fn sync_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        if let Some(dir) = path.parent() {
+            let d = std::fs::File::open(dir)?;
+            d.sync_all()?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
