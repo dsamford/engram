@@ -68,6 +68,11 @@ const ALLOW: &[Allow] = &[
     Allow::File("clippy.toml"),
     Allow::File("deny.toml"),
     Allow::File(".gitignore"),
+    // The `cargo xtask` alias. Without it the published tree cannot run a
+    // single one of its own gates — `cargo xtask all` is "no such command" —
+    // which the first public snapshot demonstrated, on the run that was
+    // supposed to prove the tree was sound.
+    Allow::File(".cargo/config.toml"),
     // Line-ending normalisation. It ships because several tests pin BYTES, and
     // a consumer who checks out this tree with CRLF and then runs the golden
     // hash tests gets a failure whose cause is their git configuration.

@@ -554,41 +554,21 @@ pub(crate) fn count_hop_ends_vectorised(
             (Some(rw), reads)
         }
     };
-    // Every demanded column must be CACHED before any adjacency is read.
-    // Fix 79: one that is not is LOADED WHOLE and kept (`label_value_columns`
-    // — the read the property-column cache files), for a label small
-    // enough that reading it whole is the cost of one of today's
-    // evaluations, not a gamble. The KMProject dashboard's nine
-    // `COUNT { (w:KMWorkItem)-[:BELONGS_TO_PROJECT]->(p) WHERE
-    // coalesce(w.status, 'backlog') = … }` per project declined here on
-    // every run, because nothing had ever read `KMWorkItem.status` as a
-    // column (the listings bind `properties(w)` whole): 14k projected
-    // record reads per statement, 156 ms against Neo4j's 21.5 on the
-    // mirror after fix 70. One whole-label read is ~15k gets once; every
-    // later body over that label is column-at-a-time. A label past the
-    // bound, or a load that declines, still hands the body to the matcher.
+    // Every demanded column must be CACHED before any adjacency is read:
+    // an uncached one hands the whole body back to the matcher.
     let mut columns: Vec<GatheredColumn> = Vec::new();
     if let Some(l) = label {
-        let mut wanted: Vec<(String, bool)> = reads.props.iter().map(|p| (p.clone(), false)).collect();
-        wanted.extend(reads.presence_only().into_iter().map(|p| (p, true)));
-        for (p, presence) in wanted {
-            let col = match graph.prop_column(l, &p, false) {
-                Some(PropColumn::Values(col)) => col,
-                _ => {
-                    if graph.count_label_nodes(l) > WHOLE_LABEL_READ_MAX {
-                        return Ok(None);
-                    }
-                    let Some(mut loaded) = label_value_columns(graph, l, std::slice::from_ref(&p), params)? else {
-                        return Ok(None);
-                    };
-                    let Some(col) = loaded.pop() else {
-                        return Ok(None);
-                    };
-                    counted!("interp.subquery hop loaded its far end's column whole");
-                    std::sync::Arc::new(col)
-                }
+        for p in &reads.props {
+            let Some(PropColumn::Values(col)) = graph.prop_column(l, p, false) else {
+                return Ok(None);
             };
-            columns.push((local_for_prop(&reads.tag, &p), col, presence));
+            columns.push((local_for_prop(&reads.tag, p), col, false));
+        }
+        for p in reads.presence_only() {
+            let Some(PropColumn::Values(col)) = graph.prop_column(l, &p, false) else {
+                return Ok(None);
+            };
+            columns.push((local_for_prop(&reads.tag, &p), col, true));
         }
     }
     let mut ids: Vec<u64> = Vec::new();
@@ -1807,31 +1787,6 @@ fn restrict_entries_to(col: &[(u64, Value)], ids: &[u64]) -> Vec<(u64, Value)> {
     out
 }
 
-/// [`restrict_entries_to`] that TAKES the values out of an owned column
-/// (the whole-label walk's own copy, which nothing else reads) instead of
-/// cloning them — a 38k-entry column of list values restricted to 18k
-/// members would otherwise clone every list.
-fn take_entries_to(col: &mut [(u64, Value)], ids: &[u64]) -> Vec<(u64, Value)> {
-    let mut out = Vec::with_capacity(ids.len());
-    let mut ci = 0usize;
-    for &id in ids {
-        while ci < col.len() && col[ci].0 < id {
-            ci += 1;
-        }
-        if ci < col.len() && col[ci].0 == id {
-            out.push((id, std::mem::replace(&mut col[ci].1, Value::Null)));
-        }
-    }
-    out
-}
-
-/// Fix 78: a population at least this share of its label (1/N) is read as
-/// the whole label so the columns are kept.
-const WHOLE_LABEL_SHARE: u64 = 8;
-/// ...and only for a label up to this many members: reading a bigger label
-/// whole for a fraction of it is a gamble the population read need not take.
-const WHOLE_LABEL_READ_MAX: u64 = 262_144;
-
 /// [`restrict_entries_to`] for a presence column (ids only).
 fn restrict_ids_to(present: &[u64], ids: &[u64]) -> Vec<u64> {
     let mut out = Vec::with_capacity(ids.len().min(present.len()));
@@ -1972,60 +1927,6 @@ fn load_walk_budgeted(
     let Some(probe_ends) = resolve_probe_ends(graph, reads, params)? else {
         return Ok(None);
     };
-    // Fix 78: a SUPPLIED population that is a large share of its one label
-    // is read as the WHOLE label and restricted afterwards. A population
-    // read is never kept (the cache holds whole-label columns only), so a
-    // listing over most of a label re-read its columns on every statement:
-    // the email classification listing projected eight properties over 18k
-    // of the 38k UserDataNode emails and gathered 18k records per run
-    // (1,005 ms against Neo4j's 207), and the next run did it again. The
-    // whole-label read costs what the population read costs — the same
-    // span when the ids spread over the label, else a gather of the label
-    // instead of most of it — and the columns it assembles are KEPT, so the
-    // next statement over the label reads nothing. Taken only for a
-    // one-label node source with no probe or degree (their per-member
-    // answers are aligned to the population), when a demanded column is
-    // not already cached, the population is at least an eighth of the
-    // label, and the label is not so large that reading it whole is a
-    // gamble; a declined whole-label walk falls back to the population read.
-    if let (Some(over_ids), Source::Nodes { labels, any_of }) = (&over, source) {
-        if labels.len() == 1
-            && any_of.is_empty()
-            && reads.probes.is_empty()
-            && reads.degrees.is_empty()
-            && !reads.type_read
-        {
-            let label = labels[0].as_str();
-            let total = graph.count_label_nodes(label);
-            let uncached = reads.props.iter().any(|p| {
-                !matches!(graph.prop_column(label, p, false), Some(PropColumn::Values(_)))
-            }) || reads.presence_only().iter().any(|p| {
-                !matches!(graph.prop_column(label, p, true), Some(PropColumn::Presence(_)))
-            });
-            if uncached
-                && total <= WHOLE_LABEL_READ_MAX
-                && (over_ids.len() as u64).saturating_mul(WHOLE_LABEL_SHARE) >= total
-            {
-                if let Some(mut walk) = load_walk_budgeted(graph, source, reads, None, None, params)? {
-                    counted!("interp.columnar population read its label whole to keep the columns");
-                    for col in walk.columns.iter_mut() {
-                        *col = take_entries_to(col, over_ids);
-                    }
-                    walk.cursors = vec![0; walk.columns.len()];
-                    for (_, ids, cur) in walk.presence.iter_mut() {
-                        *ids = restrict_ids_to(ids, over_ids);
-                        *cur = 0;
-                    }
-                    for (_, _, cur) in walk.label_members.iter_mut() {
-                        *cur = 0;
-                    }
-                    walk.members = std::sync::Arc::clone(over_ids);
-                    return Ok(Some(walk));
-                }
-                counted!("interp.columnar whole-label read for a population declined");
-            }
-        }
-    }
     // Every column read is bounded to the label's id span and budgeted at
     // `factor × |members|` entries: a property the whole graph carries is
     // a 1.79M-entry column however small the label, and nine production

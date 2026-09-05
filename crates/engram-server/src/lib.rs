@@ -1095,11 +1095,7 @@ pub fn run_server_with_config(
                         eprintln!(
                             "[engram-server] released {dropped} in-memory log entry(ies) \
                              below seq {upto} (durable via {})",
-                            if paged.is_some() && !store.has_wal() {
-                                "sealed segments"
-                            } else {
-                                "the WAL"
-                            }
+                            if paged.is_some() { "sealed segments" } else { "the WAL" }
                         );
                     }
                 }
@@ -1816,33 +1812,13 @@ fn spill_and_report(
     cache: &Arc<engram_store::paged::BlockCache>,
 ) {
     let t = std::time::Instant::now();
-    match store.spill_sealed_into_reporting(dir, cache) {
-        Ok((0, _)) => {}
-        Ok((n, durable_below)) => {
-            eprintln!(
-                "[engram-server] spilled {n} segment(s) to paged in {} ms ({} sealed total)",
-                t.elapsed().as_millis(),
-                store.segment_count()
-            );
-            // The segments just written hold every logged record below the
-            // boundary, fsync'd: the WAL may drop that prefix. A boundary
-            // below the log's retained range (a newer seal already truncated
-            // past it, and its segment is still resident) is left for the
-            // spill that writes that segment.
-            if let (Some(below), true) = (durable_below, store.has_wal()) {
-                match store.checkpoint_wal(below) {
-                    Ok(dropped) => eprintln!(
-                        "[engram-server] WAL checkpointed below seq {below} ({dropped} record(s) \
-                         dropped behind the spilled segments)"
-                    ),
-                    Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {}
-                    Err(e) => eprintln!(
-                        "[engram-server] WAL checkpoint FAILED: {e} — the WAL keeps its prefix; \
-                         durability is intact, the file grows until a checkpoint succeeds"
-                    ),
-                }
-            }
-        }
+    match store.spill_sealed_into(dir, cache) {
+        Ok(0) => {}
+        Ok(n) => eprintln!(
+            "[engram-server] spilled {n} segment(s) to paged in {} ms ({} sealed total)",
+            t.elapsed().as_millis(),
+            store.segment_count()
+        ),
         Err(e) => eprintln!(
             "[engram-server] spill FAILED: {e} — sealed segments stay RESIDENT and memory \
              is unbounded until a spill succeeds"

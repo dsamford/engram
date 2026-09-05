@@ -2758,9 +2758,6 @@ pub(crate) fn run_single(
                             hook(graph);
                         }
                         let mut r = row.clone();
-                        // Fix 75: a refusal an EARLIER statement left on this
-                        // thread must not name the winner here.
-                        let _ = graph.take_unique_refusal();
                         match exec_create_path(graph, path, &mut r, params, true) {
                             Ok(()) => {
                                 sometimes!("interp.merge created", true);
@@ -2788,42 +2785,7 @@ pub(crate) fn run_single(
                             // would instead spin a real violation up to the
                             // retry bound before reporting it.
                             Err(RunError::Graph(GraphError::ConstraintViolation(why))) => {
-                                // Fix 75: the re-match MISSED the winner about
-                                // 1–3 % of the racing-merge test's runs (gate72
-                                // under load; v135 1/91 and v136 3/86 alone):
-                                // the constraint check had just proved the
-                                // winner LIVE by a record read, but the
-                                // re-match seeks through the scoped index,
-                                // and a commit records the log entries that
-                                // advance the index's epoch AFTER it publishes
-                                // its rows — in that window the cached index
-                                // reads as current and does not hold the
-                                // winner. Two levers, in order: the refusal
-                                // names the winner, so a hop-less pattern
-                                // binds it BY ID and tests it with the same
-                                // `node_satisfies` a match would (a record
-                                // read, never a derived structure); anything
-                                // else settles behind the in-flight writers
-                                // — the fence a commit holds until its entries
-                                // are recorded — and only then re-matches.
-                                let refused = graph.take_unique_refusal();
-                                let mut now: Vec<Row> = Vec::new();
-                                if let (Some((false, id)), true) = (refused, path.hops.is_empty()) {
-                                    if let Some(node) = graph.node(id)? {
-                                        if node_satisfies(graph, &node, &path.start, &row, params)? {
-                                            counted!("interp.merge converged on the refusing node by id");
-                                            let mut r = row.clone();
-                                            if let Some(v) = &path.start.var {
-                                                r.insert(v.clone(), node);
-                                            }
-                                            now.push(r);
-                                        }
-                                    }
-                                }
-                                if now.is_empty() {
-                                    graph.settle_in_flight_writers();
-                                    now = match_path(graph, path, &row, params, true)?;
-                                }
+                                let now = match_path(graph, path, &row, params, true)?;
                                 if now.is_empty() {
                                     return Err(RunError::Graph(
                                         GraphError::ConstraintViolation(why),
@@ -3434,20 +3396,13 @@ fn reverse_pattern_paths<'p>(
 
 impl GraphHooks for Hooks<'_> {
     fn exists(&self, body: &SubqueryBody, scope: &Scope<'_>) -> Result<Value, EvalError> {
+        let row: Row = scope.materialise();
         // A pattern-shaped body (`pattern_body`: the bare pattern, or a
         // Query whose only clause is a plain MATCH of it) takes the pattern
         // path — the adjacency fast probe, then the pattern matcher; any
         // other Query body re-enters the interpreter with the row.
         let any = match pattern_body(body) {
             Some((pattern, where_)) => {
-                // Fix 51: an existence test reads nothing of the body's
-                // vars beyond its own WHERE — the ends bind to that. Fix
-                // 76: and the seed row carries the bound nodes trimmed to
-                // that demand (plus the pattern's own inline maps).
-                let mut demand = demand_of_exprs(&[where_]);
-                let mut keep_full = Vec::new();
-                pattern_seed_demand(&pattern.paths, &mut demand, &mut keep_full);
-                let row: Row = lean_seed(self.graph, scope, &demand, &keep_full);
                 if where_.is_none() {
                     if let Some(hit) =
                         exists_probe_fast(self.graph, pattern, &row).map_err(run_to_eval)?
@@ -3478,6 +3433,9 @@ impl GraphHooks for Hooks<'_> {
                 }
                 let pattern =
                     reverse_pattern_paths(self.graph, pattern, &row).map_err(run_to_eval)?;
+                // Fix 51: an existence test reads nothing of the body's
+                // vars beyond its own WHERE — the ends bind to that.
+                let demand = demand_of_exprs(&[where_]);
                 !match_pattern_rows(self.graph, &pattern, where_, vec![row], self.params, Some(&demand))
                     .map_err(run_to_eval)?
                     .is_empty()
@@ -3486,9 +3444,6 @@ impl GraphHooks for Hooks<'_> {
                 let SubqueryBody::Query(q) = body else {
                     unreachable!("a bare pattern body is always pattern-shaped")
                 };
-                // A general body re-enters the interpreter: it may read
-                // anything, so it gets the whole row.
-                let row: Row = scope.materialise();
                 let q = concludable(q);
                 let q = reverse_subquery_paths(self.graph, &q, &row).map_err(run_to_eval)?;
                 !run_single(self.graph, &q, self.params, vec![row])
@@ -3501,14 +3456,9 @@ impl GraphHooks for Hooks<'_> {
     }
 
     fn count(&self, body: &SubqueryBody, scope: &Scope<'_>) -> Result<Value, EvalError> {
+        let row: Row = scope.materialise();
         let n = match pattern_body(body) {
             Some((pattern, where_)) => {
-                // Fix 76: the seed row carries the bound nodes trimmed to
-                // the body's demand (its WHERE and the pattern's maps).
-                let mut demand = demand_of_exprs(&[where_]);
-                let mut keep_full = Vec::new();
-                pattern_seed_demand(&pattern.paths, &mut demand, &mut keep_full);
-                let row: Row = lean_seed(self.graph, scope, &demand, &keep_full);
                 if where_.is_none() {
                     if let Some(n) =
                         count_probe_fast(self.graph, pattern, &row).map_err(run_to_eval)?
@@ -3539,6 +3489,7 @@ impl GraphHooks for Hooks<'_> {
                 }
                 let pattern =
                     reverse_pattern_paths(self.graph, pattern, &row).map_err(run_to_eval)?;
+                let demand = demand_of_exprs(&[where_]);
                 match_pattern_rows(self.graph, &pattern, where_, vec![row], self.params, Some(&demand))
                     .map_err(run_to_eval)?
                     .len()
@@ -3547,7 +3498,6 @@ impl GraphHooks for Hooks<'_> {
                 let SubqueryBody::Query(q) = body else {
                     unreachable!("a bare pattern body is always pattern-shaped")
                 };
-                let row: Row = scope.materialise();
                 let q = concludable(q);
                 let q = reverse_subquery_paths(self.graph, &q, &row).map_err(run_to_eval)?;
                 run_single(self.graph, &q, self.params, vec![row])
@@ -3578,17 +3528,9 @@ impl GraphHooks for Hooks<'_> {
         map: &Expr,
         scope: &Scope<'_>,
     ) -> Result<Value, EvalError> {
-        // Fix 51: the comprehension reads its vars in its filter and map
-        // only. Fix 76: the pattern's inline maps join that demand, and the
-        // seed row carries the bound nodes trimmed to it — the KM work-item
-        // listing's two comprehensions per row each cloned the fat outer
-        // node several times through the matcher (22 of 34 ms on the
-        // mirror; locally the cost tracked the node's property count, 7×
-        // for 12× the properties).
-        let mut demand = demand_of_exprs(&[filter, Some(map)]);
-        let mut keep_full = Vec::new();
-        pattern_seed_demand(std::slice::from_ref(path), &mut demand, &mut keep_full);
-        let row: Row = lean_seed(self.graph, scope, &demand, &keep_full);
+        let row: Row = scope.materialise();
+        // Fix 51: the comprehension reads its vars in its filter and map only.
+        let demand = demand_of_exprs(&[filter, Some(map)]);
         let matches = match_path_with(self.graph, path, &row, self.params, false, Some(&demand))
             .map_err(run_to_eval)?;
         let mut out = Vec::new();
@@ -3603,101 +3545,6 @@ impl GraphHooks for Hooks<'_> {
         }
         Ok(Value::List(out))
     }
-}
-
-/// Fix 76: what a pattern's INLINE MAPS read of the outer row (`(p:KMProject
-/// {id: w.projectRef})` reads `w.projectRef`), folded into `demand`; and the
-/// bound variables whose own pattern node carries a map — `node_satisfies`
-/// tests such a map against the bound VALUE, so those stay whole
-/// (`keep_full`).
-fn pattern_seed_demand(
-    paths: &[PathPattern],
-    demand: &mut BTreeMap<String, VarDemand>,
-    keep_full: &mut Vec<String>,
-) {
-    for path in paths {
-        let nodes = std::iter::once(&path.start).chain(path.hops.iter().map(|(_, n)| n));
-        for n in nodes {
-            if let Some(p) = &n.props {
-                collect_demand(p, &mut Vec::new(), demand);
-                if let Some(v) = &n.var {
-                    keep_full.push(v.clone());
-                }
-            }
-        }
-        for (r, _) in &path.hops {
-            if let Some(p) = &r.props {
-                collect_demand(p, &mut Vec::new(), demand);
-            }
-        }
-    }
-}
-
-/// Fix 76: the seed row of a subquery body — a pattern comprehension, an
-/// EXISTS / COUNT pattern body — with every bound NODE trimmed to what the
-/// body reads of it: a node the body never reads a property of keeps its id
-/// and labels (the pattern tests both; identity survives DISTINCT); a node
-/// whose properties the body reads keeps exactly those; a node the body
-/// uses whole (`| w`, `properties(w)`) stays whole, as does one whose own
-/// pattern node carries an inline map (`keep_full`). `scope.materialise()`
-/// copied every property of every bound node, and the general matcher then
-/// cloned that row several more times per evaluation (the bound-start
-/// candidate, the seed row, the candidate insert, a partial per hop): the
-/// KM work-item listing's `properties(w)` bound `w` in FULL for the top-k
-/// survivors, and its two pattern comprehensions per row cost 22 of the
-/// statement's 34 ms on the mirror. A body with a star demand, or the
-/// lever off, gets the whole row.
-fn lean_seed(
-    graph: &Graph,
-    scope: &Scope<'_>,
-    demand: &BTreeMap<String, VarDemand>,
-    keep_full: &[String],
-) -> Row {
-    if !graph.lean_subquery_seed_enabled() || demand.contains_key(DEMAND_EVERYTHING) {
-        return scope.materialise();
-    }
-    let mut trimmed = false;
-    let mut trim = |name: &str, value: &Value| -> Value {
-        if let Value::Node { id, labels, props } = value {
-            if !props.is_empty() && !keep_full.iter().any(|k| k == name) {
-                match demand.get(name) {
-                    Some(VarDemand::Full) => {}
-                    Some(VarDemand::Props(set)) => {
-                        trimmed = true;
-                        return Value::Node {
-                            id: *id,
-                            labels: labels.clone(),
-                            props: props
-                                .iter()
-                                .filter(|(k, _)| set.contains(k.as_str()))
-                                .map(|(k, v)| (k.clone(), v.clone()))
-                                .collect(),
-                        };
-                    }
-                    None => {
-                        trimmed = true;
-                        return Value::Node {
-                            id: *id,
-                            labels: labels.clone(),
-                            props: BTreeMap::new(),
-                        };
-                    }
-                }
-            }
-        }
-        value.clone()
-    };
-    let mut row = Row::new();
-    for (n, v) in scope.vars.iter() {
-        row.insert(n.clone(), trim(n, v));
-    }
-    for (n, v) in &scope.locals {
-        row.insert(n.clone(), trim(n, v));
-    }
-    if trimmed {
-        counted!("interp.subquery seeded with a lean row");
-    }
-    row
 }
 
 fn run_to_eval(e: RunError) -> EvalError {
@@ -5615,24 +5462,14 @@ pub(crate) fn collect_demand(
             };
             demand_pattern_endpoints(&one, locals, demands);
         }
-        // Fix 76: a pattern comprehension demands like an EXISTS body —
-        // its endpoints by identity (a bound endpoint with an inline map in
-        // full), its inline maps', filter's and map's reads walked normally.
-        // The arm used to ask `free_vars`, which has no comprehension arm
-        // and answered NOTHING: the outer node was bound without the
-        // properties the comprehension read, so `MATCH (w:KMWorkItem {id:
-        // $id}) RETURN [(w)-[:BELONGS_TO_PROJECT]->(p) | w.title][0]`
-        // answered NULL and a correlated map `(p {id: w.projectRef})`
-        // matched nothing — silently, since fix 51.
-        Expr::PatternComp { path, filter, map } => {
-            let one = Pattern {
-                paths: vec![(**path).clone()],
-            };
-            demand_pattern_endpoints(&one, locals, demands);
-            if let Some(f) = filter {
-                collect_demand(f, locals, demands);
+        Expr::PatternComp { .. } => {
+            let mut free = Vec::new();
+            free_vars(e, &mut Vec::new(), &mut free);
+            for v in free {
+                if !locals.contains(&v) {
+                    note_full(demands, &v);
+                }
             }
-            collect_demand(map, locals, demands);
         }
         _ => {}
     }

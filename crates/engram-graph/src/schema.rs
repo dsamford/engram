@@ -1210,7 +1210,6 @@ impl Graph {
                 if self.marker_owner_live(c, is_rel, o, t)? {
                     sometimes!("graph.constraint refused", true);
                     counted!("graph.constraint marker refused a duplicate");
-                    Graph::note_unique_refusal(is_rel, o);
                     return Err(GraphError::ConstraintViolation(format!(
                         "`{}`.(`{}`) already exists on {} {o}",
                         c.def.label,
@@ -1301,7 +1300,6 @@ impl Graph {
                 });
                 if same {
                     sometimes!("graph.constraint refused", true);
-                    Graph::note_unique_refusal(true, other.id);
                     return Err(GraphError::ConstraintViolation(format!(
                         "`{}`.(`{}`) already exists on relationship {}",
                         c.def.label,
@@ -1325,7 +1323,6 @@ impl Graph {
                 });
                 if same {
                     sometimes!("graph.constraint refused", true);
-                    Graph::note_unique_refusal(false, id);
                     return Err(GraphError::ConstraintViolation(format!(
                         "`{}`.(`{}`) already exists on node {id}",
                         c.def.label,

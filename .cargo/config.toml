@@ -1,0 +1,6 @@
+[alias]
+# `cargo xtask <gate>` — the gates are a workspace member, so they are compiled
+# and type-checked by the same build as everything else. A gate that lives in a
+# shell script rots without the compiler noticing, and a step that has silently
+# stopped running looks exactly like a step that passes.
+xtask = "run --quiet --package xtask --"

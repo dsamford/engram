@@ -107,24 +107,47 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      # This job belongs to the SOURCE repository's release lane. The published
+      # snapshot IS the output of `public-tree`, and it deliberately does not
+      # carry the scrub gate's rules — so it cannot re-derive itself, and a job
+      # that tried would be permanently red in the one place a reader is most
+      # likely to look. Skipping is stated rather than silent: an absent rules
+      # file must never read the same as a clean scan.
+      - name: Is this the source repository?
+        id: src
+        run: |
+          if [ -f scrub-rules.txt ]; then
+            echo "source=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "source=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No scrub-rules.txt — this is a published snapshot,           not the source tree. The publishable-tree checks run in the source           repository, which is where the rules live."
+          fi
+
       # Assemble the tree that would be published and prove it is clean. This
       # runs on every push, not only at release, because the cost of finding a
       # forbidden token is lowest on the commit that introduced it.
-      - run: cargo xtask public-tree "${RUNNER_TEMP}/engram-public"
-      - run: cargo xtask scrub "${RUNNER_TEMP}/engram-public"
+      - if: steps.src.outputs.source == 'true'
+        run: cargo xtask public-tree "${RUNNER_TEMP}/engram-public"
+      - if: steps.src.outputs.source == 'true'
+        run: cargo xtask scrub "${RUNNER_TEMP}/engram-public"
       # The allow-list must actually carry the documentation and the workflows.
       # A tree that builds but ships no docs is the failure this asserts away.
       - name: The publishable tree carries the book and the workflows
+        if: steps.src.outputs.source == 'true'
         run: |
           test -f "${RUNNER_TEMP}/engram-public/docs/book/src/SUMMARY.md"
           test -f "${RUNNER_TEMP}/engram-public/docs/book/book.toml"
           test -f "${RUNNER_TEMP}/engram-public/.github/workflows/ci.yml"
+          # Without the alias the published tree cannot run one of its own
+          # gates. The first public snapshot shipped without it.
+          test -f "${RUNNER_TEMP}/engram-public/.cargo/config.toml"
       # Stated as a CLASS rather than as a list of names. The first cut of this
       # step named the private directories it was checking for — and `scrub`
       # failed this very file for spelling one of them, which is the gate
       # working exactly as intended. A named list would also go stale the day
       # someone adds a directory nobody thought to name here.
       - name: And leaves the private material behind
+        if: steps.src.outputs.source == 'true'
         run: |
           cd "${RUNNER_TEMP}/engram-public"
           test ! -e measurements
