@@ -1,0 +1,22 @@
+[package]
+name = "engram-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "D1 + D2 — all time, randomness, spawning and I/O behind one trait, with a deterministic simulated implementation."
+
+[dependencies]
+engram-observe.workspace = true
+# Optional, and off by default. The simulation lane must be buildable and
+# runnable with no third-party code in the graph at all: a dependency's thread
+# pool or clock read is exactly the kind of thing that makes a seed stop
+# reproducing, and it would do so from inside a crate nobody thinks to look at.
+tokio = { workspace = true, optional = true, features = ["rt", "time", "macros", "fs", "io-util"] }
+
+[features]
+default = []
+tokio-runtime = ["dep:tokio"]
+
+[lints]
+workspace = true

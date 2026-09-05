@@ -1,0 +1,33 @@
+[book]
+title = "Engram"
+description = "A property-graph database in Rust, speaking openCypher over the Bolt protocol."
+authors = ["The Engram authors"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+# A link into a page that does not exist is a broken promise, and the whole
+# point of the `docs` gate is that promises are checked. mdBook can only see
+# intra-book links; `cargo xtask docs` covers the rest.
+create-missing = false
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "ayu"
+git-repository-url = "https://github.com/dsamford/engram"
+edit-url-template = "https://github.com/dsamford/engram/edit/main/docs/book/{path}"
+additional-js = ["mermaid.min.js", "mermaid-init.js"]
+additional-css = ["theme/engram.css"]
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.search]
+enable = true
+limit-results = 20
+use-boolean-and = true

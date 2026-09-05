@@ -1,0 +1,28 @@
+[package]
+name = "engram-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The storage tail: record layer, MVCC (READ COMMITTED + entity write locks), native CAS, protected-KIND enforcement."
+
+# engram-key and engram-observe only. No I/O yet — this is the in-memory tail
+# the LSM grows from, and keeping it dependency-free keeps it simulable.
+[dependencies]
+engram-key.workspace = true
+engram-observe.workspace = true
+engram-log.workspace = true
+# Lock-free atomic `Arc` swap for the immutable sealed segments: readers load the
+# sealed snapshot with no lock (the D2-revision read-scaling refactor), so a
+# single RwLock no longer serialises every scan. Pure Rust, no build script.
+arc-swap = "1"
+# Per-block integrity for the on-disk segment format (Track B, `paged` storage):
+# the same BLAKE3 the commit-log hash-chain uses, extended to disk at the
+# cache/read-unit (block) granularity. Pure Rust, no build script.
+blake3 = "1"
+
+[dev-dependencies]
+engram-runtime.workspace = true
+
+[lints]
+workspace = true

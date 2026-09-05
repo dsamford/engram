@@ -1,0 +1,82 @@
+# cargo-deny — the supply-chain gate.
+#
+# Run: `cargo deny check`
+#
+# This file is deliberately ALLOW-LISTED rather than deny-listed. A deny-list
+# passes anything nobody thought to forbid, which is the wrong failure direction
+# for a licence gate: the first copyleft dependency to arrive would be the one
+# that slips through. Everything here was taken from the tree as it actually is
+# (`cargo metadata`), not from what its dependencies are assumed to use.
+
+[graph]
+all-features = true
+
+# ── Licences ───────────────────────────────────────────────────────────────
+#
+# Measured across the whole graph, the distinct expressions are:
+#
+#   (MIT OR Apache-2.0) AND Unicode-3.0        unicode-ident
+#   Apache-2.0 AND ISC                          ring
+#   Apache-2.0 / Apache-2.0 OR MIT / MIT OR Apache-2.0
+#   Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
+#   BSD-2-Clause                                arrayref
+#   CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception
+#   CC0-1.0 OR MIT-0 OR Apache-2.0
+#   ISC / MIT / MIT-0 OR MIT OR Apache-2.0
+#
+# Every one is permissive. There is NO copyleft in the tree — no GPL, LGPL,
+# AGPL or MPL — which is what makes an MIT release of the whole thing possible
+# without a per-dependency argument.
+[licenses]
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "Zlib",
+]
+# A dual-licensed crate resolves to the first allowed arm; prefer the ones this
+# project itself uses so NOTICE stays short and consistent.
+confidence-threshold = 0.93
+
+# ── Advisories ─────────────────────────────────────────────────────────────
+[advisories]
+yanked = "deny"
+ignore = []
+
+# ── Bans ───────────────────────────────────────────────────────────────────
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+# aws-lc-rs / aws-lc-sys are BANNED BY NAME, not merely unused.
+#
+# They are rustls's other cryptographic backend, and the natural thing to reach
+# for when TLS lands — `rustls` pulls `aws-lc-rs` by DEFAULT. It builds vendored
+# C and assembly through several `cc` invocations, which violates this
+# workspace's one-`cc`-invocation purity rule (see the note in Cargo.toml), and
+# it would arrive as a transitive default rather than as a decision anyone made.
+#
+# The consequence is recorded because it is a real trade being made here: FIPS.
+# `aws-lc-rs` is FIPS-validated and `ring` is not. If a compliance regime ever
+# requires FIPS, this ban is the thing that has to be revisited — deliberately,
+# with the purity rule reopened at the same time — rather than quietly satisfied
+# by a default feature flag.
+#
+# TLS therefore uses: rustls with `default-features = false, features = ["ring"]`.
+deny = [
+    { name = "aws-lc-rs" },
+    { name = "aws-lc-sys" },
+    { name = "openssl-sys" },
+]
+
+# ── Sources ────────────────────────────────────────────────────────────────
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

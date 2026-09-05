@@ -1,0 +1,61 @@
+/* Engram documentation — a light layer over the stock mdBook themes.
+ *
+ * Deliberately small. The stock themes are readable and theme-aware already;
+ * what they do not handle well is the two shapes this book leans on heavily:
+ * wide reference tables, and byte-layout diagrams that must not reflow. */
+
+/* Reference tables run wide — every CLI flag with its type, default and cost.
+ * Let them scroll inside their own box rather than widening the page. */
+.content table {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+    border-collapse: collapse;
+}
+
+.content table th {
+    text-align: left;
+    font-weight: 600;
+}
+
+.content table td,
+.content table th {
+    vertical-align: top;
+    padding: 0.35em 0.75em;
+}
+
+/* Defaults and flag names read as code even when written as prose. */
+.content table code {
+    white-space: nowrap;
+}
+
+/* A byte layout must keep its columns; wrapping one turns a diagram into a
+ * paragraph. Used by the key-encoding and PackStream pages. */
+.content pre.byte-layout,
+.content .byte-layout pre {
+    overflow-x: auto;
+    white-space: pre;
+    line-height: 1.4;
+}
+
+/* Blockquotes carry the safety notes — no auth, no TLS, what a crash loses.
+ * They should not read as decoration. */
+.content blockquote {
+    border-inline-start: 3px solid var(--quote-border, currentColor);
+    background: none;
+    padding-inline-start: 1em;
+    margin-inline-start: 0;
+}
+
+/* Mermaid diagrams sit centred with room to breathe, and scroll rather than
+ * shrink to illegibility on a narrow viewport. */
+.content .mermaid {
+    overflow-x: auto;
+    text-align: center;
+    margin: 1.5rem 0;
+}
+
+/* The landing page's "where to start" tables are navigation, not data. */
+.content h2 + table td:first-child {
+    white-space: nowrap;
+}

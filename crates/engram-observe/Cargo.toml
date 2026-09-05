@@ -1,0 +1,20 @@
+[package]
+name = "engram-observe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "D3 — the four things every subsystem registers, and the always/sometimes/reachable/unreachable vocabulary."
+
+# NO DEPENDENCIES, deliberately.
+#
+# This crate defines the trace that the determinism gate hashes. A dependency
+# that iterates a HashMap, reduces floats in a thread-pool order, or seeds itself
+# from the system clock would make that trace irreproducible from within a
+# library nobody thinks to look at. The simulation lane's whole claim is that a
+# seed reproduces a run; the crate the claim is measured in should not import
+# anything that can quietly break it.
+[dependencies]
+
+[lints]
+workspace = true

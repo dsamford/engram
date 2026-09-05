@@ -1,0 +1,119 @@
+[workspace]
+resolver = "3"
+members = ["crates/engram-observe", "crates/engram-runtime", "crates/engram-key", "crates/engram-store", "crates/engram-log", "crates/engram-sim", "crates/engram-exec", "crates/engram-crypto", "crates/engram-objstore", "crates/engram-blob", "crates/engram-cypher", "crates/engram-graph", "crates/engram-bolt", "crates/engram-server", "crates/engram-bench", "crates/engram-tck", "xtask"]
+
+[workspace.package]
+edition = "2024"
+# ── ONE version for the whole workspace ────────────────────────────────────
+#
+# Every member inherits this (`version.workspace = true`). It was a literal in
+# all 17 manifests, which means a release bump is 17 edits and a missed one is a
+# crate published at the wrong version — the kind of mistake that is permanent
+# on crates.io.
+version = "0.1.0"
+# MIT, per the owner's decision: everything public, no open core.
+#
+# NOTE: the workspace declares the licence; the LICENSE file at the root is what
+# actually grants it, and that file needs a copyright HOLDER, which is still an
+# open decision. This field being right does not make the tree publishable on
+# its own.
+license = "MIT"
+# The public mirror. This string ends up in crates.io metadata, where it is
+# permanent — so it names the repository the published tree actually appears in,
+# not the one it is developed in. The private history lives elsewhere; GitHub
+# receives the `cargo xtask public-tree` output, which is why every path that
+# must ship has to be an ALLOW rule in `xtask/src/public_tree.rs` rather than
+# merely present in the working tree.
+repository = "https://github.com/dsamford/engram"
+# ── MSRV: a RECORDED decision, and one that is actually enforced ────────────
+#
+# Risk C11 in the plan: "`rust-version` is advisory in most build paths — so the
+# break fails late and quietly." Cargo only errors on it when resolving a
+# dependency that declares a higher one; a crate in THIS workspace using a
+# newer language feature compiles happily on the developer's newer toolchain and
+# breaks for whoever pinned the declared minimum.
+#
+# So this field is the declaration and `cargo xtask msrv` is the enforcement: it
+# checks every member inherits this exact value, and CI additionally builds with
+# a toolchain pinned to it. A version number nothing verifies is documentation,
+# not a constraint.
+rust-version = "1.85"
+
+[workspace.dependencies]
+# ── Every internal dependency carries a VERSION as well as a path ───────────
+#
+# `cargo publish` REFUSES a dependency with no version requirement, and it does
+# so at publish time — so a tree that builds, tests and gates perfectly is
+# nonetheless unpublishable, and nothing says so until the first release
+# attempt. The path is what the workspace builds against; the version is what a
+# consumer of the published crate resolves.
+#
+# These must move together with `workspace.package.version`.
+engram-observe = { path = "crates/engram-observe", version = "0.1.0" }
+engram-runtime = { path = "crates/engram-runtime", version = "0.1.0" }
+engram-key = { path = "crates/engram-key", version = "0.1.0" }
+engram-store = { path = "crates/engram-store", version = "0.1.0" }
+engram-log = { path = "crates/engram-log", version = "0.1.0" }
+engram-sim = { path = "crates/engram-sim", version = "0.1.0" }
+engram-exec = { path = "crates/engram-exec", version = "0.1.0" }
+engram-crypto = { path = "crates/engram-crypto", version = "0.1.0" }
+engram-objstore = { path = "crates/engram-objstore", version = "0.1.0" }
+engram-blob = { path = "crates/engram-blob", version = "0.1.0" }
+engram-server = { path = "crates/engram-server", version = "0.1.0" }
+engram-bench = { path = "crates/engram-bench", version = "0.1.0" }
+engram-cypher = { path = "crates/engram-cypher", version = "0.1.0" }
+engram-graph = { path = "crates/engram-graph", version = "0.1.0" }
+engram-bolt = { path = "crates/engram-bolt", version = "0.1.0" }
+engram-tck = { path = "crates/engram-tck", version = "0.1.0" }
+
+# ── The one-`cc`-invocation purity rule ────────────────────────────────────
+#
+# Recorded HERE, in the one file every crate's dependencies pass through,
+# because the constraint is a property of the whole workspace: cargo unifies
+# features per crate-version across the entire build, so one member enabling a
+# cmake-driven backend changes what every other member links.
+#
+# THE RULE: a native dependency may need ONE `cc` invocation. It may not need
+# cmake, bindgen, an external shared library, or a process at build time.
+# `ring` and `blake3` satisfy it; `aws-lc-rs` (cmake + AWS-LC) does not.
+#
+# `cargo xtask c-deps` enforces it, and keys on `links` / build-script presence
+# rather than on a `-sys` or `cc` NAME match — `ring` and `crc-fast` match
+# neither pattern, so a name-based gate would pass them both while claiming to
+# have checked.
+tokio = { version = "1", default-features = false }
+tz-rs = { version = "0.7", default-features = false, features = ["std"] }
+tzdb = { version = "0.7", default-features = false }
+
+[workspace.lints.rust]
+# ── Determinism, enforced by the compiler where it can be ──────────────────
+#
+# The engine is generic over `Runtime` precisely so that time, randomness,
+# spawning and I/O are injected rather than reached for. These make the two
+# easiest violations loud. They are a first line, NOT the enforcement:
+# `cargo xtask determinism` runs the same seed twice and requires an identical
+# trace hash, because determinism rots through routes no lint can see —
+# HashMap iteration order, float reduction order, a dependency's thread pool.
+unsafe_code = "deny"
+# DENY, not warn. Public-item coverage was already complete when this was
+# raised — `cargo doc` reported zero missing-docs warnings across the
+# workspace — so this costs nothing today and is the only thing that keeps it
+# true tomorrow. A warning in a build that emits thousands of lines is a
+# preference; this is the rule.
+missing_docs = "deny"
+
+[workspace.lints.rustdoc]
+# The API reference is published beside the book, so a link that does not
+# resolve is a 404 with the project's name on it. Raised with `missing_docs`
+# after fixing the fifteen that had accumulated: five wrong paths, nine links
+# from public documentation to private items (which rustdoc cannot render and
+# a reader cannot follow), and one redundant explicit target.
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "deny"
+
+[workspace.lints.clippy]
+disallowed_methods = "deny"
+disallowed_types = "deny"
+
+[profile.release]
+debug = 1

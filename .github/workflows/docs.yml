@@ -1,0 +1,106 @@
+name: docs
+
+# The documentation site: the mdBook narrative plus the generated rustdoc.
+#
+# PAGES IS DELIBERATELY NOT ENABLED YET. The repository is private, and GitHub
+# Pages published from a private repository is PUBLIC on every plan below
+# Enterprise Cloud — so turning it on here would publish the documentation of a
+# codebase that is deliberately not published. That is the exact disclosure this
+# project's `scrub` and `public-tree` gates exist to prevent, arriving through a
+# side door.
+#
+# So this workflow BUILDS the site on every push (a broken book fails the build
+# like a broken test) and uploads it as an artifact you can download and open.
+# The deploy job below is written and inert; it runs only when the repository
+# variable PUBLISH_PAGES is set to "true", which is the single switch to flip
+# when the decision to go public is actually made.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install mdBook
+        run: |
+          cargo install mdbook --version ^0.5 --locked
+          cargo install mdbook-mermaid --version ^0.17 --locked
+
+      # The book's own gate: no orphan pages, no dead intra-book links, no
+      # forbidden token, and the CLI reference agrees with the CLI.
+      - name: Documentation gate
+        run: cargo xtask docs
+
+      - name: Build the book
+        run: mdbook build docs/book
+
+      # `missing_docs` and `broken_intra_doc_links` are denied in the workspace
+      # lints, so this failing means the API reference has developed a hole.
+      - name: Build the API documentation
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      - name: Assemble the site
+        run: |
+          mkdir -p site
+          cp -r docs/book/book/. site/
+          mkdir -p site/api
+          cp -r target/doc/. site/api/
+          # rustdoc's root has no index; send /api at the graph facade.
+          printf '<meta http-equiv="refresh" content="0;url=engram_graph/index.html">\n' \
+            > site/api/index.html
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engram-docs
+          path: site
+          retention-days: 14
+
+  # Inert until the repository variable PUBLISH_PAGES is "true".
+  #
+  # Before flipping it, run `cargo xtask public-tree` and `cargo xtask scrub`
+  # over the assembled tree and read the result — publishing the site publishes
+  # the documentation of a private codebase, and that is a decision, not a step.
+  deploy:
+    needs: build
+    if: >
+      vars.PUBLISH_PAGES == 'true' &&
+      github.ref == 'refs/heads/main' &&
+      github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: engram-docs
+          path: site
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deployment
+        uses: actions/deploy-pages@v4

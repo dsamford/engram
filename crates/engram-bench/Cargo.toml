@@ -1,0 +1,40 @@
+[package]
+name = "engram-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+# NOT published. Benchmark binaries and corpus loaders, useful in this repo and
+# meaningless outside it — and the loader's shape is derived from a private
+# production export, so it is the wrong crate to hand to strangers by default.
+publish = false
+description = "The scalability and performance harness: sized runs over every layer, growth-shape checks, a committed JSON baseline."
+
+[dependencies]
+engram-bolt.workspace = true
+engram-cypher.workspace = true
+engram-graph.workspace = true
+engram-key.workspace = true
+engram-log.workspace = true
+engram-observe.workspace = true
+engram-server.workspace = true
+engram-store.workspace = true
+
+# musl's bundled mallocng collapses under multi-GB allocation churn (the
+# full-DB port load measured ~2.5 ms per 116-byte node at a 3 GB heap), and it
+# is ALSO single-arena, so concurrent multi-hop queries serialise on the
+# allocator lock (the measured concurrency ceiling — foaf collapsed 32→18 q/s,
+# ~2.5 cores of futex at K=6). Both `portbench` and `portserve` therefore use
+# mimalloc, MATCHING the production `engram-server`: thread-caching (per-thread
+# heaps) lifts the concurrency ceiling (foaf 73→324, 4.4×) AND roughly halves
+# single-query latency on allocation-heavy columnar joins vs dlmalloc (IC5:
+# 191 ms → ~92 ms). A benchmark on a different allocator than prod measures the
+# wrong heap. mimalloc is a C library (allow-listed in xtask's c-deps gate as
+# `libmimalloc-sys`), the deliberate owner-level trade — no battle-tested
+# PURE-RUST thread-caching allocator exists (ferroc is nightly-only and
+# abandoned). See `engram-server/Cargo.toml` for the full rationale. musl-only.
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = { version = "0.1", default-features = false }
+
+[lints]
+workspace = true

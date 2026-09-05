@@ -1,0 +1,21 @@
+[package]
+name = "engram-objstore"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "M5.5 — the object-storage seam: fail-closed tiers, sealed content-named segments, the root beacon, and the placement rule."
+
+[dependencies]
+engram-crypto.workspace = true
+engram-key.workspace = true
+engram-observe.workspace = true
+# Already accepted for the commit log's chain: pure Rust by default here (the
+# one `cc` path is its optional SIMD feature, on the allow-list either way).
+blake3 = "1"
+
+[dev-dependencies]
+engram-runtime.workspace = true
+
+[lints]
+workspace = true

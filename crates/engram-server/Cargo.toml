@@ -1,0 +1,38 @@
+[package]
+name = "engram-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The out-of-envelope TCP adapter: bolt:// over std::net, one engine thread owning the shard, IO threads owning nothing else."
+
+[dependencies]
+engram-bolt.workspace = true
+engram-cypher.workspace = true
+engram-graph.workspace = true
+engram-key.workspace = true
+engram-observe.workspace = true
+engram-store.workspace = true
+
+# The multi-worker server (ENGRAM_SERVER_WORKERS>1) shares one heap across worker
+# threads. musl's `mallocng` — like every SINGLE-ARENA allocator — serialises
+# concurrent allocation on one lock, which caps concurrent allocation-heavy
+# queries (multi-hop expansion): measured as ~2.5 cores of futex system-time at
+# K=6, with foaf COLLAPSING 32→18 q/s. mimalloc is a THREAD-CACHING allocator
+# (each thread its own heap, no shared lock); it lifts that ceiling (foaf
+# 73→324 q/s, a 4.4× scale, sys-time 51%→1%) AND is 2.3× faster single-thread.
+# It is a C library (see the `libmimalloc-sys` allow-list entry in xtask's c-deps
+# gate) — the one place a battle-tested C allocator beats every pure-Rust option
+# (ferroc, the only pure-Rust thread-caching allocator, is nightly-only and
+# abandoned). musl-only: native builds keep the system allocator.
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = { version = "0.1", default-features = false }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+engram-observe.workspace = true
+# For `tests/group_commit_fsyncs.rs`, which reads the WAL's process-wide fsync
+# counter to prove batching happens by sharing fsyncs, not by skipping them.
+engram-log.workspace = true

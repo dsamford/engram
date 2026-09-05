@@ -1,0 +1,17 @@
+[package]
+name = "engram-bolt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "M7 — the wire: PackStream v2 (13 structures), Bolt framing and handshake, and the sans-io server state machine."
+
+[dependencies]
+engram-cypher.workspace = true
+engram-graph.workspace = true
+engram-key.workspace = true
+engram-observe.workspace = true
+engram-store.workspace = true
+
+[lints]
+workspace = true

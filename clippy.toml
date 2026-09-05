@@ -1,0 +1,22 @@
+# Types and methods that break determinism, denied at the lint layer.
+#
+# This file is a CONVENIENCE, not the enforcement. Clippy config is bypassable
+# (`#[allow]`, a different lint level, a build that does not run clippy), which
+# is why R14 requires "a disallowed-types list AND a durable xtask gate". The
+# gate is `cargo xtask determinism`: same seed twice, hash the full event trace,
+# require equality. That catches what this cannot — HashMap iteration order,
+# float reduction order, a dependency spawning its own threads.
+
+disallowed-types = [
+    # Iteration order is unspecified and varies per process (RandomState seed).
+    # A trace built by iterating one of these is not reproducible from a seed.
+    { path = "std::collections::HashMap", reason = "iteration order is not deterministic; use BTreeMap, or IndexMap when insertion order is what you mean" },
+    { path = "std::collections::HashSet", reason = "iteration order is not deterministic; use BTreeSet" },
+]
+
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "take time from Runtime::now() — a direct clock read is invisible to the simulation and makes the run unreproducible" },
+    { path = "std::time::SystemTime::now", reason = "take time from Runtime::now()" },
+    { path = "std::thread::spawn", reason = "D2 is single-threaded-per-shard; spawn cooperative tasks through Runtime::spawn" },
+    { path = "std::thread::sleep", reason = "blocks the shard's thread and stops virtual time; use Runtime::sleep" },
+]

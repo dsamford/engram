@@ -1,0 +1,24 @@
+[package]
+name = "engram-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The DST harness: seeded swarm sweeps over the store, with the coverage floor enforced."
+
+[dependencies]
+engram-key.workspace = true
+engram-log.workspace = true
+engram-observe.workspace = true
+engram-runtime.workspace = true
+engram-store.workspace = true
+engram-exec.workspace = true
+engram-crypto.workspace = true
+engram-objstore.workspace = true
+engram-blob.workspace = true
+engram-cypher.workspace = true
+engram-graph.workspace = true
+engram-bolt.workspace = true
+
+[lints]
+workspace = true

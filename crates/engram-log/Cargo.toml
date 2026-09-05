@@ -1,0 +1,18 @@
+[package]
+name = "engram-log"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "L4 — the BLAKE3 hash-chained commit log: replication, tamper-evidence, CDC and PITR in one artifact."
+
+[dependencies]
+engram-key.workspace = true
+engram-observe.workspace = true
+# On the c-deps allow-list with its reason recorded there: one `cc` invocation
+# for SIMD, no external library, no cmake/bindgen. The gate verifies this on
+# every run rather than trusting this comment.
+blake3 = "1"
+
+[lints]
+workspace = true

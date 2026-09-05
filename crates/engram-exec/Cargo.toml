@@ -1,0 +1,21 @@
+[package]
+name = "engram-exec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Physical operators — single-threaded, no tokio. The ASP semi-mask lands first."
+
+# No tokio, no async. The layout note is a constraint, not a style: operators
+# run inside one shard's poll, and an operator that awaited would hand the
+# scheduler a suspension point mid-pipeline.
+[dependencies]
+engram-observe.workspace = true
+engram-key.workspace = true
+engram-store.workspace = true
+
+[dev-dependencies]
+engram-runtime.workspace = true
+
+[lints]
+workspace = true

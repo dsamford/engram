@@ -1,0 +1,20 @@
+[package]
+name = "engram-blob"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "M6 — blobs referenced not embedded: the manifest, tiering, chunked sealing with seek, and a GC whose UNKNOWN aborts."
+
+[dependencies]
+engram-crypto.workspace = true
+engram-key.workspace = true
+engram-observe.workspace = true
+engram-store.workspace = true
+blake3 = "1"
+
+[dev-dependencies]
+engram-runtime.workspace = true
+
+[lints]
+workspace = true

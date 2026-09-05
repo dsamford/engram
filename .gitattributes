@@ -1,0 +1,40 @@
+# Normalise line endings in the repository, and check out native.
+#
+# This matters more here than in most projects: several tests pin BYTES —
+# the key encoding's golden ordering tests, the commit log's frozen hash rule
+# (`GOLDEN_the_hash_rule_is_frozen`), and the SST block layout. A fixture that
+# round-trips through a CRLF checkout is a fixture whose hash changed for a
+# reason that has nothing to do with the format it is guarding.
+* text=auto
+
+# Sources and configuration: LF in the repository, always.
+*.rs      text eol=lf
+*.toml    text eol=lf
+*.md      text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+*.json    text eol=lf
+*.jsonl   text eol=lf
+*.sh      text eol=lf
+*.py      text eol=lf
+*.js      text eol=lf
+*.mjs     text eol=lf
+*.css     text eol=lf
+*.feature text eol=lf
+
+# The vendored openCypher TCK is upstream's, byte for byte. It is redistributed
+# under its own licence and its scenarios are compared literally, so it is not
+# ours to normalise.
+crates/engram-tck/features/** -text
+
+# Binary, so git neither diffs nor mangles them.
+*.png     binary
+*.seg     binary
+*.wal     binary
+*.zst     binary
+*.diff    -text
+*.patch   -text
+
+# Generated and vendored: keep them out of diffs and out of language stats.
+docs/book/mermaid.min.js  linguist-vendored -diff
+docs/book/mermaid-init.js linguist-vendored

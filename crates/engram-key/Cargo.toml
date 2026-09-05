@@ -1,0 +1,16 @@
+[package]
+name = "engram-key"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Artifact #1 — the frozen memcomparable key encoding, its KIND registry, and the keyspace hygiene rule."
+
+# No dependencies. This crate defines the on-disk format; a dependency that
+# changed its integer encoding across a semver bump would silently change what
+# is already written to disk, and there is no migration for that.
+[dependencies]
+engram-observe.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,22 @@
+[package]
+name = "engram-tck"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+# NOT published. This crate vendors the openCypher TCK — 220 files, Apache-2.0,
+# copyright Neo4j Sweden AB. Publishing it would redistribute another project's
+# corpus under this workspace's MIT declaration, which is both wrong about the
+# licence and unnecessary: the TCK is a measurement instrument for this repo,
+# not a library anyone consumes.
+publish = false
+description = "openCypher TCK conformance harness — runs the vendored openCypher Technology Compatibility Kit feature files against the engine and reports the pass rate. The measurement instrument for the full-openCypher program."
+
+[dependencies]
+engram-cypher.workspace = true
+engram-graph.workspace = true
+engram-key.workspace = true
+engram-store.workspace = true
+
+[lints]
+workspace = true

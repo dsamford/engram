@@ -1,0 +1,86 @@
+Engram
+Copyright (c) 2026 The Engram Authors
+
+This product is licensed under the MIT License. See LICENSE.
+
+================================================================================
+Third-party components
+================================================================================
+
+Every dependency in this workspace is permissively licensed; there is no
+copyleft anywhere in the tree. `cargo deny check` enforces that against the
+allow-list in `deny.toml`.
+
+Most dependencies are MIT OR Apache-2.0 and are satisfied by the MIT notice
+above. The four below carry terms that travel with a BINARY and are therefore
+reproduced or pointed to explicitly.
+
+--------------------------------------------------------------------------------
+ring — Apache-2.0 AND ISC
+--------------------------------------------------------------------------------
+https://github.com/briansmith/ring
+
+`ring` is dual-natured: its own code is ISC-style, and it incorporates code
+derived from BoringSSL (Apache-2.0, Copyright The BoringSSL Authors / Google
+Inc.) and from fiat-crypto (MIT, Copyright the fiat-crypto authors). Both
+upstream notices are carried in `ring`'s own LICENSE file, which a distribution
+of this software in binary form must include.
+
+--------------------------------------------------------------------------------
+unicode-ident — (MIT OR Apache-2.0) AND Unicode-3.0
+--------------------------------------------------------------------------------
+https://github.com/dtolnay/unicode-ident
+
+The Unicode-3.0 arm is NOT optional — it applies in addition to the MIT/Apache
+choice, because the crate embeds data tables derived from the Unicode Character
+Database. The Unicode, Inc. license agreement for data files and software
+applies to those tables.
+
+--------------------------------------------------------------------------------
+arrayref — BSD-2-Clause
+--------------------------------------------------------------------------------
+https://github.com/droundy/arrayref
+
+Copyright (c) 2015 David Roundy. Redistribution in binary form must reproduce
+the BSD-2-Clause notice and disclaimer in the documentation or other materials
+provided with the distribution.
+
+--------------------------------------------------------------------------------
+mimalloc — MIT  (x86_64-unknown-linux-musl builds ONLY)
+--------------------------------------------------------------------------------
+https://github.com/microsoft/mimalloc
+
+Copyright (c) 2018-2021 Microsoft Corporation, Daan Leijen. The Rust binding
+vendors mimalloc's C sources.
+
+This dependency is **target-conditional**: it is compiled only for musl targets,
+where the single-arena system allocator serialises concurrent allocation-heavy
+queries. A build for any other target does not include it.
+
+That is why per-target notices matter here, and why the release job emits
+`THIRD-PARTY-NOTICES-<triple>.txt` rather than one file: a notice listing
+mimalloc for a glibc build would be claiming a component that is not in it, and
+one omitting it for a musl build would be missing a component that is.
+
+================================================================================
+openCypher TCK
+================================================================================
+
+`crates/engram-tck/` vendors the openCypher Technology Compatibility Kit —
+feature files, Apache License 2.0, Copyright (c) Neo4j Sweden AB. They are
+redistributed under the terms of that licence, which is reproduced in that
+crate. The crate is marked `publish = false` and is not distributed to
+crates.io.
+
+The TCK is a measurement instrument for this repository. Conformance figures
+quoted anywhere in this project are produced by running it.
+
+================================================================================
+Trademarks
+================================================================================
+
+Neo4j is a registered trademark of Neo4j, Inc. Cypher is a trademark of Neo4j,
+Inc. LDBC and the LDBC benchmark names are marks of the Linked Data Benchmark
+Council. Use of these names in this project is nominative — to say what this
+software is compatible with and what it is measured against — and does not
+imply affiliation with or endorsement by their holders.

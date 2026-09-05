@@ -1,0 +1,16 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "The durable gates: D3 registration, C-dependency purity, MSRV, determinism."
+
+# No dependencies. A gate that pulls in a TOML parser can fail to build for a
+# reason unrelated to what it checks, and a gate that does not run reports
+# nothing — which in CI reads the same as a gate that passed.
+[dependencies]
+
+[lints]
+workspace = true

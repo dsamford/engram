@@ -1,0 +1,21 @@
+[package]
+name = "engram-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "M5 — per-tenant DEKs derived from the realm prefix, AEAD sealing, and the redaction discipline."
+
+[dependencies]
+engram-key.workspace = true
+engram-observe.workspace = true
+# On the c-deps allow-list with its reason recorded there: pre-generated
+# assembly, one `cc` invocation, no cmake/bindgen — the accepted level. The
+# gate re-verifies on every run.
+ring = "0.17"
+
+[dev-dependencies]
+engram-store.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,14 @@
+[toolchain]
+# Pinned so every developer and every CI run compiles with the same rustc.
+#
+# This is NOT the MSRV. The MSRV (`rust-version` in the workspace Cargo.toml) is
+# the OLDEST toolchain this code must build on; this is the one it is developed
+# and tested against. Conflating them is how the declared minimum stops being
+# true: everyone builds on something newer, a newer language feature slips in,
+# and the break surfaces only for whoever actually pinned the minimum.
+#
+# `cargo xtask msrv` checks the declaration is consistent across members; CI
+# additionally runs a build on a toolchain pinned to the MSRV itself, which is
+# the only thing that makes the number a constraint rather than a comment.
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]

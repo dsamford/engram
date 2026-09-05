@@ -1,0 +1,24 @@
+[package]
+name = "engram-graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "M7 — the property-graph facade over the store, and the Cypher interpreter that runs statements against it."
+
+[dependencies]
+blake3 = "1"
+engram-cypher.workspace = true
+engram-key.workspace = true
+engram-observe.workspace = true
+engram-store.workspace = true
+# Lock-free atomic-Arc swap for the epoch-keyed read caches: readers load the
+# built cache with no lock (the D2-revision read-scaling refactor), so many
+# workers no longer bounce a RwLock reader-count. Pure Rust, no build script.
+arc-swap = "1"
+
+[dev-dependencies]
+engram-runtime.workspace = true
+
+[lints]
+workspace = true

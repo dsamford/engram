@@ -1,0 +1,15 @@
+[package]
+name = "engram-cypher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "M7 — the Cypher front end: tokenizer, Pratt expression parser, the value model with three-valued logic, and the constant evaluator."
+
+[dependencies]
+engram-observe.workspace = true
+tz-rs.workspace = true
+tzdb.workspace = true
+
+[lints]
+workspace = true
