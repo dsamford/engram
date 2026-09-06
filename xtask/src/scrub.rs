@@ -470,12 +470,25 @@ mod tests {
     /// The real rules file must load, and both canaries must hold. The same
     /// check `run` performs, pinned as a test so a bad edit fails `cargo test`
     /// and not only the release lane.
+    ///
+    /// SKIPPED in a published snapshot, which deliberately does not carry the
+    /// rules — they name the private material, which is the disclosure this
+    /// whole arrangement exists to prevent. The missing-file case is not left
+    /// uncovered by that: `run` fails hard when the rules cannot load, and
+    /// `a_missing_rules_file_FAILS` proves it. A file genuinely deleted from
+    /// the source repository therefore still fails, in the gate.
     #[test]
     fn the_repository_rules_load_and_both_canaries_hold() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("workspace root")
             .to_path_buf();
+        if !root.join(RULES_FILE).is_file() {
+            println!(
+                "skipping: no {RULES_FILE} — this is a published snapshot, not the                  source tree. The gate still refuses to run without rules."
+            );
+            return;
+        }
         let loaded = load_rules(&root.join(RULES_FILE)).expect("the rules file must load");
         assert!(loaded.rules.len() >= 10, "suspiciously few rules");
 
