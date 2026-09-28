@@ -129,7 +129,9 @@ fn the_suffix_walk_touches_far_fewer_entries() {
     };
     let full = walked(false);
     let suffix = walked(true);
-    eprintln!("[window suffix] entries walked under the commit latch: {full} scanning, {suffix} suffix");
+    eprintln!(
+        "[window suffix] entries walked under the commit latch: {full} scanning, {suffix} suffix"
+    );
     assert!(
         full >= 2_000,
         "the OFF arm must walk the whole ring, or the ON arm's saving is \

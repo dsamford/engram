@@ -173,7 +173,7 @@ fn in_list_param() {
     let mut p = BTreeMap::new();
     p.insert(
         "xs".to_string(),
-        Value::List(vec![Value::Int(10), Value::Int(30)]),
+        Value::List((vec![Value::Int(10), Value::Int(30)]).into()),
     );
     let (on, off) = both(
         &g,

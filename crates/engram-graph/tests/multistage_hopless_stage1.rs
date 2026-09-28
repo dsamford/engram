@@ -61,7 +61,11 @@ fn corpus() -> Graph {
         let mut m = BTreeMap::new();
         m.insert(
             "userId".to_string(),
-            Value::Str(if i % 3 == 0 { "u1".into() } else { format!("u{}", 2 + i % 5) }),
+            Value::Str(if i % 3 == 0 {
+                "u1".into()
+            } else {
+                format!("u{}", 2 + i % 5)
+            }),
         );
         m.insert("id".to_string(), Value::Str(format!("rt-{i:05}")));
         let t = g.create_node(&["RT".into()], &m).expect("rt");
@@ -69,7 +73,11 @@ fn corpus() -> Graph {
             let mut pm = BTreeMap::new();
             pm.insert(
                 "status".to_string(),
-                Value::Str(if (i + k) % 4 == 0 { "pending".into() } else { "done".into() }),
+                Value::Str(if (i + k) % 4 == 0 {
+                    "pending".into()
+                } else {
+                    "done".into()
+                }),
             );
             let p = g.create_node(&["GWP".into()], &pm).expect("gwp");
             g.create_rel(t, "PGW", p, &BTreeMap::new()).expect("pgw");
@@ -93,12 +101,22 @@ fn a_hopless_stage_one_carried_into_a_stage_two_hop_runs_on_the_pipeline() {
         assert!(!want.is_empty(), "fixture: `{src}`");
         let (got, c) = traced(&g, src);
         assert_eq!(got, want, "`{src}`");
-        assert!(count_of(&c, MULTISTAGE) > 0, "`{src}` runs on the multistage pipeline: {c:?}");
-        assert_eq!(count_of(&c, FULL), 0, "`{src}` materialises nothing in full: {c:?}");
+        assert!(
+            count_of(&c, MULTISTAGE) > 0,
+            "`{src}` runs on the multistage pipeline: {c:?}"
+        );
+        assert_eq!(
+            count_of(&c, FULL),
+            0,
+            "`{src}` materialises nothing in full: {c:?}"
+        );
     }
     // 400 seeds × (1 or 2 ends): 400 + 200 = 600.
     assert_eq!(
-        rows(&g, "MATCH (t:RT) WHERE t.userId = $u WITH t MATCH (t)-[:PGW]->(p:GWP) RETURN count(p) AS n"),
+        rows(
+            &g,
+            "MATCH (t:RT) WHERE t.userId = $u WITH t MATCH (t)-[:PGW]->(p:GWP) RETURN count(p) AS n"
+        ),
         vec![vec![Value::Int(600)]]
     );
 }

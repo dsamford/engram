@@ -83,7 +83,10 @@ fn snb_shaped(persons: i64) -> Graph {
     .expect("create index");
     run(
         &g,
-        &format!("UNWIND range(0, {}) AS i CREATE (:Person {{pid: i}})", persons - 1),
+        &format!(
+            "UNWIND range(0, {}) AS i CREATE (:Person {{pid: i}})",
+            persons - 1
+        ),
     );
     run(
         &g,
@@ -275,8 +278,16 @@ fn report_how_each_form_scales_with_the_big_label() {
 
     let s_small = median((0..3).map(|_| time_form(&small, SCAN_FIRST, 10)).collect());
     let s_large = median((0..3).map(|_| time_form(&large, SCAN_FIRST, 10)).collect());
-    let a_small = median((0..3).map(|_| time_form(&small, ANCHOR_FIRST, 10)).collect());
-    let a_large = median((0..3).map(|_| time_form(&large, ANCHOR_FIRST, 10)).collect());
+    let a_small = median(
+        (0..3)
+            .map(|_| time_form(&small, ANCHOR_FIRST, 10))
+            .collect(),
+    );
+    let a_large = median(
+        (0..3)
+            .map(|_| time_form(&large, ANCHOR_FIRST, 10))
+            .collect(),
+    );
 
     eprintln!(
         "  message-first: 10k msgs {:.3} ms -> 100k msgs {:.3} ms  ({:.1}x)",

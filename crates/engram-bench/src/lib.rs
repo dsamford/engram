@@ -4,6 +4,26 @@
 
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
+// The RDBMS comparator's client. It lives in the lib rather than beside a bin
+// because more than one instrument needs it — the port harness, the concurrency
+// sweep and the LSQB comparison all have to reach the same PostgreSQL — and a
+// wire client copied per binary is a wire client that diverges per binary.
+pub mod pgwire;
+
+// ── The converged harness ──────────────────────────────────────────────────
+//
+// Four engines, two workloads, one implementation of each. These live in the
+// LIB for the same reason `pgwire` does: the moment a workload is implemented
+// beside a binary, the second engine gets a second implementation and the two
+// stop being comparable. See `docs/converged-harness.md`.
+pub mod backend;
+pub mod catalogue;
+pub mod fairness;
+pub mod params;
+pub mod plan;
+pub mod report;
+pub mod workload;
+
 use std::collections::BTreeMap;
 
 use engram_cypher::temporal::{parse_date, parse_duration, parse_time_of_day, parse_zone};
@@ -159,9 +179,13 @@ pub fn untag_prop(v: &Value, unloadable: &mut usize) -> Value {
                     .collect(),
             )
         }
-        Value::List(items) => {
-            Value::List(items.iter().map(|x| untag_prop(x, unloadable)).collect())
-        }
+        Value::List(items) => Value::List(
+            items
+                .iter()
+                .map(|x| untag_prop(x, unloadable))
+                .collect::<Vec<_>>()
+                .into(),
+        ),
         other => other.clone(),
     }
 }
@@ -191,7 +215,7 @@ pub fn canon_float(f: f64) -> Value {
 fn canon_list(items: &[Value], f: fn(&Value) -> Value) -> Value {
     let mut out: Vec<Value> = items.iter().map(f).collect();
     out.sort_by_key(json::to_json);
-    Value::List(out)
+    Value::List((out).into())
 }
 
 /// Canonicalise an Engram result value into the JSON-carrier shape the
@@ -220,10 +244,13 @@ pub fn canon_engram(v: &Value) -> Value {
             );
             Value::Map(BTreeMap::from([(
                 "~n".to_string(),
-                Value::List(vec![
-                    Value::List(ls.into_iter().map(Value::Str).collect()),
-                    props,
-                ]),
+                Value::List(
+                    (vec![
+                        Value::List(ls.into_iter().map(Value::Str).collect::<Vec<_>>().into()),
+                        props,
+                    ])
+                    .into(),
+                ),
             )]))
         }
         Value::Rel {
@@ -237,7 +264,7 @@ pub fn canon_engram(v: &Value) -> Value {
             );
             Value::Map(BTreeMap::from([(
                 "~r".to_string(),
-                Value::List(vec![Value::Str(rel_type.clone()), props]),
+                Value::List((vec![Value::Str(rel_type.clone()), props]).into()),
             )]))
         }
         temporal => Value::Str(canon_temporal_str(&temporal_to_string(temporal))),
@@ -477,14 +504,20 @@ mod canon_tests {
     /// a divergence. Row `["Bo", [Tag1, Tag2, Tag3]]` vs `["Bo", [Tag3, Tag1, Tag2]]`.
     #[test]
     fn collect_list_order_is_ignored() {
-        let engram = Value::List(vec![
-            s("Bo"),
-            Value::List(vec![s("Tag1"), s("Tag2"), s("Tag3")]),
-        ]);
-        let neo4j = Value::List(vec![
-            s("Bo"),
-            Value::List(vec![s("Tag3"), s("Tag1"), s("Tag2")]),
-        ]);
+        let engram = Value::List(
+            vec![
+                s("Bo"),
+                Value::List(vec![s("Tag1"), s("Tag2"), s("Tag3")].into()),
+            ]
+            .into(),
+        );
+        let neo4j = Value::List(
+            vec![
+                s("Bo"),
+                Value::List(vec![s("Tag3"), s("Tag1"), s("Tag2")].into()),
+            ]
+            .into(),
+        );
         assert_eq!(
             canon_engram(&engram),
             canon_incumbent(&neo4j),
@@ -496,8 +529,8 @@ mod canon_tests {
     /// not a blanket equality).
     #[test]
     fn different_list_elements_still_diverge() {
-        let a = Value::List(vec![s("Tag1"), s("Tag2")]);
-        let b = Value::List(vec![s("Tag1"), s("Tag9")]);
+        let a = Value::List((vec![s("Tag1"), s("Tag2")]).into());
+        let b = Value::List((vec![s("Tag1"), s("Tag9")]).into());
         assert_ne!(canon_engram(&a), canon_incumbent(&b));
     }
 }

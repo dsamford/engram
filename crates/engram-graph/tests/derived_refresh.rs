@@ -50,10 +50,18 @@ fn snb_shaped() -> (Graph, Vec<u64>, u32) {
             .expect("has_creator");
     }
     g.shared_store().seal();
-    let tok = g.type_tokens_peek(&["HAS_CREATOR".to_string()]).expect("minted")[0];
+    let tok = g
+        .type_tokens_peek(&["HAS_CREATOR".to_string()])
+        .expect("minted")[0];
     // The reads that build the structures a burst will leave stale.
-    assert_eq!(in_row(&g, persons[0], tok), (SEED_MESSAGES / PERSONS) as usize);
-    assert_eq!(g.members(Some("Message")).expect("members").len(), SEED_MESSAGES as usize);
+    assert_eq!(
+        in_row(&g, persons[0], tok),
+        (SEED_MESSAGES / PERSONS) as usize
+    );
+    assert_eq!(
+        g.members(Some("Message")).expect("members").len(),
+        SEED_MESSAGES as usize
+    );
     assert_eq!(
         g.members(None).expect("all").len(),
         (PERSONS + SEED_MESSAGES) as usize
@@ -72,8 +80,13 @@ fn burst(g: &Graph, persons: &[u64], n: u64) {
     let none = BTreeMap::new();
     for i in 0..n {
         let m = g.create_node(&message, &none).expect("message");
-        g.create_rel(m, "HAS_CREATOR", persons[(i % BURST_PERSONS) as usize], &none)
-            .expect("has_creator");
+        g.create_rel(
+            m,
+            "HAS_CREATOR",
+            persons[(i % BURST_PERSONS) as usize],
+            &none,
+        )
+        .expect("has_creator");
     }
 }
 
@@ -122,8 +135,18 @@ fn a_refresh_after_a_write_only_burst_leaves_the_next_read_nothing_to_do() {
     let (rows, members, trace) = traced_read(&g, persons[0], tok);
     assert_eq!(rows, expected_in_degree(n), "the read must see the burst");
     assert_eq!(members, (SEED_MESSAGES + n) as usize);
-    assert_eq!(count(&trace, "graph.adjacency tables built"), 0, "{:?}", trace.counters());
-    assert_eq!(count(&trace, "graph.adjacency tables repaired"), 0, "{:?}", trace.counters());
+    assert_eq!(
+        count(&trace, "graph.adjacency tables built"),
+        0,
+        "{:?}",
+        trace.counters()
+    );
+    assert_eq!(
+        count(&trace, "graph.adjacency tables repaired"),
+        0,
+        "{:?}",
+        trace.counters()
+    );
     assert!(count(&trace, "graph.adjacency tables reused") >= 1);
     assert_eq!(count(&trace, "graph.membership snapshots caught up"), 0);
     assert_eq!(count(&trace, "graph.membership snapshots built"), 0);
@@ -134,7 +157,10 @@ fn a_refresh_after_a_write_only_burst_leaves_the_next_read_nothing_to_do() {
     );
 
     // Idempotent: nothing is stale now.
-    assert!(!g.refresh_stale_derived().any(), "a second refresh must find nothing stale");
+    assert!(
+        !g.refresh_stale_derived().any(),
+        "a second refresh must find nothing stale"
+    );
 }
 
 /// The canary: the SAME burst with no refresh, and the read pays — repairs
@@ -146,7 +172,8 @@ fn without_the_refresh_the_next_read_pays_for_the_burst() {
     let (rows, _, trace) = traced_read(&g, persons[0], tok);
     assert_eq!(rows, expected_in_degree(3_000));
     assert!(
-        count(&trace, "graph.adjacency tables repaired") + count(&trace, "graph.adjacency tables built")
+        count(&trace, "graph.adjacency tables repaired")
+            + count(&trace, "graph.adjacency tables built")
             >= 1,
         "the reader must have done the work the refresh would have: {:?}",
         trace.counters()
@@ -170,12 +197,17 @@ fn the_refresh_is_a_no_op_with_incremental_caches_off() {
 fn the_refresh_does_not_warm_unbuilt_structures() {
     let (g, persons, _tok) = snb_shaped();
     let none = BTreeMap::new();
-    g.create_rel(persons[0], "KNOWS", persons[1], &none).expect("knows");
+    g.create_rel(persons[0], "KNOWS", persons[1], &none)
+        .expect("knows");
     let (report, trace) = engram_observe::with_trace(|| g.refresh_stale_derived());
     // KNOWS's type epoch moved but no KNOWS table exists; the all-nodes
     // membership did not change (no node created); only the untyped tables,
     // if cached, would be behind — and none was built by the reads above.
-    assert_eq!(count(&trace, "graph.adjacency tables built"), 0, "{report:?}");
+    assert_eq!(
+        count(&trace, "graph.adjacency tables built"),
+        0,
+        "{report:?}"
+    );
 }
 
 /// The batched membership fold reaches the same membership the serial fold

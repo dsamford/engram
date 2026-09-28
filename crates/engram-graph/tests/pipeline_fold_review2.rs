@@ -81,6 +81,20 @@ fn agrees_and_folds(g: &Graph, src: &str) -> Rows {
     on
 }
 
+/// Separate MATCH clauses (deliberate relationship reuse: openCypher scopes
+/// isomorphism to one clause) are held to the general path's answer only: the
+/// fold claims ONE MATCH, and reaches separate clauses only where fusion hands
+/// them over as one, so whether it fires is not this test's claim. A
+/// single-MATCH statement must fold as before. When the pipeline learns the
+/// clause rule for comma paths, these go back to one MATCH and fold again (§44).
+fn folds_if_one_clause(g: &Graph, src: &str) -> Rows {
+    if src.matches("MATCH").count() > 1 {
+        agrees(g, src)
+    } else {
+        agrees_and_folds(g, src)
+    }
+}
+
 /// memo ON == memo OFF (the memo is a pure cache, never a semantics change).
 fn memo_agrees(g: &Graph, src: &str) {
     engram_graph::pipeline::set_count_fold(true);
@@ -273,7 +287,7 @@ fn rel_var_on_a_folded_close_unread_later_var_is_unharmed() {
 #[test]
 fn rel_var_on_a_folded_close_reads_the_next_vars_column() {
     let g = gself();
-    let src = "MATCH (a:P)-[:K]->(b:P)-[r:K]->(b), (a)-[:M]->(c:P), (c)-[:K]->(d:P) RETURN c.pk AS k, count(*) AS n ORDER BY k";
+    let src = "MATCH (a:P)-[:K]->(b:P)-[r:K]->(b) MATCH (a)-[:M]->(c:P) MATCH (c)-[:K]->(d:P) RETURN c.pk AS k, count(*) AS n ORDER BY k";
     engram_graph::pipeline::set_count_fold(false);
     g.set_columnar_scans(true);
     let off = rows(&g, src);
@@ -379,7 +393,7 @@ fn a_continuation_root_inherits_the_rows_used_rels() {
 /// `memo_ok_for` disables the memo for a level whose tracked subtree hop
 /// shares a relationship type with ANY other hop of the same path — not only
 /// with its siblings. These shapes put the sharing hop two levels up, and in a
-/// sibling BRANCH, and then check the converse: across a path boundary
+/// sibling BRANCH, and then check the converse: across a CLAUSE boundary
 /// (`reset`) the sets never meet, so the memo may stay on and must still agree.
 #[test]
 fn the_memo_is_a_pure_cache_across_shared_types_and_path_boundaries() {
@@ -395,17 +409,18 @@ fn the_memo_is_a_pure_cache_across_shared_types_and_path_boundaries() {
         // The same type on every hop of a three-hop path.
         "MATCH (a:P)-[:K]-(b:P)-[:K]-(c:P)-[:K]-(d:P) RETURN count(*) AS n",
         "MATCH (a:P)-[:K]->(b:P)-[:K]->(c:P)-[:K]->(d:P) RETURN count(*) AS n",
-        // ACROSS a path boundary: the second path re-seeds `used`, so a shared
-        // type there must NOT change the answer (and the memo may stay on).
-        "MATCH (a:P)-[:K]-(b:P)-[:M]-(c:P), (a)-[:K]-(d:P) RETURN count(*) AS n",
-        "MATCH (a:P)-[:K]-(b:P), (a)-[:K]-(c:P)-[:K]-(d:P) RETURN count(*) AS n",
-        "MATCH (a:P)-[:K]-(b:P), (b)-[:K]-(c:P) RETURN count(*) AS n",
+        // ACROSS a clause boundary: a separate MATCH may reuse a relationship,
+        // so a shared type there must NOT change the answer (and the memo may
+        // stay on).
+        "MATCH (a:P)-[:K]-(b:P)-[:M]-(c:P) MATCH (a)-[:K]-(d:P) RETURN count(*) AS n",
+        "MATCH (a:P)-[:K]-(b:P) MATCH (a)-[:K]-(c:P)-[:K]-(d:P) RETURN count(*) AS n",
+        "MATCH (a:P)-[:K]-(b:P) MATCH (b)-[:K]-(c:P) RETURN count(*) AS n",
         // A branch under one folded level: two children with a shared type.
-        "MATCH (a:P)-[:M]-(b:P)-[:K]-(c:P), (b)-[:K]-(d:P) RETURN count(*) AS n",
-        "MATCH (a:P)-[:M]-(b:P)-[:K]-(c:P), (b)-[:M]-(d:P) RETURN count(*) AS n",
+        "MATCH (a:P)-[:M]-(b:P)-[:K]-(c:P) MATCH (b)-[:K]-(d:P) RETURN count(*) AS n",
+        "MATCH (a:P)-[:M]-(b:P)-[:K]-(c:P) MATCH (b)-[:M]-(d:P) RETURN count(*) AS n",
     ];
     for src in shapes {
-        agrees_and_folds(&g, src);
+        folds_if_one_clause(&g, src);
         memo_agrees(&g, src);
     }
     // The memo must actually FIRE on at least one of these, or the whole
@@ -414,16 +429,19 @@ fn the_memo_is_a_pure_cache_across_shared_types_and_path_boundaries() {
         .iter()
         .filter(|s| counter(&g, s, MEMO).is_some())
         .count();
-    assert!(fired > 0, "the memo never fired on any shape: differential vacuous");
+    assert!(
+        fired > 0,
+        "the memo never fired on any shape: differential vacuous"
+    );
     // And the same over the deeper, pairwise-disjoint fixture (where the memo
     // is expected ON for every level).
     let gd = gdeep();
     for src in [
         "MATCH (a:A)-[:R]->(b:B)-[:S]->(c:C)-[:U]->(d:B) RETURN count(*) AS n",
         "MATCH (a:A)-[:R]->(b:B)-[:S]->(c:C)-[:U]->(d:B)-[:S]->(e:C) RETURN count(*) AS n",
-        "MATCH (a:A)-[:R]->(b:B)-[:S]->(c:C), (b)-[:S]->(e:C) RETURN count(*) AS n",
+        "MATCH (a:A)-[:R]->(b:B)-[:S]->(c:C) MATCH (b)-[:S]->(e:C) RETURN count(*) AS n",
     ] {
-        agrees_and_folds(&gd, src);
+        folds_if_one_clause(&gd, src);
         memo_agrees(&gd, src);
     }
 }
@@ -577,16 +595,15 @@ fn multi_type_and_txn_buffered_closes_fall_back_to_the_walk() {
     // Multi-type closes and probes: `edge_count_slim` must never binary-search.
     let multi: &[&str] = &[
         "MATCH (a:P)-[:K]-(b:P)-[:K|M]-(a) RETURN count(*) AS n",
-        "MATCH (a:P)-[:K]-(b:P), (b)-[:K|M]-(b) RETURN a.pk AS k, count(*) AS n ORDER BY k",
+        "MATCH (a:P)-[:K]-(b:P) MATCH (b)-[:K|M]-(b) RETURN a.pk AS k, count(*) AS n ORDER BY k",
         "MATCH (a:P)-[:K]-(b:P)-[:K]-(c:P) WHERE NOT (a)-[:K|M]-(c) RETURN count(*) AS n",
-        "MATCH (a:P)-[:K]-(b:P), (b)-[:K|M]-(b) RETURN b.pk AS j, count(*) AS n ORDER BY j",
+        "MATCH (a:P)-[:K]-(b:P) MATCH (b)-[:K|M]-(b) RETURN b.pk AS j, count(*) AS n ORDER BY j",
     ];
     for src in multi {
         agrees(&g, src);
     }
-    let (_, trace) = engram_observe::with_trace(|| {
-        multi.iter().map(|s| rows(&g, s)).collect::<Vec<Rows>>()
-    });
+    let (_, trace) =
+        engram_observe::with_trace(|| multi.iter().map(|s| rows(&g, s)).collect::<Vec<Rows>>());
     assert!(
         trace
             .counters()
@@ -606,7 +623,10 @@ fn multi_type_and_txn_buffered_closes_fall_back_to_the_walk() {
     let ids = rows(&g, "MATCH (p:P) RETURN p.pk AS k ORDER BY k");
     assert_eq!(ids.len(), 5, "five P nodes visible inside the transaction");
     let in_txn: Vec<Rows> = multi.iter().map(|s| rows(&g, s)).collect();
-    assert_eq!(base, in_txn, "an open transaction with no writes changes nothing");
+    assert_eq!(
+        base, in_txn,
+        "an open transaction with no writes changes nothing"
+    );
     g.rollback_txn();
 
     // A transaction that DOES buffer rows on the closing nodes.
@@ -615,9 +635,8 @@ fn multi_type_and_txn_buffered_closes_fall_back_to_the_walk() {
         &g,
         "MATCH (x:P) WHERE x.pk = 3 CREATE (x)-[:K]->(x) RETURN count(*) AS n",
     );
-    let (buffered, trace) = engram_observe::with_trace(|| {
-        multi.iter().map(|s| agrees(&g, s)).collect::<Vec<Rows>>()
-    });
+    let (buffered, trace) =
+        engram_observe::with_trace(|| multi.iter().map(|s| agrees(&g, s)).collect::<Vec<Rows>>());
     assert!(
         trace
             .counters()
@@ -649,8 +668,8 @@ fn the_sorted_flag_canary_moves_no_number() {
     let g = gself();
     g.set_degree_table_after(0);
     let stmts: &[&str] = &[
-        "MATCH (a:P)-[:K]-(b:P), (b)-[:K]-(b) RETURN a.pk AS k, count(*) AS n ORDER BY k",
-        "MATCH (a:P)-[:K]-(b:P), (b)-[:K]-(b) RETURN b.pk AS j, count(*) AS n ORDER BY j",
+        "MATCH (a:P)-[:K]-(b:P) MATCH (b)-[:K]-(b) RETURN a.pk AS k, count(*) AS n ORDER BY k",
+        "MATCH (a:P)-[:K]-(b:P) MATCH (b)-[:K]-(b) RETURN b.pk AS j, count(*) AS n ORDER BY j",
         "MATCH (a:P)-[:K]->(b:P)-[:K]->(b) RETURN count(*) AS n",
         "MATCH (a:P)-[:K]-(b:P)-[:K]-(c:P)-[:K]-(a) RETURN count(*) AS n",
         "MATCH (a:P)-[:K]->(b:P)-[:M]->(a) RETURN a.pk AS k, count(*) AS n ORDER BY k",
@@ -659,9 +678,8 @@ fn the_sorted_flag_canary_moves_no_number() {
         "MATCH (a:P)-[:K]-(b:P)-[:K]-(c:P) WHERE (a)-[:M]-(c) RETURN count(*) AS n",
     ];
     let before: Vec<Rows> = stmts.iter().map(|s| agrees(&g, s)).collect();
-    let (_, warm) = engram_observe::with_trace(|| {
-        stmts.iter().map(|s| rows(&g, s)).collect::<Vec<Rows>>()
-    });
+    let (_, warm) =
+        engram_observe::with_trace(|| stmts.iter().map(|s| rows(&g, s)).collect::<Vec<Rows>>());
     assert!(
         warm.counters()
             .get("graph.edge probe binary search")
@@ -684,9 +702,8 @@ fn the_sorted_flag_canary_moves_no_number() {
     );
     let flipped = g.clear_adjacency_sorted_flags();
     assert!(flipped > 0, "the canary cleared no table");
-    let (after, trace) = engram_observe::with_trace(|| {
-        stmts.iter().map(|s| rows(&g, s)).collect::<Vec<Rows>>()
-    });
+    let (after, trace) =
+        engram_observe::with_trace(|| stmts.iter().map(|s| rows(&g, s)).collect::<Vec<Rows>>());
     assert_eq!(before, after, "the walk must answer what the search did");
     assert_eq!(
         trace
@@ -719,25 +736,40 @@ fn both_self_loops_counted_once_per_relationship() {
     let p: Vec<u64> = (0..4).map(mk).collect();
     let e = BTreeMap::new();
     // p0: three parallel K self-loops. p1: none. p2: one. p3: none.
-    for (s, d) in [(0, 0), (0, 0), (0, 0), (2, 2), (0, 1), (1, 2), (2, 3), (3, 0)] {
+    for (s, d) in [
+        (0, 0),
+        (0, 0),
+        (0, 0),
+        (2, 2),
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 0),
+    ] {
         g.create_rel(p[s], "K", p[d], &e).expect("K");
     }
     // The bare self-loop degree, undirected: p0 -> 3, p2 -> 1, others 0.
     assert_eq!(
-        agrees(&g, "MATCH (x:P)-[:K]-(x) RETURN x.pk AS k, count(*) AS n ORDER BY k"),
+        agrees(
+            &g,
+            "MATCH (x:P)-[:K]-(x) RETURN x.pk AS k, count(*) AS n ORDER BY k"
+        ),
         vec![vec![i(0), i(3)], vec![i(2), i(1)]],
         "an undirected self-loop binds ONCE per relationship"
     );
     assert_eq!(
-        agrees(&g, "MATCH (x:P)-[:K]->(x) RETURN x.pk AS k, count(*) AS n ORDER BY k"),
+        agrees(
+            &g,
+            "MATCH (x:P)-[:K]->(x) RETURN x.pk AS k, count(*) AS n ORDER BY k"
+        ),
         vec![vec![i(0), i(3)], vec![i(2), i(1)]],
         "the directed spelling agrees"
     );
     for src in [
         // UNTRACKED close (its own path): the arriving rel is not excluded.
-        "MATCH (a:P)-[:K]-(b:P), (b)-[:K]-(b) RETURN count(*) AS n",
-        "MATCH (a:P)-[:K]-(b:P), (b)-[:K]-(b) RETURN a.pk AS k, count(*) AS n ORDER BY k",
-        "MATCH (a:P)-[:K]-(b:P), (b)-[:K]-(b) RETURN b.pk AS j, count(*) AS n ORDER BY j",
+        "MATCH (a:P)-[:K]-(b:P) MATCH (b)-[:K]-(b) RETURN count(*) AS n",
+        "MATCH (a:P)-[:K]-(b:P) MATCH (b)-[:K]-(b) RETURN a.pk AS k, count(*) AS n ORDER BY k",
+        "MATCH (a:P)-[:K]-(b:P) MATCH (b)-[:K]-(b) RETURN b.pk AS j, count(*) AS n ORDER BY j",
         // TRACKED close onto the level's own var.
         "MATCH (a:P)-[:K]-(b:P)-[:K]-(b) RETURN count(*) AS n",
         "MATCH (a:P)-[:K]-(b:P)-[:K]-(b) RETURN a.pk AS k, count(*) AS n ORDER BY k",
@@ -798,7 +830,7 @@ fn both_self_loops_counted_once_per_relationship() {
     let warm: Vec<Rows> = [
         "MATCH (a:P)-[:K]->(b:P)-[:K]->(b) RETURN a.pk AS k, count(*) AS n ORDER BY k",
         "MATCH (a:P)-[:K]->(b:P)-[:K]->(b) RETURN b.pk AS j, count(*) AS n ORDER BY j",
-        "MATCH (a:P)-[:K]-(b:P), (b)-[:K]-(b) RETURN a.pk AS k, count(*) AS n ORDER BY k",
+        "MATCH (a:P)-[:K]-(b:P) MATCH (b)-[:K]-(b) RETURN a.pk AS k, count(*) AS n ORDER BY k",
     ]
     .iter()
     .map(|s| rows(&g, s))
@@ -808,7 +840,7 @@ fn both_self_loops_counted_once_per_relationship() {
     let walked: Vec<Rows> = [
         "MATCH (a:P)-[:K]->(b:P)-[:K]->(b) RETURN a.pk AS k, count(*) AS n ORDER BY k",
         "MATCH (a:P)-[:K]->(b:P)-[:K]->(b) RETURN b.pk AS j, count(*) AS n ORDER BY j",
-        "MATCH (a:P)-[:K]-(b:P), (b)-[:K]-(b) RETURN a.pk AS k, count(*) AS n ORDER BY k",
+        "MATCH (a:P)-[:K]-(b:P) MATCH (b)-[:K]-(b) RETURN a.pk AS k, count(*) AS n ORDER BY k",
     ]
     .iter()
     .map(|s| agrees(&g, s))
@@ -899,7 +931,7 @@ fn paged_agrees_with_resident_on_the_fold_and_the_anti_join() {
         "MATCH (a:P)-[:K]-(b:P)-[:K]-(c:P) WHERE NOT (a)-[:K]-(c) AND a <> c RETURN count(*) AS n",
         "MATCH (a:P)-[:K]-(b:P)-[:K]-(c:P) RETURN b.pk AS k, count(*) AS n ORDER BY k",
         "MATCH (a:P)-[:K]->(b:P)-[:K]->(b) RETURN a.pk AS k, count(*) AS n ORDER BY k",
-        "MATCH (a:P)-[:K]-(b:P), (b)-[:K]-(b) RETURN b.pk AS j, count(*) AS n ORDER BY j",
+        "MATCH (a:P)-[:K]-(b:P) MATCH (b)-[:K]-(b) RETURN b.pk AS j, count(*) AS n ORDER BY j",
         "MATCH (a:P)-[:K]-(b:P)-[:M]-(c:P)-[:K]-(d:P) RETURN count(*) AS n",
         "MATCH (a:P)-[:K]-(b:P)-[:K|M]-(c:P)-[:HI]->(t:Tag) RETURN count(*) AS n",
         "MATCH (a:P)-[:K]->(b:P) WHERE NOT (b)-[:K]-(a) RETURN a.pk AS k, b.pk AS j ORDER BY k, j",
@@ -916,7 +948,10 @@ fn paged_agrees_with_resident_on_the_fold_and_the_anti_join() {
     let paged = Graph::new(store.clone(), realm, ns);
     paged.set_degree_table_after(0);
     let (got, trace) = engram_observe::with_trace(|| {
-        stmts.iter().map(|s| agrees(&paged, s)).collect::<Vec<Rows>>()
+        stmts
+            .iter()
+            .map(|s| agrees(&paged, s))
+            .collect::<Vec<Rows>>()
     });
     assert_eq!(resident, got, "paged vs resident");
     assert!(trace.counters().get("paged.pread").copied().unwrap_or(0) > 0);
@@ -940,8 +975,9 @@ fn paged_agrees_with_resident_on_the_fold_and_the_anti_join() {
 
 /// The triage's new rule un-folds a close TARGET that is not on the level's
 /// ancestor chain, then lets the fixpoint re-decide. Over `gself` every hop is
-/// `:K`, so relationship isomorphism (per PATH) is live on every one of these
-/// and a plan that moved a hop across a path boundary would show. The pairs
+/// `:K`, so relationship isomorphism (within each path; these shapes spell
+/// every further path as its own MATCH clause) is live on every one of these
+/// and a plan that moved a hop across a clause boundary would show. The pairs
 /// below are the SAME patterns written in two orders — the rule's whole claim
 /// is that both orders reach the same answer.
 #[test]
@@ -949,30 +985,33 @@ fn sibling_closes_agree_in_both_pattern_orders() {
     let g = gself();
     let pairs: &[(&str, &str)] = &[
         (
-            "MATCH (a:P)-[:K]-(d:P), (a)-[:K]-(b:P)-[:K]-(c:P), (c)-[:K]-(d) RETURN count(*) AS n",
-            "MATCH (a:P)-[:K]-(b:P)-[:K]-(c:P), (a)-[:K]-(d:P), (c)-[:K]-(d) RETURN count(*) AS n",
+            "MATCH (a:P)-[:K]-(d:P) MATCH (a)-[:K]-(b:P)-[:K]-(c:P) MATCH (c)-[:K]-(d) RETURN count(*) AS n",
+            "MATCH (a:P)-[:K]-(b:P)-[:K]-(c:P) MATCH (a)-[:K]-(d:P) MATCH (c)-[:K]-(d) RETURN count(*) AS n",
         ),
         (
-            "MATCH (a:P)-[:M]-(d:P), (a)-[:K]-(b:P)-[:K]-(c:P), (c)-[:M]-(d) RETURN count(*) AS n",
-            "MATCH (a:P)-[:K]-(b:P)-[:K]-(c:P), (a)-[:M]-(d:P), (c)-[:M]-(d) RETURN count(*) AS n",
+            "MATCH (a:P)-[:M]-(d:P) MATCH (a)-[:K]-(b:P)-[:K]-(c:P) MATCH (c)-[:M]-(d) RETURN count(*) AS n",
+            "MATCH (a:P)-[:K]-(b:P)-[:K]-(c:P) MATCH (a)-[:M]-(d:P) MATCH (c)-[:M]-(d) RETURN count(*) AS n",
         ),
         (
-            "MATCH (a:P)-[:K]->(d:P), (a)-[:K]->(b:P)-[:K]->(c:P), (c)-[:K]->(d) RETURN a.pk AS k, count(*) AS n ORDER BY k",
-            "MATCH (a:P)-[:K]->(b:P)-[:K]->(c:P), (a)-[:K]->(d:P), (c)-[:K]->(d) RETURN a.pk AS k, count(*) AS n ORDER BY k",
+            "MATCH (a:P)-[:K]->(d:P) MATCH (a)-[:K]->(b:P)-[:K]->(c:P) MATCH (c)-[:K]->(d) RETURN a.pk AS k, count(*) AS n ORDER BY k",
+            "MATCH (a:P)-[:K]->(b:P)-[:K]->(c:P) MATCH (a)-[:K]->(d:P) MATCH (c)-[:K]->(d) RETURN a.pk AS k, count(*) AS n ORDER BY k",
         ),
     ];
     for (first, second) in pairs {
         let x = agrees(&g, first);
         let y = agrees(&g, second);
-        assert_eq!(x, y, "the two orders count the same walks:\n  {first}\n  {second}");
+        assert_eq!(
+            x, y,
+            "the two orders count the same walks:\n  {first}\n  {second}"
+        );
         memo_agrees(&g, first);
         memo_agrees(&g, second);
     }
     // The keyed spelling of the same shape (which materialises the target for
     // the OTHER reason) must reach the same plan and the same number.
     for src in [
-        "MATCH (a:P)-[:K]-(d:P), (a)-[:K]-(b:P)-[:K]-(c:P), (c)-[:K]-(d) RETURN d.pk AS k, count(*) AS n ORDER BY k",
-        "MATCH (a:P)-[:K]-(d:P), (a)-[:K]-(b:P)-[:K]-(c:P), (c)-[:K]-(d) RETURN a.pk AS k, count(*) AS n ORDER BY k",
+        "MATCH (a:P)-[:K]-(d:P) MATCH (a)-[:K]-(b:P)-[:K]-(c:P) MATCH (c)-[:K]-(d) RETURN d.pk AS k, count(*) AS n ORDER BY k",
+        "MATCH (a:P)-[:K]-(d:P) MATCH (a)-[:K]-(b:P)-[:K]-(c:P) MATCH (c)-[:K]-(d) RETURN a.pk AS k, count(*) AS n ORDER BY k",
     ] {
         agrees(&g, src);
     }
@@ -1050,9 +1089,9 @@ fn inline_predicates_against_a_materialised_var_both_sides_of_the_position_rule(
         "MATCH (a:A)-[:R]->(b:B)-[:S]->(c:C)-[:U]->(d:B) WHERE b = d RETURN b.bk AS k, count(*) AS n ORDER BY k",
         "MATCH (a:A)-[:R]->(b:B)-[:S]->(c:C)-[:U]->(d:B) WHERE NOT (d)-[:S]->(c) RETURN b.bk AS k, count(*) AS n ORDER BY k",
         // The other var is bound AFTER the root: the level must un-fold.
-        "MATCH (a:A)-[:R]->(b:B)-[:S]->(c:C), (a)-[:R]->(d:B) WHERE c <> d RETURN count(*) AS n",
-        "MATCH (a:A)-[:R]->(b:B)-[:S]->(c:C), (a)-[:R]->(d:B) WHERE NOT (c)-[:U]->(d) RETURN count(*) AS n",
-        "MATCH (a:A)-[:R]->(b:B)-[:S]->(c:C), (a)-[:R]->(d:B) WHERE b <> d RETURN count(*) AS n",
+        "MATCH (a:A)-[:R]->(b:B)-[:S]->(c:C) MATCH (a)-[:R]->(d:B) WHERE c <> d RETURN count(*) AS n",
+        "MATCH (a:A)-[:R]->(b:B)-[:S]->(c:C) MATCH (a)-[:R]->(d:B) WHERE NOT (c)-[:U]->(d) RETURN count(*) AS n",
+        "MATCH (a:A)-[:R]->(b:B)-[:S]->(c:C) MATCH (a)-[:R]->(d:B) WHERE b <> d RETURN count(*) AS n",
     ] {
         agrees(&g, src);
         memo_agrees(&g, src);

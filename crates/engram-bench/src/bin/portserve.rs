@@ -74,17 +74,17 @@ fn main() -> std::io::Result<()> {
     engram_server::run_server_with_config(
         listener,
         move || {
-        let graph = Graph::new(Store::new(), Realm(1), Namespace(1));
-        let stats = engram_bench::load_export(&graph, &dir);
-        eprintln!(
-            "[portserve] world loaded: {} nodes, {} rels in {} ms; sealing and compacting",
-            stats.nodes, stats.rels, stats.load_ms
-        );
-        let store = graph.shared_store();
-        store.seal();
-        let (blocks, rows) = store.compact();
-        eprintln!("[portserve] compacted: {blocks} blocks / {rows} rows; serving");
-        (store, Realm(1), Namespace(1))
+            let graph = Graph::new(Store::new(), Realm(1), Namespace(1));
+            let stats = engram_bench::load_export(&graph, &dir);
+            eprintln!(
+                "[portserve] world loaded: {} nodes, {} rels in {} ms; sealing and compacting",
+                stats.nodes, stats.rels, stats.load_ms
+            );
+            let store = graph.shared_store();
+            store.seal();
+            let (blocks, rows) = store.compact();
+            eprintln!("[portserve] compacted: {blocks} blocks / {rows} rows; serving");
+            (store, Realm(1), Namespace(1))
         },
         cfg,
     )

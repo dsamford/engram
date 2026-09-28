@@ -150,10 +150,10 @@ fn a_whole_session_over_a_REAL_socket() {
         panic!("record row")
     };
     assert_eq!(
-        row,
-        &vec![
+        **row,
+        vec![
             Value::Str("Ada".into()),
-            Value::List(vec![Value::Int(1), Value::Int(2)]),
+            Value::List(vec![Value::Int(1), Value::Int(2)].into()),
         ],
         "identical decoded values, through TCP"
     );
@@ -174,7 +174,7 @@ fn two_connections_share_ONE_shard() {
     let Pack::Value(Value::List(row)) = &r[1].1[0] else {
         panic!()
     };
-    assert_eq!(row, &vec![Value::Int(42)], "B sees A's write");
+    assert_eq!(**row, vec![Value::Int(42)], "B sees A's write");
 }
 
 #[test]
@@ -244,7 +244,7 @@ fn two_connections_share_ONE_graph() {
     let Pack::Value(Value::List(row)) = &r[1].1[0] else {
         panic!()
     };
-    assert_eq!(row, &vec![Value::Int(1)], "B sees A's index");
+    assert_eq!(**row, vec![Value::Int(1)], "B sees A's index");
 }
 
 #[test]
@@ -268,7 +268,7 @@ fn sessions_on_different_namespaces_are_ISOLATED() {
     let Pack::Value(Value::List(row)) = &r[1].1[0] else {
         panic!()
     };
-    assert_eq!(row, &vec![Value::Int(0)], "namespace 8 is isolated from 7");
+    assert_eq!(**row, vec![Value::Int(0)], "namespace 8 is isolated from 7");
 
     // A second namespace-7 session DOES see it.
     let r = run_pull(&mut a2, "MATCH (n:Tenant) RETURN n.v", 3);
@@ -277,8 +277,8 @@ fn sessions_on_different_namespaces_are_ISOLATED() {
         panic!()
     };
     assert_eq!(
-        row,
-        &vec![Value::Int(7)],
+        **row,
+        vec![Value::Int(7)],
         "the same namespace shares its graph"
     );
 
@@ -289,8 +289,8 @@ fn sessions_on_different_namespaces_are_ISOLATED() {
         panic!()
     };
     assert_eq!(
-        row,
-        &vec![Value::Int(0)],
+        **row,
+        vec![Value::Int(0)],
         "the default coordinate is isolated"
     );
 }
@@ -311,9 +311,9 @@ fn the_reusable_bolt_client_round_trips_over_a_real_socket() {
     assert_eq!(
         rows,
         vec![
-            Value::List(vec![Value::Int(1)]),
-            Value::List(vec![Value::Int(2)]),
-            Value::List(vec![Value::Int(3)]),
+            Value::List((vec![Value::Int(1)]).into()),
+            Value::List((vec![Value::Int(2)]).into()),
+            Value::List((vec![Value::Int(3)]).into()),
         ],
         "three RECORDs, each a one-column row, decoded through the client"
     );
@@ -333,7 +333,7 @@ fn the_reusable_bolt_client_round_trips_over_a_real_socket() {
         .expect("match");
     assert_eq!(
         got,
-        vec![Value::List(vec![Value::Str("A1".into()), Value::Int(7)])],
+        vec![Value::List((vec![Value::Str("A1".into()), Value::Int(7)]).into())],
         "the written row reads back through the client, byte-identical"
     );
 }

@@ -588,7 +588,7 @@ fn bench_vector(b: &mut Bench) {
                 })
                 .collect();
             let mut props = BTreeMap::new();
-            props.insert("e".to_string(), Value::List(v));
+            props.insert("e".to_string(), Value::List((v).into()));
             g.create_node(&["V".to_string()], &props).expect("node");
         }
         g
@@ -664,7 +664,7 @@ fn bench_wire(b: &mut Bench) {
     props.insert("score".to_string(), Value::Float(0.987));
     props.insert(
         "tags".to_string(),
-        Value::List(vec![Value::Str("x".into()), Value::Str("y".into())]),
+        Value::List((vec![Value::Str("x".into()), Value::Str("y".into())]).into()),
     );
     let node = Value::Node {
         id: 42,
@@ -928,7 +928,8 @@ fn main() {
                     e.insert("ops_per_sec".to_string(), Value::Float(m.ops_per_sec()));
                     Value::Map(e)
                 })
-                .collect(),
+                .collect::<Vec<_>>()
+                .into(),
         ),
     );
     doc.insert(
@@ -944,7 +945,8 @@ fn main() {
                     e.insert("ok".to_string(), Value::Bool(s.ok));
                     Value::Map(e)
                 })
-                .collect(),
+                .collect::<Vec<_>>()
+                .into(),
         ),
     );
     let json = engram_cypher::json::to_json(&Value::Map(doc));

@@ -28,7 +28,7 @@ fn params() -> BTreeMap<String, Value> {
     p.insert("u".to_string(), Value::Str("u1".to_string()));
     p.insert(
         "types".to_string(),
-        Value::List(vec![Value::Str("KNOWS".into()), Value::Str("WORKS_WITH".into())]),
+        Value::List((vec![Value::Str("KNOWS".into()), Value::Str("WORKS_WITH".into())]).into()),
     );
     p
 }
@@ -62,7 +62,10 @@ fn count_of(c: &BTreeMap<String, u64>, key: &str) -> u64 {
 /// dominated by the types the filter drops.
 fn corpus() -> Graph {
     let g = Graph::new(Store::new(), Realm(1), Namespace(1));
-    ddl(&g, "CREATE INDEX udn_user FOR (n:UserDataNode) ON (n.userId)");
+    ddl(
+        &g,
+        "CREATE INDEX udn_user FOR (n:UserDataNode) ON (n.userId)",
+    );
     let mut ents = Vec::new();
     for k in 0..30i64 {
         let mut e = BTreeMap::new();
@@ -73,34 +76,65 @@ fn corpus() -> Graph {
     for k in 0..25i64 {
         let mut c = BTreeMap::new();
         c.insert("name".to_string(), Value::Str(format!("contact-{k:02}")));
-        contacts.push(g.create_node(&["UserDataNode".into()], &c).expect("contact"));
+        contacts.push(
+            g.create_node(&["UserDataNode".into()], &c)
+                .expect("contact"),
+        );
     }
     for i in 0..3000i64 {
         let mut m = BTreeMap::new();
         m.insert("nodeType".to_string(), Value::Str("email".into()));
-        m.insert("userId".to_string(), Value::Str(if i % 5 == 4 { "u2".into() } else { "u1".into() }));
+        m.insert(
+            "userId".to_string(),
+            Value::Str(if i % 5 == 4 { "u2".into() } else { "u1".into() }),
+        );
         m.insert("nodeId".to_string(), Value::Str(format!("mail-{i:05}")));
         let n = g.create_node(&["UserDataNode".into()], &m).expect("email");
         for j in 0..3usize {
-            g.create_rel(n, "MENTIONS", ents[(i as usize * 3 + j) % 30], &BTreeMap::new())
-                .expect("mention");
+            g.create_rel(
+                n,
+                "MENTIONS",
+                ents[(i as usize * 3 + j) % 30],
+                &BTreeMap::new(),
+            )
+            .expect("mention");
         }
         if i % 40 == 0 {
-            g.create_rel(n, "FRIEND_OF", contacts[(i / 40 % 25) as usize], &BTreeMap::new())
-                .expect("friend");
+            g.create_rel(
+                n,
+                "FRIEND_OF",
+                contacts[(i / 40 % 25) as usize],
+                &BTreeMap::new(),
+            )
+            .expect("friend");
         }
         if i % 53 == 0 {
-            g.create_rel(n, "KNOWS", contacts[(i / 53 % 25) as usize], &BTreeMap::new()).expect("knows");
+            g.create_rel(
+                n,
+                "KNOWS",
+                contacts[(i / 53 % 25) as usize],
+                &BTreeMap::new(),
+            )
+            .expect("knows");
         }
         if i % 71 == 0 {
-            g.create_rel(n, "WORKS_WITH", contacts[(i / 71 % 25) as usize], &BTreeMap::new())
-                .expect("works");
+            g.create_rel(
+                n,
+                "WORKS_WITH",
+                contacts[(i / 71 % 25) as usize],
+                &BTreeMap::new(),
+            )
+            .expect("works");
         }
         if i % 7 == 0 {
             let mut a = BTreeMap::new();
-            a.insert("deadline".to_string(), Value::Str(format!("2026-10-{:02}", 1 + (i % 28))));
+            a.insert(
+                "deadline".to_string(),
+                Value::Str(format!("2026-10-{:02}", 1 + (i % 28))),
+            );
             let ask = g.create_node(&["EmailAsk".into()], &a).expect("ask");
-            g.create_rel(n, "HAS_ASK", ask, &BTreeMap::new()).expect("has ask");
+            g.create_rel(n, "HAS_ASK", ask, &BTreeMap::new())
+                .expect("has ask");
         }
     }
     g
@@ -109,7 +143,10 @@ fn corpus() -> Graph {
 fn check_folded(g: &Graph, written: &str, typed: &str) {
     let want_typed = rows(g, typed);
     let want_general = general(g, written);
-    assert_eq!(want_typed, want_general, "the typed spelling and the general path agree: `{written}`");
+    assert_eq!(
+        want_typed, want_general,
+        "the typed spelling and the general path agree: `{written}`"
+    );
     let (got, c) = traced(g, written);
     assert_eq!(got, want_typed, "`{written}`");
     assert!(count_of(&c, FOLDED) > 0, "`{written}`: {c:?}");

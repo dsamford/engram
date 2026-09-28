@@ -82,11 +82,7 @@ fn identical_and_zero_vectors_never_panic_and_report_their_skips() {
         props.insert("i".to_string(), Value::Int(i));
         props.insert(
             "e".to_string(),
-            Value::List(vec![
-                Value::Float(1.0),
-                Value::Float(0.0),
-                Value::Float(0.0),
-            ]),
+            Value::List((vec![Value::Float(1.0), Value::Float(0.0), Value::Float(0.0)]).into()),
         );
         g.create_node(&["V".into()], &props).expect("node");
     }
@@ -95,11 +91,7 @@ fn identical_and_zero_vectors_never_panic_and_report_their_skips() {
         props.insert("i".to_string(), Value::Int(1_000 + i));
         props.insert(
             "e".to_string(),
-            Value::List(vec![
-                Value::Float(0.0),
-                Value::Float(0.0),
-                Value::Float(0.0),
-            ]),
+            Value::List((vec![Value::Float(0.0), Value::Float(0.0), Value::Float(0.0)]).into()),
         );
         g.create_node(&["V".into()], &props)
             .expect("zero-norm node");

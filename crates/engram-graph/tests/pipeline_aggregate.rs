@@ -319,11 +319,16 @@ fn agg_count_star_folds_the_unread_tail() {
         let (on, fold_off, general) = triple(src);
         assert_eq!(on, general, "fold ON vs general disagree: `{src}`");
         assert_eq!(fold_off, general, "fold OFF vs general disagree: `{src}`");
-        assert_eq!(counter(&g, src, "interp.pipeline count fold"), 1, "fold did not fire: `{src}`");
+        assert_eq!(
+            counter(&g, src, "interp.pipeline count fold"),
+            1,
+            "fold did not fire: `{src}`"
+        );
         assert!(agg_fired(&g, src), "operator did not fire: `{src}`");
     }
     // a0 has 5 R edges, a1 3, a2 1, a3 none (no group).
-    let (on, _, _) = triple("MATCH (a:Ag)-[:R]->(b:Bg) RETURN a.ak AS ak, count(*) AS c ORDER BY ak ASC");
+    let (on, _, _) =
+        triple("MATCH (a:Ag)-[:R]->(b:Bg) RETURN a.ak AS ak, count(*) AS c ORDER BY ak ASC");
     assert_eq!(
         on,
         vec![
@@ -343,7 +348,11 @@ fn agg_count_star_folds_the_unread_tail() {
         let (on, fold_off, general) = triple(src);
         assert_eq!(on, general, "columnar vs general disagree: `{src}`");
         assert_eq!(fold_off, general, "fold OFF vs general disagree: `{src}`");
-        assert_eq!(counter(&g, src, "interp.pipeline count fold"), 0, "fold must decline: `{src}`");
+        assert_eq!(
+            counter(&g, src, "interp.pipeline count fold"),
+            0,
+            "fold must decline: `{src}`"
+        );
         assert!(agg_fired(&g, src), "operator did not fire: `{src}`");
     }
 }
@@ -400,7 +409,11 @@ fn whole_node_carry_still_materialises() {
         "a bare carry read only by property after the WITH gathers"
     );
     assert!(
-        counter(&g, src, "interp.agg bare group key gathered for its later reads") > 0
+        counter(
+            &g,
+            src,
+            "interp.agg bare group key gathered for its later reads"
+        ) > 0
     );
     assert_eq!(
         counter(&g, src, "graph.nodes materialised in full"),

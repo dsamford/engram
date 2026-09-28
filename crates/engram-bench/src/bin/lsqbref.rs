@@ -20,10 +20,11 @@
 //!
 //! # The nine queries, and what each one's Cypher actually means
 //!
-//! The query texts are the lane's table (`lsqb.rs`, the official
-//! `ldbc/lsqb` cypher, line-joined); they are repeated in [`QUERIES`] here
-//! and a unit test pins them to that file byte for byte, so this oracle can
-//! never quietly implement a different query from the one measured.
+//! The query texts are the lane's (the official `ldbc/lsqb` cypher,
+//! line-joined); they are repeated in [`QUERIES`] here and a unit test pins
+//! them byte for byte to the shared statement catalogue the lane renders
+//! from, so this oracle can never quietly implement a different query from
+//! the one measured.
 //!
 //! Semantics honoured, in the order they bite:
 //!
@@ -129,9 +130,9 @@ use engram_cypher::json::{from_json, to_json};
 
 // ─── The nine queries, as measured ──────────────────────────────────────────
 
-/// The nine LSQB queries, byte for byte the `adapted` text of `lsqb.rs`'s
-/// table (a unit test holds them there). They are here so the file that
-/// implements a count also STATES the query it is a count of.
+/// The nine LSQB queries, byte for byte the Cypher the shared statement
+/// catalogue carries (a unit test holds them there). They are here so the
+/// file that implements a count also STATES the query it is a count of.
 const QUERIES: [(&str, &str); 9] = [
     (
         "q1",
@@ -277,7 +278,11 @@ struct Raw {
 
 /// A parse error the corpus reader refuses on. The loaders panic on the same
 /// conditions; an oracle should say what it saw and exit.
-fn read_lines(reader: impl BufRead, what: &str, mut f: impl FnMut(BTreeMap<String, Value>)) -> Result<(), String> {
+fn read_lines(
+    reader: impl BufRead,
+    what: &str,
+    mut f: impl FnMut(BTreeMap<String, Value>),
+) -> Result<(), String> {
     for (n, line) in reader.lines().enumerate() {
         let line = line.map_err(|e| format!("{what} line {}: read error: {e}", n + 1))?;
         if line.trim().is_empty() {
@@ -429,7 +434,10 @@ impl MultiCsr {
 
     /// `(neighbour, multiplicity)` pairs of `u`, sorted by neighbour.
     fn of(&self, u: u32) -> (&[u32], &[u32]) {
-        let (a, b) = (self.off[u as usize] as usize, self.off[u as usize + 1] as usize);
+        let (a, b) = (
+            self.off[u as usize] as usize,
+            self.off[u as usize + 1] as usize,
+        );
         (&self.nbr[a..b], &self.mult[a..b])
     }
 
@@ -597,7 +605,12 @@ fn q1(c: &Corpus) -> u64 {
     }
     let mut w_comment = vec![0u64; n];
     for cm in c.nodes_with(L_COMMENT) {
-        w_comment[cm as usize] = c.has_tag_out.of(cm).iter().map(|&t| w_tag[t as usize]).sum();
+        w_comment[cm as usize] = c
+            .has_tag_out
+            .of(cm)
+            .iter()
+            .map(|&t| w_tag[t as usize])
+            .sum();
     }
     let mut total = 0u64;
     for post in c.nodes_with(L_POST) {
@@ -890,15 +903,43 @@ type Count = fn(&Corpus) -> u64;
 /// The nine, in table order, each with the method name the stderr line
 /// reports.
 const METHODS: [(&str, &str, Count); 9] = [
-    ("q1", "yannakakis chain (semi-join sums folded onto Post)", q1),
-    ("q2", "reply pairs x undirected KNOWS multiplicity lookup", q2),
-    ("q3", "sorted-neighbour triangle intersection x 6 x shared-country paths", q3),
+    (
+        "q1",
+        "yannakakis chain (semi-join sums folded onto Post)",
+        q1,
+    ),
+    (
+        "q2",
+        "reply pairs x undirected KNOWS multiplicity lookup",
+        q2,
+    ),
+    (
+        "q3",
+        "sorted-neighbour triangle intersection x 6 x shared-country paths",
+        q3,
+    ),
     ("q4", "per-message degree product (4 legs)", q4),
-    ("q5", "per-reply |tags|x|tags| minus shared-tag run-length merge", q5),
+    (
+        "q5",
+        "per-reply |tags|x|tags| minus shared-tag run-length merge",
+        q5,
+    ),
     ("q6", "per-centre wedge sum minus diagonal", q6),
-    ("q7", "per-message degree product, optional legs as max(1,deg)", q7),
-    ("q8", "per-reply |tags| x (|tags| minus membership-shared bindings)", q8),
-    ("q9", "per-edge wedge count minus common-neighbour intersection", q9),
+    (
+        "q7",
+        "per-message degree product, optional legs as max(1,deg)",
+        q7,
+    ),
+    (
+        "q8",
+        "per-reply |tags| x (|tags| minus membership-shared bindings)",
+        q8,
+    ),
+    (
+        "q9",
+        "per-edge wedge count minus common-neighbour intersection",
+        q9,
+    ),
 ];
 
 // ─── `--expect` (the same document shapes `lsqb --expect` accepts) ──────────
@@ -915,12 +956,14 @@ fn parse_expect(src: &str) -> Result<BTreeMap<String, i64>, String> {
     };
     let mut out = BTreeMap::new();
     if let Some(Value::List(entries)) = m.get("queries") {
-        for e in entries {
+        for e in (entries).iter() {
             let Value::Map(em) = e else {
                 return Err("--expect: entries under \"queries\" must be objects".to_string());
             };
             let Some(Value::Str(name)) = em.get("query") else {
-                return Err("--expect: an entry under \"queries\" has no \"query\" name".to_string());
+                return Err(
+                    "--expect: an entry under \"queries\" has no \"query\" name".to_string()
+                );
             };
             if !known(name) {
                 return Err(format!("--expect names unknown query {name:?}"));
@@ -931,7 +974,9 @@ fn parse_expect(src: &str) -> Result<BTreeMap<String, i64>, String> {
                 }
                 Some(Value::Null) | None => {}
                 Some(other) => {
-                    return Err(format!("--expect: {name} has a non-integer count {other:?}"));
+                    return Err(format!(
+                        "--expect: {name} has a non-integer count {other:?}"
+                    ));
                 }
             }
         }
@@ -968,8 +1013,12 @@ fn render_counts(counts: &BTreeMap<&'static str, u64>) -> Result<String, String>
 
 fn usage() -> ! {
     eprintln!("usage: lsqbref <corpus dir> [--json <out>] [--expect <counts.json>]");
-    eprintln!("  computes the nine LSQB counts from nodes.jsonl + rels.jsonl with no graph engine.");
-    eprintln!("  --expect: a flat {{\"q1\": 123, ...}} map, or an lsqb --json report; any mismatch exits 1.");
+    eprintln!(
+        "  computes the nine LSQB counts from nodes.jsonl + rels.jsonl with no graph engine."
+    );
+    eprintln!(
+        "  --expect: a flat {{\"q1\": 123, ...}} map, or an lsqb --json report; any mismatch exits 1."
+    );
     std::process::exit(2);
 }
 
@@ -1035,7 +1084,10 @@ fn main() {
 
     // ── Read ───────────────────────────────────────────────────────────────
     let t0 = Instant::now();
-    let raw = match Raw::read(open(&dir.join("nodes.jsonl")), open(&dir.join("rels.jsonl"))) {
+    let raw = match Raw::read(
+        open(&dir.join("nodes.jsonl")),
+        open(&dir.join("rels.jsonl")),
+    ) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("[lsqbref] FAIL — {e}");
@@ -1054,7 +1106,10 @@ fn main() {
     // engine that also failed to load — the lane's census rule, applied here.
     let persons = raw.labels.iter().filter(|&&l| l & L_PERSON != 0).count();
     if raw.nodes == 0 || persons == 0 {
-        eprintln!("[lsqbref] FAIL — corpus is empty ({} nodes, {persons} persons); nothing to count", raw.nodes);
+        eprintln!(
+            "[lsqbref] FAIL — corpus is empty ({} nodes, {persons} persons); nothing to count",
+            raw.nodes
+        );
         std::process::exit(1);
     }
     let t1 = Instant::now();
@@ -1105,7 +1160,9 @@ fn main() {
     }
     println!("{doc}");
     if mismatches > 0 {
-        eprintln!("[lsqbref] FAIL — {mismatches} count(s) differ from --expect; the oracle and the reference disagree");
+        eprintln!(
+            "[lsqbref] FAIL — {mismatches} count(s) differ from --expect; the oracle and the reference disagree"
+        );
         std::process::exit(1);
     }
     if expect.is_some() {
@@ -1274,7 +1331,10 @@ mod tests {
         let c = corpus(&nodes, &rels);
         let got = all_counts(&c);
         assert_eq!(got["q1"], 2, "q1 walks REPLY_OF into a Post only");
-        assert_eq!(got["q2"], 2, "q2 needs post:Post — C knows B but the reply target is a Comment");
+        assert_eq!(
+            got["q2"], 2,
+            "q2 needs post:Post — C knows B but the reply target is a Comment"
+        );
         // q4: comment:0 now has 1 reply → 1·1·1·1 = 1 more; comment:1 has no likes → 0.
         assert_eq!(got["q4"], 3, "q4");
         // q7: comment:1 = 1 tag · 1 creator · max(1,0) · max(1,0) = 1 more.
@@ -1299,9 +1359,15 @@ mod tests {
         rels.push_str(&rel("comment:0", "HAS_TAG", "bot"));
         let c = corpus(&nodes, &rels);
         let got = all_counts(&c);
-        assert_eq!(got["q4"], 2, "a non-Person liker and a non-Tag tag add no rows");
+        assert_eq!(
+            got["q4"], 2,
+            "a non-Person liker and a non-Tag tag add no rows"
+        );
         assert_eq!(got["q7"], 3);
-        assert_eq!(got["q5"], 1, "a shared non-Tag target is not a (tag1, tag2) pair");
+        assert_eq!(
+            got["q5"], 1,
+            "a shared non-Tag target is not a (tag1, tag2) pair"
+        );
         assert_eq!(got["q8"], 1);
     }
 
@@ -1309,7 +1375,9 @@ mod tests {
     fn knows_self_loop_is_refused_not_guessed() {
         let (nodes, mut rels) = ten_nodes();
         rels.push_str(&rel("A", "KNOWS", "A"));
-        let err = Raw::read(nodes.as_bytes(), rels.as_bytes()).err().expect("must refuse");
+        let err = Raw::read(nodes.as_bytes(), rels.as_bytes())
+            .err()
+            .expect("must refuse");
         assert!(err.contains("self-loop"), "{err}");
     }
 
@@ -1344,38 +1412,53 @@ mod tests {
         assert_eq!(c.knows.degree(cc), 2);
     }
 
-    /// The query texts here are byte for byte the lane's `adapted` texts —
-    /// read from `lsqb.rs`'s SOURCE with the `\`-continuations joined, so
+    /// The query texts here are byte for byte the ones the lane measures, so
     /// an edit to the measured query that is not mirrored here fails.
+    ///
+    /// The comparison is against the shared statement catalogue. It used to
+    /// read `lsqb.rs`'s SOURCE and join its `\`-continuations, because the
+    /// lane carried its own copy of the text; the lane now reads the
+    /// catalogue and carries none, so pinning to the catalogue is the same
+    /// claim made against the thing that actually decides what gets sent —
+    /// and the `contains` became an equality, which is what the claim always
+    /// said.
     #[test]
     fn queries_match_the_lane_table_verbatim() {
-        // CRs stripped first so a CRLF checkout still joins its continuations.
-        let src: String = include_str!("lsqb.rs").chars().filter(|&c| c != '\r').collect();
-        // Join Rust string continuations: a backslash, a newline, leading blanks.
-        let mut joined = String::with_capacity(src.len());
-        let mut rest = src.as_str();
-        while let Some(i) = rest.find("\\\n") {
-            joined.push_str(&rest[..i]);
-            rest = rest[i + 2..].trim_start_matches([' ', '\t']);
-        }
-        joined.push_str(rest);
+        use engram_bench::catalogue::{Catalogue, Dialect};
+
+        let cat = Catalogue::load().expect("the compiled-in statement catalogue");
+        let mut checked = 0usize;
         for (name, text) in QUERIES {
-            assert!(
-                joined.contains(&format!("name: \"{name}\"")),
-                "{name}: not in the lane table"
+            let entry = cat
+                .lsqb(name, Dialect::Cypher)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(
+                entry.text, text,
+                "\n{name}: this oracle states a DIFFERENT query from the one the \
+                 lane measures.\n  catalogue: {}\n  lsqbref:   {text}",
+                entry.text
             );
-            assert!(joined.contains(text), "{name}: text differs from the lane table:\n{text}");
+            checked += 1;
         }
+        // A loop that checked nothing passes every assertion it never made.
+        assert_eq!(checked, 9, "all nine texts must have been compared");
+        // The other direction: a tenth query in the catalogue that this oracle
+        // does not implement would be a measured count nobody cross-checked.
+        let names = cat.lsqb_names().expect("lsqb names");
+        assert_eq!(
+            names.len(),
+            QUERIES.len(),
+            "the catalogue and this oracle disagree on how many queries exist: {names:?}"
+        );
     }
 
     #[test]
     fn expect_parses_both_shapes_and_refuses_junk() {
         let flat = parse_expect(r#"{"q4": 16312503, "q5": 12501170}"#).unwrap();
         assert_eq!(flat.get("q4"), Some(&16312503));
-        let own = parse_expect(
-            r#"{"queries":[{"query":"q4","count":7},{"query":"q3","count":null}]}"#,
-        )
-        .unwrap();
+        let own =
+            parse_expect(r#"{"queries":[{"query":"q4","count":7},{"query":"q3","count":null}]}"#)
+                .unwrap();
         assert_eq!(own.get("q4"), Some(&7));
         assert!(!own.contains_key("q3"));
         assert!(parse_expect(r#"{"qX": 1}"#).is_err());

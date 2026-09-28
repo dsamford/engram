@@ -51,7 +51,10 @@ OPTIONS:
         --workers N         Engine worker threads    [default: 1]
         --max-connections N Concurrent connections   [default: 512]
         --row-budget N      Max rows one query may materialise, 0 = unlimited
-                            [default: 20000000]
+                            [default: derived from this process's memory limit
+                            (cgroup, else MemTotal): ceiling / 4 / 96 B per row,
+                            clamped to 1M..4G. Printed at startup. An explicit
+                            value wins and is what a reproducible run should pin]
         --read-timeout-secs N  Reap a connection quiet for N seconds, 0 = never.
                             A client waiting on a long analytic query is quiet —
                             raise or disable this to serve queries past 5 min
@@ -61,12 +64,33 @@ OPTIONS:
                             the hottest read in the engine and pays a BTreeMap
                             descent per hop while an overlay is present; 0
                             folds every repair.
+        --memory-max-mb N   Resident memory ceiling. Above 90% of it new
+                            statements QUEUE (and are refused only after
+                            waiting 30 s); below 80% they are admitted again.
+                            0 disables the ceiling entirely, leaving the OOM
+                            killer as the only limit. Default: the container's
+                            own memory limit, so the process uses the machine
+                            it was given.
         --degree-table-after N  Direct adjacency probes tolerated in one
                             epoch before a table may be BUILT [default: 1024].
                             The counter resets on the GLOBAL adjacency epoch, so
                             under a write stream it may never reach N and a
                             table for an untouched type is never built. 0 admits
                             immediately — the A/B arm.
+        --no-algo-parallel  A graph algorithm runs its fixpoint on one thread
+                            even when ENGRAM_QUERY_PARALLELISM installed a
+                            pool. The scores are bit-identical either way; this
+                            measures the split's cost.
+        --no-trigram-indexes
+                            `=~`, CONTAINS, STARTS WITH and ENDS WITH scan the
+                            label instead of seeking a declared trigram index.
+        --no-bm25           A BM25 fulltext index is answered by a scan rather
+                            than by its term index. The SCORES are unchanged;
+                            only the path is.
+        --no-bm25-by-default
+                            A newly created fulltext index is stamped for
+                            term-frequency scoring rather than BM25. Existing
+                            indexes are unaffected either way.
         --no-property-seek  An anchored MATCH scans its label instead of
                             seeking a property range index. A/B arm for the
                             index-churn interference on mixed profiles.
@@ -83,6 +107,63 @@ OPTIONS:
         --single-flight-repair  Readers queue on the build guard so a stale
                             table is repaired once between them. Measured 40%
                             SLOWER; present as the control, not a setting.
+        --no-subquery-end-gather  A label past the whole-label read ceiling
+                            falls to one projected record read per subquery
+                            hop end, as before fix 121. A/B arm.
+        --whole-label-read-max N  The label size past which a whole-label
+                            column read is declined (fix 118's ceiling)
+                            [default: 262144]. 0 keeps the built-in.
+        --match-start-chunk N  How many start candidates a writing
+                            statement's matcher carries through a path's
+                            hops at once, testing its WHERE as rows finish
+                            [default: 4096]. 0 is the A/B arm: every
+                            candidate at once, the WHERE after collection.
+        --no-split-maintenance  The derived refresh runs at the tail of the
+                            storage thread's loop instead of on its own
+                            thread, so it cannot start until a spill or a
+                            compaction returns. A/B arm: on the pod, with 99
+                            segments on disk, that froze refresh_runs at 20
+                            for a whole 70 s window.
+        --range-fold-at N   Overlay size past which a range-index catch-up
+                            folds. A READER is the only thing that folds a
+                            range index, and `folded()` is O(base) whatever it
+                            collapses — so a larger N gives proportionally
+                            FEWER folds at the same cost each, paid back on
+                            ordinary reads that merge a bigger overlay. The
+                            SNB balanced SF10 stall is one such fold, 3.7 s
+                            inside a p95 of 1.25 ms [default: 4096]. 0 keeps
+                            the built-in.
+        --no-deferred-reader-fold
+                            A READER's adjacency repair folds its overlay into
+                            a fresh base on the query thread — one pass over
+                            every row of the table, 50-100 MB on SF1, once per
+                            stale table per multi-node statement under a write
+                            stream. Fix 83's A/B arm.
+        --no-unmetered-members-catch-up
+                            A membership catch-up the label's log covers is
+                            metered against the pass's row budget at one row
+                            per entry and deferred when it does not fit —
+                            until the log overflows and the pass REBUILDS the
+                            whole label. Fix 82's A/B arm.
+        --no-cheap-repair-pricing  The maintenance refresh prices each stale
+                            table's repair by WALKING its whole change set
+                            and building a set of every changed node, once
+                            per table, instead of reading the logs' lengths.
+                            A/B arm: the walk is what fix 76 multiplied by the
+                            stale-table count, and the 320 -> 920 ms median.
+        --amortised-reader-repair  A single-node reader repairs up to the
+                            change log's capacity instead of declining at 8,192
+                            rows and walking its own span. A/B arm: the decline
+                            is cached per snapshot, so every reader behind it
+                            walks too — at SF10 one query pays ~1,000 store-wide
+                            prefix scans and takes 194-316 s.
+        --no-bounded-derived-repair  The maintenance refresh races for its row
+                            budget first-come-first-served and takes ONE
+                            unbounded repair, instead of sharing the budget
+                            max-min across every stale table and bounding each
+                            repair to its slice. A/B arm: same window, same
+                            binary, the OFF arm's worst refresh was 12,344 ms
+                            against the ON arm's 1,772.
         --members-bitmap-after N  Base probes before a membership base is
                             answered from a presence bitmap [default: 4096].
                             0 never builds one.
@@ -102,6 +183,55 @@ OPTIONS:
         --no-adj-snap-memo  Every adjacency probe rebuilds its (tag, types)
                             map key (a heap allocation for a typed hop) and
                             walks the table map, once per row. A/B arm.
+        --no-count-fold     A count(*) over a chain expands every hop instead
+                            of folding its unmaterialised suffix into a
+                            weight. Server-unreachable until v187. A/B arm.
+        --no-count-fold-memo  A var's level is recomputed per visit even when
+                            it is a pure function of the node id. A/B arm.
+        --no-fold-child-order  A var's folded children run in pattern order
+                            rather than semijoin-first. A/B arm.
+        --no-count-only-reorder  A count(*) pattern's hops run in the order
+                            written. A/B arm.
+        --no-fold-hoisted-close  A fold CLOSE probes the adjacency table per
+                            probe instead of a hoisted, peer-sorted copy of
+                            the bound node's row (fix 84). A/B arm.
+        --fold-hoist-after N  Probes a binding of a close's bound node answers
+                            through the table before its row is hoisted
+                            (default 8; 0 hoists on the first probe). A hoist
+                            costs the row; a probe costs a lookup.
+        --no-fold-symmetry-breaking  A count fold enumerates every order of
+                            an interchangeable var set instead of one order
+                            times its size factorial (fix 90). A/B arm.
+        --expand-truncation          Follow only `truncationLimit` edges out of
+                                     each node on a variable-length hop (LDBC
+                                     FinBench). CHANGES ANSWERS by design.
+        --path-estimate              Price a both-ends-bound multi-hop path
+                                     from a measured first hop (off: use the
+                                     written order).
+        --no-rel-predicate-pushdown  Filter variable-length paths after
+                                     enumerating them, instead of refusing an
+                                     edge the path predicate already rejects.
+        --no-prefix-streaming        Run every clause of a statement the
+                                     streaming pipeline refuses as a whole (a
+                                     procedure CALL mid-statement) on the
+                                     materialising loop, instead of streaming
+                                     its prefix. A/B arm.
+        --no-prop-column-epoch-currency  Any commit anywhere retires every
+                            cached property column, instead of only a commit
+                            that moved the column's own label or property
+                            epoch (fix 124). A/B arm — the one that says what
+                            the column cache is worth under a write stream.
+        --prop-column-restamp  A commit that touched neither a cached
+                            property column's label nor its property advances
+                            that column's stamp instead of retiring it, giving
+                            currency to properties with NO change log (fix 93,
+                            strategy O4). OFF by default: it is the one
+                            currency lever that can revive a stale column if a
+                            write path is unaccounted for.
+        --prop-column-budget-mb N  The property-column cache's byte budget in
+                            MiB [default: 512]. 0 turns the cache OFF — the
+                            arm that prices the whole columnar family against
+                            no cache at all; a small value exercises eviction.
         --no-order-peak-search  The count-only reorder keeps its greedy, which
                             scores only the immediate step. A/B arm.
         --no-derived-refresh  Do NOT refresh derived structures from the
@@ -182,6 +312,7 @@ fn main() -> std::io::Result<()> {
         return Ok(());
     }
 
+
     // A hand-rolled parser, deliberately: this crate has no dependencies today
     // and the flag set is small. When the full configuration surface lands
     // (config file, precedence, completions) it brings an argument parser with
@@ -195,6 +326,14 @@ fn main() -> std::io::Result<()> {
     };
     let num_of =
         |names: [&str; 2]| -> Option<usize> { value_of(names).and_then(|v| v.parse().ok()) };
+
+    // Fix 86: the growth report's wall clock, so its lines carry the same
+    // `t=<unix ms>` stamp as the maintenance lines and the stress harness's
+    // level-start / slow-statement log. Every mode, not only paged: the report
+    // is bolt-side and fires whatever the store shape. The bolt crate cannot
+    // read a clock itself (the determinism gate), so it is handed the
+    // library's (the one crate the gate lets read one).
+    engram_bolt::set_wall_clock_probe(Box::new(engram_server::unix_ms));
 
     let addr = args
         .first()
@@ -212,18 +351,120 @@ fn main() -> std::io::Result<()> {
         std::process::exit(1);
     }
 
+    // ── --data-dir over a PAGED directory is the one wrong-answer case ──────
+    //
+    // `Store::open_wal` opens one FILE. It never enumerates the directory, so
+    // it cannot see `seg-<seq>.seg` and does not know it is standing on a paged
+    // store. Point `--data-dir` at a paged directory whose WAL is still
+    // genesis-anchored and the open SUCCEEDS: the whole log replays, every
+    // segment on disk is ignored, and the server serves an empty — or worse, a
+    // partial — database while reporting nothing wrong at all.
+    //
+    // That shape is reachable rather than theoretical. `--bulk-ingest` writes
+    // through `put_unlogged`, landing rows in segments while leaving the WAL at
+    // genesis, and the project's own fixture builds exactly this state
+    // (`engram-store/tests/paged_wal.rs`).
+    //
+    // The other refusals on this path exist because "your data directory was
+    // unreadable so we started empty" is how a restore gets overwritten. This
+    // is the same argument for the case where nothing is unreadable and the
+    // answer is still wrong.
+    //
+    // IT LIVES HERE, with the other argument checks, and NOT at the open site,
+    // for a reason worth stating: `std::process::exit` does not run
+    // destructors, so a refusal raised after `DirLock::acquire` would leave a
+    // stale LOCK behind and the next start would report a lock held by a pid
+    // that never ran. Argument validation belongs before anything is acquired —
+    // before the lock, and before the listener binds.
+    //
+    // An unreadable directory is deliberately NOT this check's business; the
+    // open reports that properly with the OS error attached, so a failed
+    // `read_dir` falls through rather than inventing a second diagnostic for
+    // one fault.
+    if let Some(dir) = data_dir.as_ref()
+        && let Ok(rd) = std::fs::read_dir(dir)
+    {
+        let mut segs: Vec<String> = rd
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("seg-") && n.ends_with(".seg"))
+            .collect();
+        if !segs.is_empty() {
+            segs.sort();
+            let shown = segs.len().min(4);
+            eprintln!(
+                "[engram-server] --data-dir was given a PAGED directory: {} contains {} segment \
+                 file(s) ({}{}).\n\
+                 Refusing to start. Resident mode reads only `engram.wal` and would ignore every \
+                 one of them — serving an empty or partial database without reporting an error, \
+                 which is worse than failing to start.\n\
+                 Use --paged-dir for this directory.",
+                dir.display(),
+                segs.len(),
+                segs[..shown].join(", "),
+                if segs.len() > shown { ", …" } else { "" }
+            );
+            std::process::exit(1);
+        }
+    }
+
     let mut cfg = ServerConfig::from_env();
     if let Some(w) = num_of(["--workers", "--workers"]) {
         cfg.workers = w.max(1);
     }
+    // ── What this server ANSWERS about the knobs a benchmark compares it on ─
+    //
+    // A benchmark's fairness stamp is typed on the CLIENT's command line while
+    // the server is started here, by someone else, possibly on another day. So
+    // a stamp can describe a server that is not running and nothing downstream
+    // can tell — the harness's reporter compares two stamps for equality and
+    // both can be equally wrong. Answering in HELLO closes that: a client that
+    // asks this server cannot be told about a different one.
+    //
+    // Both numbers are the ones that are actually in circuit, not the flags
+    // that were typed:
+    //
+    //   * a block cache exists only under `--paged-dir`. `--data-dir` and the
+    //     in-memory mode are fully resident, so `--paged-cache-mb` is not in
+    //     circuit and this reports `None` rather than the flag's value — a
+    //     `--cache-mb 8192` stamped against a `--data-dir` run is describing a
+    //     knob that is not there, which is worth SAYING rather than agreeing
+    //     with.
+    //   * the intra-query width is `ENGRAM_QUERY_PARALLELISM`, read through
+    //     the one function that also INSTALLS it. `--workers` is the
+    //     connection worker count and is reported separately, because the
+    //     2026-09-08 dry run stamped `thread_cap: 6` off `--workers 6` against
+    //     a server whose real width was 1.
+    cfg.serving_hint = Some(engram_bolt::ServingHint {
+        cache_budget_mb: paged_dir
+            .as_ref()
+            .and_then(|_| u32::try_from(paged_cache_mb).ok()),
+        thread_cap: u32::try_from(engram_server::installed_query_parallelism()).ok(),
+        workers: u32::try_from(cfg.workers).ok(),
+    });
     if let Some(m) = num_of(["--max-connections", "--max-connections"]) {
         cfg.max_connections = m.max(1);
     }
-    if let Some(b) = num_of(["--row-budget", "--row-budget"]) {
-        // 0 means unlimited, which is what the engine's `None` means. Spelling
-        // it as a number keeps the flag one type.
-        cfg.row_budget = if b == 0 { None } else { Some(b) };
-    }
+    // ONE call, both arms, in library code a test can reach. This used to be
+    // an if/else here in `main`, where nothing in the suite could see it: the
+    // budget arithmetic had four tests and the decision that consumes it had
+    // none, so a server could announce one budget and enforce another — which
+    // it did, at SF10, for q7.
+    let (resolved, why) = engram_server::resolve_row_budget(num_of(["--row-budget", "--row-budget"]));
+    cfg.row_budget = resolved;
+    eprintln!("[engram-server] row budget: {why}");
+
+    // THE MEMORY CEILING, and it is a different kind of guard from the budget
+    // above. The row budget bounds one statement's materialisation between
+    // samples; this bounds the PROCESS over time, by measuring the resident
+    // set rather than multiplying a row count by an assumed 96 bytes. Over the
+    // ceiling, new statements QUEUE — they are refused only after waiting the
+    // whole deadline, because a peak that drains should cost latency and not
+    // an error.
+    let (mem_ceiling, mem_why) =
+        engram_server::resolve_memory_max(num_of(["--memory-max-mb", "--memory-max-mb"]));
+    eprintln!("[engram-server] memory ceiling: {mem_why}");
+    engram_server::spawn_memory_governor(mem_ceiling, engram_server::memory_queue_wait_ms());
     if let Some(secs) = num_of(["--read-timeout-secs", "--read-timeout-secs"]) {
         // The read timeout reaps a socket that has SENT nothing — which is
         // exactly what a client waiting on a long analytic query looks like.
@@ -241,6 +482,13 @@ fn main() -> std::io::Result<()> {
     }
     if let Some(n) = num_of(["--compact-after", "--compact-after"]) {
         cfg.compact_after_segments = n.max(2);
+    }
+    // A weakened default is said out loud at boot (security plan §1.1). The
+    // permission itself is read where the sessions are built.
+    if std::env::var_os("ENGRAM_TRACE_MARKER").is_some() {
+        eprintln!(
+            "[engram-server] per-statement trace marker HONOURED (ENGRAM_TRACE_MARKER is set): any client may trace its own statements, at a traced statement's cost, into this log"
+        );
     }
     if args.iter().any(|a| a == "--no-tail-copyout") {
         cfg.tail_span_copyout = false;
@@ -270,6 +518,69 @@ fn main() -> std::io::Result<()> {
         cfg.single_flight_repair = true;
         eprintln!(
             "[engram-server] single-flight repair ON: readers queue on the build guard to repair once between them — MEASURED 40% SLOWER, kept as a control"
+        );
+    }
+    if args.iter().any(|a| a == "--no-subquery-end-gather") {
+        cfg.subquery_end_gather = false;
+        eprintln!(
+            "[engram-server] subquery end gather OFF: a label past the whole-label read ceiling falls to one projected record read per end, as before fix 121 (the A/B arm)"
+        );
+    }
+    if let Some(n) = num_of(["--whole-label-read-max", "--whole-label-read-max"]) {
+        // 0 keeps the built-in WHOLE_LABEL_READ_MAX (262,144).
+        cfg.whole_label_read_max = n as u64;
+    }
+    if let Some(n) = num_of(["--match-start-chunk", "--match-start-chunk"]) {
+        cfg.match_start_chunk = Some(n);
+        if n == 0 {
+            eprintln!(
+                "[engram-server] match start chunking OFF: a writing statement binds every start candidate at once and filters its WHERE after collecting every row (the A/B arm)"
+            );
+        }
+    }
+    if args.iter().any(|a| a == "--no-split-maintenance") {
+        cfg.split_maintenance = false;
+        eprintln!(
+            "[engram-server] split maintenance OFF: the derived refresh runs at the tail of the storage thread's loop and cannot start until a spill or compaction returns — the arm in which refresh_runs froze at 20 through a 70 s window on a 99-segment paged store (the A/B arm)"
+        );
+    }
+    if let Some(n) = args
+        .iter()
+        .position(|a| a == "--range-fold-at")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        cfg.range_fold_at = n;
+        eprintln!("[engram-server] range-index fold threshold: {n} (0 = built-in 4096)");
+    }
+    if args.iter().any(|a| a == "--no-deferred-reader-fold") {
+        cfg.deferred_reader_fold = false;
+        eprintln!(
+            "[engram-server] reader folds ON: a reader's adjacency repair folds its overlay into a fresh base on the query thread, once per stale table per multi-node statement (the A/B arm)"
+        );
+    }
+    if args.iter().any(|a| a == "--no-unmetered-members-catch-up") {
+        cfg.members_unmetered_catch_up = false;
+        eprintln!(
+            "[engram-server] membership catch-ups METERED: a covered catch-up over the membership half of the row budget is deferred, and a deferred label rebuilds once its log overflows (the A/B arm)"
+        );
+    }
+    if args.iter().any(|a| a == "--no-cheap-repair-pricing") {
+        cfg.cheap_repair_pricing = false;
+        eprintln!(
+            "[engram-server] cheap repair pricing OFF: every stale table's repair is priced by walking its whole change set under the writers' lock, once per table — the arm behind fix 76's 320 -> 920 ms median (the A/B arm)"
+        );
+    }
+    if args.iter().any(|a| a == "--amortised-reader-repair") {
+        cfg.amortised_reader_repair = true;
+        eprintln!(
+            "[engram-server] amortised reader repair ON: a single-node reader repairs up to the change log's capacity instead of declining at 8,192 rows and walking its own span (the A/B arm for the SF10 write-path collapse)"
+        );
+    }
+    if args.iter().any(|a| a == "--no-bounded-derived-repair") {
+        cfg.bounded_derived_repair = false;
+        eprintln!(
+            "[engram-server] bounded derived repair OFF: the maintenance pass races for its row budget first-come-first-served and takes ONE UNBOUNDED repair — the arm that produced 109 refreshes totalling 82.7 s, the longest 9.9 s, on a 400 s sweep (the A/B arm)"
         );
     }
     if args.iter().any(|a| a == "--no-hop-membership-contains") {
@@ -308,6 +619,80 @@ fn main() -> std::io::Result<()> {
             "[engram-server] adjacency snapshot memo OFF: every probe rebuilds its (tag, types) map key — a heap allocation for a typed hop — and walks the table map, once per row (the A/B arm)"
         );
     }
+    if args.iter().any(|a| a == "--no-count-fold") {
+        cfg.count_fold = false;
+        eprintln!(
+            "[engram-server] count fold OFF: a count(*) over a chain expands every hop instead of folding its unmaterialised suffix into a weight (the A/B arm — the first time this mechanism can be run both ways on one binary)"
+        );
+    }
+    if args.iter().any(|a| a == "--no-count-fold-memo") {
+        cfg.count_fold_memo = false;
+        eprintln!(
+            "[engram-server] count fold memo OFF: a var's level is recomputed per visit even when it is a pure function of the node id (the A/B arm)"
+        );
+    }
+    if args.iter().any(|a| a == "--no-fold-child-order") {
+        cfg.fold_child_order = false;
+        eprintln!(
+            "[engram-server] fold child order OFF: a var's folded children run in pattern order rather than semijoin-first, as before fix 120 (the A/B arm)"
+        );
+    }
+    if args.iter().any(|a| a == "--no-count-only-reorder") {
+        cfg.count_only_reorder = false;
+        eprintln!(
+            "[engram-server] count-only reorder OFF: a count(*) pattern's hops run in the order written, as before v55 (the A/B arm)"
+        );
+    }
+    if let Some(n) = num_of(["--fold-hoist-after", "--fold-hoist-after"]) {
+        cfg.fold_hoist_after = n;
+        eprintln!(
+            "[engram-server] fold hoist after {n} probe(s): a close's bound row is read only once a binding has been probed that many times through the table (fix 84)"
+        );
+    }
+    if args.iter().any(|a| a == "--no-fold-hoisted-close") {
+        cfg.fold_hoisted_close = false;
+        eprintln!(
+            "[engram-server] hoisted close OFF: every fold close probes the adjacency table through edges_to_peer_slim, as before fix 84 (the A/B arm)"
+        );
+    }
+    if args.iter().any(|a| a == "--no-fold-symmetry-breaking") {
+        cfg.fold_symmetry_breaking = false;
+        eprintln!(
+            "[engram-server] fold symmetry breaking OFF: a count fold enumerates every order of a symmetric var set and multiplies nothing, as before fix 90 (the A/B arm)"
+        );
+    }
+    if args.iter().any(|a| a == "--no-rel-predicate-pushdown") {
+        cfg.rel_predicate_pushdown = false;
+    }
+    if args.iter().any(|a| a == "--path-estimate") {
+        cfg.path_estimate = true;
+    }
+    if args.iter().any(|a| a == "--expand-truncation") {
+        cfg.expand_truncation = true;
+    }
+    if args.iter().any(|a| a == "--no-prefix-streaming") {
+        cfg.prefix_streaming = false;
+        eprintln!(
+            "[engram-server] prefix streaming OFF: a statement the pipeline refuses as a whole runs every clause on the materialising loop (the A/B arm)"
+        );
+    }
+    if args.iter().any(|a| a == "--no-prop-column-epoch-currency") {
+        cfg.prop_column_epoch_currency = false;
+        eprintln!(
+            "[engram-server] property column epoch currency OFF: any commit retires every cached column, as before fix 124 (the A/B arm — first reachable from the server in fix 91)"
+        );
+    }
+    if args.iter().any(|a| a == "--prop-column-restamp") {
+        cfg.prop_column_restamp = true;
+        eprintln!(
+            "[engram-server] property column re-stamp ON (fix 93 / O4): a commit that touched neither a column's label nor its property advances its stamp instead of retiring it"
+        );
+    }
+    if let Some(mb) = num_of(["--prop-column-budget-mb", "--prop-column-budget-mb"]) {
+        // 0 is a setting, not an absence: it turns the cache off.
+        cfg.prop_column_budget_mb = Some(mb);
+        eprintln!("[engram-server] property column cache budget: {mb} MiB (0 = off)");
+    }
     if args.iter().any(|a| a == "--no-order-peak-search") {
         cfg.order_peak_search = false;
         eprintln!(
@@ -328,6 +713,30 @@ fn main() -> std::io::Result<()> {
         cfg.degree_table_after = n as u64;
         eprintln!(
             "[engram-server] degree/adjacency table admission after {n} probes per epoch (0 = admit immediately)"
+        );
+    }
+    if args.iter().any(|a| a == "--no-algo-parallel") {
+        cfg.algo_parallel = false;
+        eprintln!(
+            "[engram-server] algorithm parallelism OFF: every fixpoint runs on the calling thread (the A/B arm; the answers are bit-identical either way)"
+        );
+    }
+    if args.iter().any(|a| a == "--no-trigram-indexes") {
+        cfg.trigram_indexes = false;
+        eprintln!(
+            "[engram-server] trigram indexes OFF: `=~`, CONTAINS, STARTS WITH and ENDS WITH scan their label (the A/B arm for the text seek)"
+        );
+    }
+    if args.iter().any(|a| a == "--no-bm25") {
+        cfg.bm25_scoring = false;
+        eprintln!(
+            "[engram-server] BM25 term index OFF: a fulltext query is scored the same way by a scan (the A/B arm for the index, not for the scoring)"
+        );
+    }
+    if args.iter().any(|a| a == "--no-bm25-by-default") {
+        cfg.bm25_by_default = false;
+        eprintln!(
+            "[engram-server] new fulltext indexes will be stamped `tf`: existing indexes keep whatever their catalogue row says"
         );
     }
     if args.iter().any(|a| a == "--no-property-seek") {
@@ -514,16 +923,16 @@ fn main() -> std::io::Result<()> {
         // appended and fsync'd before every acknowledgement, checkpointed
         // behind every spill.
         let wal = dir.join("engram.wal");
-        let (store, cache) =
-            match Store::open_paged_dir_with_wal(&dir, paged_cache_mb << 20, &wal) {
-                Ok(v) => v,
-                Err(e) => panic!(
-                    "cannot open the paged directory: {e}\n\
+        let (store, cache) = match Store::open_paged_dir_with_wal(&dir, paged_cache_mb << 20, &wal)
+        {
+            Ok(v) => v,
+            Err(e) => panic!(
+                "cannot open the paged directory: {e}\n\
                      Refusing to start empty over a paged directory that was requested — \
                      starting empty here would look like an empty database rather than a \
                      failed open."
-                ),
-            };
+            ),
+        };
         eprintln!(
             "[engram-server] paged: {} — cache {paged_cache_mb} MiB, {} segment(s) on disk; \
              durable: {} fronts the tail ({} version(s) replayed).",
@@ -533,6 +942,10 @@ fn main() -> std::io::Result<()> {
             store.tail_versions()
         );
         cfg.paged_dir = Some(dir);
+        // Fix 85 (instrument): a statement's resident-set growth report names
+        // the block cache's share of it, so a cold fill is not read as a leak.
+        let probe_cache = std::sync::Arc::clone(&cache);
+        engram_bolt::set_resident_cache_probe(Box::new(move || probe_cache.resident_bytes()));
         cfg.paged_spill_cache = Some(cache);
         return engram_server::run_server_with_config(
             listener,
@@ -544,6 +957,7 @@ fn main() -> std::io::Result<()> {
     match data_dir {
         Some(dir) => {
             // The directory is already locked, above, before the bind.
+            //
             let wal = dir.join("engram.wal");
             eprintln!("[engram-server] durable: {}", wal.display());
             // The store is built ON the engine thread (it is deliberately not

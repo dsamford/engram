@@ -102,6 +102,27 @@ const ALLOW: &[Allow] = &[
         dir: "crates/engram-tck/features",
         exts: &["feature", "md", "txt"],
     },
+    // The benchmark harness's statement catalogue and its golden files.
+    // `engram-bench` compiles the catalogue in with `include_str!`, and two of
+    // its tests pin golden files the same way, so without them the crate does
+    // not BUILD — and the `crates` rule above takes only `.rs` and `.toml`.
+    Allow::Tree {
+        dir: "crates/engram-bench/catalogue",
+        exts: &["json"],
+    },
+    Allow::Tree {
+        dir: "crates/engram-bench/tests/golden",
+        exts: &["txt"],
+    },
+    // The checked-in regression baselines: Engram's own recorded documents,
+    // their parameter files, and the README that says how they were taken.
+    // `the_checked_in_baselines_still_gate` reads them, so a published tree
+    // can run the regression gate its documentation describes. The rest of
+    // `measurements/` is the engineering record and stays behind.
+    Allow::Tree {
+        dir: "measurements/baselines",
+        exts: &["json", "md"],
+    },
     // ── The documentation site ─────────────────────────────────────────────
     //
     // `docs/book`, NOT `docs`. The tree under `docs/` is the engineering
@@ -306,7 +327,9 @@ pub fn run(root: &Path, dest: &Path) -> TreeReport {
     // output, and the whole value of this gate is that the result contains
     // ONLY what the allow-list chose.
     if dest.exists() {
-        let empty = fs::read_dir(dest).map(|mut d| d.next().is_none()).unwrap_or(false);
+        let empty = fs::read_dir(dest)
+            .map(|mut d| d.next().is_none())
+            .unwrap_or(false);
         if !empty {
             return TreeReport {
                 passed: false,

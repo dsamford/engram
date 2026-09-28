@@ -21,10 +21,25 @@ commits at one**. That single value is the atomic visibility point: before it,
 none of the writes are visible; after it, all of them are. There is no window
 in which half a transaction can be observed.
 
-A read takes a **snapshot** — a timestamp — and sees exactly the versions
-committed at or before it.
+A **transaction** takes a snapshot — a timestamp — and sees exactly the
+versions committed at or before it. A single statement outside a transaction
+does not; that is the next section.
 
 The `bookmark: "eg:<commit_ts>"` a Bolt reply carries is this number.
+
+### What one statement sees
+
+A statement reads read-committed **per row**, against the visible clock. A
+commit that lands while the statement is running can therefore be seen by later
+rows and not by earlier ones.
+
+That is true whether or not the statement parallelises. A morsel worker reads
+exactly as the serial loop it replaces, so parallelism changes which rows count
+as "later" and not which anomalies are possible.
+
+If you need one consistent view across a whole statement, take an explicit
+transaction: the snapshot is then the transaction's, and commit validates the
+read set against it.
 
 ## Why reads are read committed, not snapshot
 
@@ -110,9 +125,9 @@ touching one hub node therefore wrote the same guard row and aborted each
 other, even though they conflicted over nothing real.
 
 The **guard exemption** recognises that case: two *puts* of the same guard row,
-neither in a read set, do not conflict. It is on by default and worth 3.7× on
-the shared-endpoint shape. `--no-guard-exemption` restores the old behaviour as
-the measurement control.
+neither in a read set, do not conflict. It is on by default, and it is what
+stops concurrent relationship writes to one hub node from aborting each other.
+`--no-guard-exemption` restores the old behaviour as the measurement control.
 
 ## Explicit transactions
 
@@ -123,10 +138,20 @@ Two properties to know:
 
 - **A read-only transaction never validates and never aborts.** If the write
   set is empty, commit returns the snapshot timestamp immediately.
-- **Statements inside an explicit transaction never parallelise.** The
+- **Query statements inside an explicit transaction never parallelise.** The
   read-your-writes overlays and the OCC read set are thread-local, so a morsel
-  worker would silently read committed state and record nothing. The dispatch
-  gates enforce this.
+  worker would silently read committed state and record nothing, and the
+  dispatch gates enforce that. The graph-algorithm procedures are the deliberate
+  exception: their fixpoint reads an already-materialised CSR and nothing else —
+  no store, no overlay, no thread-local — so the hazard the gate exists for
+  cannot arise there, and the gate is not copied across. On a server that has
+  `ENGRAM_QUERY_PARALLELISM` set, a `stream`, `stats` or `mutate` algorithm call
+  inside an open transaction does parallelise; on a default install nothing
+  parallelises at all, because that variable is what installs the pool. An
+  algorithm's `write` mode is refused inside an open transaction for an
+  unrelated reason — it computes against a read snapshot and commits
+  separately, so an enclosing transaction would either see its own uncommitted
+  writes in that snapshot or hold entity locks across the whole computation.
 
 ## Phantoms and `--precision-locking`
 

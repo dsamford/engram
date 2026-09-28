@@ -152,7 +152,12 @@ pub(crate) fn sidecar_path(dir: &Path, prefix: &[u8]) -> PathBuf {
     dir.join(name)
 }
 
-fn encode_adj(key: &(u8, Vec<u32>), index: &RowIndex, entries: &[SlimAdj], sorted: bool) -> Vec<u8> {
+fn encode_adj(
+    key: &(u8, Vec<u32>),
+    index: &RowIndex,
+    entries: &[SlimAdj],
+    sorted: bool,
+) -> Vec<u8> {
     let (nodes, bits, starts) = index.parts();
     let mut body = Vec::with_capacity(32 + bits.len() * 8 + starts.len() * 4 + entries.len() * 20);
     body.push(key.0);
@@ -294,11 +299,60 @@ pub(crate) struct SidecarWriter {
     out: BufWriter<File>,
     at: u64,
     toc: Vec<TocEntry>,
+    /// This writer's hold on `path`, released when it is finished, abandoned
+    /// or dropped. See [`WRITING`].
+    _claim: Claim,
+}
+
+/// The sidecar paths a [`SidecarWriter`] in this process is writing.
+///
+/// # One writer per sidecar
+///
+/// Every writer of one graph's sidecar writes the SAME temporary file, and
+/// `File::create` truncates it. Two at once, and the second's create empties
+/// what the first has written; the first then syncs and renames whatever is
+/// left — possibly nothing — to the final path, and reports success. On
+/// 2026-09-27 (rev65) the maintenance tick and the drained checkpoint
+/// persisted one graph together: the checkpoint said `derived bases
+/// persisted=true`, and the next start found a file shorter than a footer and
+/// rebuilt every structure (122 s at SF3 where an adopted start takes 23 s).
+/// The reader refused it, as it must, so nothing wrong was served; the cost
+/// was every restart after a write. A second writer for a path being written
+/// is now refused.
+static WRITING: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// A [`SidecarWriter`]'s hold on its path in [`WRITING`].
+struct Claim(PathBuf);
+
+impl Claim {
+    fn take(path: &Path) -> io::Result<Claim> {
+        let mut writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+        if !writing.insert(path.to_path_buf()) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "this sidecar is already being written",
+            ));
+        }
+        Ok(Claim(path.to_path_buf()))
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        WRITING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
 }
 
 impl SidecarWriter {
+    /// A writer for `prefix`'s sidecar in `dir`. Refused (`WouldBlock`) while
+    /// another writer in this process holds the same path — see [`WRITING`].
     pub(crate) fn create(dir: &Path, prefix: &[u8]) -> io::Result<SidecarWriter> {
         let path = sidecar_path(dir, prefix);
+        let claim = Claim::take(&path)?;
         let tmp = path.with_extension("dsctmp");
         let out = BufWriter::with_capacity(1 << 20, File::create(&tmp)?);
         Ok(SidecarWriter {
@@ -307,6 +361,7 @@ impl SidecarWriter {
             out,
             at: 0,
             toc: Vec::new(),
+            _claim: claim,
         })
     }
 
@@ -440,10 +495,7 @@ impl SidecarReader {
     ) -> Result<SidecarReader, SidecarRefusal> {
         use SidecarRefusal::*;
         let mut file = File::open(sidecar_path(dir, prefix)).map_err(|_| Absent)?;
-        let len = file
-            .metadata()
-            .map_err(|_| Unreadable("metadata"))?
-            .len();
+        let len = file.metadata().map_err(|_| Unreadable("metadata"))?.len();
         if len < FOOTER_LEN as u64 {
             return Err(Unreadable("shorter than a footer"));
         }
@@ -621,7 +673,12 @@ mod tests {
                     ],
                     false,
                 ),
-                ((b'I', vec![3, 5]), RowIndex::from_dense(&[0, 0]), vec![], true),
+                (
+                    (b'I', vec![3, 5]),
+                    RowIndex::from_dense(&[0, 0]),
+                    vec![],
+                    true,
+                ),
             ],
             members: BTreeMap::from([(1u32, vec![2u64, 4, 6]), (9u32, vec![])]),
         }
@@ -700,6 +757,41 @@ mod tests {
         assert_eq!(r.stamp(), STAMP);
         let records = read_all(&dir, SEALED).expect("read");
         assert!(matches_sample(&records), "the encoding must be lossless");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two writers of one sidecar at once: the second is REFUSED while the
+    /// first is open, instead of truncating the temporary file under it —
+    /// which on 2026-09-27 published an empty sidecar as a success (see
+    /// `WRITING`). Another graph's sidecar is not held, the first writer's
+    /// file lands whole, and finishing frees the path.
+    #[test]
+    fn a_second_writer_of_one_sidecar_is_refused_while_the_first_is_open() {
+        let dir = tmpdir("claim");
+        let s = sample();
+        let mut first = SidecarWriter::create(&dir, b"pfx").expect("create");
+        for (key, index, entries, sorted) in &s.adj {
+            first.add_adj(key, index, entries, *sorted).expect("adj");
+        }
+        let second = SidecarWriter::create(&dir, b"pfx");
+        assert!(
+            matches!(&second, Err(e) if e.kind() == io::ErrorKind::WouldBlock),
+            "a second writer of the same sidecar must be refused, got {:?}",
+            second.as_ref().map(|_| "a writer")
+        );
+        drop(second);
+        SidecarWriter::create(&dir, b"other")
+            .expect("another graph's sidecar is not held")
+            .abandon();
+        for (token, ids) in &s.members {
+            first.add_members(*token, ids).expect("members");
+        }
+        first.finish(STAMP, SEALED).expect("finish");
+        let records = read_all(&dir, SEALED).expect("the first writer's file is whole");
+        assert!(matches_sample(&records), "and it is what the first wrote");
+        SidecarWriter::create(&dir, b"pfx")
+            .expect("finishing frees the path")
+            .abandon();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

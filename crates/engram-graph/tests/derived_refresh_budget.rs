@@ -19,6 +19,26 @@
 //! 3. The budget never turns a repairable table into a permanently stale one:
 //!    after enough passes every table is current, and a reader sees correct
 //!    adjacency throughout.
+//!
+//! # Claim 1 now belongs to the OFF arm — and that is the finding
+//!
+//! Claim 1's "repairs one and DEFERS the rest" describes a budget that is
+//! RACED FOR: the pass takes the first stale table it prices and defers every
+//! later one. Deferral looked like the budget working. It was also the thing
+//! that starved those tables — the map's iteration order does not change
+//! between passes, so the same table was taken and the same tables deferred
+//! every time, and their deltas grew until one was taken whole (109 refreshes
+//! totalling 82,748 ms in a 400 s sweep, the longest 9,935 ms, every one
+//! reporting `adjacency repaired=1 adjacency deferred=2`).
+//!
+//! Under `set_bounded_derived_repair` (default ON) the budget is SHARED
+//! max-min across every stale table and each repair is bounded to its slice,
+//! so the adjacency half defers nothing and every table drains a little every
+//! pass. Claim 1's test therefore sets the lever OFF, to keep pinning the arm
+//! it was written for, and `a_shared_budget_defers_nothing_and_still_converges`
+//! below states the ON arm's invariant beside it. Claims 2 and 3 are unchanged
+//! and hold on both arms — which is the real point: the two arms differ in WHO
+//! does the work WHEN, and never in the answer.
 
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
@@ -88,6 +108,10 @@ fn staled_graph() -> (Graph, Vec<u64>, Vec<u32>) {
 #[test]
 fn a_budgeted_pass_repairs_some_and_defers_the_rest() {
     let (g, _ids, _toks) = staled_graph();
+    // THE FIRST-COME ARM. Deferral is what a raced-for budget does, and it is
+    // the behaviour this claim was written about — see the module doc for why
+    // it is no longer the default.
+    g.set_bounded_derived_repair(false);
     // A budget that covers roughly one table's repair: BURST changed nodes
     // times the per-node scan constant, plus its entries.
     g.set_refresh_pass_rows(BURST as usize * 40);
@@ -109,11 +133,55 @@ fn a_budgeted_pass_repairs_some_and_defers_the_rest() {
         report = g.refresh_stale_derived();
         passes += 1;
     }
-    assert!(passes < 50, "the budget never converged after {passes} passes");
+    assert!(
+        passes < 50,
+        "the budget never converged after {passes} passes"
+    );
     let last = g.refresh_stale_derived();
     assert_eq!(
         last.adjacency_deferred, 0,
         "a settled graph defers nothing: {last:?}"
+    );
+}
+
+/// The ON arm's invariant, stated beside the OFF arm's so the file says what
+/// the budget does under BOTH rules on the same fixture.
+///
+/// Six stale tables, a budget under any one of their repairs. The shared rule
+/// defers NOTHING — every table gets a slice — and still converges, because a
+/// slice that cannot finish leaves the table stale for the next pass rather
+/// than dropping it. That is the same "delay, never a drop" guarantee claim 1
+/// makes, reached without starving anybody.
+#[test]
+fn a_shared_budget_defers_nothing_and_still_converges() {
+    let (g, _ids, _toks) = staled_graph();
+    g.set_refresh_pass_rows(BURST as usize * 40);
+
+    let first = g.refresh_stale_derived();
+    eprintln!("[shared] first pass: {first:?}");
+    assert_eq!(
+        first.adjacency_deferred, 0,
+        "the shared budget serves every stale table, so nothing is deferred by \
+         it — deferral is the first-come rule's behaviour, and it is what \
+         starved the tables it skipped: {first:?}"
+    );
+    assert!(
+        first.adjacency_repaired > 0,
+        "and it still makes progress: {first:?}"
+    );
+
+    let mut passes = 1;
+    let mut report = first;
+    while (report.adjacency_repaired > 0 || report.adjacency_deferred > 0) && passes < 50 {
+        report = g.refresh_stale_derived();
+        passes += 1;
+    }
+    assert!(passes < 50, "the shared budget never converged: {report:?}");
+    let last = g.refresh_stale_derived();
+    assert_eq!(
+        (last.adjacency_repaired, last.adjacency_deferred),
+        (0, 0),
+        "a settled graph needs nothing: {last:?}"
     );
 }
 
@@ -141,7 +209,10 @@ fn the_budget_delays_work_it_never_drops_it() {
     let _ = gref.refresh_stale_derived();
     let want: Vec<usize> = toksref
         .iter()
-        .map(|&t| gref.adjacent_slim(idsref[0], Dir::Out, &Some(vec![t])).len())
+        .map(|&t| {
+            gref.adjacent_slim(idsref[0], Dir::Out, &Some(vec![t]))
+                .len()
+        })
         .collect();
 
     g.set_refresh_pass_rows(BURST as usize * 40);
@@ -154,5 +225,8 @@ fn the_budget_delays_work_it_never_drops_it() {
         .iter()
         .map(|&t| g.adjacent_slim(ids[0], Dir::Out, &Some(vec![t])).len())
         .collect();
-    assert_eq!(got, want, "a budgeted refresh must answer what an unbudgeted one does");
+    assert_eq!(
+        got, want,
+        "a budgeted refresh must answer what an unbudgeted one does"
+    );
 }

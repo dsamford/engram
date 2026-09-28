@@ -73,7 +73,11 @@ fn corpus() -> Graph {
         m.insert("title".to_string(), Value::Str(format!("Story {i}")));
         m.insert(
             "status".to_string(),
-            Value::Str(if i % 9 == 0 { "stale".into() } else { "live".into() }),
+            Value::Str(if i % 9 == 0 {
+                "stale".into()
+            } else {
+                "live".into()
+            }),
         );
         m.insert("lastUpdatedAt".to_string(), Value::Int(300 + i * 20));
         stories.push(g.create_node(&["Story".into()], &m).expect("story"));
@@ -84,10 +88,12 @@ fn corpus() -> Graph {
         let a = g.create_node(&["Article".into()], &m).expect("article");
         for k in 0..3 {
             let e = ents[((i * 7 + k * 13) % 60) as usize];
-            g.create_rel(a, "MENTIONS", e, &BTreeMap::new()).expect("mentions");
+            g.create_rel(a, "MENTIONS", e, &BTreeMap::new())
+                .expect("mentions");
         }
         let s = stories[((i * 3) % 40) as usize];
-        g.create_rel(a, "PART_OF_STORY", s, &BTreeMap::new()).expect("part");
+        g.create_rel(a, "PART_OF_STORY", s, &BTreeMap::new())
+            .expect("part");
     }
     g
 }
@@ -107,7 +113,11 @@ fn the_story_tracker_runs_on_the_aggregate_pipeline() {
     assert_eq!(got, want);
     assert!(count_of(&c, FUSED) > 0, "{c:?}");
     assert!(count_of(&c, AGG_RUNS) > 0, "{c:?}");
-    assert_eq!(count_of(&c, FULL), 0, "the stories are gathered, not decoded in full: {c:?}");
+    assert_eq!(
+        count_of(&c, FULL),
+        0,
+        "the stories are gathered, not decoded in full: {c:?}"
+    );
 }
 
 /// The tail's forms — SKIP with LIMIT, a filter that empties the groups, an

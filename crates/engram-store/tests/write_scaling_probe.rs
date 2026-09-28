@@ -41,14 +41,22 @@ fn run(threads: usize, per_thread: usize, variant: &str) -> f64 {
                 match variant {
                     "logged" => {
                         for i in 0..per_thread as u64 {
-                            s.put(&prefix(), &(base + i).to_be_bytes(), StoredValue::Plain(value.clone()))
-                                .expect("put");
+                            s.put(
+                                &prefix(),
+                                &(base + i).to_be_bytes(),
+                                StoredValue::Plain(value.clone()),
+                            )
+                            .expect("put");
                         }
                     }
                     "unlogged" => {
                         for i in 0..per_thread as u64 {
-                            s.put_unlogged(&prefix(), &(base + i).to_be_bytes(), StoredValue::Plain(value.clone()))
-                                .expect("put");
+                            s.put_unlogged(
+                                &prefix(),
+                                &(base + i).to_be_bytes(),
+                                StoredValue::Plain(value.clone()),
+                            )
+                            .expect("put");
                         }
                     }
                     "txn16" => {
@@ -56,8 +64,12 @@ fn run(threads: usize, per_thread: usize, variant: &str) -> f64 {
                         while (i as usize) < per_thread {
                             let mut txn = s.begin();
                             for _ in 0..16 {
-                                txn.put(&prefix(), &(base + i).to_be_bytes(), StoredValue::Plain(value.clone()))
-                                    .expect("put");
+                                txn.put(
+                                    &prefix(),
+                                    &(base + i).to_be_bytes(),
+                                    StoredValue::Plain(value.clone()),
+                                )
+                                .expect("put");
                                 i += 1;
                             }
                             txn.commit().expect("commit");
@@ -76,7 +88,10 @@ fn run(threads: usize, per_thread: usize, variant: &str) -> f64 {
 #[ignore = "a probe with timings; run by hand with --ignored --nocapture"]
 fn where_the_write_path_stops_scaling() {
     let per_thread = 40_000;
-    eprintln!("\n{:<10} {:>8} {:>10} {:>10} {:>10}", "variant", "threads", "ops/s", "x1", "share");
+    eprintln!(
+        "\n{:<10} {:>8} {:>10} {:>10} {:>10}",
+        "variant", "threads", "ops/s", "x1", "share"
+    );
     for variant in ["logged", "unlogged", "txn16"] {
         let base = run(1, per_thread, variant);
         for &threads in &[1usize, 2, 4, 6, 8] {

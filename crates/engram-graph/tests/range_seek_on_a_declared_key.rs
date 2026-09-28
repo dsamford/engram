@@ -28,10 +28,18 @@ fn ddl(g: &Graph, src: &str) {
 fn params() -> BTreeMap<String, Value> {
     let mut p = BTreeMap::new();
     p.insert("t".to_string(), Value::Str("Business and Finance".into()));
-    p.insert("cutoff".to_string(), Value::Str("2026-08-31T00:00:00.000Z".into()));
+    p.insert(
+        "cutoff".to_string(),
+        Value::Str("2026-08-31T00:00:00.000Z".into()),
+    );
     p.insert(
         "existingIds".to_string(),
-        Value::List((4600..4610).map(|i| Value::Str(format!("s-{i:05}"))).collect()),
+        Value::List(
+            (4600..4610)
+                .map(|i| Value::Str(format!("s-{i:05}")))
+                .collect::<Vec<_>>()
+                .into(),
+        ),
     );
     p
 }
@@ -66,31 +74,62 @@ fn count_of(c: &BTreeMap<String, u64>, key: &str) -> u64 {
 fn corpus() -> Graph {
     let g = Graph::new(Store::new(), Realm(1), Namespace(1));
     ddl(&g, "CREATE INDEX story_id FOR (s:NewsStory) ON (s.storyId)");
-    ddl(&g, "CREATE INDEX story_pub FOR (s:NewsStory) ON (s.publishedAt)");
-    ddl(&g, "CREATE INDEX story_status_updated FOR (s:NewsStory) ON (s.status, s.lastUpdatedAt)");
-    ddl(&g, "CREATE INDEX story_score FOR (s:NewsStory) ON (s.score)");
+    ddl(
+        &g,
+        "CREATE INDEX story_pub FOR (s:NewsStory) ON (s.publishedAt)",
+    );
+    ddl(
+        &g,
+        "CREATE INDEX story_status_updated FOR (s:NewsStory) ON (s.status, s.lastUpdatedAt)",
+    );
+    ddl(
+        &g,
+        "CREATE INDEX story_score FOR (s:NewsStory) ON (s.score)",
+    );
     let n = 5000i64;
     for i in 0..n {
         let mut m = BTreeMap::new();
         m.insert("storyId".to_string(), Value::Str(format!("s-{i:05}")));
         m.insert(
             "primaryTopic".to_string(),
-            Value::Str(if i % 50 == 0 { "Sports".into() } else { "Business and Finance".into() }),
+            Value::Str(if i % 50 == 0 {
+                "Sports".into()
+            } else {
+                "Business and Finance".into()
+            }),
         );
         m.insert(
             "status".to_string(),
-            Value::Str(if i % 10 == 3 { "stale".into() } else { "active".into() }),
+            Value::Str(if i % 10 == 3 {
+                "stale".into()
+            } else {
+                "active".into()
+            }),
         );
         let recent = i >= n - n / 12 || i % 97 == 0;
         m.insert(
             "lastUpdatedAt".to_string(),
             Value::Str(if recent {
-                format!("2026-09-0{}T{:02}:{:02}:00.000Z", 1 + (i % 4), i % 24, i % 60)
+                format!(
+                    "2026-09-0{}T{:02}:{:02}:00.000Z",
+                    1 + (i % 4),
+                    i % 24,
+                    i % 60
+                )
             } else {
-                format!("2026-0{}-{:02}T{:02}:{:02}:00.000Z", 1 + (i % 8), 1 + (i % 28), i % 24, i % 60)
+                format!(
+                    "2026-0{}-{:02}T{:02}:{:02}:00.000Z",
+                    1 + (i % 8),
+                    1 + (i % 28),
+                    i % 24,
+                    i % 60
+                )
             }),
         );
-        m.insert("publishedAt".to_string(), Value::Str(format!("2026-0{}-{:02}", 1 + (i % 8), 1 + (i % 28))));
+        m.insert(
+            "publishedAt".to_string(),
+            Value::Str(format!("2026-0{}-{:02}", 1 + (i % 8), 1 + (i % 28))),
+        );
         m.insert("title".to_string(), Value::Str(format!("Story {i}")));
         m.insert("score".to_string(), Value::Float((i % 100) as f64 / 100.0));
         if i % 11 == 0 {
@@ -112,8 +151,27 @@ fn check(g: &Graph, src: &str) -> BTreeMap<String, u64> {
     c
 }
 
-const PRED: &str =
-    "s.primaryTopic = $t AND s.status <> 'stale' AND s.lastUpdatedAt > $cutoff";
+/// A CAPPED scan's answer (fix 82): the general path's row count, every
+/// row one the unlimited statement answers, and the same rows again —
+/// which k matches a bare LIMIT keeps is the scan's choice (it takes them
+/// from the newest chunk first).
+fn check_capped(g: &Graph, src: &str, unlimited: &str) -> BTreeMap<String, u64> {
+    let want_n = general(g, src).len();
+    let all = general(g, unlimited);
+    let first = rows(g, src);
+    assert_eq!(first.len(), want_n, "first run `{src}`: {first:?}");
+    for r in &first {
+        assert!(
+            all.contains(r),
+            "`{src}` answered a row the unlimited statement does not: {r:?}"
+        );
+    }
+    let (got, c) = traced(g, src);
+    assert_eq!(got, first, "second run `{src}`");
+    c
+}
+
+const PRED: &str = "s.primaryTopic = $t AND s.status <> 'stale' AND s.lastUpdatedAt > $cutoff";
 
 #[test]
 fn the_topic_listing_seeks_the_composite_s_trailing_key() {
@@ -121,12 +179,14 @@ fn the_topic_listing_seeks_the_composite_s_trailing_key() {
     let src = format!(
         "MATCH (s:NewsStory) WHERE {PRED} AND NOT s.storyId IN $existingIds RETURN s.storyId AS storyId, s.title AS title LIMIT 5"
     );
-    let c = check(&g, &src);
+    let c = check_capped(&g, &src, &src.replace(" LIMIT 5", ""));
     assert!(count_of(&c, RANGE_SEEK) > 0, "{c:?}");
     // The sought ids are a few hundred, not the label: the residual runs
     // over them alone.
     assert!(count_of(&c, EXPR) < 2000, "{c:?}");
-    let src2 = format!("MATCH (s:NewsStory) WHERE {PRED} RETURN s.storyId AS storyId ORDER BY s.lastUpdatedAt DESC, storyId LIMIT 5");
+    let src2 = format!(
+        "MATCH (s:NewsStory) WHERE {PRED} RETURN s.storyId AS storyId ORDER BY s.lastUpdatedAt DESC, storyId LIMIT 5"
+    );
     let c2 = check(&g, &src2);
     assert!(count_of(&c2, RANGE_SEEK) > 0, "{c2:?}");
 }
@@ -142,7 +202,10 @@ fn every_comparison_and_the_mirrored_spelling_seek() {
         "MATCH (s:NewsStory) WHERE s.status = 'active' AND s.lastUpdatedAt > $cutoff RETURN count(s) AS n",
     ] {
         let c = check(&g, src);
-        assert!(count_of(&c, RANGE_SEEK) + count_of(&c, COVERED_RANGE) > 0, "`{src}`: {c:?}");
+        assert!(
+            count_of(&c, RANGE_SEEK) + count_of(&c, COVERED_RANGE) > 0,
+            "`{src}`: {c:?}"
+        );
     }
 }
 
@@ -158,6 +221,10 @@ fn a_numeric_bound_an_undeclared_key_and_a_variable_bound_do_not_seek() {
         "MATCH (s:NewsStory) WHERE s.lastUpdatedAt > 5 RETURN count(s) AS n",
     ] {
         let c = check(&g, src);
-        assert_eq!(count_of(&c, RANGE_SEEK) + count_of(&c, COVERED_RANGE), 0, "`{src}`: {c:?}");
+        assert_eq!(
+            count_of(&c, RANGE_SEEK) + count_of(&c, COVERED_RANGE),
+            0,
+            "`{src}`: {c:?}"
+        );
     }
 }

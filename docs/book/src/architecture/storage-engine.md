@@ -43,8 +43,8 @@ immutable, which is what makes segment reads lock-free.
 
 **Every read of a store with a non-empty tail takes a latch writers hold.** This
 is why sealing matters operationally: a recovered server that never sealed
-served its whole history from behind the write lock — about a thousand latch
-acquisitions per statement under a balanced load.
+served its whole history from behind the write lock, taking shard latches on
+every read of every statement.
 
 ## Sealing
 
@@ -76,8 +76,11 @@ While the shard latches are held, no version enters or leaves the tail, so a
 reader blocked on one finds either the tail as it was or the segment the
 versions moved into — never neither.
 
-Triggered at `--seal-after` versions (default 65,536), and once at startup to
-drain a bulk-loaded tail.
+Triggered at `--seal-after` versions (default 65,536), once at startup to
+drain a bulk-loaded tail, and by `CALL engram.checkpoint()`. The threshold is
+checked **after** the sync that made the writes durable — under group commit on
+the flusher thread, once the batch's replies have gone — so a sealed segment
+holds only durable versions and no reply waits on a seal.
 
 ## Segments
 
@@ -151,6 +154,31 @@ A columnar scan declines past `COLUMN_SCAN_BYTE_BUDGET` (256 MiB) and the
 general path answers instead. Declining rather than truncating is the pattern
 throughout this layer: a bounded mechanism that gives up cleanly, with a correct
 fallback behind it.
+
+There are two narrow reads of an encoded record beside the full `decode`.
+`Record::decode_projected` keeps only the properties asked for. `RecordWalk` is
+a **borrowed** iterator that yields `(PropertyId, &[u8])` in record order and
+copies nothing — `decode` builds a map of every value, allocating as it goes,
+before a caller can look at one. Its structural checks are `decode`'s, pinned in
+both directions by a pair of tests: one asserts it yields what `decode` decodes,
+the other that it rejects what `decode` rejects.
+
+### The property-column cache
+
+Above the store, `Graph` keeps whole **property columns** — one label's members'
+values for one property — between statements, so a vectorised property read or
+predicate does not re-gather them. It has a byte budget
+(`PROP_COLUMN_BUDGET_BYTES`, 512 MiB) with least-recently-used eviction.
+
+A column is current while neither its label's epoch nor its property's epoch has
+moved, which is the test every other derived structure uses. A property with no
+change log has no epoch that moves, so those entries fall back to the commit
+clock, under which any write anywhere retires them. `--prop-column-restamp`
+narrows that fallback and ships **off**: its soundness depends on every path
+that can invalidate a column having accounted for itself.
+
+[Derived structures](./derived-structures.md) carries the rest of the currency
+argument, and the cache is listed there with everything else derived.
 
 ## Locks and CAS
 

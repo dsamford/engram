@@ -37,6 +37,15 @@ pub enum IndexDef {
         labels: Vec<String>,
         /// The properties.
         props: Vec<String>,
+        /// How matches are scored.
+        ///
+        /// **STAMPED AT CREATE AND PERSISTED, never read from a lever at query
+        /// time.** Two servers with different settings would otherwise score
+        /// the same index differently, and a rolling upgrade would re-rank
+        /// mid-query-set. Absent in the stored row means [`Scoring::Tf`], so
+        /// every index created before this field existed keeps the scoring it
+        /// has always had — the same vintage rule `on_rel` uses.
+        scoring: Scoring,
     },
     /// A range index (accepted and stored; the scan planner consumes the
     /// node-scoped ones).
@@ -52,6 +61,31 @@ pub enum IndexDef {
         /// population — CREATE used to discard this bit.
         on_relationships: bool,
     },
+    /// A trigram index over one label + property — what makes `=~`,
+    /// `CONTAINS` and `ENDS WITH` seekable instead of scans.
+    Trigram {
+        /// The label.
+        label: String,
+        /// The property, which must hold strings. Rows carrying a non-string
+        /// value under it disable the index rather than shrinking its answer;
+        /// see `engram_store::trigram`.
+        prop: String,
+    },
+}
+
+/// How a fulltext index scores a match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Scoring {
+    /// Raw summed term frequency — what every index created before BM25
+    /// existed uses, and what they keep.
+    ///
+    /// A term appearing in every document counts as much as one appearing in
+    /// three, and a long document outranks a short one for being long. Both
+    /// are why `Bm25` is the default for anything new.
+    #[default]
+    Tf,
+    /// Okapi BM25 with Lucene's parameters and idf.
+    Bm25,
 }
 
 /// A DECLARED range index, as the catalogue holds it.
@@ -126,15 +160,38 @@ fn def_to_value(def: &IndexDef) -> Value {
             m.insert("label".into(), Value::Str(label.clone()));
             m.insert("prop".into(), Value::Str(prop.clone()));
         }
-        IndexDef::Fulltext { labels, props } => {
+        IndexDef::Fulltext {
+            labels,
+            props,
+            scoring,
+        } => {
             m.insert("kind".into(), Value::Str("fulltext".into()));
+            // WRITTEN ONLY WHEN BM25, so a row this build writes for a
+            // Tf index is byte-identical to one an older build wrote.
+            if *scoring == Scoring::Bm25 {
+                m.insert("scoring".into(), Value::Str("bm25".into()));
+            }
             m.insert(
                 "labels".into(),
-                Value::List(labels.iter().cloned().map(Value::Str).collect()),
+                Value::List(
+                    labels
+                        .iter()
+                        .cloned()
+                        .map(Value::Str)
+                        .collect::<Vec<_>>()
+                        .into(),
+                ),
             );
             m.insert(
                 "props".into(),
-                Value::List(props.iter().cloned().map(Value::Str).collect()),
+                Value::List(
+                    props
+                        .iter()
+                        .cloned()
+                        .map(Value::Str)
+                        .collect::<Vec<_>>()
+                        .into(),
+                ),
             );
         }
         IndexDef::Range {
@@ -146,11 +203,23 @@ fn def_to_value(def: &IndexDef) -> Value {
             m.insert("label".into(), Value::Str(label.clone()));
             m.insert(
                 "props".into(),
-                Value::List(props.iter().cloned().map(Value::Str).collect()),
+                Value::List(
+                    props
+                        .iter()
+                        .cloned()
+                        .map(Value::Str)
+                        .collect::<Vec<_>>()
+                        .into(),
+                ),
             );
             if *on_relationships {
                 m.insert("on_rel".into(), Value::Bool(true));
             }
+        }
+        IndexDef::Trigram { label, prop } => {
+            m.insert("kind".into(), Value::Str("trigram".into()));
+            m.insert("label".into(), Value::Str(label.clone()));
+            m.insert("prop".into(), Value::Str(prop.clone()));
         }
     }
     Value::Map(m)
@@ -165,7 +234,7 @@ fn value_to_def(v: &Value) -> Option<IndexDef> {
     let list = |k: &str| match m.get(k) {
         Some(Value::List(items)) => {
             let mut out = Vec::new();
-            for i in items {
+            for i in (items).iter() {
                 match i {
                     Value::Str(s) => out.push(s.clone()),
                     _ => return None,
@@ -183,12 +252,31 @@ fn value_to_def(v: &Value) -> Option<IndexDef> {
         "fulltext" => Some(IndexDef::Fulltext {
             labels: list("labels")?,
             props: list("props")?,
+            // ABSENT MEANS `Tf`. An index written before this field existed
+            // keeps term-frequency scoring for ever, which is what makes
+            // adding BM25 a change no existing deployment can notice.
+            scoring: match s("scoring").as_deref() {
+                None | Some("tf") => Scoring::Tf,
+                Some("bm25") => Scoring::Bm25,
+                // A scoring this build has never heard of, from a newer one.
+                // Refusing the ROW (skipping the index) is the conservative
+                // direction: guessing a formula would silently re-rank.
+                Some(_) => return None,
+            },
         }),
         "range" => Some(IndexDef::Range {
             label: s("label")?,
             props: list("props")?,
             on_relationships: matches!(m.get("on_rel"), Some(Value::Bool(true))),
         }),
+        "trigram" => Some(IndexDef::Trigram {
+            label: s("label")?,
+            prop: s("prop")?,
+        }),
+        // AN UNKNOWN KIND IS SKIPPED, NOT AN ERROR. A catalogue written by a
+        // newer build can name an index this one has never heard of, and the
+        // right answer is to carry on without it rather than to refuse to open
+        // the database. Every caller treats `None` as "not an index I can use".
         _ => None,
     }
 }
@@ -226,6 +314,21 @@ impl Graph {
                 IndexDef::Fulltext {
                     labels: labels.clone(),
                     props: props.clone(),
+                    // Read HERE, at create, and written into the row.
+                    scoring: self.fulltext_default_scoring(),
+                },
+            ),
+            SchemaCmd::CreateTrigramIndex {
+                name,
+                if_not_exists,
+                label,
+                prop,
+            } => self.create_index(
+                name,
+                *if_not_exists,
+                IndexDef::Trigram {
+                    label: label.clone(),
+                    prop: prop.clone(),
                 },
             ),
             SchemaCmd::CreateRangeIndex {
@@ -311,6 +414,7 @@ impl Graph {
         // test caught: `CREATE INDEX` after a first read left the planner
         // seeing an empty catalogue for the rest of the process.
         *self.range_index_cache.borrow_mut() = None;
+        *self.trigram_index_cache.borrow_mut() = None;
         counted!("graph.indexes created");
         Ok(())
     }
@@ -450,13 +554,19 @@ impl Graph {
                 seen.push(t);
             }
         }
-        let markers_built =
-            all_encodable || matches!(def.kind, ConstraintKind::NotNull);
+        let markers_built = all_encodable || matches!(def.kind, ConstraintKind::NotNull);
         let mut m = BTreeMap::new();
         m.insert("label".into(), Value::Str(def.label.clone()));
         m.insert(
             "props".into(),
-            Value::List(def.props.iter().cloned().map(Value::Str).collect()),
+            Value::List(
+                def.props
+                    .iter()
+                    .cloned()
+                    .map(Value::Str)
+                    .collect::<Vec<_>>()
+                    .into(),
+            ),
         );
         m.insert(
             "kind".into(),
@@ -497,6 +607,7 @@ impl Graph {
         // Same obligation as `create_index`: a dropped index must stop being
         // consulted, and index DDL does not move the schema epoch.
         *self.range_index_cache.borrow_mut() = None;
+        *self.trigram_index_cache.borrow_mut() = None;
         Ok(())
     }
 
@@ -563,9 +674,7 @@ impl Graph {
     /// duplicates (drift through the phantom this work closes) also stays
     /// v1 and is REPORTED — an upgrade must not certify what does not hold.
     /// Returns `(upgraded, skipped-with-reasons)`.
-    pub fn upgrade_constraint_markers(
-        &self,
-    ) -> Result<(usize, Vec<String>), GraphError> {
+    pub fn upgrade_constraint_markers(&self) -> Result<(usize, Vec<String>), GraphError> {
         if self.in_txn() {
             return Err(GraphError::SchemaConflict(
                 "constraint upgrade cannot run inside an open transaction".into(),
@@ -605,10 +714,7 @@ impl Graph {
                     },
                     Err(GraphError::ConstraintViolation(why)) => {
                         self.rollback_owned(txn);
-                        skipped.push(format!(
-                            "`{}` stays walk-enforced: {why}",
-                            c.name
-                        ));
+                        skipped.push(format!("`{}` stays walk-enforced: {why}", c.name));
                         break;
                     }
                     Err(e) => {
@@ -712,12 +818,8 @@ impl Graph {
                                 // if that owner is live and eq3-equal (i.e.
                                 // this is a pre-existing duplicate the
                                 // constraint predates, reported separately).
-                                let t: Vec<&Value> = c
-                                    .def
-                                    .props
-                                    .iter()
-                                    .filter_map(|p| props.get(p))
-                                    .collect();
+                                let t: Vec<&Value> =
+                                    c.def.props.iter().filter_map(|p| props.get(p)).collect();
                                 self.marker_owner_live(&c, c.def.on_relationships, o, &t)?
                             }
                             None => false,
@@ -842,7 +944,10 @@ impl Graph {
         tail: bool,
     ) -> Result<(Vec<String>, Vec<Vec<Value>>), GraphError> {
         let up = subject.to_ascii_uppercase();
-        let known = matches!(up.as_str(), "INDEX" | "INDEXES" | "CONSTRAINT" | "CONSTRAINTS");
+        let known = matches!(
+            up.as_str(),
+            "INDEX" | "INDEXES" | "CONSTRAINT" | "CONSTRAINTS"
+        );
         if known && tail {
             return Err(GraphError::SchemaConflict(format!(
                 "SHOW {subject} with a trailing clause (YIELD/WHERE/RETURN) is not supported yet"
@@ -857,24 +962,39 @@ impl Graph {
                         IndexDef::Vector { label, prop } => {
                             ("VECTOR", "NODE", vec![label], vec![prop])
                         }
-                        IndexDef::Fulltext { labels, props } => ("FULLTEXT", "NODE", labels, props),
+                        IndexDef::Fulltext { labels, props, .. } => {
+                            ("FULLTEXT", "NODE", labels, props)
+                        }
                         IndexDef::Range {
                             label,
                             props,
                             on_relationships,
                         } => (
                             "RANGE",
-                            if on_relationships { "RELATIONSHIP" } else { "NODE" },
+                            if on_relationships {
+                                "RELATIONSHIP"
+                            } else {
+                                "NODE"
+                            },
                             vec![label],
                             props,
                         ),
+                        IndexDef::Trigram { label, prop } => {
+                            ("TRIGRAM", "NODE", vec![label], vec![prop])
+                        }
                     };
                     rows.push(vec![
                         Value::Str(name),
                         Value::Str(ty.into()),
                         Value::Str(entity.into()),
-                        Value::List(labels.into_iter().map(Value::Str).collect()),
-                        Value::List(props.into_iter().map(Value::Str).collect()),
+                        Value::List(
+                            labels
+                                .into_iter()
+                                .map(Value::Str)
+                                .collect::<Vec<_>>()
+                                .into(),
+                        ),
+                        Value::List(props.into_iter().map(Value::Str).collect::<Vec<_>>().into()),
                         // Index population is synchronous here — a stored
                         // index is a usable index, so state is a constant.
                         Value::Str("ONLINE".into()),
@@ -918,8 +1038,15 @@ impl Graph {
                             Value::Str(c.name),
                             Value::Str(ty.into()),
                             Value::Str(entity.into()),
-                            Value::List(vec![Value::Str(c.def.label)]),
-                            Value::List(c.def.props.into_iter().map(Value::Str).collect()),
+                            Value::List((vec![Value::Str(c.def.label)]).into()),
+                            Value::List(
+                                c.def
+                                    .props
+                                    .into_iter()
+                                    .map(Value::Str)
+                                    .collect::<Vec<_>>()
+                                    .into(),
+                            ),
                         ]
                     })
                     .collect();
@@ -938,7 +1065,7 @@ impl Graph {
 
     /// Every stored index as `(name, def)`, name-ordered — two runs of one
     /// seed must render one catalogue (the determinism gate compares output).
-    fn scan_index_defs(&self) -> Vec<(String, IndexDef)> {
+    pub(crate) fn scan_index_defs(&self) -> Vec<(String, IndexDef)> {
         let mut out = Vec::new();
         for (body, bytes) in self.store.scan_body_prefix(&self.kv, b"idx:") {
             let Some(pos) = body.windows(4).position(|w| w == b"idx:") else {
@@ -1001,7 +1128,7 @@ impl Graph {
             return Err(GraphError::Corrupt("constraint fields".into()));
         };
         let mut ps = Vec::with_capacity(props.len());
-        for p in props {
+        for p in (props).iter() {
             match p {
                 Value::Str(s) => ps.push(s.clone()),
                 _ => return Err(GraphError::Corrupt("constraint prop".into())),
@@ -1039,7 +1166,7 @@ impl Graph {
     pub(crate) const CON_EPOCH_BODY: &'static [u8] = b"con\x00epoch";
 
     /// The committed schema epoch — a RECORDED read inside a transaction.
-    fn constraint_epoch_recorded(&self) -> u64 {
+    pub(crate) fn constraint_epoch_recorded(&self) -> u64 {
         self.store_get_w(&self.kv, Self::CON_EPOCH_BODY)
             .and_then(|b| b.try_into().ok().map(u64::from_le_bytes))
             .unwrap_or(0)
@@ -1160,7 +1287,12 @@ impl Graph {
             .map(|p| props.get(p).filter(|v| !matches!(v, Value::Null)))
             .collect();
         let missing = tuple.iter().any(|v| v.is_none());
-        if missing && matches!(c.def.kind, ConstraintKind::NotNull | ConstraintKind::NodeKey) {
+        if missing
+            && matches!(
+                c.def.kind,
+                ConstraintKind::NotNull | ConstraintKind::NodeKey
+            )
+        {
             sometimes!("graph.constraint refused", true);
             return Err(GraphError::ConstraintViolation(format!(
                 "`{}`.`{}` is required",
@@ -1665,7 +1797,7 @@ impl Graph {
             };
             let mut v = Vec::with_capacity(items.len());
             let mut ok = true;
-            for i in &items {
+            for i in items.iter() {
                 match i {
                     Value::Float(f) => v.push(*f),
                     Value::Int(n) => v.push(*n as f64),
@@ -1787,10 +1919,23 @@ impl Graph {
         ))
     }
 
-    /// `db.index.fulltext.queryNodes(name, query)` — term matching with a
-    /// term-frequency score. Lucene's full syntax this is not (yet): terms
-    /// are OR-combined, case-insensitive, punctuation-split. Documented
-    /// divergence, refused nowhere — a simple query behaves as Neo4j's.
+    /// `db.index.fulltext.queryNodes(name, query)`.
+    ///
+    /// Terms are OR-combined, case-insensitive and punctuation-split. Lucene's
+    /// full query syntax this is not — no phrases, no field boosts, no fuzzy
+    /// matching — and that is a documented divergence rather than a refusal: a
+    /// simple query behaves as Neo4j's does.
+    ///
+    /// # Two scorers, one of which is chosen by the index's vintage
+    ///
+    /// An index carrying [`Scoring::Bm25`] is answered from a maintained term
+    /// index. One carrying [`Scoring::Tf`] — which is every index created
+    /// before that field existed — takes the original label scan, unchanged,
+    /// so its rows, its scores and even its tie order are exactly what they
+    /// have always been.
+    ///
+    /// The BM25 arm falls back to a scan of its own whenever the index cannot
+    /// serve. The general path always answers.
     pub fn fulltext_query(
         &self,
         index: &str,
@@ -1801,11 +1946,38 @@ impl Graph {
                 "no such index `{index}`"
             )));
         };
-        let IndexDef::Fulltext { labels, props } = def else {
+        let IndexDef::Fulltext {
+            labels,
+            props,
+            scoring,
+        } = def
+        else {
             return Err(GraphError::SchemaConflict(format!(
                 "`{index}` is not a fulltext index"
             )));
         };
+        if scoring == Scoring::Bm25 {
+            // THE LEVER CHOOSES THE INDEX, NOT THE FORMULA. With it off the
+            // query still gets BM25 — computed the slow way, by a scan. Letting
+            // it fall through to the term-frequency path instead would mean the
+            // A/B compared two different ANSWERS, so it could never show what
+            // the index cost or saved.
+            if self.bm25_scoring.get() {
+                if let Some(hits) = self.fulltext_bm25(index, &labels, &props, query)? {
+                    counted!("graph.fulltext answered from the index");
+                    return Ok(hits);
+                }
+                // COUNTED, NOT `sometimes!` — the counter beside it already
+                // says the scan answered, and reaching this in the sweep needs
+                // an index whose property has never been written.
+                // `the_index_and_the_fallback_scan_return_the_same_ranking`
+                // proves the fallback reachable and, more importantly, proves
+                // it returns the same answer.
+                counted!("graph.fulltext index declined");
+            }
+            counted!("graph.fulltext fell back to a scan");
+            return self.fulltext_bm25_by_scan(&labels, &props, query);
+        }
         let terms: Vec<String> = tokenize(query);
         if terms.is_empty() {
             return Ok(Vec::new());
@@ -1841,11 +2013,17 @@ impl Graph {
     }
 }
 
+/// The analyzer, delegated rather than duplicated.
+///
+/// `engram-graph` depends on `engram-store`, so the index build, the
+/// incremental catch-up and this scan can all call ONE function — and a
+/// ranking that drifted because two of them disagreed about what a token is
+/// would be near-impossible to attribute. Contrast `trigram::fold_scalar`,
+/// which genuinely must exist twice because `engram-cypher` cannot reach the
+/// store; that duplication is asserted equal by a test, and this one needs no
+/// test because there is nothing to keep equal.
 fn tokenize(text: &str) -> Vec<String> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .map(|t| t.to_lowercase())
-        .collect()
+    engram_store::text::analyse(text)
 }
 
 #[cfg(test)]

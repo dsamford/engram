@@ -49,6 +49,7 @@
 
 pub mod adjacency;
 pub mod columnar;
+mod compact_paged;
 pub mod dirlock;
 pub mod index;
 pub mod overlay;
@@ -56,7 +57,9 @@ pub mod paged;
 pub mod record;
 pub mod replica;
 pub mod segment;
-mod compact_paged;
+pub mod term;
+pub mod text;
+pub mod trigram;
 pub use compact_paged::MergeObserver;
 pub mod sst;
 pub(crate) mod tail;
@@ -82,7 +85,7 @@ pub use overlay::{
     NamespaceRegistry, NamespaceRole, OverlayError, SYSTEM_REALM, SystemWriteCap, TenantSession,
     system_put,
 };
-pub use record::{PropertyId, Record, RecordError, get_property};
+pub use record::{PropertyId, Record, RecordError, RecordWalk, get_property};
 pub use replica::{AppliedReport, ApplyError, Replica, RestoreVerdict, recover_to, verify_restore};
 pub use segment::{Projected, SealedSegment, Segment};
 pub use vector::{SearchAnswer, VectorError, VectorIndex, encode_f32_vector};
@@ -147,6 +150,52 @@ pub static INDEX_FOLDS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 pub static SPAN_READS_EXCLUDING_WRITERS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Data-block preads served from DISK, and the cache misses that caused them.
+///
+/// These two already existed as `counted!("paged.pread")` and
+/// `counted!("paged.block cache miss")`, which are THREAD-LOCAL trace counters:
+/// a `Trace` in a test sees them, and a running server never does, because its
+/// periodic dump prints global atomics from its own thread. So the busiest
+/// read path in a paged deployment was invisible in exactly the setting that
+/// matters.
+///
+/// That is not hypothetical. The SNB `balanced` SF10 stall — throughput
+/// collapsing to 0 every ~1,800 reads — was chased through every counter the
+/// server prints, and NONE of them moved in a stall second: each was flat or
+/// lower, the signature of "less work happened", not of a subsystem doing the
+/// stalling. The time is in a path the dump cannot see, and a paged store's
+/// block I/O is the first place to look.
+pub static PAGED_PREADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Block-cache misses. The CONTROL for [`PAGED_PREADS`]: preads alone cannot
+/// separate "reads are frequent" from "the cache stopped holding the working
+/// set", and a stall that is eviction thrash looks like the second.
+pub static PAGED_BLOCK_MISSES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Blocks EVICTED. A cache at its budget evicting what the next read wants is
+/// the classic periodic collapse, and it is distinguishable from cold misses
+/// only by counting both.
+pub static PAGED_BLOCK_EVICTIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Change logs POISONED — cleared wholesale because a write arrived with a
+/// stamp at or below where the log had already been pruned.
+///
+/// This is not the overflow path (which drops the oldest half and keeps
+/// serving). Poisoning calls `entries.clear()` and lifts the floor to the
+/// current epoch, so afterwards NO snapshot can catch up and the next reader
+/// rebuilds the structure from scratch — for a label membership that is
+/// O(label), on a reader's thread.
+///
+/// It had only a thread-local `counted!`, so a running server could not see
+/// it, which is why the SNB `balanced` SF10 stall survived nine other
+/// explanations: `mem_built=18` per 75 s with every printed counter flat.
+/// Widening the log's cap changed nothing precisely BECAUSE this is not
+/// overflow.
+pub static CHANGE_LOGS_POISONED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Span reads that skipped the latches because the tail was empty — the
 /// control. Without it, a high exclusion count could mean "reads are frequent"
 /// rather than "reads exclude writers", and the two arms are the whole point.
@@ -160,6 +209,18 @@ pub static SPAN_READS_LATCH_FREE: std::sync::atomic::AtomicU64 =
 pub static SPAN_ROWS_UNDER_LATCHES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Span merges whose visitor stopped the walk before the span ran out.
+///
+/// The point of the counter is the work NOT done: past the stop no further
+/// block is fetched, verified or decoded. It reads 0 on a build where
+/// termination does not propagate, which is what this was — the single-paged-
+/// segment fast path used a non-stopping walk so that it could keep the scan
+/// cache policy, and read every remaining block after its visitor had
+/// finished. A fix here is invisible to answers by construction, so a counter
+/// is the only thing that says it engaged.
+pub static SPAN_STOPPED_EARLY: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Entries of the commit window this validator actually walked.
 ///
 /// The window is ts-monotone, so only the SUFFIX above a reader's snapshot can
@@ -167,6 +228,35 @@ pub static SPAN_ROWS_UNDER_LATCHES: std::sync::atomic::AtomicU64 =
 /// suffix" is a number rather than an argument — and so the OFF arm's full-ring
 /// scan is visible next to it.
 pub static WINDOW_ENTRIES_SCANNED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Commits whose read-set validation was answered from the commit window, and
+/// commits that had to fall back to a point lookup per read-set key.
+///
+/// PROCESS-GLOBAL on purpose. The equivalent `counted!` pairs are thread-local
+/// (`engram_observe`'s `CURRENT` is a `RefCell` per thread), so a running
+/// server cannot surface them and they are invisible to exactly the workload
+/// that matters — many client threads committing at once.
+///
+/// These two are the discriminating measurement for the SF10 write-path gap.
+/// `COMMIT_WINDOW_CAP` bounds the window in ENTRIES, so the span of history it
+/// covers is `cap / commit rate` and a transaction outside it pays a point
+/// lookup PER READ-SET KEY across the sealed segments. Measured locally
+/// (`tests/validation_cost_under_the_log_latch.rs`), that fallback is 5-8x
+/// DEARER than the window at a 50,000-key read set — the opposite of what
+/// `COMMIT_WINDOW_CAP`'s own docstring claims — so the SHARE of commits taking
+/// it, at SF10 against SF3, is the number that settles whether validation
+/// accounts for the gap.
+pub static VALIDATE_FROM_WINDOW: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// See [`VALIDATE_FROM_WINDOW`].
+pub static VALIDATE_FELL_BACK: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Read-set keys walked by the FALLBACK point loop — its actual cost, not its
+/// frequency. A rare fallback over an enormous read set and a frequent one over
+/// a tiny read set are the same share and very different bills.
+pub static VALIDATE_FALLBACK_KEYS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Rows of the commit delta §7's predicate pass will examine before it gives up
@@ -183,16 +273,14 @@ const PRECISION_MAX_DELTA: usize = 4_096;
 /// phantom that read-set validation could not have seen. Counted separately
 /// because it is the whole measurable effect of precision locking: the two arms
 /// must differ here and nowhere else.
-pub static PHANTOM_CONFLICTS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub static PHANTOM_CONFLICTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Write-write conflicts EXEMPTED because both sides were puts to a key class
 /// that declares put-vs-put harmless (the adjacency guard row — see the
 /// exemption in `commit_reporting`). Monotonic; the evidence that the
 /// exemption is doing anything, and the number to watch if a dangling-edge
 /// bug is ever suspected.
-pub static PUT_PUT_EXEMPTED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub static PUT_PUT_EXEMPTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Re-exported so the server can print one counter surface without a direct
 /// engram-log dependency.
@@ -609,8 +697,7 @@ impl LogState {
 ///
 /// Process-wide and `Relaxed`: it is an instrument for a sizing decision, not a
 /// correctness signal. See `log_payload` for what it is deciding.
-pub static LOG_BYTES_COPIED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub static LOG_BYTES_COPIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Recent commits the validator may answer from before falling back to a point
 /// lookup per key.
@@ -655,6 +742,63 @@ struct Sealed {
     /// is `Resident` (in RAM, the default) or `Paged` (on disk, cache-backed) —
     /// the read sites are agnostic.
     segments: Vec<std::sync::Arc<SealedSegment>>,
+}
+
+/// Persisted range indexes by `(realm, namespace, property token)`. See
+/// `StoreInner::persisted_indexes` for why the coordinate is in the key.
+type PersistedIndexes =
+    BTreeMap<(engram_key::Realm, engram_key::Namespace, u32), Arc<crate::index::RangeIndex>>;
+
+/// The file a persisted range index lives in: `idx-<realm><ns>-<token>.idx`,
+/// the realm and namespace as eight hex digits each — the same coordinate-first
+/// discipline the derived-structure sidecars follow, so two graphs sharing one
+/// directory cannot write, or read, each other's file.
+fn index_sidecar_name(realm: engram_key::Realm, ns: engram_key::Namespace, token: u32) -> String {
+    format!("idx-{:08x}{:08x}-{token}.idx", realm.0, ns.0)
+}
+
+/// What a directory entry is, as far as the index-sidecar loader cares.
+#[derive(Debug, PartialEq, Eq)]
+enum SidecarName {
+    /// A sidecar attributable to exactly one graph.
+    Coordinate(engram_key::Realm, engram_key::Namespace, u32),
+    /// `idx-<token>.idx`: written before the coordinate was part of the name.
+    Legacy,
+    /// Anything else in the directory.
+    NotASidecar,
+}
+
+fn parse_index_sidecar_name(name: &str) -> SidecarName {
+    let Some(stem) = name.strip_prefix("idx-").and_then(|n| n.strip_suffix(".idx")) else {
+        return SidecarName::NotASidecar;
+    };
+    // Every accepted name must be the one the writer would produce for what it
+    // parses to. The number parsers accept `+7`, `007` and upper-case hex, so
+    // without this one coordinate would have several names — and "which of
+    // these files is the graph's" is a question the loader must never face.
+    let Some((coord, token)) = stem.split_once('-') else {
+        return match stem.parse::<u32>() {
+            Ok(t) if format!("idx-{t}.idx") == name => SidecarName::Legacy,
+            _ => SidecarName::NotASidecar,
+        };
+    };
+    let hex = |s: &str| u32::from_str_radix(s, 16).ok();
+    let parsed = (
+        coord.get(..8).and_then(hex),
+        coord.get(8..).and_then(hex),
+        token.parse::<u32>().ok(),
+    );
+    match parsed {
+        (Some(r), Some(n), Some(t)) => {
+            let (realm, ns) = (engram_key::Realm(r), engram_key::Namespace(n));
+            if index_sidecar_name(realm, ns, t) == name {
+                SidecarName::Coordinate(realm, ns, t)
+            } else {
+                SidecarName::NotASidecar
+            }
+        }
+        _ => SidecarName::NotASidecar,
+    }
 }
 
 /// The shared store body — fine-grained latches, one per concern.
@@ -721,15 +865,26 @@ struct StoreInner {
     /// publishes the new `sealed` BEFORE zeroing this (Release), so a reader that
     /// sees 0 (Acquire) also sees the segment the drained versions moved into.
     tail_nonempty: std::sync::atomic::AtomicUsize,
-    /// Property indexes loaded from disk at open (index-at-seal): `prop token →
-    /// index`. A reader consults these before rebuilding, so a store opened from
-    /// disk does not pay the first-query index build. Empty for a store that was
-    /// not opened with sidecar indexes.
-    persisted_indexes: arc_swap::ArcSwap<BTreeMap<u32, Arc<crate::index::RangeIndex>>>,
+    /// Property indexes loaded from disk at open (index-at-seal): `(realm,
+    /// namespace, prop token) → index`. A reader consults these before
+    /// rebuilding, so a store opened from disk does not pay the first-query
+    /// index build. Empty for a store that was not opened with sidecar indexes.
+    ///
+    /// Keyed by the COORDINATE as well as the token, because a token is minted
+    /// per graph: two graphs sharing this store give unrelated properties the
+    /// same token number, and a map keyed by the token alone served one
+    /// tenant's index — built from its values — to the other.
+    persisted_indexes: arc_swap::ArcSwap<PersistedIndexes>,
     /// Cross-worker group commit: the durable watermark and the file handle
     /// the fsync is performed on — OUTSIDE the hot lock. See
     /// [`Store::sync_pending`].
     group: std::sync::Mutex<GroupSync>,
+    /// `GroupSync::synced_seq`, mirrored OUTSIDE its mutex: the log sequence up
+    /// to which records are on stable storage. The mutex is held for the whole
+    /// fsync, so a caller asking "is this already durable?" through it waits
+    /// for a sync it may not need; this atomic answers without waiting. Only
+    /// ever raised, and only after the fsync that covers it returned.
+    durable_seq: std::sync::atomic::AtomicU64,
     /// Serialises compactions among themselves. The hot lock is NOT held for
     /// the merge — see [`Store::compact`] — so two compactions could otherwise
     /// both rebuild the same sealed set.
@@ -977,6 +1132,7 @@ impl Store {
                     synced_seq: 0,
                     file: None,
                 }),
+                durable_seq: std::sync::atomic::AtomicU64::new(0),
                 compacting: std::sync::Mutex::new(()),
             }),
         }
@@ -1303,7 +1459,12 @@ impl Store {
     /// every record to read one property from each; this reads the property
     /// off the borrowed bytes and copies only that. Resolution is exactly
     /// `get`'s: tail, then segments newest first, at the visible clock.
-    pub fn get_with<R>(&self, prefix: &KeyPrefix, body: &[u8], f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+    pub fn get_with<R>(
+        &self,
+        prefix: &KeyPrefix,
+        body: &[u8],
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Option<R> {
         let ts = self.now_ts();
         let key = Self::logical_key(prefix, body);
         counted!("store.gets");
@@ -1320,6 +1481,49 @@ impl Store {
             }
         }
         None
+    }
+
+    /// [`Store::get_with`] for a RUN of keys — `f(index, bytes)` for each
+    /// key that has a visible value, in the order given, resolved exactly
+    /// as `get_with` resolves one (the tail, then the sealed segments newest
+    /// first, at the visible clock). A paged segment keeps the last block
+    /// it fetched per run, so keys that fall in one block (a sorted id set
+    /// reads a block's rows in a row) cost one cache touch instead of one
+    /// each: the MENTIONS aggregate's 37,270-id gather on the mirror paid
+    /// ~7 µs a get, most of it the touch. Unsorted keys are answered the
+    /// same, only without the reuse.
+    pub fn get_many_with(
+        &self,
+        prefix: &KeyPrefix,
+        bodies: impl IntoIterator<Item = impl AsRef<[u8]>>,
+        mut f: impl FnMut(usize, &[u8]),
+    ) {
+        let ts = self.now_ts();
+        let tail_versions = self.tail_has_versions();
+        let sealed = self.sealed();
+        let mut cursors: Vec<Option<(usize, paged::Block)>> =
+            (0..sealed.segments.len()).map(|_| None).collect();
+        for (i, body) in bodies.into_iter().enumerate() {
+            let key = Self::logical_key(prefix, body.as_ref());
+            counted!("store.gets");
+            if tail_versions {
+                if let Some(v) = self.inner.tail.visible_at(&key, ts) {
+                    if let Some(b) = v.value.as_ref() {
+                        f(i, b);
+                    }
+                    continue;
+                }
+            }
+            for (si, seg) in sealed.segments.iter().enumerate().rev() {
+                if seg
+                    .visit_at_with_cursor(&key, ts, &mut cursors[si], |b| f(i, b))
+                    .is_some()
+                {
+                    sometimes!("store.read served from a sealed segment", true);
+                    break;
+                }
+            }
+        }
     }
 
     /// [`Store::get`] PROJECTED to `props`: a row-form record comes back
@@ -1455,8 +1659,7 @@ impl Store {
                     "wait_for_allocated_to_publish: visible {v} < allocated {allocated}; \
                      ring[{}] holds {} (want {gap})",
                     gap % ring.len() as u64,
-                    ring[(gap % ring.len() as u64) as usize]
-                        .load(Ordering::Relaxed),
+                    ring[(gap % ring.len() as u64) as usize].load(Ordering::Relaxed),
                 )
             });
         }
@@ -1722,9 +1925,10 @@ impl Store {
                     new_segs.push(std::sync::Arc::new(paged));
                     converted += 1;
                     if resident.log_upto() > 0 {
-                        durable_below = Some(durable_below.map_or(resident.log_upto(), |d| {
-                            d.max(resident.log_upto())
-                        }));
+                        durable_below = Some(
+                            durable_below
+                                .map_or(resident.log_upto(), |d| d.max(resident.log_upto())),
+                        );
                     }
                 }
                 // Already paged (an earlier spill): keep the existing backing.
@@ -1758,11 +1962,7 @@ impl Store {
     /// successor too) or the new file after it — never the old handle for
     /// records that only the new file holds.
     pub fn checkpoint_wal(&self, seq: u64) -> std::io::Result<u64> {
-        let mut g = self
-            .inner
-            .group
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut g = self.inner.group.lock().unwrap_or_else(|e| e.into_inner());
         let mut lg = self.log_mut();
         let dropped = lg.log.rotate_sink_below(seq)?;
         if let Some(handle) = lg.log.sync_handle() {
@@ -1800,7 +2000,8 @@ impl Store {
         cache_bytes: usize,
         wal_path: &std::path::Path,
     ) -> Result<(Store, std::sync::Arc<crate::paged::BlockCache>), OpenPagedWalError> {
-        let (store, cache) = Self::open_paged_dir(dir, cache_bytes).map_err(OpenPagedWalError::Paged)?;
+        let (store, cache) =
+            Self::open_paged_dir(dir, cache_bytes).map_err(OpenPagedWalError::Paged)?;
         let (anchor, entries, wal) =
             Wal::open_anchored(wal_path).map_err(|e| OpenPagedWalError::Wal(e.into()))?;
         match CommitLog::verify_entries_from(anchor, &entries) {
@@ -1830,11 +2031,10 @@ impl Store {
             lg.log.seed_anchor(anchor);
             let mut newest = 0u64;
             for e in &entries {
-                let (body, value) = Self::decode_log_payload(&e.payload).ok_or(
-                    OpenPagedWalError::Wal(OpenWalError::Recover(RecoverError::MalformedPayload {
-                        seq: e.seq,
-                    })),
-                )?;
+                let (body, value) =
+                    Self::decode_log_payload(&e.payload).ok_or(OpenPagedWalError::Wal(
+                        OpenWalError::Recover(RecoverError::MalformedPayload { seq: e.seq }),
+                    ))?;
                 let prefix = KeyPrefix {
                     realm: e.header.realm,
                     namespace: e.header.namespace,
@@ -1946,26 +2146,33 @@ impl Store {
         // index builds read an empty graph).
         store.advance_ts_to(max_commit_ts + 1);
         store.advance_visible_to(max_commit_ts);
-        // Load any persisted property indexes (`idx-<token>.idx`) so the first
-        // query need not rebuild them (index-at-seal). A corrupt/foreign file is
-        // skipped — the store rebuilds that index on demand as usual.
-        let mut loaded: BTreeMap<u32, Arc<crate::index::RangeIndex>> = BTreeMap::new();
+        // Load any persisted property indexes (`idx-<coordinate>-<token>.idx`)
+        // so the first query need not rebuild them (index-at-seal). A
+        // corrupt/foreign file is skipped — the store rebuilds that index on
+        // demand as usual.
+        let mut loaded = PersistedIndexes::new();
         if let Ok(rd) = std::fs::read_dir(dir) {
             for entry in rd.flatten() {
                 let path = entry.path();
-                let Some(token) = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .and_then(|n| n.strip_prefix("idx-"))
-                    .and_then(|n| n.strip_suffix(".idx"))
-                    .and_then(|n| n.parse::<u32>().ok())
-                else {
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                     continue;
+                };
+                let (realm, ns, token) = match parse_index_sidecar_name(name) {
+                    SidecarName::Coordinate(realm, ns, token) => (realm, ns, token),
+                    // Written by a build before the coordinate was in the name.
+                    // It names no graph, so it cannot be attributed to one, and
+                    // guessing is exactly the defect this naming closes. One
+                    // rebuild is the whole cost.
+                    SidecarName::Legacy => {
+                        counted!("store.legacy index sidecar not adopted");
+                        continue;
+                    }
+                    SidecarName::NotASidecar => continue,
                 };
                 if let Ok(bytes) = std::fs::read(&path) {
                     let def = crate::index::IndexDef::new(token, crate::record::PropertyId(token));
                     if let Some(idx) = crate::index::RangeIndex::from_bytes(&bytes, def) {
-                        loaded.insert(token, Arc::new(idx));
+                        loaded.insert((realm, ns, token), Arc::new(idx));
                     }
                 }
             }
@@ -1981,19 +2188,37 @@ impl Store {
     /// A property index persisted at open (index-at-seal), if any — a reader
     /// consults this before rebuilding. `None` once any write advances the clock
     /// past the index's vintage (the caller checks `as_of`).
-    pub fn persisted_index(&self, token: u32) -> Option<Arc<crate::index::RangeIndex>> {
-        self.inner.persisted_indexes.load().get(&token).cloned()
+    ///
+    /// `token` is the caller's OWN property token, which is only meaningful
+    /// inside `(realm, ns)`: the same number names an unrelated property in
+    /// another graph, so the coordinate is part of the lookup, not a filter
+    /// applied after it.
+    pub fn persisted_index(
+        &self,
+        realm: engram_key::Realm,
+        ns: engram_key::Namespace,
+        token: u32,
+    ) -> Option<Arc<crate::index::RangeIndex>> {
+        self.inner
+            .persisted_indexes
+            .load()
+            .get(&(realm, ns, token))
+            .cloned()
     }
 
-    /// Write a property index to `dir/idx-<token>.idx` (atomic tmp+rename), so a
-    /// later [`Store::open_paged_dir`] loads it instead of rebuilding. The token
-    /// names the file; the index carries its own vintage + BLAKE3.
+    /// Write a property index to `dir/idx-<realm><ns>-<token>.idx` (atomic
+    /// tmp+rename), so a later [`Store::open_paged_dir`] loads it instead of
+    /// rebuilding. The coordinate and the token together name the file — the
+    /// token alone is not unique across the graphs that share one directory;
+    /// the index carries its own vintage + BLAKE3.
     pub fn write_index_sidecar(
         dir: &std::path::Path,
+        realm: engram_key::Realm,
+        ns: engram_key::Namespace,
         token: u32,
         idx: &crate::index::RangeIndex,
     ) -> std::io::Result<()> {
-        let path = dir.join(format!("idx-{token}.idx"));
+        let path = dir.join(index_sidecar_name(realm, ns, token));
         let tmp = path.with_extension("idxtmp");
         std::fs::write(&tmp, idx.to_bytes())?;
         std::fs::rename(&tmp, path)
@@ -2283,7 +2508,10 @@ impl Store {
             return (0, 0);
         }
         if current.segments.len() > merged_n {
-            sometimes!("store.compaction carried over a segment sealed meanwhile", true);
+            sometimes!(
+                "store.compaction carried over a segment sealed meanwhile",
+                true
+            );
             new_segments.extend(current.segments[merged_n..].iter().cloned());
         }
         self.inner.sealed.store(std::sync::Arc::new(Sealed {
@@ -2557,7 +2785,8 @@ impl Store {
         // `resolve_rows_only`): a span wider than the budget declines here,
         // before any presence is tested, exactly as it declines below once
         // the hits exceed it — the caller's per-id path answers either way.
-        let Some((overrides, sealed)) = self.resolve_rows_only(tail, &lo, hi.as_deref(), ts, budget)
+        let Some((overrides, sealed)) =
+            self.resolve_rows_only(tail, &lo, hi.as_deref(), ts, budget)
         else {
             counted!("store.column presence scan declined on rows visited");
             return None;
@@ -2749,7 +2978,10 @@ impl Store {
                     // first (the row-form visits alone are within it — see
                     // `resolve_rows_only`), so it shares the block arm's
                     // declared name rather than claiming a state of its own.
-                    sometimes!("store.column scan aborted on its budget in block rows", true);
+                    sometimes!(
+                        "store.column scan aborted on its budget in block rows",
+                        true
+                    );
                     return None;
                 }
                 f(&k[strip..], val);
@@ -2912,7 +3144,10 @@ impl Store {
         // it needs a seal to land inside one range descent.
         let mut copied = None;
         let mut sealed = self.sealed();
-        if self.inner.tail_span_copyout.load(std::sync::atomic::Ordering::Relaxed)
+        if self
+            .inner
+            .tail_span_copyout
+            .load(std::sync::atomic::Ordering::Relaxed)
             && self.tail_has_versions()
         {
             let c = self.inner.tail.range_copied(
@@ -3008,26 +3243,32 @@ impl Store {
             && sealed.segments.len() == 1
             && sealed.segments[0].as_resident().is_none()
         {
+            // TERMINATION PROPAGATES. This used a NON-stopping walk with a
+            // local `stop` flag: once the visitor said stop, the closure
+            // returned early per row while the walk kept fetching, verifying
+            // and decoding every remaining block in the span. A budgeted
+            // reader paid for the span, not for its budget — which is exactly
+            // what `range_for_each_until` exists to prevent, and it was not
+            // used here only because it could not carry the scan policy.
+            // It can now.
             let mut visited = 0u64;
-            let mut stop = false;
-            let mut visit = |k: &LogicalKey, versions: &[Version]| {
-                if stop {
-                    return;
-                }
-                if let Some(v) = versions.iter().rev().find(|v| v.commit_ts <= ts) {
-                    if let Some(bytes) = &v.value {
-                        visited += 1;
-                        let val = if values { Some(&bytes[..]) } else { None };
-                        if !f(&k.as_slice()[strip..], val) {
-                            stop = true;
+            let complete = sealed.segments[0].range_for_each_until(
+                &lo,
+                hi.as_deref(),
+                scan,
+                |k: &LogicalKey, versions: &[Version]| {
+                    if let Some(v) = versions.iter().rev().find(|v| v.commit_ts <= ts) {
+                        if let Some(bytes) = &v.value {
+                            visited += 1;
+                            let val = if values { Some(&bytes[..]) } else { None };
+                            return f(&k.as_slice()[strip..], val);
                         }
                     }
-                }
-            };
-            if scan {
-                sealed.segments[0].range_for_each_scan(&lo, hi.as_deref(), &mut visit);
-            } else {
-                sealed.segments[0].range_for_each(&lo, hi.as_deref(), &mut visit);
+                    true
+                },
+            );
+            if !complete {
+                SPAN_STOPPED_EARLY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             return visited;
         }
@@ -3152,8 +3393,7 @@ impl Store {
         // Charged only when the latches were actually held: the rows merged
         // under them are the size of the window every writer waited on.
         if all.is_some() {
-            SPAN_ROWS_UNDER_LATCHES
-                .fetch_add(visited, std::sync::atomic::Ordering::Relaxed);
+            SPAN_ROWS_UNDER_LATCHES.fetch_add(visited, std::sync::atomic::Ordering::Relaxed);
         }
         visited
     }
@@ -3256,7 +3496,7 @@ impl Store {
         // block walk uses the same set the overrides were resolved against.
         let sealed = self.sealed();
         for seg in sealed.segments.iter().rev() {
-            let complete = seg.range_for_each_until(lo, hi, |k, versions| {
+            let complete = seg.range_for_each_until(lo, hi, false, |k, versions| {
                 if out.contains_key(k) {
                     return true;
                 }
@@ -3532,11 +3772,7 @@ impl Store {
         // What THIS caller needs durable: the log's tail right now, which is
         // at or past its own last append. A read only — no flush yet.
         let need = self.log_mut().log.len();
-        let mut g = self
-            .inner
-            .group
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut g = self.inner.group.lock().unwrap_or_else(|e| e.into_inner());
         if g.synced_seq >= need {
             counted!("store.group commit covered by another worker");
             return Ok(false);
@@ -3545,6 +3781,7 @@ impl Store {
             // In-memory store: nothing to fsync. Record the watermark so the
             // comparison above stays cheap and truthful.
             g.synced_seq = need;
+            self.inner.durable_seq.fetch_max(need, Ordering::AcqRel);
             return Ok(false);
         };
         // We are the syncer. Flush EVERYTHING appended so far — every worker's
@@ -3563,10 +3800,30 @@ impl Store {
         // syncer's.
         let covers = self.log_mut().log.flush_to_os()?;
         engram_log::FSYNCS.fetch_add(1, Ordering::Relaxed);
-        file.sync_all()?;
+        // A DATA sync: the records sit in zero-filled space the WAL wrote and
+        // synced ahead of them (`engram_log::Wal`), so there is no metadata to
+        // journal — the cost that made a commit ~5.6 ms at one client on the
+        // bench volume against PostgreSQL's ~2.4 ms. Linux's fdatasync still
+        // flushes a size change if an append outran that space.
+        file.sync_data()?;
         g.synced_seq = g.synced_seq.max(covers);
+        self.inner.durable_seq.fetch_max(g.synced_seq, Ordering::AcqRel);
         counted!("store.group commits");
         Ok(true)
+    }
+
+    /// The log sequence up to which records are known to be on stable
+    /// storage, read WITHOUT the group mutex (which a running fsync holds).
+    ///
+    /// A caller that finds `durable_seq() >= log_len()` — read in that order —
+    /// knows everything appended before its read is durable, and can
+    /// acknowledge without calling [`Store::sync_pending`]; one that finds it
+    /// lower must have a sync run for it. Conservative: it can only lag
+    /// `synced_seq`, never lead it.
+    pub fn durable_seq(&self) -> u64 {
+        self.inner
+            .durable_seq
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Whether a deferred fsync is owed.
@@ -3768,10 +4025,7 @@ impl Future for LockFuture {
         let ours = eldest.is_none() || eldest == this.waiter_id;
         if free && ours {
             if let Some(id) = this.waiter_id.take() {
-                let q = st
-                    .waiters
-                    .get_mut(&this.key)
-                    .expect("our entry exists");
+                let q = st.waiters.get_mut(&this.key).expect("our entry exists");
                 let front = q.pop_front();
                 debug_assert_eq!(front.map(|(i, _)| i), Some(id));
                 if q.is_empty() {
@@ -3859,8 +4113,26 @@ impl Subsystem for Store {
         Registration::new()
             .crash_point("store.before_log_append")
             .crash_point("store.between_log_and_publish")
+            .counter("store.legacy index sidecar not adopted")
+            .gate(
+                Gate::new(
+                    "a persisted index is served only to the graph whose coordinate names it",
+                    Canary::new("look a persisted index up by its property token alone and assert the tenant-isolation differential fails"),
+                ),
+            )
             .sometimes("store.cas lost the race")
             .sometimes("store.lock contended")
+            .counter("store.term index built")
+            .counter("store.term index caught up")
+            .counter("store.term index queries")
+            .sometimes("fulltext.document field was not a string")
+            .counter("store.trigram index built")
+            .counter("store.trigram postings intersected")
+            .sometimes("trigram.row was not a string")
+            .counter("trigram.overlay folded")
+            .counter("fulltext.overlay folded")
+            .sometimes("trigram.probe declined over an unindexable row")
+            .sometimes("trigram.probe declined over the cap")
             .counter("store.puts")
             .counter("store.gets")
             .counter("store.deletes")
@@ -4199,10 +4471,7 @@ impl Transaction {
     /// exempted only when the committed version AND this transaction's intent
     /// are both puts and the key is not in the read set — see the argument at
     /// the exemption site.
-    pub fn set_exempt_put_put(
-        &mut self,
-        pred: ExemptPutPut,
-    ) {
+    pub fn set_exempt_put_put(&mut self, pred: ExemptPutPut) {
         self.exempt_put_put = Some(pred);
     }
 
@@ -4235,6 +4504,16 @@ impl Transaction {
     /// Whether this transaction has buffered any write.
     pub fn has_writes(&self) -> bool {
         !self.writes.is_empty()
+    }
+
+    /// How many distinct keys are in this transaction's READ SET.
+    ///
+    /// For tests that need to compare read sets directly. A behavioural probe
+    /// — "does a concurrent write abort us" — cannot isolate ONE binding's
+    /// contribution, because any other read of the same entity aborts the
+    /// commit just as well; a count can.
+    pub fn read_set_len(&self) -> usize {
+        self.reads.len()
     }
 
     /// This transaction's buffered writes under `prefix` whose body starts
@@ -4454,59 +4733,73 @@ impl Transaction {
         // cannot be answered from it and falls back. That is also the case
         // where the point loop is the better answer: a long-running
         // transaction's window would be enormous.
-        let window_view: Option<BTreeMap<LogicalKey, (u64, bool)>> =
-            if store.inner.commit_window.load(std::sync::atomic::Ordering::Relaxed)
-                && snapshot_ts >= lg.window_low
+        let window_view: Option<BTreeMap<LogicalKey, (u64, bool)>> = if store
+            .inner
+            .commit_window
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && snapshot_ts >= lg.window_low
+        {
+            // THE SUFFIX, by binary search — not a scan of the whole ring.
+            //
+            // The window is ts-MONOTONE by construction: every entry is
+            // appended by `note_commit` with the log latch held, at the
+            // moment the ts is allocated, and `bump_ts` has no other caller.
+            // So the entries at or below `snapshot_ts` form a prefix, and
+            // the ones this validator wants are exactly the suffix after it.
+            //
+            // The first cut iterated the ENTIRE deque and filtered — up to
+            // `COMMIT_WINDOW_CAP` (65,536) entries, roughly 2.6 MB touched
+            // per commit, INSIDE the one latch that cannot be parallelised,
+            // to build a map from the handful of entries a short statement
+            // actually needs. The prose describing this path said "suffix"
+            // (see the comment above and docs/write-path-phase0.md); the
+            // code said `.iter()`. This makes them agree.
+            //
+            // Equal-ts runs — a multi-key transaction commits every write at
+            // one ts — are excluded by `<=`, exactly as the `>` filter
+            // excluded them, so the map is IDENTICAL and not merely
+            // equivalent.
+            let mut m: BTreeMap<LogicalKey, (u64, bool)> = BTreeMap::new();
+            let start = if store
+                .inner
+                .window_suffix_scan
+                .load(std::sync::atomic::Ordering::Relaxed)
             {
-                // THE SUFFIX, by binary search — not a scan of the whole ring.
-                //
-                // The window is ts-MONOTONE by construction: every entry is
-                // appended by `note_commit` with the log latch held, at the
-                // moment the ts is allocated, and `bump_ts` has no other caller.
-                // So the entries at or below `snapshot_ts` form a prefix, and
-                // the ones this validator wants are exactly the suffix after it.
-                //
-                // The first cut iterated the ENTIRE deque and filtered — up to
-                // `COMMIT_WINDOW_CAP` (65,536) entries, roughly 2.6 MB touched
-                // per commit, INSIDE the one latch that cannot be parallelised,
-                // to build a map from the handful of entries a short statement
-                // actually needs. The prose describing this path said "suffix"
-                // (see the comment above and docs/write-path-phase0.md); the
-                // code said `.iter()`. This makes them agree.
-                //
-                // Equal-ts runs — a multi-key transaction commits every write at
-                // one ts — are excluded by `<=`, exactly as the `>` filter
-                // excluded them, so the map is IDENTICAL and not merely
-                // equivalent.
-                let mut m: BTreeMap<LogicalKey, (u64, bool)> = BTreeMap::new();
-                let start = if store
-                    .inner
-                    .window_suffix_scan
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    lg.window.partition_point(|(wts, _, _)| *wts <= snapshot_ts)
-                } else {
-                    0
-                };
-                for (wts, k, is_put) in lg.window.range(start..) {
-                    debug_assert!(
-                        *wts > snapshot_ts || start == 0,
-                        "the suffix must start above the snapshot"
-                    );
-                    if *wts > snapshot_ts {
-                        m.insert(k.clone(), (*wts, *is_put));
-                    }
-                }
-                WINDOW_ENTRIES_SCANNED
-                    .fetch_add((lg.window.len() - start) as u64, std::sync::atomic::Ordering::Relaxed);
-                counted!("store.validate answered from the commit window");
-                Some(m)
+                lg.window.partition_point(|(wts, _, _)| *wts <= snapshot_ts)
             } else {
-                counted!("store.validate fell back to the point loop");
-                sometimes!("store.commit window did not reach the snapshot", true);
-                None
+                0
             };
+            for (wts, k, is_put) in lg.window.range(start..) {
+                debug_assert!(
+                    *wts > snapshot_ts || start == 0,
+                    "the suffix must start above the snapshot"
+                );
+                if *wts > snapshot_ts {
+                    m.insert(k.clone(), (*wts, *is_put));
+                }
+            }
+            WINDOW_ENTRIES_SCANNED.fetch_add(
+                (lg.window.len() - start) as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            counted!("store.validate answered from the commit window");
+            VALIDATE_FROM_WINDOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(m)
+        } else {
+            counted!("store.validate fell back to the point loop");
+            VALIDATE_FELL_BACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            sometimes!("store.commit window did not reach the snapshot", true);
+            None
+        };
 
+        if window_view.is_none() {
+            // The fallback's BILL, not its frequency: one point lookup across
+            // the sealed segments per key below.
+            VALIDATE_FALLBACK_KEYS.fetch_add(
+                (reads.len() + writes.len()) as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         for key in reads.iter().chain(writes.keys()) {
             let found = match &window_view {
                 Some(m) => m.get(key).copied(),
@@ -4539,9 +4832,7 @@ impl Transaction {
                     let exempt = committed_is_put
                         && ours_is_put
                         && !reads.contains(key)
-                        && exempt_put_put
-                            .as_ref()
-                            .is_some_and(|p| p(key));
+                        && exempt_put_put.as_ref().is_some_and(|p| p(key));
                     if exempt {
                         counted!("store.txn put-vs-put conflict exempted");
                         PUT_PUT_EXEMPTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4599,7 +4890,10 @@ impl Transaction {
                 // degrade here — never soundness.
                 Some(delta) if delta.len() > PRECISION_MAX_DELTA => {
                     counted!("store.precision locking skipped: delta over the cap");
-                    sometimes!("store.precision locking skipped for an oversized delta", true);
+                    sometimes!(
+                        "store.precision locking skipped for an oversized delta",
+                        true
+                    );
                 }
                 Some(delta) => {
                     for (key, (_ts, is_put)) in delta.iter() {
@@ -4825,6 +5119,69 @@ mod serializability {
 }
 
 #[cfg(test)]
+mod index_sidecar_names {
+    //! The persisted-index filename carries the graph's coordinate, and the
+    //! loader reads back exactly what the writer wrote — no name is ever read
+    //! as two different coordinates, and the pre-coordinate form is recognised
+    //! so it can be refused by name rather than silently skipped.
+    use super::{SidecarName, index_sidecar_name, parse_index_sidecar_name};
+    use engram_key::{Namespace, Realm};
+
+    #[test]
+    fn a_written_name_parses_back_to_its_own_coordinate() {
+        for (r, n, t) in [(0, 0, 0), (1, 1, 7), (2, 1, 7), (u32::MAX, 3, u32::MAX)] {
+            let name = index_sidecar_name(Realm(r), Namespace(n), t);
+            assert_eq!(
+                parse_index_sidecar_name(&name),
+                SidecarName::Coordinate(Realm(r), Namespace(n), t),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_graphs_with_the_same_token_get_different_files() {
+        assert_ne!(
+            index_sidecar_name(Realm(1), Namespace(1), 7),
+            index_sidecar_name(Realm(2), Namespace(1), 7)
+        );
+        assert_ne!(
+            index_sidecar_name(Realm(1), Namespace(1), 7),
+            index_sidecar_name(Realm(1), Namespace(2), 7)
+        );
+    }
+
+    #[test]
+    fn the_token_only_name_is_legacy_and_anything_malformed_is_not_a_sidecar() {
+        assert_eq!(parse_index_sidecar_name("idx-7.idx"), SidecarName::Legacy);
+        for junk in [
+            "idx-.idx",
+            "idx-x.idx",
+            "idx-0000000100000001-.idx",
+            "idx-00000001000000-7.idx",   // fourteen digits
+            "idx-000000010000000100-7.idx", // eighteen
+            "idx-0000000g00000001-7.idx",
+            // Non-canonical spellings of a real coordinate: one name each.
+            "idx-0000000A00000001-7.idx",
+            "idx-+000000100000001-7.idx",
+            "idx-0000000100000001-07.idx",
+            "idx-0000000100000001-+7.idx",
+            "idx-07.idx",
+            "idx-+7.idx",
+            "idx-0000000100000001-7.idxtmp",
+            "derived-0000000100000001.dsc",
+            "warmset.tsv",
+        ] {
+            assert_eq!(
+                parse_index_sidecar_name(junk),
+                SidecarName::NotASidecar,
+                "{junk}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod paged_store_differential {
     //! Track B M1.1 gate: the SAME store, read through its public API, must
     //! answer identically whether its sealed segments are RESIDENT or PAGED
@@ -4972,12 +5329,16 @@ mod paged_store_differential {
         for part in [1u32, 2] {
             for prefix in [&b""[..], b"body-001", b"body-0039"] {
                 let plain = walk(&s, false, part, prefix);
-                let (scanned, trace) =
-                    engram_observe::with_trace(|| walk(&s, true, part, prefix));
+                let (scanned, trace) = engram_observe::with_trace(|| walk(&s, true, part, prefix));
                 assert!(!plain.is_empty(), "vacuous walk");
                 assert_eq!(plain, scanned, "scan policy changed the rows (part {part})");
                 assert!(
-                    trace.counters().get("store.scan-policy span walks").copied().unwrap_or(0) > 0
+                    trace
+                        .counters()
+                        .get("store.scan-policy span walks")
+                        .copied()
+                        .unwrap_or(0)
+                        > 0
                 );
             }
         }

@@ -57,15 +57,21 @@ fn corpus() -> Graph {
         if i % 3 != 0 {
             m.insert(
                 "countries".to_string(),
-                Value::List(if i % 6 == 1 {
-                    vec![Value::Str("USA".into()), Value::Str("CAN".into())]
-                } else {
-                    vec![Value::Str("DEU".into())]
-                }),
+                Value::List(
+                    if i % 6 == 1 {
+                        vec![Value::Str("USA".into()), Value::Str("CAN".into())]
+                    } else {
+                        vec![Value::Str("DEU".into())]
+                    }
+                    .into(),
+                ),
             );
         }
         if i % 7 != 0 {
-            m.insert("startAt".to_string(), Value::Str(format!("2026-08-{:02}", 1 + i % 28)));
+            m.insert(
+                "startAt".to_string(),
+                Value::Str(format!("2026-08-{:02}", 1 + i % 28)),
+            );
         }
         m.insert("sev".to_string(), Value::Float((i % 10) as f64 / 10.0));
         g.create_node(&["Ev".into()], &m).expect("ev");
@@ -73,12 +79,10 @@ fn corpus() -> Graph {
     g
 }
 
-const COALESCE_IN: &str =
-    "MATCH (e:Ev) WHERE e.startAt IS NOT NULL AND $a IN coalesce(e.countries, []) RETURN count(e) AS n";
+const COALESCE_IN: &str = "MATCH (e:Ev) WHERE e.startAt IS NOT NULL AND $a IN coalesce(e.countries, []) RETURN count(e) AS n";
 const IN_COLUMN: &str = "MATCH (e:Ev) WHERE $a IN e.countries RETURN count(e) AS n";
 /// A constant list on the right (with the property seek off — see the test).
-const IN_CONST: &str =
-    "MATCH (e:Ev) WHERE e.sev >= 0.0 AND e.startAt IN ['2026-08-01', '2026-08-05'] RETURN count(e) AS n";
+const IN_CONST: &str = "MATCH (e:Ev) WHERE e.sev >= 0.0 AND e.startAt IN ['2026-08-01', '2026-08-05'] RETURN count(e) AS n";
 
 fn general(g: &Graph, src: &str) -> Vec<Vec<Value>> {
     g.set_columnar_scans(false);
@@ -103,7 +107,11 @@ fn the_vectorised_count_reads_aligned_columns_kept_by_the_cache() {
     let (second, c2) = traced(&g, COALESCE_IN);
     assert_eq!(second, want);
     assert!(count_of(&c2, VECTORISED) > 0, "vectorised: {c2:?}");
-    assert_eq!(count_of(&c2, ALIGNED), 1, "one value column aligned once: {c2:?}");
+    assert_eq!(
+        count_of(&c2, ALIGNED),
+        1,
+        "one value column aligned once: {c2:?}"
+    );
     assert_eq!(count_of(&c2, KEPT_ALIGNED), 1, "…and kept: {c2:?}");
     assert_eq!(count_of(&c2, SERVED_ALIGNED), 0, "{c2:?}");
     // Third read: the aligned vector is served — no align at all.
@@ -133,7 +141,9 @@ fn borrowed_membership_keeps_the_three_valued_rule() {
     }
     assert_eq!(
         rows(&g, IN_COLUMN),
-        vec![vec![Value::Int((0..3000i64).filter(|i| i % 6 == 1).count() as i64)]]
+        vec![vec![Value::Int(
+            (0..3000i64).filter(|i| i % 6 == 1).count() as i64
+        )]]
     );
     assert_eq!(
         rows(&g, IN_CONST),
@@ -154,12 +164,21 @@ fn a_commit_retires_the_aligned_vector_with_its_column() {
     let (_, c) = traced(&g, COALESCE_IN);
     assert!(count_of(&c, ALIGNED) > 0, "{c:?}");
     let mut m = BTreeMap::new();
-    m.insert("countries".to_string(), Value::List(vec![Value::Str("USA".into())]));
+    m.insert(
+        "countries".to_string(),
+        Value::List((vec![Value::Str("USA".into())]).into()),
+    );
     m.insert("startAt".to_string(), Value::Str("2026-09-01".into()));
     g.create_node(&["Ev".into()], &m).expect("ev");
     let (after, c) = traced(&g, COALESCE_IN);
-    assert_eq!(count_of(&c, SERVED_ALIGNED), 0, "retired by the commit: {c:?}");
+    assert_eq!(
+        count_of(&c, SERVED_ALIGNED),
+        0,
+        "retired by the commit: {c:?}"
+    );
     assert_eq!(after, general(&g, COALESCE_IN));
-    let Value::Int(b) = before[0][0] else { panic!() };
+    let Value::Int(b) = before[0][0] else {
+        panic!()
+    };
     assert_eq!(after, vec![vec![Value::Int(b + 1)]]);
 }

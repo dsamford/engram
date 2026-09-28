@@ -83,6 +83,64 @@ fn esc(s: &str, out: &mut String) {
 enum P {
     Int(i64),
     Str(String),
+    /// A TAGGED temporal — `("~dt", "2011-09-01T00:00:00Z")` — which the JSONL
+    /// contract already understands (`engram_bench::untag_temporal`) and which
+    /// `untag_prop` rebuilds as a real `Value::DateTime` / `Value::Date`.
+    ///
+    /// This column USED to flatten to epoch millis as a plain integer. The
+    /// instant survived; the TYPE did not, and SNB BI is where that shows.
+    /// Every BI query compares `creationDate` against a `datetime()` literal,
+    /// and `Int < DateTime` is not an error in Cypher -- it is FALSE. So bi1,
+    /// bi9 and bi13 returned zero rows and read as clean executions, while
+    /// bi16 (`date(message.creationDate)`) and bi17 (`creationDate + duration`)
+    /// failed outright because there is no `.year`, no `date()` and no duration
+    /// arithmetic on an integer. Four of the family cannot be EXPRESSED against
+    /// an integer corpus, and three more answer wrongly in silence.
+    ///
+    /// FinBench is the opposite case and stays as it is: its published
+    /// reference compares `e.timestamp` against INTEGER parameters and carries
+    /// `i64::MAX` as a sentinel, so epoch millis is the correct type there.
+    /// The two corpora genuinely differ; `finbench2jsonl` is a separate binary.
+    Temporal(&'static str, String),
+}
+
+/// `days` since the epoch → `yyyy-MM-dd` (Howard Hinnant's `civil_from_days`,
+/// the inverse of `days_from_civil` above).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Epoch millis → the ISO-8601 spelling the `~dt` tag parses back.
+///
+/// Rendered from the PARSED instant rather than passed through from the CSV:
+/// datagen writes `+0000`, which `parse_zone` does not accept, and a tag that
+/// failed to parse would land in the store as `<unloadable ~dt>` — a string,
+/// which is exactly the silent-wrong-type failure this change exists to end.
+fn iso_utc_from_ms(ms: i64) -> String {
+    let (days, rem) = (ms.div_euclid(86_400_000), ms.rem_euclid(86_400_000));
+    let (y, mo, d) = civil_from_days(days);
+    let (h, mi, s, milli) = (
+        rem / 3_600_000,
+        rem / 60_000 % 60,
+        rem / 1000 % 60,
+        rem % 1000,
+    );
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{milli:03}Z")
+}
+
+/// Epoch millis → `yyyy-MM-dd` for a `~date` tag.
+fn iso_date_from_ms(ms: i64) -> String {
+    let (y, m, d) = civil_from_days(ms.div_euclid(86_400_000));
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 fn write_props(props: &[(String, P)], out: &mut String) {
@@ -100,6 +158,13 @@ fn write_props(props: &[(String, P)], out: &mut String) {
                 out.push_str("\"}");
             }
             P::Str(s) => esc(s, out),
+            P::Temporal(tag, text) => {
+                out.push_str("{\"");
+                out.push_str(tag);
+                out.push_str("\":");
+                esc(text, out);
+                out.push('}');
+            }
         }
     }
     out.push('}');
@@ -302,11 +367,24 @@ fn column_ty(name: &str) -> Ty {
 }
 
 fn coerce(raw: &str, ty: Ty, coerced_to_str: &mut u64) -> P {
+    // A temporal column keeps its TYPE, not just its instant — see `P::Temporal`.
+    if let Ty::Date | Ty::DateTime = ty {
+        let (tag, parsed) = match ty {
+            Ty::Date => ("~date", parse_date_ms(raw).map(iso_date_from_ms)),
+            _ => ("~dt", parse_datetime_ms(raw).map(iso_utc_from_ms)),
+        };
+        return match parsed {
+            Some(text) => P::Temporal(tag, text),
+            None => {
+                *coerced_to_str += 1;
+                P::Str(raw.to_string())
+            }
+        };
+    }
     let parsed = match ty {
         Ty::Str => return P::Str(raw.to_string()),
         Ty::Int => parse_plain_int(raw),
-        Ty::Date => parse_date_ms(raw),
-        Ty::DateTime => parse_datetime_ms(raw),
+        _ => unreachable!("temporal columns returned above"),
     };
     match parsed {
         Some(n) => P::Int(n),
@@ -393,7 +471,10 @@ fn assign_node(
     ) -> Result<(String, i64, &'static [&'static str]), String> {
         let dense = *ctr;
         if map.insert(src_id, dense).is_some() {
-            return Err(format!("duplicate {} id {src_id}", labels[labels.len() - 1]));
+            return Err(format!(
+                "duplicate {} id {src_id}",
+                labels[labels.len() - 1]
+            ));
         }
         *ctr += 1;
         Ok((format!("{prefix}:{dense}"), dense, labels))
@@ -438,12 +519,36 @@ fn assign_node(
             *ctr += 1;
             Ok((cid, dense, labels))
         }
-        Kind::TagClass => take(&mut maps.tagclass, &mut maps.tagclass_n, "tc", &["TagClass"], src_id),
+        Kind::TagClass => take(
+            &mut maps.tagclass,
+            &mut maps.tagclass_n,
+            "tc",
+            &["TagClass"],
+            src_id,
+        ),
         Kind::Tag => take(&mut maps.tag, &mut maps.tag_n, "tag", &["Tag"], src_id),
-        Kind::Person => take(&mut maps.person, &mut maps.person_n, "p", &["Person"], src_id),
+        Kind::Person => take(
+            &mut maps.person,
+            &mut maps.person_n,
+            "p",
+            &["Person"],
+            src_id,
+        ),
         Kind::Forum => take(&mut maps.forum, &mut maps.forum_n, "f", &["Forum"], src_id),
-        Kind::Post => take(&mut maps.post, &mut maps.msg_n, "m", &["Message", "Post"], src_id),
-        Kind::Comment => take(&mut maps.comment, &mut maps.msg_n, "m", &["Message", "Comment"], src_id),
+        Kind::Post => take(
+            &mut maps.post,
+            &mut maps.msg_n,
+            "m",
+            &["Message", "Post"],
+            src_id,
+        ),
+        Kind::Comment => take(
+            &mut maps.comment,
+            &mut maps.msg_n,
+            "m",
+            &["Message", "Comment"],
+            src_id,
+        ),
     }
 }
 
@@ -485,29 +590,167 @@ struct EdgeSpec {
 }
 
 const EDGE_FILES: &[EdgeSpec] = &[
-    EdgeSpec { base: "place_isPartOf_place", src: Kind::Place, dst: Kind::Place, t: "IS_PART_OF", prop: None },
-    EdgeSpec { base: "tagclass_isSubclassOf_tagclass", src: Kind::TagClass, dst: Kind::TagClass, t: "IS_SUBCLASS_OF", prop: None },
-    EdgeSpec { base: "tag_hasType_tagclass", src: Kind::Tag, dst: Kind::TagClass, t: "HAS_TYPE", prop: None },
-    EdgeSpec { base: "organisation_isLocatedIn_place", src: Kind::Organisation, dst: Kind::Place, t: "IS_LOCATED_IN", prop: None },
-    EdgeSpec { base: "person_isLocatedIn_place", src: Kind::Person, dst: Kind::Place, t: "IS_LOCATED_IN", prop: None },
-    EdgeSpec { base: "person_studyAt_organisation", src: Kind::Person, dst: Kind::Organisation, t: "STUDY_AT", prop: Some("classYear") },
-    EdgeSpec { base: "person_workAt_organisation", src: Kind::Person, dst: Kind::Organisation, t: "WORK_AT", prop: Some("workFrom") },
-    EdgeSpec { base: "person_hasInterest_tag", src: Kind::Person, dst: Kind::Tag, t: "HAS_INTEREST", prop: None },
-    EdgeSpec { base: "person_knows_person", src: Kind::Person, dst: Kind::Person, t: "KNOWS", prop: Some("creationDate") },
-    EdgeSpec { base: "person_likes_post", src: Kind::Person, dst: Kind::Post, t: "LIKES", prop: Some("creationDate") },
-    EdgeSpec { base: "person_likes_comment", src: Kind::Person, dst: Kind::Comment, t: "LIKES", prop: Some("creationDate") },
-    EdgeSpec { base: "forum_hasModerator_person", src: Kind::Forum, dst: Kind::Person, t: "HAS_MODERATOR", prop: None },
-    EdgeSpec { base: "forum_hasMember_person", src: Kind::Forum, dst: Kind::Person, t: "HAS_MEMBER", prop: Some("joinDate") },
-    EdgeSpec { base: "forum_containerOf_post", src: Kind::Forum, dst: Kind::Post, t: "CONTAINER_OF", prop: None },
-    EdgeSpec { base: "forum_hasTag_tag", src: Kind::Forum, dst: Kind::Tag, t: "HAS_TAG", prop: None },
-    EdgeSpec { base: "post_hasCreator_person", src: Kind::Post, dst: Kind::Person, t: "HAS_CREATOR", prop: None },
-    EdgeSpec { base: "post_hasTag_tag", src: Kind::Post, dst: Kind::Tag, t: "HAS_TAG", prop: None },
-    EdgeSpec { base: "post_isLocatedIn_place", src: Kind::Post, dst: Kind::Place, t: "IS_LOCATED_IN", prop: None },
-    EdgeSpec { base: "comment_hasCreator_person", src: Kind::Comment, dst: Kind::Person, t: "HAS_CREATOR", prop: None },
-    EdgeSpec { base: "comment_hasTag_tag", src: Kind::Comment, dst: Kind::Tag, t: "HAS_TAG", prop: None },
-    EdgeSpec { base: "comment_isLocatedIn_place", src: Kind::Comment, dst: Kind::Place, t: "IS_LOCATED_IN", prop: None },
-    EdgeSpec { base: "comment_replyOf_post", src: Kind::Comment, dst: Kind::Post, t: "REPLY_OF", prop: None },
-    EdgeSpec { base: "comment_replyOf_comment", src: Kind::Comment, dst: Kind::Comment, t: "REPLY_OF", prop: None },
+    EdgeSpec {
+        base: "place_isPartOf_place",
+        src: Kind::Place,
+        dst: Kind::Place,
+        t: "IS_PART_OF",
+        prop: None,
+    },
+    EdgeSpec {
+        base: "tagclass_isSubclassOf_tagclass",
+        src: Kind::TagClass,
+        dst: Kind::TagClass,
+        t: "IS_SUBCLASS_OF",
+        prop: None,
+    },
+    EdgeSpec {
+        base: "tag_hasType_tagclass",
+        src: Kind::Tag,
+        dst: Kind::TagClass,
+        t: "HAS_TYPE",
+        prop: None,
+    },
+    EdgeSpec {
+        base: "organisation_isLocatedIn_place",
+        src: Kind::Organisation,
+        dst: Kind::Place,
+        t: "IS_LOCATED_IN",
+        prop: None,
+    },
+    EdgeSpec {
+        base: "person_isLocatedIn_place",
+        src: Kind::Person,
+        dst: Kind::Place,
+        t: "IS_LOCATED_IN",
+        prop: None,
+    },
+    EdgeSpec {
+        base: "person_studyAt_organisation",
+        src: Kind::Person,
+        dst: Kind::Organisation,
+        t: "STUDY_AT",
+        prop: Some("classYear"),
+    },
+    EdgeSpec {
+        base: "person_workAt_organisation",
+        src: Kind::Person,
+        dst: Kind::Organisation,
+        t: "WORK_AT",
+        prop: Some("workFrom"),
+    },
+    EdgeSpec {
+        base: "person_hasInterest_tag",
+        src: Kind::Person,
+        dst: Kind::Tag,
+        t: "HAS_INTEREST",
+        prop: None,
+    },
+    EdgeSpec {
+        base: "person_knows_person",
+        src: Kind::Person,
+        dst: Kind::Person,
+        t: "KNOWS",
+        prop: Some("creationDate"),
+    },
+    EdgeSpec {
+        base: "person_likes_post",
+        src: Kind::Person,
+        dst: Kind::Post,
+        t: "LIKES",
+        prop: Some("creationDate"),
+    },
+    EdgeSpec {
+        base: "person_likes_comment",
+        src: Kind::Person,
+        dst: Kind::Comment,
+        t: "LIKES",
+        prop: Some("creationDate"),
+    },
+    EdgeSpec {
+        base: "forum_hasModerator_person",
+        src: Kind::Forum,
+        dst: Kind::Person,
+        t: "HAS_MODERATOR",
+        prop: None,
+    },
+    EdgeSpec {
+        base: "forum_hasMember_person",
+        src: Kind::Forum,
+        dst: Kind::Person,
+        t: "HAS_MEMBER",
+        prop: Some("joinDate"),
+    },
+    EdgeSpec {
+        base: "forum_containerOf_post",
+        src: Kind::Forum,
+        dst: Kind::Post,
+        t: "CONTAINER_OF",
+        prop: None,
+    },
+    EdgeSpec {
+        base: "forum_hasTag_tag",
+        src: Kind::Forum,
+        dst: Kind::Tag,
+        t: "HAS_TAG",
+        prop: None,
+    },
+    EdgeSpec {
+        base: "post_hasCreator_person",
+        src: Kind::Post,
+        dst: Kind::Person,
+        t: "HAS_CREATOR",
+        prop: None,
+    },
+    EdgeSpec {
+        base: "post_hasTag_tag",
+        src: Kind::Post,
+        dst: Kind::Tag,
+        t: "HAS_TAG",
+        prop: None,
+    },
+    EdgeSpec {
+        base: "post_isLocatedIn_place",
+        src: Kind::Post,
+        dst: Kind::Place,
+        t: "IS_LOCATED_IN",
+        prop: None,
+    },
+    EdgeSpec {
+        base: "comment_hasCreator_person",
+        src: Kind::Comment,
+        dst: Kind::Person,
+        t: "HAS_CREATOR",
+        prop: None,
+    },
+    EdgeSpec {
+        base: "comment_hasTag_tag",
+        src: Kind::Comment,
+        dst: Kind::Tag,
+        t: "HAS_TAG",
+        prop: None,
+    },
+    EdgeSpec {
+        base: "comment_isLocatedIn_place",
+        src: Kind::Comment,
+        dst: Kind::Place,
+        t: "IS_LOCATED_IN",
+        prop: None,
+    },
+    EdgeSpec {
+        base: "comment_replyOf_post",
+        src: Kind::Comment,
+        dst: Kind::Post,
+        t: "REPLY_OF",
+        prop: None,
+    },
+    EdgeSpec {
+        base: "comment_replyOf_comment",
+        src: Kind::Comment,
+        dst: Kind::Comment,
+        t: "REPLY_OF",
+        prop: None,
+    },
 ];
 
 // ── Discovery ───────────────────────────────────────────────────────────────
@@ -697,7 +940,9 @@ fn load_side_values(paths: &[PathBuf]) -> Result<BTreeMap<i64, Vec<String>>, Str
     for path in paths {
         let file =
             std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let mut lines = std::io::BufReader::with_capacity(1 << 20, file).lines().enumerate();
+        let mut lines = std::io::BufReader::with_capacity(1 << 20, file)
+            .lines()
+            .enumerate();
         match lines.next() {
             None => continue, // empty file — side data is optional
             Some((_, Err(e))) => return Err(format!("{}: read: {e}", path.display())),
@@ -718,7 +963,11 @@ fn load_side_values(paths: &[PathBuf]) -> Result<BTreeMap<i64, Vec<String>>, Str
                 ));
             };
             let id = parse_plain_int(id_raw).ok_or_else(|| {
-                format!("{}: line {}: unparseable person id {id_raw:?}", path.display(), n + 1)
+                format!(
+                    "{}: line {}: unparseable person id {id_raw:?}",
+                    path.display(),
+                    n + 1
+                )
             })?;
             out.entry(id).or_default().push(val.to_string());
         }
@@ -735,7 +984,9 @@ fn convert_node_file(
     sum: &mut Summary,
 ) -> Result<(), String> {
     let file = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    let mut lines = std::io::BufReader::with_capacity(1 << 20, file).lines().enumerate();
+    let mut lines = std::io::BufReader::with_capacity(1 << 20, file)
+        .lines()
+        .enumerate();
     let header_line = match lines.next() {
         None => return Err(format!("{}: empty file (no header row)", path.display())),
         Some((_, Err(e))) => return Err(format!("{}: read: {e}", path.display())),
@@ -760,13 +1011,14 @@ fn convert_node_file(
         .iter()
         .position(|h| h == "id")
         .ok_or_else(|| format!("{}: no 'id' column in header {header:?}", path.display()))?;
-    let type_col = if matches!(kind, Kind::Place | Kind::Organisation) {
-        Some(header.iter().position(|h| h == "type").ok_or_else(|| {
-            format!("{}: no 'type' column in header {header:?}", path.display())
-        })?)
-    } else {
-        None
-    };
+    let type_col =
+        if matches!(kind, Kind::Place | Kind::Organisation) {
+            Some(header.iter().position(|h| h == "type").ok_or_else(|| {
+                format!("{}: no 'type' column in header {header:?}", path.display())
+            })?)
+        } else {
+            None
+        };
     let has_language = header.iter().any(|h| h.as_str() == "language");
     let has_email = header.iter().any(|h| h.as_str() == "email");
     let mut rows = 0u64;
@@ -788,7 +1040,11 @@ fn convert_node_file(
             ));
         }
         let src_id = parse_plain_int(fields[id_col]).ok_or_else(|| {
-            format!("{}: line {lineno}: unparseable id {:?}", path.display(), fields[id_col])
+            format!(
+                "{}: line {lineno}: unparseable id {:?}",
+                path.display(),
+                fields[id_col]
+            )
         })?;
         let subtype = type_col.map_or("", |c| fields[c]);
         let (cid, dense, labels) = assign_node(maps, kind, subtype, src_id)
@@ -804,7 +1060,10 @@ fn convert_node_file(
                 sum.empty_fields_omitted += 1;
                 continue;
             }
-            props.push((h.clone(), coerce(raw, column_ty(h), &mut sum.coerced_to_str)));
+            props.push((
+                h.clone(),
+                coerce(raw, column_ty(h), &mut sum.coerced_to_str),
+            ));
         }
         if kind == Kind::Person {
             if !has_language {
@@ -835,7 +1094,9 @@ fn convert_edge_file(
     sum: &mut Summary,
 ) -> Result<(), String> {
     let file = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    let mut lines = std::io::BufReader::with_capacity(1 << 20, file).lines().enumerate();
+    let mut lines = std::io::BufReader::with_capacity(1 << 20, file)
+        .lines()
+        .enumerate();
     let header_line = match lines.next() {
         None => return Err(format!("{}: empty file (no header row)", path.display())),
         Some((_, Err(e))) => return Err(format!("{}: read: {e}", path.display())),
@@ -888,10 +1149,18 @@ fn convert_edge_file(
             ));
         }
         let s_id = parse_plain_int(fields[0]).ok_or_else(|| {
-            format!("{}: line {lineno}: unparseable id {:?}", path.display(), fields[0])
+            format!(
+                "{}: line {lineno}: unparseable id {:?}",
+                path.display(),
+                fields[0]
+            )
         })?;
         let d_id = parse_plain_int(fields[1]).ok_or_else(|| {
-            format!("{}: line {lineno}: unparseable id {:?}", path.display(), fields[1])
+            format!(
+                "{}: line {lineno}: unparseable id {:?}",
+                path.display(),
+                fields[1]
+            )
         })?;
         // An unknown endpoint is a HARD error, not a skip: snbload would skip
         // the rel with only a warning, and a corpus that quietly loses edges
@@ -918,7 +1187,10 @@ fn convert_edge_file(
             if raw.is_empty() {
                 sum.empty_fields_omitted += 1;
             } else {
-                props.push((pname.to_string(), coerce(raw, column_ty(pname), &mut sum.coerced_to_str)));
+                props.push((
+                    pname.to_string(),
+                    coerce(raw, column_ty(pname), &mut sum.coerced_to_str),
+                ));
             }
         }
         sink.write_with(|out| emit_rel(&s_cid, &d_cid, spec.t, &props, out));
@@ -948,7 +1220,11 @@ fn write_meta(out_dir: &Path, sum: &Summary) -> Result<(), String> {
     let mut m = String::new();
     m.push_str("{\"captured_at\":{\"~dt\":\"2013-01-01T00:00:00.000+0000\"}");
     m.push_str(",\"generator\":\"datagen2jsonl\"");
-    let _ = write!(m, ",\"persons\":{},\"messages\":{}", sum.persons, sum.messages);
+    let _ = write!(
+        m,
+        ",\"persons\":{},\"messages\":{}",
+        sum.persons, sum.messages
+    );
     let _ = write!(m, ",\"nodes\":{}", counts_json(&sum.node_counts));
     let _ = write!(m, ",\"rels\":{}", counts_json(&sum.rel_counts));
     let _ = write!(
@@ -962,8 +1238,7 @@ fn write_meta(out_dir: &Path, sum: &Summary) -> Result<(), String> {
 
 fn convert(in_dir: &Path, out_dir: &Path) -> Result<Summary, String> {
     let inputs = discover(in_dir)?;
-    std::fs::create_dir_all(out_dir)
-        .map_err(|e| format!("create {}: {e}", out_dir.display()))?;
+    std::fs::create_dir_all(out_dir).map_err(|e| format!("create {}: {e}", out_dir.display()))?;
     let side = SideData {
         email: load_side_values(&inputs.email)?,
         speaks: load_side_values(&inputs.speaks)?,
@@ -1066,7 +1341,11 @@ mod tests {
     }
 
     fn fname(base: &str, numbered: bool) -> String {
-        if numbered { format!("{base}_0_0.csv") } else { format!("{base}.csv") }
+        if numbered {
+            format!("{base}_0_0.csv")
+        } else {
+            format!("{base}.csv")
+        }
     }
 
     fn wf(dir: &Path, base: &str, numbered: bool, content: &str) {
@@ -1089,81 +1368,226 @@ mod tests {
         std::fs::create_dir_all(&dynd).unwrap();
 
         // static
-        wf(&stat, "place", numbered,
+        wf(
+            &stat,
+            "place",
+            numbered,
             "id|name|url|type\n\
              0|Africa|http://x/Africa|continent\n\
              10|India|http://x/India|country\n\
-             55|Mumbai|http://x/Mumbai|city\n");
-        wf(&stat, "tagclass", numbered, "id|name|url\n3|Thing|http://x/Thing\n");
-        wf(&stat, "tag", numbered, "id|name|url\n1386|Hamid_Karzai|http://x/HK\n");
-        wf(&stat, "organisation", numbered,
+             55|Mumbai|http://x/Mumbai|city\n",
+        );
+        wf(
+            &stat,
+            "tagclass",
+            numbered,
+            "id|name|url\n3|Thing|http://x/Thing\n",
+        );
+        wf(
+            &stat,
+            "tag",
+            numbered,
+            "id|name|url\n1386|Hamid_Karzai|http://x/HK\n",
+        );
+        wf(
+            &stat,
+            "organisation",
+            numbered,
             "id|type|name|url\n\
              2755|university|MIT|http://x/MIT\n\
-             900|company|Acme|http://x/Acme\n");
-        wf(&stat, "place_isPartOf_place", numbered, "Place.id|Place.id\n55|10\n10|0\n");
-        wf(&stat, "tagclass_isSubclassOf_tagclass", numbered, "TagClass.id|TagClass.id\n");
-        wf(&stat, "tag_hasType_tagclass", numbered, "Tag.id|TagClass.id\n1386|3\n");
-        wf(&stat, "organisation_isLocatedIn_place", numbered,
-            "Organisation.id|Place.id\n2755|55\n900|10\n");
+             900|company|Acme|http://x/Acme\n",
+        );
+        wf(
+            &stat,
+            "place_isPartOf_place",
+            numbered,
+            "Place.id|Place.id\n55|10\n10|0\n",
+        );
+        wf(
+            &stat,
+            "tagclass_isSubclassOf_tagclass",
+            numbered,
+            "TagClass.id|TagClass.id\n",
+        );
+        wf(
+            &stat,
+            "tag_hasType_tagclass",
+            numbered,
+            "Tag.id|TagClass.id\n1386|3\n",
+        );
+        wf(
+            &stat,
+            "organisation_isLocatedIn_place",
+            numbered,
+            "Organisation.id|Place.id\n2755|55\n900|10\n",
+        );
 
         // dynamic — person rows: sparse ids 933, 12, 4398046511151; row for
         // person 12 uses LongDateFormatter-style epoch millis in the same
         // columns; person 4398046511151 has a literal `"` in lastName.
         if basic {
-            wf(&dynd, "person", numbered,
+            wf(
+                &dynd,
+                "person",
+                numbered,
                 "id|firstName|lastName|gender|birthday|creationDate|locationIP|browserUsed\n\
                  933|Mahinda|Perera|male|1989-12-03|2010-02-14T15:32:10.447+0000|119.235.7.103|Firefox\n\
                  12|Jane|Doe|female|628646400000|1266161530447|10.0.0.1|Chrome\n\
-                 4398046511151|Bob|Sm\"ith|male|1985-01-01|2011-01-01T00:00:00.000+0000|10.0.0.2|Safari\n");
-            wf(&dynd, "person_email_emailaddress", numbered,
-                "Person.id|email\n933|a@x.com\n933|b@y.com\n4398046511151|bob@x.com\n");
-            wf(&dynd, "person_speaks_language", numbered,
-                "Person.id|language\n933|si\n933|en\n4398046511151|en\n");
+                 4398046511151|Bob|Sm\"ith|male|1985-01-01|2011-01-01T00:00:00.000+0000|10.0.0.2|Safari\n",
+            );
+            wf(
+                &dynd,
+                "person_email_emailaddress",
+                numbered,
+                "Person.id|email\n933|a@x.com\n933|b@y.com\n4398046511151|bob@x.com\n",
+            );
+            wf(
+                &dynd,
+                "person_speaks_language",
+                numbered,
+                "Person.id|language\n933|si\n933|en\n4398046511151|en\n",
+            );
         } else {
-            wf(&dynd, "person", numbered,
+            wf(
+                &dynd,
+                "person",
+                numbered,
                 "id|firstName|lastName|gender|birthday|creationDate|locationIP|browserUsed|language|email\n\
                  933|Mahinda|Perera|male|1989-12-03|2010-02-14T15:32:10.447+0000|119.235.7.103|Firefox|si;en|a@x.com;b@y.com\n\
                  12|Jane|Doe|female|628646400000|1266161530447|10.0.0.1|Chrome||\n\
-                 4398046511151|Bob|Sm\"ith|male|1985-01-01|2011-01-01T00:00:00.000+0000|10.0.0.2|Safari|en|bob@x.com\n");
+                 4398046511151|Bob|Sm\"ith|male|1985-01-01|2011-01-01T00:00:00.000+0000|10.0.0.2|Safari|en|bob@x.com\n",
+            );
         }
-        wf(&dynd, "forum", numbered,
-            "id|title|creationDate\n37|Wall of Mahinda Perera|2010-02-15T00:46:00.000+0000\n");
-        wf(&dynd, "post", numbered,
+        wf(
+            &dynd,
+            "forum",
+            numbered,
+            "id|title|creationDate\n37|Wall of Mahinda Perera|2010-02-15T00:46:00.000+0000\n",
+        );
+        wf(
+            &dynd,
+            "post",
+            numbered,
             "id|imageFile|creationDate|locationIP|browserUsed|language|content|length\n\
              618475290624||2011-08-17T06:05:40.595+0000|49.14.113.213|Firefox|en|About stuff|11\n\
-             618475290625|photo.jpg|2011-08-17T06:05:41.000+0000|49.14.113.213|Firefox|||0\n");
-        wf(&dynd, "comment", numbered,
+             618475290625|photo.jpg|2011-08-17T06:05:41.000+0000|49.14.113.213|Firefox|||0\n",
+        );
+        wf(
+            &dynd,
+            "comment",
+            numbered,
             "id|creationDate|locationIP|browserUsed|content|length\n\
-             1030792151058|2012-01-01T00:00:00.000+0000|10.1.1.1|Chrome|hi \"there\"|10\n");
-        wf(&dynd, "person_isLocatedIn_place", numbered, "Person.id|Place.id\n933|55\n");
-        wf(&dynd, "person_hasInterest_tag", numbered, "Person.id|Tag.id\n933|1386\n");
-        wf(&dynd, "person_studyAt_organisation", numbered,
-            "Person.id|Organisation.id|classYear\n933|2755|2006\n");
-        wf(&dynd, "person_workAt_organisation", numbered,
-            "Person.id|Organisation.id|workFrom\n12|900|2010\n");
-        wf(&dynd, "person_knows_person", numbered,
-            "Person.id|Person.id|creationDate\n933|12|2010-07-30T15:19:53.298+0000\n");
-        wf(&dynd, "person_likes_post", numbered,
-            "Person.id|Post.id|creationDate\n12|618475290624|2011-09-01T00:00:00.000+0000\n");
-        wf(&dynd, "person_likes_comment", numbered,
-            "Person.id|Comment.id|creationDate\n933|1030792151058|2012-02-01T00:00:00.000+0000\n");
-        wf(&dynd, "forum_hasModerator_person", numbered, "Forum.id|Person.id\n37|933\n");
-        wf(&dynd, "forum_hasMember_person", numbered,
-            "Forum.id|Person.id|joinDate\n37|12|2010-03-01T00:00:00.000+0000\n");
-        wf(&dynd, "forum_containerOf_post", numbered,
-            "Forum.id|Post.id\n37|618475290624\n37|618475290625\n");
-        wf(&dynd, "forum_hasTag_tag", numbered, "Forum.id|Tag.id\n37|1386\n");
-        wf(&dynd, "post_hasCreator_person", numbered, "Post.id|Person.id\n618475290624|933\n");
-        wf(&dynd, "post_hasTag_tag", numbered, "Post.id|Tag.id\n618475290624|1386\n");
-        wf(&dynd, "post_isLocatedIn_place", numbered, "Post.id|Place.id\n618475290624|10\n");
-        wf(&dynd, "comment_hasCreator_person", numbered,
-            "Comment.id|Person.id\n1030792151058|12\n");
+             1030792151058|2012-01-01T00:00:00.000+0000|10.1.1.1|Chrome|hi \"there\"|10\n",
+        );
+        wf(
+            &dynd,
+            "person_isLocatedIn_place",
+            numbered,
+            "Person.id|Place.id\n933|55\n",
+        );
+        wf(
+            &dynd,
+            "person_hasInterest_tag",
+            numbered,
+            "Person.id|Tag.id\n933|1386\n",
+        );
+        wf(
+            &dynd,
+            "person_studyAt_organisation",
+            numbered,
+            "Person.id|Organisation.id|classYear\n933|2755|2006\n",
+        );
+        wf(
+            &dynd,
+            "person_workAt_organisation",
+            numbered,
+            "Person.id|Organisation.id|workFrom\n12|900|2010\n",
+        );
+        wf(
+            &dynd,
+            "person_knows_person",
+            numbered,
+            "Person.id|Person.id|creationDate\n933|12|2010-07-30T15:19:53.298+0000\n",
+        );
+        wf(
+            &dynd,
+            "person_likes_post",
+            numbered,
+            "Person.id|Post.id|creationDate\n12|618475290624|2011-09-01T00:00:00.000+0000\n",
+        );
+        wf(
+            &dynd,
+            "person_likes_comment",
+            numbered,
+            "Person.id|Comment.id|creationDate\n933|1030792151058|2012-02-01T00:00:00.000+0000\n",
+        );
+        wf(
+            &dynd,
+            "forum_hasModerator_person",
+            numbered,
+            "Forum.id|Person.id\n37|933\n",
+        );
+        wf(
+            &dynd,
+            "forum_hasMember_person",
+            numbered,
+            "Forum.id|Person.id|joinDate\n37|12|2010-03-01T00:00:00.000+0000\n",
+        );
+        wf(
+            &dynd,
+            "forum_containerOf_post",
+            numbered,
+            "Forum.id|Post.id\n37|618475290624\n37|618475290625\n",
+        );
+        wf(
+            &dynd,
+            "forum_hasTag_tag",
+            numbered,
+            "Forum.id|Tag.id\n37|1386\n",
+        );
+        wf(
+            &dynd,
+            "post_hasCreator_person",
+            numbered,
+            "Post.id|Person.id\n618475290624|933\n",
+        );
+        wf(
+            &dynd,
+            "post_hasTag_tag",
+            numbered,
+            "Post.id|Tag.id\n618475290624|1386\n",
+        );
+        wf(
+            &dynd,
+            "post_isLocatedIn_place",
+            numbered,
+            "Post.id|Place.id\n618475290624|10\n",
+        );
+        wf(
+            &dynd,
+            "comment_hasCreator_person",
+            numbered,
+            "Comment.id|Person.id\n1030792151058|12\n",
+        );
         wf(&dynd, "comment_hasTag_tag", numbered, "Comment.id|Tag.id\n");
-        wf(&dynd, "comment_isLocatedIn_place", numbered,
-            "Comment.id|Place.id\n1030792151058|10\n");
-        wf(&dynd, "comment_replyOf_post", numbered,
-            "Comment.id|Post.id\n1030792151058|618475290624\n");
-        wf(&dynd, "comment_replyOf_comment", numbered, "Comment.id|Comment.id\n");
+        wf(
+            &dynd,
+            "comment_isLocatedIn_place",
+            numbered,
+            "Comment.id|Place.id\n1030792151058|10\n",
+        );
+        wf(
+            &dynd,
+            "comment_replyOf_post",
+            numbered,
+            "Comment.id|Post.id\n1030792151058|618475290624\n",
+        );
+        wf(
+            &dynd,
+            "comment_replyOf_comment",
+            numbered,
+            "Comment.id|Comment.id\n",
+        );
     }
 
     // ── output readers ──────────────────────────────────────────────────────
@@ -1207,7 +1631,9 @@ mod tests {
 
     /// A property, decoded exactly the way the loaders decode it.
     fn prop(m: &BTreeMap<String, Value>, k: &str) -> Value {
-        let Some(Value::Map(p)) = m.get("p") else { panic!("no props map") };
+        let Some(Value::Map(p)) = m.get("p") else {
+            panic!("no props map")
+        };
         let raw = p.get(k).unwrap_or_else(|| panic!("no prop {k}: {p:?}"));
         let mut unloadable = 0usize;
         let v = engram_bench::untag_prop(raw, &mut unloadable);
@@ -1242,9 +1668,11 @@ mod tests {
         let rels_v = read_jsonl_values(&out.join("rels.jsonl"));
 
         // Sparse person ids 933, 12, 4398046511151 → dense 0, 1, 2 in file order.
-        for (cid, dense, source) in
-            [("p:0", 0, 933), ("p:1", 1, 12), ("p:2", 2, 4_398_046_511_151)]
-        {
+        for (cid, dense, source) in [
+            ("p:0", 0, 933),
+            ("p:1", 1, 12),
+            ("p:2", 2, 4_398_046_511_151),
+        ] {
             let p = node(&nodes, cid);
             assert_eq!(prop(p, "id"), Value::Int(dense));
             assert_eq!(prop(p, "sourceId"), Value::Int(source));
@@ -1258,8 +1686,14 @@ mod tests {
         assert_eq!(labels(node(&nodes, "cont:0")), ["Place", "Continent"]);
         assert_eq!(labels(node(&nodes, "country:0")), ["Place", "Country"]);
         assert_eq!(labels(node(&nodes, "city:0")), ["Place", "City"]);
-        assert_eq!(labels(node(&nodes, "univ:0")), ["Organisation", "University"]);
-        assert_eq!(labels(node(&nodes, "company:0")), ["Organisation", "Company"]);
+        assert_eq!(
+            labels(node(&nodes, "univ:0")),
+            ["Organisation", "University"]
+        );
+        assert_eq!(
+            labels(node(&nodes, "company:0")),
+            ["Organisation", "Company"]
+        );
 
         // Edges were remapped through the same maps.
         rel(&rels_v, "city:0", "IS_PART_OF", "country:0");
@@ -1268,7 +1702,11 @@ mod tests {
         rel(&rels_v, "p:1", "LIKES", "m:0");
         rel(&rels_v, "univ:0", "IS_LOCATED_IN", "city:0");
         let k = rel(&rels_v, "p:0", "KNOWS", "p:1");
-        assert!(matches!(prop(k, "creationDate"), Value::Int(n) if n > 0));
+        assert!(
+            matches!(prop(k, "creationDate"), Value::DateTime { epoch_seconds, .. } if epoch_seconds > 0),
+            "a relationship temporal keeps its TYPE, not just its instant: {:?}",
+            prop(k, "creationDate")
+        );
         let st = rel(&rels_v, "p:0", "STUDY_AT", "univ:0");
         assert_eq!(prop(st, "classYear"), Value::Int(2006));
 
@@ -1287,38 +1725,77 @@ mod tests {
 
         // meta.json parses and keeps snbgen's captured_at shape.
         let meta = std::fs::read_to_string(out.join("meta.json")).unwrap();
-        let Value::Map(m) = json::from_json(&meta).unwrap() else { panic!("meta not a map") };
+        let Value::Map(m) = json::from_json(&meta).unwrap() else {
+            panic!("meta not a map")
+        };
         assert!(matches!(m.get("captured_at"), Some(Value::Map(_))));
         assert!(meta.contains("\"persons\":3"));
         assert!(meta.contains("\"messages\":3"));
     }
 
     #[test]
-    fn dates_parse_to_epoch_ms_in_both_formatter_variants() {
+    fn dates_parse_to_typed_temporals_in_both_formatter_variants() {
+        // BOTH halves of the claim. The instant must be the same one the old
+        // integer carried -- 628646400000 and 1266161530447, pinned here since
+        // before this column was typed -- AND the value must now be a temporal,
+        // because an integer cannot answer `.year`, `date()` or `+ duration`.
+        // Asserting only the type would let a converter that lost a day pass;
+        // asserting only the instant is what let the old shape look correct.
         let root = tdir("dates");
         write_fixture(&root, false, true, false);
         let out = root.join("out");
         convert(&root, &out).expect("convert");
         let nodes = read_jsonl_values(&out.join("nodes.jsonl"));
-        // StringDateFormatter row.
-        let p0 = node(&nodes, "p:0");
-        assert_eq!(prop(p0, "birthday"), Value::Int(628_646_400_000));
-        assert_eq!(prop(p0, "creationDate"), Value::Int(1_266_161_530_447));
-        // LongDateFormatter-style row (plain epoch millis) — same values.
-        let p1 = node(&nodes, "p:1");
-        assert_eq!(prop(p1, "birthday"), Value::Int(628_646_400_000));
-        assert_eq!(prop(p1, "creationDate"), Value::Int(1_266_161_530_447));
+
+        // `birthday` is a Date and `creationDate` a DateTime -- different
+        // types, from the same row, so a converter that tagged everything
+        // `~dt` does not pass either.
+        for who in ["p:0", "p:1"] {
+            // p:0 is the StringDateFormatter row, p:1 the LongDateFormatter
+            // (plain epoch millis) row; the two spellings must agree.
+            let n = node(&nodes, who);
+            assert_eq!(
+                prop(n, "birthday"),
+                Value::Date(628_646_400_000 / 86_400_000),
+                "{who} birthday"
+            );
+            assert_eq!(
+                prop(n, "creationDate"),
+                Value::DateTime {
+                    epoch_seconds: 1_266_161_530,
+                    nanos: 447_000_000,
+                    offset_seconds: 0,
+                    zone: None,
+                },
+                "{who} creationDate"
+            );
+        }
     }
 
     #[test]
     fn datetime_parser_anchors() {
         // Anchors verified against the extracted SF0.1 String/Long archives.
-        assert_eq!(parse_datetime_ms("2010-02-14T15:32:10.447+0000"), Some(1_266_161_530_447));
-        assert_eq!(parse_datetime_ms("2010-01-01T00:00:00.000+0000"), Some(1_262_304_000_000));
-        assert_eq!(parse_datetime_ms("2013-01-01T00:00:00.000+0000"), Some(1_356_998_400_000));
+        assert_eq!(
+            parse_datetime_ms("2010-02-14T15:32:10.447+0000"),
+            Some(1_266_161_530_447)
+        );
+        assert_eq!(
+            parse_datetime_ms("2010-01-01T00:00:00.000+0000"),
+            Some(1_262_304_000_000)
+        );
+        assert_eq!(
+            parse_datetime_ms("2013-01-01T00:00:00.000+0000"),
+            Some(1_356_998_400_000)
+        );
         // An offset shifts the instant.
-        assert_eq!(parse_datetime_ms("2010-01-01T01:00:00.000+0100"), Some(1_262_304_000_000));
-        assert_eq!(parse_datetime_ms("2010-01-01T00:00:00Z"), Some(1_262_304_000_000));
+        assert_eq!(
+            parse_datetime_ms("2010-01-01T01:00:00.000+0100"),
+            Some(1_262_304_000_000)
+        );
+        assert_eq!(
+            parse_datetime_ms("2010-01-01T00:00:00Z"),
+            Some(1_262_304_000_000)
+        );
         // LongDateFormatter passthrough.
         assert_eq!(parse_datetime_ms("1266161530447"), Some(1_266_161_530_447));
         assert_eq!(parse_datetime_ms("not-a-date"), None);
@@ -1336,8 +1813,14 @@ mod tests {
         let out = root.join("out");
         convert(&root, &out).expect("convert");
         let nodes = read_jsonl_values(&out.join("nodes.jsonl"));
-        assert_eq!(prop(node(&nodes, "p:2"), "lastName"), Value::Str("Sm\"ith".into()));
-        assert_eq!(prop(node(&nodes, "m:2"), "content"), Value::Str("hi \"there\"".into()));
+        assert_eq!(
+            prop(node(&nodes, "p:2"), "lastName"),
+            Value::Str("Sm\"ith".into())
+        );
+        assert_eq!(
+            prop(node(&nodes, "m:2"), "content"),
+            Value::Str("hi \"there\"".into())
+        );
     }
 
     #[test]
@@ -1428,22 +1911,42 @@ mod tests {
         let mut ids: BTreeSet<String> = BTreeSet::new();
         for n in &nodes {
             let m = as_map(n);
-            let Some(Value::Str(i)) = m.get("i") else { panic!("'i' is not a string") };
+            let Some(Value::Str(i)) = m.get("i") else {
+                panic!("'i' is not a string")
+            };
             assert!(ids.insert(i.clone()), "duplicate corpus id {i}");
             let ls = labels(m);
-            assert!(!ls.is_empty(), "label-less node {i} — snbload would skip its rels");
+            assert!(
+                !ls.is_empty(),
+                "label-less node {i} — snbload would skip its rels"
+            );
             for l in &ls {
                 assert!(ident_ok(l), "label {l:?} is not a bare identifier");
             }
-            let Some(Value::Map(p)) = m.get("p") else { panic!("no props") };
+            let Some(Value::Map(p)) = m.get("p") else {
+                panic!("no props")
+            };
             assert!(!p.contains_key("gid"), "'gid' is reserved by snbload");
             // The structured-id contract snbload's relationship pass parses:
             // `<prefix>:<n>` with `n` the node's dense `id`, canonically spelled.
             let (prefix, digits) = i.rsplit_once(':').unwrap_or_else(|| panic!("{i}: no ':'"));
-            assert!(!prefix.is_empty() && prefix.bytes().all(|b| b.is_ascii_alphabetic()), "{i}");
-            assert!(!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()), "{i}");
-            assert!(digits.len() == 1 || !digits.starts_with('0'), "{i}: non-canonical id");
-            assert_eq!(prop(m, "id"), Value::Int(digits.parse::<i64>().unwrap()), "{i}");
+            assert!(
+                !prefix.is_empty() && prefix.bytes().all(|b| b.is_ascii_alphabetic()),
+                "{i}"
+            );
+            assert!(
+                !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()),
+                "{i}"
+            );
+            assert!(
+                digits.len() == 1 || !digits.starts_with('0'),
+                "{i}: non-canonical id"
+            );
+            assert_eq!(
+                prop(m, "id"),
+                Value::Int(digits.parse::<i64>().unwrap()),
+                "{i}"
+            );
             for (k, v) in p {
                 assert!(ident_ok(k), "property key {k:?} would panic snbload");
                 let mut unloadable = 0usize;
@@ -1452,7 +1955,13 @@ mod tests {
                 assert!(
                     matches!(
                         u,
-                        Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Str(_) | Value::Null
+                        Value::Int(_)
+                            | Value::Float(_)
+                            | Value::Bool(_)
+                            | Value::Str(_)
+                            | Value::Null
+                            | Value::Date(_)
+                            | Value::DateTime { .. }
                     ),
                     "prop {k}={u:?} would panic snbload's renderer"
                 );

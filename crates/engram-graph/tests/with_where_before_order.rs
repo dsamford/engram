@@ -58,7 +58,9 @@ fn where_before_skip_limit_without_order_by() {
 fn where_before_order_by_skip_limit() {
     // Neo4j: v 5
     assert_eq!(
-        ints("UNWIND [1,2,3,4,5,6] AS v WITH v WHERE v > 3 ORDER BY v DESC SKIP 1 LIMIT 1 RETURN v"),
+        ints(
+            "UNWIND [1,2,3,4,5,6] AS v WITH v WHERE v > 3 ORDER BY v DESC SKIP 1 LIMIT 1 RETURN v"
+        ),
         vec![5]
     );
 }
@@ -116,7 +118,8 @@ fn order_by_after_the_where_sees_only_the_projected_names() {
     // Neo4j: Variable `v` not defined. The canonical order may still sort by a
     // pre-projection variable; this order may not.
     let g = Graph::new(Store::new(), Realm(1), Namespace(1));
-    let q = parse_statement("UNWIND [3,1,2] AS v WITH v AS w WHERE w > 1 ORDER BY v RETURN w").unwrap();
+    let q =
+        parse_statement("UNWIND [3,1,2] AS v WITH v AS w WHERE w > 1 ORDER BY v RETURN w").unwrap();
     assert!(run_query(&g, &q, BTreeMap::new()).is_err());
     assert_eq!(
         ints("UNWIND [3,1,2] AS v WITH v AS w ORDER BY v WHERE w > 1 RETURN w"),
@@ -142,6 +145,11 @@ fn the_story_tracker_shape_over_zero_rows_returns_no_rows_and_no_error() {
     let r = run_query(&g, &parse_statement(src).unwrap(), params).unwrap();
     assert!(r.rows.is_empty());
     // And a plain `RETURN *` over zero rows is fine too.
-    let r = run_query(&g, &parse_statement("MATCH (n:Nothing) WITH n RETURN *").unwrap(), BTreeMap::new()).unwrap();
+    let r = run_query(
+        &g,
+        &parse_statement("MATCH (n:Nothing) WITH n RETURN *").unwrap(),
+        BTreeMap::new(),
+    )
+    .unwrap();
     assert!(r.rows.is_empty());
 }

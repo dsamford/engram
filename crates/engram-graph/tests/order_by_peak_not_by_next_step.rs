@@ -87,9 +87,7 @@ fn fixture() -> Graph {
     for i in 0..PERSONS {
         run(
             &g,
-            &format!(
-                "MATCH (p:Person {{id: {i}}}) CREATE (:Post {{id: {i}}})-[:HAS_CREATOR]->(p)"
-            ),
+            &format!("MATCH (p:Person {{id: {i}}}) CREATE (:Post {{id: {i}}})-[:HAS_CREATOR]->(p)"),
         );
     }
     // Each person authors COMMENTS comments, each replying to a spread of posts.
@@ -110,7 +108,21 @@ fn fixture() -> Graph {
     g
 }
 
-fn count_and_work(g: &Graph) -> (i64, u64) {
+/// The count, the fold's WALKS (`interp.pipeline fold hop walks` — every row
+/// the plan enumerated, the work the ordering decides) and the adjacency-table
+/// LOOKUPS (`graph.adjacency tables reused`).
+///
+/// The walks are the metric the assertion below reads. The lookups were, until
+/// fix 84: every close probed the table once per row, so the two counted the
+/// same thing. The hoisted close reads a bound row ONCE per binding and
+/// answers the probes under it locally, so a plan that probes one bound row
+/// thousands of times now records one lookup for it — the greedy ordering's
+/// 28,800 close probes on this fixture became 60 lookups, an 18.7x drop in
+/// lookups for the SAME walks — and the lookup count stopped measuring the
+/// plan. The walks did not move with the hoist (it changes what a walk costs,
+/// never how many there are), which is exactly why they are the right proxy
+/// for what the search is asked to minimise.
+fn count_and_work(g: &Graph) -> (i64, u64, u64) {
     let q = parse_statement(Q2).expect("parse");
     let (r, t) = engram_observe::with_trace(|| run_query(g, &q, BTreeMap::new()));
     let r = r.expect("run q2");
@@ -118,12 +130,17 @@ fn count_and_work(g: &Graph) -> (i64, u64) {
         Some(Value::Int(n)) => *n,
         other => panic!("q2 must answer one Int, got {other:?}"),
     };
-    let work = t
+    let walks = t
+        .counters()
+        .get("interp.pipeline fold hop walks")
+        .copied()
+        .unwrap_or(0);
+    let lookups = t
         .counters()
         .get("graph.adjacency tables reused")
         .copied()
         .unwrap_or(0);
-    (count, work)
+    (count, walks, lookups)
 }
 
 #[test]
@@ -131,13 +148,18 @@ fn the_cyclic_count_is_unchanged_and_the_ordering_costs_far_less() {
     let g = fixture();
 
     engram_graph::pipeline::set_order_peak_search(false);
-    let (greedy_count, greedy_work) = count_and_work(&g);
+    let (greedy_count, greedy_work, greedy_lookups) = count_and_work(&g);
     engram_graph::pipeline::set_order_peak_search(true);
-    let (search_count, search_work) = count_and_work(&g);
+    let (search_count, search_work, search_lookups) = count_and_work(&g);
 
     eprintln!(
-        "[q2-shape] greedy: count {greedy_count}, {greedy_work} adjacency rows\n\
-         [q2-shape] search: count {search_count}, {search_work} adjacency rows"
+        "[q2-shape] greedy: count {greedy_count}, {greedy_work} fold walks, {greedy_lookups} table lookups\n\
+         [q2-shape] search: count {search_count}, {search_work} fold walks, {search_lookups} table lookups"
+    );
+    assert!(
+        greedy_work > 0 && search_work > 0,
+        "the count fold did not run on one arm (walks greedy {greedy_work}, search {search_work}), \
+         so there is no plan to compare"
     );
 
     // THE ASSERTION THAT MATTERS. The reorder is unobservable — both orderings
@@ -156,7 +178,7 @@ fn the_cyclic_count_is_unchanged_and_the_ordering_costs_far_less() {
     // above would pass just as well if the search never fired.
     assert!(
         search_work < greedy_work,
-        "the search visited {search_work} adjacency rows against the greedy's \
+        "the search's plan walked {search_work} rows against the greedy's \
          {greedy_work} — it did not change the ordering, so this fixture does \
          not pose the question the pod measured at 65.7x"
     );

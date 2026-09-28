@@ -1,0 +1,1466 @@
+{
+  "catalogue_version": 1,
+  "what_this_is": "The LDBC SNB Interactive v1 READ battery -- seven short reads (IS1-IS7) and fourteen complex reads (IC1-IC14) -- as statement text, one entry per dialect, in the shape of the lsqb family in crates/engram-bench/catalogue/statements.json. It is a SECOND catalogue file rather than a block added to that one, and that is the whole reason it exists separately: catalogue::digest() is FNV-1a over a WHOLE file, the digest travels in every result document, and report.rs refuses to build a comparison row out of two runs whose digests differ. Adding one byte to statements.json would orphan every LSQB number this project has already measured, including the SF10 campaign in flight. A new family gets a new file and its own digest.",
+  "status_values": [
+    "verified",
+    "unverified",
+    "unsupported"
+  ],
+  "dialects": [
+    "cypher",
+    "cypher_ladybug",
+    "sql"
+  ],
+  "every_entry_is_unverified": "NOTHING IN THIS FILE HAS BEEN EXECUTED. Not one statement, in any dialect, against any engine. In this catalogue `verified` means an answer was run and checked against another engine's answer, and the word does not appear anywhere in this file. The expected first result of running it is that several of these are wrong; the per-query hazards blocks say where to look first.",
+  "provenance": {
+    "cypher": "TRANSCRIBED FROM THE OFFICIAL SOURCE, mechanically. Every cypher entry was fetched from raw.githubusercontent.com/ldbc/ldbc_snb_interactive_v1_impls/main/cypher/queries/ on 2026-09-11 and transformed by exactly three rules: the leading // title line dropped, the /* :param ... */ block dropped, and each $name rewritten to ${name} -- or to '${name}' for a string parameter, since the renderer substitutes text and does not quote. Nothing else was touched: no reordering, no re-indentation, no improvement. Each entry carries its source_file URL and the source_sha256 of the file as fetched, so the transformation can be re-run and diffed rather than trusted.",
+    "sql": "WRITTEN HERE, from the official Cypher, against the table names this tree's PostgreSQL arm uses (docs/bench/pg-snb-schema.sql) plus the extension declared in sql_schema_required below. It is not a transcription of anything -- LDBC's own SQL implementations target a different schema, and adapting them would have been a translation of a translation. This is the least trustworthy half of the file, and most of the hazards blocks are about it.",
+    "cypher_ladybug": "ABSENT, and declared unsupported on every entry with the reason spelled out. Nothing was transcribed for this dialect and nothing was invented for it either.",
+    "draft_adapted": "snb-statements.json at the repo root -- 18 entries, IS1-IS7 plus 11 complex reads, never executed -- was read and deliberately NOT used as text. It supplied the corpus-specific decisions (the dense integer id, the :Message supertype, the label spellings), and each of those was then re-checked against crates/engram-bench/src/bin/datagen2jsonl.rs:407-471 rather than taken on trust. Where the draft and the official text disagree the official text wins; three of those disagreements are recorded as hazards rather than silently corrected -- IS4's coalesce(content, content), IS7's shortened `knows` column name, and the projection columns IC1/IC2/IC9 dropped.",
+    "could_not_source": "Nothing. All 21 reference files were fetched successfully. IC14 is declared unsupported by DECISION (see its reason), not for want of text, and the distinction matters: a gap invites someone to fill it, a decision invites them to argue with it."
+  },
+  "parameter_note": "Placeholders are ${name}, the same textual substitution catalogue::render already performs for LSQB. String parameters carry their quotes IN THE TEXT ('${firstName}') because the renderer does not add them -- which makes a value containing an apostrophe, and LDBC's name corpus has them, a BROKEN statement rather than a wrong one. A renderer must REFUSE such a value rather than escape it quietly; an arm that binds natively (Bolt, libpq) should do that instead and ignore the quoting entirely. The VALUES are not in this file and must not be invented. LDBC curates substitution parameters precisely because uniform sampling over a skewed social graph spreads runtimes across orders of magnitude, and the curated files name Datagen's SPARSE original ids while this corpus is renumbered densely per label family. docs/bench/ldbc-coverage-plan.md section 2.1 has the translation plan (snbparams.rs), which does not exist yet. IS1-IS7 have no parameter files at all -- the official driver derives short-read parameters from earlier query results -- so those must be derived deterministically and stamped as derived.",
+  "projection_note": "Every entry declares projection (column names and types, in order), order_by (the sort keys AS THE REFERENCE WRITES THEM, including keys that are not projected -- see IC5) and limit. Two dialects returning the same rows in a different order are not the same query, and SNB pins these orderings precisely because ties decide which rows survive the LIMIT. Null ordering is left at each engine's default and is believed to agree: Neo4j sorts nulls last on ASC and first on DESC, which is also PostgreSQL's default. That is read from documentation, not executed here, and it is load-bearing for IS3, whose sort key is null on every row of a store loaded by today's loaders.",
+  "corpus_note": "Written for the corpus datagen2jsonl produces: ids are DENSE integers per label family from 0, Post and Comment share one Message id space, and the labels are exactly the ones the reference Cypher names -- Person, Message+Post, Message+Comment, Forum, Tag, TagClass, Organisation+University, Organisation+Company, Place+Continent, Place+Country, Place+City -- checked against datagen2jsonl.rs:407-471 rather than assumed. Datagen's original id survives as sourceId and is NOT indexed, so a parameter bound to sourceId is a label scan measuring something other than the query.",
+  "relationship_properties_note": "Five of the twenty runnable reads project or filter a RELATIONSHIP property -- IS3 (KNOWS.creationDate), IC1 (STUDY_AT.classYear, WORK_AT.workFrom), IC5 (HAS_MEMBER.joinDate), IC7 (LIKES.creationDate), IC11 (WORK_AT.workFrom) -- and NO loader in this tree carries relationship properties (docs/bench/ldbc-coverage-plan.md section 0.3). The failure is silent and total: right rows, null sort key, arbitrary order, every reconcile passing. A lane that runs these five before the loaders are fixed is measuring a different query and will not be told so.",
+  "sql_schema_required": {
+    "note": "docs/bench/pg-snb-schema.sql declares person, message, tag, city and five UNTYPED edge tables. That is not enough for this battery, and one of the gaps is a correctness trap rather than a missing table: because ids are dense PER LABEL FAMILY, message 5 and person 5 are different nodes carrying the same integer, so a single is_located_in(src, dst) cannot hold both Person->City and Message->Country without joining them to each other. Every IS_LOCATED_IN edge below is therefore a TYPED table. This block is the contract the SQL text assumes. None of it has been built.",
+    "new_node_tables": [
+      "forum(id, title)",
+      "country(id, name)",
+      "continent(id, name)",
+      "university(id, name)",
+      "company(id, name)",
+      "tagclass(id, name)"
+    ],
+    "new_columns": [
+      "person.gender text",
+      "person.creation_date bigint",
+      "person.email text[]",
+      "person.speaks text[]",
+      "message.image_file text"
+    ],
+    "typed_is_located_in": [
+      "person_is_located_in_city(src, dst)",
+      "message_is_located_in_country(src, dst)",
+      "organisation_is_located_in_city(src, dst)",
+      "organisation_is_located_in_country(src, dst)"
+    ],
+    "new_edge_tables": [
+      "is_part_of(src, dst) -- City -> Country",
+      "container_of(src, dst) -- Forum -> Post",
+      "has_moderator(src, dst) -- Forum -> Person",
+      "has_member(src, dst, join_date)",
+      "has_interest(src, dst) -- Person -> Tag",
+      "likes(src, dst, creation_date) -- Person -> Message",
+      "study_at(src, dst, class_year)",
+      "work_at(src, dst, work_from)",
+      "has_type(src, dst) -- Tag -> TagClass",
+      "is_subclass_of(src, dst) -- TagClass -> TagClass"
+    ],
+    "edge_properties": [
+      "knows.creation_date bigint -- added to the existing symmetric table"
+    ],
+    "knows_is_symmetric": "Every -[:KNOWS]- in the reference is undirected, and pg-snb-schema.sql's knows already stores both directions for that reason. Every probe in this file reads it by src only. A one-directional table answers a different question and would look merely sparse.",
+    "indexes_not_specified_here": "Deliberately. pg-snb-schema.sql's own header argues the rule -- one index per access path a statement actually takes and no others, because under-indexing makes PostgreSQL slow for a reason that is not PostgreSQL and over-indexing taxes the write profiles the sweep exists to measure. Naming indexes for statements that have never run would be guessing on both sides of that.",
+    "superseded": "Since 2026-09-23 the `sql` dialect is LDBC's OFFICIAL interactive-v1-postgres text (docs/bench/ldbc-official/interactive-v1-postgres, sha256 per MANIFEST.json), run against LDBC's own schema and ids (database ldbc_ic_sf3) with `@ldbc` parameter companions. This block describes the schema the superseded hand-written text targeted; it was never built."
+  },
+  "known_gaps": [
+    "Zero statements executed, in any dialect. Every status is unverified or unsupported.",
+    "The sql arm depends on a schema extension that does not exist (sql_schema_required).",
+    "The cypher_ladybug arm is unsupported on all 21 entries for a loader reason, not an expressibility reason. That is the weakest thing in this file: `unsupported` is defined as the dialect being unable to express the shape, and this stretches it. It is recorded that way because the catalogue has no other slot for a corpus gap, and it is said out loud here so nobody reads those 21 entries as a statement about Kuzu.",
+    "IC13's sql entry is unsupported on a genuine expressibility argument, which leaves that query with a thinner witness pair than the other nineteen.",
+    "No `expected` blocks: no count, row set or answer has been recorded for any corpus. An absent expectation carries NO expectation and is never an expectation of zero.",
+    "No parameter values, and none may be invented (parameter_note).",
+    "Whether engram's Cypher supports every construct these use -- shortestPath, datetime({epochMillis}), a pattern predicate inside a list comprehension (IC10), reduce over a pattern comprehension (IC14, moot) -- was checked only by grepping crates/engram-cypher for the names. Present in the source is not the same as correct at this shape, and nothing here was run."
+  ],
+  "queries": {
+    "IS1": {
+      "title": "Profile of a person",
+      "parameters": [
+        {
+          "name": "personId",
+          "type": "ID",
+          "binds": "Person.id (dense)"
+        }
+      ],
+      "projection": [
+        {
+          "name": "firstName",
+          "type": "STRING"
+        },
+        {
+          "name": "lastName",
+          "type": "STRING"
+        },
+        {
+          "name": "birthday",
+          "type": "DATE_EPOCH_MILLIS"
+        },
+        {
+          "name": "locationIP",
+          "type": "STRING"
+        },
+        {
+          "name": "browserUsed",
+          "type": "STRING"
+        },
+        {
+          "name": "cityId",
+          "type": "ID"
+        },
+        {
+          "name": "gender",
+          "type": "STRING"
+        },
+        {
+          "name": "creationDate",
+          "type": "DATETIME_EPOCH_MILLIS"
+        }
+      ],
+      "order_by": [],
+      "limit": null,
+      "notes": [
+        "Exactly one row. The reference has no ORDER BY and none is added: a second row would mean a Person located in two Cities, which is a corpus defect, and an ORDER BY would settle it quietly instead of exposing it."
+      ],
+      "cypher": {
+        "status": "unverified",
+        "text": "MATCH (n:Person {id: ${personId} })-[:IS_LOCATED_IN]->(p:City)\nRETURN\n    n.firstName AS firstName,\n    n.lastName AS lastName,\n    n.birthday AS birthday,\n    n.locationIP AS locationIP,\n    n.browserUsed AS browserUsed,\n    p.id AS cityId,\n    n.gender AS gender,\n    n.creationDate AS creationDate",
+        "source_file": "https://github.com/ldbc/ldbc_snb_interactive_v1_impls/blob/main/cypher/queries/short-1.cypher",
+        "source_sha256": "313fccbebf9ff29880d15514984ddf48d77f921908d1bd42b7b9626bd96479dc"
+      },
+      "cypher_ladybug": {
+        "status": "unsupported",
+        "reason": "No LadybugDB loader in this tree carries node or relationship properties: measurements/pod/embedded-lsqb.py:160 sends [r[\"s\"], r[\"d\"]] -- two columns, nothing else -- because LSQB reads no property at all. Every SNB Interactive read projects properties, so this dialect would return a full-width result of nulls and report nothing wrong (docs/bench/ldbc-coverage-plan.md section 0.3 records that exact silent failure). Two further rewrites are also unwritten: LadybugDB has no :Message supertype -- a node IS its table -- so every (m:Message) shape must be split into Post and Comment arms and re-unioned, and the IC1/IC13 shortestPath forms have no transcription here. This is a LOADER and TRANSCRIPTION gap recorded in the dialect slot because the catalogue has no other slot for it; it is NOT a claim that Kuzu's Cypher cannot express the shape. Revisit the whole dialect when a property-carrying loader lands."
+      },
+      "sql": {
+        "status": "unverified",
+        "text": "/* IS1. Profile of a person\n\\set personId 10995116277794\n */\nselect p_firstname, p_lastname, p_birthday, p_locationip, p_browserused, p_placeid, p_gender,  p_creationdate\nfrom person\nwhere p_personid = :personId;\n;\n",
+        "source_file": "https://raw.githubusercontent.com/ldbc/ldbc_snb_interactive_v1_impls/main/postgres/queries/interactive-short-1.sql",
+        "source_sha256": "2586411014d86d15dbaf0dcdbb9a6b930b64a50c98ced3118a5061a5ad0a0e7b",
+        "vendored": "docs/bench/ldbc-official/interactive-v1-postgres/queries/interactive-short-1.sql",
+        "superseded": {
+          "status": "unverified",
+          "text": "SELECT p.first_name    AS \"firstName\",\n       p.last_name     AS \"lastName\",\n       p.birthday      AS \"birthday\",\n       p.location_ip   AS \"locationIP\",\n       p.browser_used  AS \"browserUsed\",\n       c.id            AS \"cityId\",\n       p.gender        AS \"gender\",\n       p.creation_date AS \"creationDate\"\nFROM person p\nJOIN person_is_located_in_city pl ON pl.src = p.id\nJOIN city c ON c.id = pl.dst\nWHERE p.id = ${personId}"
+        },
+        "superseded_note": "What this entry carried until 2026-09-23: text written HERE from the official Cypher against the schema `sql_schema_required` describes, which was never built -- so it never ran, and the Interactive comparator failed naming `person_is_located_in_city` and `knows.src`. Kept for the record."
+      }
+    },
+    "IS2": {
+      "title": "Recent messages of a person",
+      "parameters": [
+        {
+          "name": "personId",
+          "type": "ID",
+          "binds": "Person.id (dense)"
+        }
+      ],
+      "projection": [
+        {
+          "name": "messageId",
+          "type": "ID"
+        },
+        {
+          "name": "messageContent",
+          "type": "STRING"
+        },
+        {
+          "name": "messageCreationDate",
+          "type": "DATETIME_EPOCH_MILLIS"
+        },
+        {
+          "name": "postId",
+          "type": "ID"
+        },
+        {
+          "name": "personId",
+          "type": "ID"
+        },
+        {
+          "name": "personFirstName",
+          "type": "STRING"
+        },
+        {
+          "name": "personLastName",
+          "type": "STRING"
+        }
+      ],
+      "order_by": [
+        "messageCreationDate DESC",
+        "messageId ASC"
+      ],
+      "limit": 10,
+      "hazards": [
+        "The LIMIT 10 is INSIDE the first stage -- ten messages, then the thread walk -- so the result may carry more or fewer than ten rows. A LIMIT 10 moved to the end is a different query that will usually agree, which is the dangerous kind of difference.",
+        "coalesce(imageFile, content) here, and coalesce(content, imageFile) in IS4. The two short reads disagree on the order in the LDBC reference itself; both are transcribed as published. snb-statements.json's IS4 draft had coalesce(content, content), which is neither.",
+        "docs/bench/ldbc-coverage-plan.md section 2.1 states that IS2 must return a Message TWICE when the Message IS the root Post, and that deduplicating is wrong. The SQL above yields one row per (message, reachable root post), and a Post reaches exactly one root -- itself -- so it yields ONE row there. The two dialects therefore disagree today on that one case. Which is right is NOT ESTABLISHED here, nothing having been executed; it is the first pair to run when the lane exists."
+      ],
+      "cypher": {
+        "status": "unverified",
+        "text": "MATCH (:Person {id: ${personId}})<-[:HAS_CREATOR]-(message)\nWITH\n message,\n message.id AS messageId,\n message.creationDate AS messageCreationDate\nORDER BY messageCreationDate DESC, messageId ASC\nLIMIT 10\nMATCH (message)-[:REPLY_OF*0..]->(post:Post),\n      (post)-[:HAS_CREATOR]->(person)\nRETURN\n messageId,\n coalesce(message.imageFile,message.content) AS messageContent,\n messageCreationDate,\n post.id AS postId,\n person.id AS personId,\n person.firstName AS personFirstName,\n person.lastName AS personLastName\nORDER BY messageCreationDate DESC, messageId ASC",
+        "source_file": "https://github.com/ldbc/ldbc_snb_interactive_v1_impls/blob/main/cypher/queries/short-2.cypher",
+        "source_sha256": "e278ea45644325be102e0574d8cc7f768633e990aa6c7b3976a84b22e66f996d"
+      },
+      "cypher_ladybug": {
+        "status": "unsupported",
+        "reason": "No LadybugDB loader in this tree carries node or relationship properties: measurements/pod/embedded-lsqb.py:160 sends [r[\"s\"], r[\"d\"]] -- two columns, nothing else -- because LSQB reads no property at all. Every SNB Interactive read projects properties, so this dialect would return a full-width result of nulls and report nothing wrong (docs/bench/ldbc-coverage-plan.md section 0.3 records that exact silent failure). Two further rewrites are also unwritten: LadybugDB has no :Message supertype -- a node IS its table -- so every (m:Message) shape must be split into Post and Comment arms and re-unioned, and the IC1/IC13 shortestPath forms have no transcription here. This is a LOADER and TRANSCRIPTION gap recorded in the dialect slot because the catalogue has no other slot for it; it is NOT a claim that Kuzu's Cypher cannot express the shape. Revisit the whole dialect when a property-carrying loader lands."
+      },
+      "sql": {
+        "status": "unverified",
+        "text": "/* IS2. Recent messages of a person\n\\set personId 10995116277795\n */\nwith recursive cposts(m_messageid, m_content, m_ps_imagefile, m_creationdate, m_c_replyof, m_creatorid) AS (\n      select m_messageid, m_content, m_ps_imagefile, m_creationdate, m_c_replyof, m_creatorid\n      from message\n      where m_creatorid = :personId\n      order by m_creationdate desc\n      limit 10\n), parent(postid,replyof,orig_postid,creator) AS (\n      select m_messageid, m_c_replyof, m_messageid, m_creatorid from cposts\n    UNION ALL\n      select m_messageid, m_c_replyof, orig_postid, m_creatorid\n      from message,parent\n      where m_messageid=replyof\n)\nselect p1.m_messageid, COALESCE(m_ps_imagefile, m_content, ''), p1.m_creationdate,\n       p2.m_messageid, p2.p_personid, p2.p_firstname, p2.p_lastname\nfrom \n     (select m_messageid, m_content, m_ps_imagefile, m_creationdate, m_c_replyof from cposts\n     ) p1\nleft join\n     (select orig_postid, postid as m_messageid, p_personid, p_firstname, p_lastname\n      from parent, person\n      where replyof is null and creator = p_personid\n     )p2  \non p2.orig_postid = p1.m_messageid\norder by m_creationdate desc, p2.m_messageid desc;\n;\n",
+        "source_file": "https://raw.githubusercontent.com/ldbc/ldbc_snb_interactive_v1_impls/main/postgres/queries/interactive-short-2.sql",
+        "source_sha256": "dbcb1514b06b359372e70ac84b1f2a828854809c0a2db8afc77da41424a9fbce",
+        "vendored": "docs/bench/ldbc-official/interactive-v1-postgres/queries/interactive-short-2.sql",
+        "superseded": {
+          "status": "unverified",
+          "text": "WITH RECURSIVE recent AS (\n  SELECT m.id AS message_id, m.creation_date, m.content, m.image_file\n  FROM message m\n  JOIN has_creator hc ON hc.src = m.id\n  WHERE hc.dst = ${personId}\n  ORDER BY m.creation_date DESC, m.id ASC\n  LIMIT 10\n),\nwalk (message_id, creation_date, content, image_file, cur) AS (\n  SELECT r.message_id, r.creation_date, r.content, r.image_file, r.message_id FROM recent r\n  UNION ALL\n  SELECT w.message_id, w.creation_date, w.content, w.image_file, ro.dst\n  FROM walk w JOIN reply_of ro ON ro.src = w.cur\n)\nSELECT w.message_id                      AS \"messageId\",\n       coalesce(w.image_file, w.content) AS \"messageContent\",\n       w.creation_date                   AS \"messageCreationDate\",\n       root.id                           AS \"postId\",\n       au.id                             AS \"personId\",\n       au.first_name                     AS \"personFirstName\",\n       au.last_name                      AS \"personLastName\"\nFROM walk w\nJOIN message root ON root.id = w.cur AND root.is_comment = false\nJOIN has_creator hc ON hc.src = root.id\nJOIN person au ON au.id = hc.dst\nORDER BY \"messageCreationDate\" DESC, \"messageId\" ASC"
+        },
+        "superseded_note": "What this entry carried until 2026-09-23: text written HERE from the official Cypher against the schema `sql_schema_required` describes, which was never built -- so it never ran, and the Interactive comparator failed naming `person_is_located_in_city` and `knows.src`. Kept for the record."
+      }
+    },
+    "IS3": {
+      "title": "Friends of a person",
+      "parameters": [
+        {
+          "name": "personId",
+          "type": "ID",
+          "binds": "Person.id (dense)"
+        }
+      ],
+      "projection": [
+        {
+          "name": "personId",
+          "type": "ID"
+        },
+        {
+          "name": "firstName",
+          "type": "STRING"
+        },
+        {
+          "name": "lastName",
+          "type": "STRING"
+        },
+        {
+          "name": "friendshipCreationDate",
+          "type": "DATETIME_EPOCH_MILLIS"
+        }
+      ],
+      "order_by": [
+        "friendshipCreationDate DESC",
+        "personId ASC"
+      ],
+      "limit": null,
+      "requires": [
+        "KNOWS.creationDate"
+      ],
+      "hazards": [
+        "No loader in this tree carries KNOWS.creationDate (docs/bench/ldbc-coverage-plan.md section 0.3). Run against a store loaded today, this returns the right rows in an arbitrary order with a null sort key on every one of them, and reports nothing wrong. It is the cheapest negative control in the battery: a null friendshipCreationDate means the corpus is not fit for this lane, whatever the other nineteen queries answer.",
+        "The reference sorts by toInteger(personId), not by personId: it is guarding against a string id. On this corpus ids are already integers, so the SQL sorts the integer column directly. Same order, different guard."
+      ],
+      "cypher": {
+        "status": "unverified",
+        "text": "MATCH (n:Person {id: ${personId} })-[r:KNOWS]-(friend)\nRETURN\n    friend.id AS personId,\n    friend.firstName AS firstName,\n    friend.lastName AS lastName,\n    r.creationDate AS friendshipCreationDate\nORDER BY\n    friendshipCreationDate DESC,\n    toInteger(personId) ASC",
+        "source_file": "https://github.com/ldbc/ldbc_snb_interactive_v1_impls/blob/main/cypher/queries/short-3.cypher",
+        "source_sha256": "424bda25c79699433d5cf6a18893b6431980155a573a97220867c00be547d323"
+      },
+      "cypher_ladybug": {
+        "status": "unsupported",
+        "reason": "No LadybugDB loader in this tree carries node or relationship properties: measurements/pod/embedded-lsqb.py:160 sends [r[\"s\"], r[\"d\"]] -- two columns, nothing else -- because LSQB reads no property at all. Every SNB Interactive read projects properties, so this dialect would return a full-width result of nulls and report nothing wrong (docs/bench/ldbc-coverage-plan.md section 0.3 records that exact silent failure). Two further rewrites are also unwritten: LadybugDB has no :Message supertype -- a node IS its table -- so every (m:Message) shape must be split into Post and Comment arms and re-unioned, and the IC1/IC13 shortestPath forms have no transcription here. This is a LOADER and TRANSCRIPTION gap recorded in the dialect slot because the catalogue has no other slot for it; it is NOT a claim that Kuzu's Cypher cannot express the shape. Revisit the whole dialect when a property-carrying loader lands."
+      },
+      "sql": {
+        "status": "unverified",
+        "text": "/* IS3. Friends of a person\n\\set personId 10995116277794\n */\nselect p_personid, p_firstname, p_lastname, k_creationdate\nfrom knows, person\nwhere k_person1id = :personId and k_person2id = p_personid\norder by k_creationdate desc, p_personid asc;\n;\n",
+        "source_file": "https://raw.githubusercontent.com/ldbc/ldbc_snb_interactive_v1_impls/main/postgres/queries/interactive-short-3.sql",
+        "source_sha256": "34ede2f4a7bc632abfd77ab210f3a240bb8b643b920803641e4e3eab297d85b6",
+        "vendored": "docs/bench/ldbc-official/interactive-v1-postgres/queries/interactive-short-3.sql",
+        "superseded": {
+          "status": "unverified",
+          "text": "SELECT f.id            AS \"personId\",\n       f.first_name    AS \"firstName\",\n       f.last_name     AS \"lastName\",\n       k.creation_date AS \"friendshipCreationDate\"\nFROM knows k\nJOIN person f ON f.id = k.dst\nWHERE k.src = ${personId}\nORDER BY \"friendshipCreationDate\" DESC, \"personId\" ASC"
+        },
+        "superseded_note": "What this entry carried until 2026-09-23: text written HERE from the official Cypher against the schema `sql_schema_required` describes, which was never built -- so it never ran, and the Interactive comparator failed naming `person_is_located_in_city` and `knows.src`. Kept for the record."
+      }
+    },
+    "IS4": {
+      "title": "Content of a message",
+      "parameters": [
+        {
+          "name": "messageId",
+          "type": "ID",
+          "binds": "Message.id (dense; Post and Comment share one id space)"
+        }
+      ],
+      "projection": [
+        {
+          "name": "messageCreationDate",
+          "type": "DATETIME_EPOCH_MILLIS"
+        },
+        {
+          "name": "messageContent",
+          "type": "STRING"
+        }
+      ],
+      "order_by": [],
+      "limit": null,
+      "cypher": {
+        "status": "unverified",
+        "text": "MATCH (m:Message {id:  ${messageId} })\nRETURN\n    m.creationDate as messageCreationDate,\n    coalesce(m.content, m.imageFile) as messageContent",
+        "source_file": "https://github.com/ldbc/ldbc_snb_interactive_v1_impls/blob/main/cypher/queries/short-4.cypher",
+        "source_sha256": "b579231518cf36352fe0237f4a36bbce5a9a96a0763565b8e17e07d9b0704642"
+      },
+      "cypher_ladybug": {
+        "status": "unsupported",
+        "reason": "No LadybugDB loader in this tree carries node or relationship properties: measurements/pod/embedded-lsqb.py:160 sends [r[\"s\"], r[\"d\"]] -- two columns, nothing else -- because LSQB reads no property at all. Every SNB Interactive read projects properties, so this dialect would return a full-width result of nulls and report nothing wrong (docs/bench/ldbc-coverage-plan.md section 0.3 records that exact silent failure). Two further rewrites are also unwritten: LadybugDB has no :Message supertype -- a node IS its table -- so every (m:Message) shape must be split into Post and Comment arms and re-unioned, and the IC1/IC13 shortestPath forms have no transcription here. This is a LOADER and TRANSCRIPTION gap recorded in the dialect slot because the catalogue has no other slot for it; it is NOT a claim that Kuzu's Cypher cannot express the shape. Revisit the whole dialect when a property-carrying loader lands."
+      },
+      "sql": {
+        "status": "unverified",
+        "text": "/* IS4. Content of a message\n\\set messageId 206158431836\n */\nselect COALESCE(m_ps_imagefile, m_content, ''), m_creationdate\nfrom message\nwhere m_messageid = :messageId;\n;\n",
+        "source_file": "https://raw.githubusercontent.com/ldbc/ldbc_snb_interactive_v1_impls/main/postgres/queries/interactive-short-4.sql",
+        "source_sha256": "8eb12987698ccba3742740740d7764c95fc9cf5da60cd5a55d3c2a0e022b590a",
+        "vendored": "docs/bench/ldbc-official/interactive-v1-postgres/queries/interactive-short-4.sql",
+        "superseded": {
+          "status": "unverified",
+          "text": "SELECT m.creation_date                   AS \"messageCreationDate\",\n       coalesce(m.content, m.image_file) AS \"messageContent\"\nFROM message m\nWHERE m.id = ${messageId}"
+        },
+        "superseded_note": "What this entry carried until 2026-09-23: text written HERE from the official Cypher against the schema `sql_schema_required` describes, which was never built -- so it never ran, and the Interactive comparator failed naming `person_is_located_in_city` and `knows.src`. Kept for the record."
+      }
+    },
+    "IS5": {
+      "title": "Creator of a message",
+      "parameters": [
+        {
+          "name": "messageId",
+          "type": "ID",
+          "binds": "Message.id (dense)"
+        }
+      ],
+      "projection": [
+        {
+          "name": "personId",
+          "type": "ID"
+        },
+        {
+          "name": "firstName",
+          "type": "STRING"
+        },
+        {
+          "name": "lastName",
+          "type": "STRING"
+        }
+      ],
+      "order_by": [],
+      "limit": null,
+      "cypher": {
+        "status": "unverified",
+        "text": "MATCH (m:Message {id:  ${messageId} })-[:HAS_CREATOR]->(p:Person)\nRETURN\n    p.id AS personId,\n    p.firstName AS firstName,\n    p.lastName AS lastName",
+        "source_file": "https://github.com/ldbc/ldbc_snb_interactive_v1_impls/blob/main/cypher/queries/short-5.cypher",
+        "source_sha256": "28d461db14b3817cfe00140fbabc7f7af796a2661b8c2492d8cf950ffce40fcd"
+      },
+      "cypher_ladybug": {
+        "status": "unsupported",
+        "reason": "No LadybugDB loader in this tree carries node or relationship properties: measurements/pod/embedded-lsqb.py:160 sends [r[\"s\"], r[\"d\"]] -- two columns, nothing else -- because LSQB reads no property at all. Every SNB Interactive read projects properties, so this dialect would return a full-width result of nulls and report nothing wrong (docs/bench/ldbc-coverage-plan.md section 0.3 records that exact silent failure). Two further rewrites are also unwritten: LadybugDB has no :Message supertype -- a node IS its table -- so every (m:Message) shape must be split into Post and Comment arms and re-unioned, and the IC1/IC13 shortestPath forms have no transcription here. This is a LOADER and TRANSCRIPTION gap recorded in the dialect slot because the catalogue has no other slot for it; it is NOT a claim that Kuzu's Cypher cannot express the shape. Revisit the whole dialect when a property-carrying loader lands."
+      },
+      "sql": {
+        "status": "unverified",
+        "text": "/* IS5. Creator of a message\n\\set messageId 206158431836\n */\nselect p_personid, p_firstname, p_lastname\nfrom message, person\nwhere m_messageid = :messageId and m_creatorid = p_personid;\n;\n",
+        "source_file": "https://raw.githubusercontent.com/ldbc/ldbc_snb_interactive_v1_impls/main/postgres/queries/interactive-short-5.sql",
+        "source_sha256": "ab3613192844ff641a7dff269ff9c31ad3421390d71262c374d7ac10a11b0ef6",
+        "vendored": "docs/bench/ldbc-official/interactive-v1-postgres/queries/interactive-short-5.sql",
+        "superseded": {
+          "status": "unverified",
+          "text": "SELECT p.id         AS \"personId\",\n       p.first_name AS \"firstName\",\n       p.last_name  AS \"lastName\"\nFROM message m\nJOIN has_creator hc ON hc.src = m.id\nJOIN person p ON p.id = hc.dst\nWHERE m.id = ${messageId}"
+        },
+        "superseded_note": "What this entry carried until 2026-09-23: text written HERE from the official Cypher against the schema `sql_schema_required` describes, which was never built -- so it never ran, and the Interactive comparator failed naming `person_is_located_in_city` and `knows.src`. Kept for the record."
+      }
+    },
+    "IS6": {
+      "title": "Forum of a message",
+      "parameters": [
+        {
+          "name": "messageId",
+          "type": "ID",
+          "binds": "Message.id (dense)"
+        }
+      ],
+      "projection": [
+        {
+          "name": "forumId",
+          "type": "ID"
+        },
+        {
+          "name": "forumTitle",
+          "type": "STRING"
+        },
+        {
+          "name": "moderatorId",
+          "type": "ID"
+        },
+        {
+          "name": "moderatorFirstName",
+          "type": "STRING"
+        },
+        {
+          "name": "moderatorLastName",
+          "type": "STRING"
+        }
+      ],
+      "order_by": [],
+      "limit": null,
+      "hazards": [
+        "A Comment's Forum is reached only through the ROOT POST of its thread -- REPLY_OF*0.. and then CONTAINER_OF -- because CONTAINER_OF links a Forum to Posts and never to Comments. A one-hop rewrite answers nothing for every Comment, and an empty result reads as 'no data' rather than as a wrong query."
+      ],
+      "cypher": {
+        "status": "unverified",
+        "text": "MATCH (m:Message {id: ${messageId} })-[:REPLY_OF*0..]->(p:Post)<-[:CONTAINER_OF]-(f:Forum)-[:HAS_MODERATOR]->(mod:Person)\nRETURN\n    f.id AS forumId,\n    f.title AS forumTitle,\n    mod.id AS moderatorId,\n    mod.firstName AS moderatorFirstName,\n    mod.lastName AS moderatorLastName",
+        "source_file": "https://github.com/ldbc/ldbc_snb_interactive_v1_impls/blob/main/cypher/queries/short-6.cypher",
+        "source_sha256": "1ac9125f6817402cd5df456b5201fc44187b646ffe6bf8497070db2abae84bce"
+      },
+      "cypher_ladybug": {
+        "status": "unsupported",
+        "reason": "No LadybugDB loader in this tree carries node or relationship properties: measurements/pod/embedded-lsqb.py:160 sends [r[\"s\"], r[\"d\"]] -- two columns, nothing else -- because LSQB reads no property at all. Every SNB Interactive read projects properties, so this dialect would return a full-width result of nulls and report nothing wrong (docs/bench/ldbc-coverage-plan.md section 0.3 records that exact silent failure). Two further rewrites are also unwritten: LadybugDB has no :Message supertype -- a node IS its table -- so every (m:Message) shape must be split into Post and Comment arms and re-unioned, and the IC1/IC13 shortestPath forms have no transcription here. This is a LOADER and TRANSCRIPTION gap recorded in the dialect slot because the catalogue has no other slot for it; it is NOT a claim that Kuzu's Cypher cannot express the shape. Revisit the whole dialect when a property-carrying loader lands."
+      },
+      "sql": {
+        "status": "unverified",
+        "text": "/* IS6. Forum of a message\n\\set messageId 206158431836\n */\nWITH RECURSIVE chain(parent, child) as(\n    SELECT m_c_replyof, m_messageid FROM message where m_messageid = :messageId\n    UNION ALL\n    SELECT p.m_c_replyof, p.m_messageid FROM message p, chain c where p.m_messageid = c.parent \n)\nselect f_forumid, f_title, p_personid, p_firstname, p_lastname\nfrom message, person, forum\nwhere m_messageid = (select coalesce(min(parent), :messageId) from chain)\n  and m_ps_forumid = f_forumid and f_moderatorid = p_personid;\n;\n",
+        "source_file": "https://raw.githubusercontent.com/ldbc/ldbc_snb_interactive_v1_impls/main/postgres/queries/interactive-short-6.sql",
+        "source_sha256": "5d6e70cf1f883f2a3b36668c9f36a9ad7614ec91fd22edf254e5b6c930ede4ed",
+        "vendored": "docs/bench/ldbc-official/interactive-v1-postgres/queries/interactive-short-6.sql",
+        "superseded": {
+          "status": "unverified",
+          "text": "WITH RECURSIVE walk (cur) AS (\n  SELECT CAST(${messageId} AS bigint)\n  UNION ALL\n  SELECT ro.dst FROM walk w JOIN reply_of ro ON ro.src = w.cur\n)\nSELECT f.id          AS \"forumId\",\n       f.title       AS \"forumTitle\",\n       mo.id         AS \"moderatorId\",\n       mo.first_name AS \"moderatorFirstName\",\n       mo.last_name  AS \"moderatorLastName\"\nFROM walk w\nJOIN message root ON root.id = w.cur AND root.is_comment = false\nJOIN container_of co ON co.dst = root.id\nJOIN forum f ON f.id = co.src\nJOIN has_moderator hm ON hm.src = f.id\nJOIN person mo ON mo.id = hm.dst"
+        },
+        "superseded_note": "What this entry carried until 2026-09-23: text written HERE from the official Cypher against the schema `sql_schema_required` describes, which was never built -- so it never ran, and the Interactive comparator failed naming `person_is_located_in_city` and `knows.src`. Kept for the record."
+      }
+    },
+    "IS7": {
+      "title": "Replies of a message",
+      "parameters": [
+        {
+          "name": "messageId",
+          "type": "ID",
+          "binds": "Message.id (dense)"
+        }
+      ],
+      "projection": [
+        {
+          "name": "commentId",
+          "type": "ID"
+        },
+        {
+          "name": "commentContent",
+          "type": "STRING"
+        },
+        {
+          "name": "commentCreationDate",
+          "type": "DATETIME_EPOCH_MILLIS"
+        },
+        {
+          "name": "replyAuthorId",
+          "type": "ID"
+        },
+        {
+          "name": "replyAuthorFirstName",
+          "type": "STRING"
+        },
+        {
+          "name": "replyAuthorLastName",
+          "type": "STRING"
+        },
+        {
+          "name": "replyAuthorKnowsOriginalMessageAuthor",
+          "type": "BOOLEAN"
+        }
+      ],
+      "order_by": [
+        "commentCreationDate DESC",
+        "replyAuthorId ASC"
+      ],
+      "limit": null,
+      "hazards": [
+        "The flag must be FALSE when the reply author and the message author are the SAME Person (docs/bench/ldbc-coverage-plan.md section 2.1). The Cypher gets that from an OPTIONAL MATCH over a KNOWS with no self-loop; the SQL gets it from an EXISTS over the same edge table. Both depend on the corpus containing no self-KNOWS edge. That is an assumption about the corpus, not a property of either statement.",
+        "The reference names this column replyAuthorKnowsOriginalMessageAuthor; snb-statements.json's draft shortened it to knows. The long name is the contract."
+      ],
+      "cypher": {
+        "status": "unverified",
+        "text": "MATCH (m:Message {id: ${messageId} })<-[:REPLY_OF]-(c:Comment)-[:HAS_CREATOR]->(p:Person)\n    OPTIONAL MATCH (m)-[:HAS_CREATOR]->(a:Person)-[r:KNOWS]-(p)\n    RETURN c.id AS commentId,\n        c.content AS commentContent,\n        c.creationDate AS commentCreationDate,\n        p.id AS replyAuthorId,\n        p.firstName AS replyAuthorFirstName,\n        p.lastName AS replyAuthorLastName,\n        CASE r\n            WHEN null THEN false\n            ELSE true\n        END AS replyAuthorKnowsOriginalMessageAuthor\n    ORDER BY commentCreationDate DESC, replyAuthorId",
+        "source_file": "https://github.com/ldbc/ldbc_snb_interactive_v1_impls/blob/main/cypher/queries/short-7.cypher",
+        "source_sha256": "7ac858ff9f60f84dfe9833f1f8285cbd2b58cd4834d8eccb2d4beaf7f41656a7"
+      },
+      "cypher_ladybug": {
+        "status": "unsupported",
+        "reason": "No LadybugDB loader in this tree carries node or relationship properties: measurements/pod/embedded-lsqb.py:160 sends [r[\"s\"], r[\"d\"]] -- two columns, nothing else -- because LSQB reads no property at all. Every SNB Interactive read projects properties, so this dialect would return a full-width result of nulls and report nothing wrong (docs/bench/ldbc-coverage-plan.md section 0.3 records that exact silent failure). Two further rewrites are also unwritten: LadybugDB has no :Message supertype -- a node IS its table -- so every (m:Message) shape must be split into Post and Comment arms and re-unioned, and the IC1/IC13 shortestPath forms have no transcription here. This is a LOADER and TRANSCRIPTION gap recorded in the dialect slot because the catalogue has no other slot for it; it is NOT a claim that Kuzu's Cypher cannot express the shape. Revisit the whole dialect when a property-carrying loader lands."
+      },
+      "sql": {
+        "status": "unverified",
+        "text": "/* IS7. Replies of a message\n\\set messageId 206158432794\n */\nselect p2.m_messageid, p2.m_content, p2.m_creationdate, p_personid, p_firstname, p_lastname,\n    (case when exists (\n                       select 1 from knows\n               where p1.m_creatorid = k_person1id and p2.m_creatorid = k_person2id)\n      then TRUE\n      else FALSE\n      end)\nfrom message p1, message p2, person\nwhere\n  p1.m_messageid = :messageId and p2.m_c_replyof = p1.m_messageid and p2.m_creatorid = p_personid\norder by p2.m_creationdate desc, p2.m_creatorid asc;\n;\n",
+        "source_file": "https://raw.githubusercontent.com/ldbc/ldbc_snb_interactive_v1_impls/main/postgres/queries/interactive-short-7.sql",
+        "source_sha256": "b146b114f43c09f2e3de19e5f24b0fc618e77be1e46f5cf36b7deb3bdfed84f0",
+        "vendored": "docs/bench/ldbc-official/interactive-v1-postgres/queries/interactive-short-7.sql",
+        "superseded": {
+          "status": "unverified",
+          "text": "SELECT c.id            AS \"commentId\",\n       c.content       AS \"commentContent\",\n       c.creation_date AS \"commentCreationDate\",\n       p.id            AS \"replyAuthorId\",\n       p.first_name    AS \"replyAuthorFirstName\",\n       p.last_name     AS \"replyAuthorLastName\",\n       EXISTS (SELECT 1\n               FROM has_creator a\n               JOIN knows k ON k.src = a.dst AND k.dst = p.id\n               WHERE a.src = ${messageId}) AS \"replyAuthorKnowsOriginalMessageAuthor\"\nFROM reply_of ro\nJOIN message c ON c.id = ro.src AND c.is_comment = true\nJOIN has_creator hc ON hc.src = c.id\nJOIN person p ON p.id = hc.dst\nWHERE ro.dst = ${messageId}\nORDER BY \"commentCreationDate\" DESC, \"replyAuthorId\" ASC"
+        },
+        "superseded_note": "What this entry carried until 2026-09-23: text written HERE from the official Cypher against the schema `sql_schema_required` describes, which was never built -- so it never ran, and the Interactive comparator failed naming `person_is_located_in_city` and `knows.src`. Kept for the record."
+      }
+    },
+    "IC1": {
+      "title": "Transitive friends with certain name",
+      "parameters": [
+        {
+          "name": "personId",
+          "type": "ID"
+        },
+        {
+          "name": "firstName",
+          "type": "STRING"
+        }
+      ],
+      "projection": [
+        {
+          "name": "friendId",
+          "type": "ID"
+        },
+        {
+          "name": "friendLastName",
+          "type": "STRING"
+        },
+        {
+          "name": "distanceFromPerson",
+          "type": "INTEGER"
+        },
+        {
+          "name": "friendBirthday",
+          "type": "DATE_EPOCH_MILLIS"
+        },
+        {
+          "name": "friendCreationDate",
+          "type": "DATETIME_EPOCH_MILLIS"
+        },
+        {
+          "name": "friendGender",
+          "type": "STRING"
+        },
+        {
+          "name": "friendBrowserUsed",
+          "type": "STRING"
+        },
+        {
+          "name": "friendLocationIp",
+          "type": "STRING"
+        },
+        {
+          "name": "friendEmails",
+          "type": "STRING[]"
+        },
+        {
+          "name": "friendLanguages",
+          "type": "STRING[]"
+        },
+        {
+          "name": "friendCityName",
+          "type": "STRING"
+        },
+        {
+          "name": "friendUniversities",
+          "type": "LIST<[STRING,INTEGER,STRING]>"
+        },
+        {
+          "name": "friendCompanies",
+          "type": "LIST<[STRING,INTEGER,STRING]>"
+        }
+      ],
+      "order_by": [
+        "distanceFromPerson ASC",
+        "friendLastName ASC",
+        "friendId ASC"
+      ],
+      "limit": 20,
+      "requires": [
+        "STUDY_AT.classYear",
+        "WORK_AT.workFrom",
+        "Person.email (list)",
+        "Person.speaks (list)"
+      ],
+      "hazards": [
+        "The SQL walk is DEPTH-BOUNDED, not a BFS with a visited set: reach re-expands a node once per path that finds it and min(dist) repairs the distance afterwards. At SF10 the 3-hop frontier is large and this may dominate the PostgreSQL arm's time. Recorded as a cost of the dialect; not measured.",
+        "The two nested list columns are jsonb in SQL and a list of lists in Cypher. Same values, different wire representation, so a comparator must parse the jsonb before comparing. Declared here rather than discovered by a diff.",
+        "collect(CASE uni.name WHEN null THEN null ELSE [...] END) over an OPTIONAL MATCH yields an EMPTY list when there is no university, because Cypher's collect drops nulls. The SQL coalesces an absent aggregate to '[]' for the same reason. An arm that emits [null] is wrong."
+      ],
+      "cypher": {
+        "status": "unverified",
+        "text": "MATCH (p:Person {id: ${personId}}), (friend:Person {firstName: '${firstName}'})\n       WHERE NOT p=friend\n       WITH p, friend\n       MATCH path = shortestPath((p)-[:KNOWS*1..3]-(friend))\n       WITH min(length(path)) AS distance, friend\nORDER BY\n    distance ASC,\n    friend.lastName ASC,\n    toInteger(friend.id) ASC\nLIMIT 20\n\nMATCH (friend)-[:IS_LOCATED_IN]->(friendCity:City)\nOPTIONAL MATCH (friend)-[studyAt:STUDY_AT]->(uni:University)-[:IS_LOCATED_IN]->(uniCity:City)\nWITH friend, collect(\n    CASE uni.name\n        WHEN null THEN null\n        ELSE [uni.name, studyAt.classYear, uniCity.name]\n    END ) AS unis, friendCity, distance\n\nOPTIONAL MATCH (friend)-[workAt:WORK_AT]->(company:Company)-[:IS_LOCATED_IN]->(companyCountry:Country)\nWITH friend, collect(\n    CASE company.name\n        WHEN null THEN null\n        ELSE [company.name, workAt.workFrom, companyCountry.name]\n    END ) AS companies, unis, friendCity, distance\n\nRETURN\n    friend.id AS friendId,\n    friend.lastName AS friendLastName,\n    distance AS distanceFromPerson,\n    friend.birthday AS friendBirthday,\n    friend.creationDate AS friendCreationDate,\n    friend.gender AS friendGender,\n    friend.browserUsed AS friendBrowserUsed,\n    friend.locationIP AS friendLocationIp,\n    friend.email AS friendEmails,\n    friend.speaks AS friendLanguages,\n    friendCity.name AS friendCityName,\n    unis AS friendUniversities,\n    companies AS friendCompanies\nORDER BY\n    distanceFromPerson ASC,\n    friendLastName ASC,\n    toInteger(friendId) ASC\nLIMIT 20",
+        "source_file": "https://github.com/ldbc/ldbc_snb_interactive_v1_impls/blob/main/cypher/queries/complex-1.cypher",
+        "source_sha256": "511e523567d5cfb0b33a3914aa40f4630473478f90b255f581883d4f5a8ba9a7"
+      },
+      "cypher_ladybug": {
+        "status": "unsupported",
+        "reason": "No LadybugDB loader in this tree carries node or relationship properties: measurements/pod/embedded-lsqb.py:160 sends [r[\"s\"], r[\"d\"]] -- two columns, nothing else -- because LSQB reads no property at all. Every SNB Interactive read projects properties, so this dialect would return a full-width result of nulls and report nothing wrong (docs/bench/ldbc-coverage-plan.md section 0.3 records that exact silent failure). Two further rewrites are also unwritten: LadybugDB has no :Message supertype -- a node IS its table -- so every (m:Message) shape must be split into Post and Comment arms and re-unioned, and the IC1/IC13 shortestPath forms have no transcription here. This is a LOADER and TRANSCRIPTION gap recorded in the dialect slot because the catalogue has no other slot for it; it is NOT a claim that Kuzu's Cypher cannot express the shape. Revisit the whole dialect when a property-carrying loader lands."
+      },
+      "sql": {
+        "status": "unverified",
+        "text": "/* Q1. Transitive friends with certain name\n\\set personId 4398046511333\n\\set firstName '\\'Jose\\''\n */\nselect\n  id,\n  p_lastname,\n  min (dist) as dist,\n  p_birthday,\n  p_creationdate,\n  p_gender,\n  p_browserused,\n  p_locationip,\n  (select array_agg(pe_email) from person_email where pe_personid = id group by pe_personid) as emails,\n  (select array_agg(plang_language) from person_language where plang_personid = id group by plang_personid) as languages,\n  p1.pl_name,\n  (select array_agg(ARRAY[o2.o_name, pu_classyear::text, p2.pl_name]) from person_university, organisation o2, place p2  where pu_personid = id and pu_organisationid = o2.o_organisationid and o2.o_placeid = p2.pl_placeid group by pu_personid) as university,\n  (select array_agg(ARRAY[o3.o_name, pc_workfrom::text, p3.pl_name]) from person_company, organisation o3, place p3 where pc_personid = id and pc_organisationid = o3.o_organisationid and o3.o_placeid = p3.pl_placeid group by pc_personid) as company\nfrom\n    (\n    select k_person2id as id, 1 as dist from knows, person where k_person1id = :personId and p_personid = k_person2id and p_firstname = :firstName\n    union all\n    select b.k_person2id as id, 2 as dist from knows a, knows b, person\n    where a.k_person1id = :personId\n      and b.k_person1id = a.k_person2id\n      and p_personid = b.k_person2id\n      and p_firstname = :firstName\n      and p_personid != :personId -- excluding start person\n    union all\n    select c.k_person2id as id, 3 as dist from knows a, knows b, knows c, person\n    where a.k_person1id = :personId\n      and b.k_person1id = a.k_person2id\n      and b.k_person2id = c.k_person1id\n      and p_personid = c.k_person2id\n      and p_firstname = :firstName\n      and p_personid != :personId -- excluding start person\n    ) tmp, person, place p1\n  where\n    p_personid = id and\n    p_placeid = p1.pl_placeid\n  group by id, p_lastname, p_birthday, p_creationdate, p_gender, p_browserused, p_locationip, p1.pl_name\n  order by dist, p_lastname, id\n  LIMIT 20\n;\n",
+        "source_file": "https://raw.githubusercontent.com/ldbc/ldbc_snb_interactive_v1_impls/main/postgres/queries/interactive-complex-1.sql",
+        "source_sha256": "2a685ce57a6673ed30054ec5ded9f1f2c2ca15068a6f654d48b7ae632b5f647e",
+        "vendored": "docs/bench/ldbc-official/interactive-v1-postgres/queries/interactive-complex-1.sql",
+        "superseded": {
+          "status": "unverified",
+          "text": "WITH RECURSIVE reach (id, dist) AS (\n  SELECT CAST(${personId} AS bigint), 0\n  UNION ALL\n  SELECT k.dst, r.dist + 1 FROM reach r JOIN knows k ON k.src = r.id WHERE r.dist < 3\n),\ndist AS (\n  SELECT id, min(dist) AS distance FROM reach WHERE id <> ${personId} GROUP BY id\n),\ncand AS (\n  SELECT p.id, d.distance\n  FROM dist d JOIN person p ON p.id = d.id\n  WHERE p.first_name = '${firstName}'\n  ORDER BY d.distance ASC, p.last_name ASC, p.id ASC\n  LIMIT 20\n)\nSELECT p.id            AS \"friendId\",\n       p.last_name     AS \"friendLastName\",\n       c.distance      AS \"distanceFromPerson\",\n       p.birthday      AS \"friendBirthday\",\n       p.creation_date AS \"friendCreationDate\",\n       p.gender        AS \"friendGender\",\n       p.browser_used  AS \"friendBrowserUsed\",\n       p.location_ip   AS \"friendLocationIp\",\n       p.email         AS \"friendEmails\",\n       p.speaks        AS \"friendLanguages\",\n       ci.name         AS \"friendCityName\",\n       coalesce((SELECT jsonb_agg(jsonb_build_array(u.name, sa.class_year, uc.name))\n                 FROM study_at sa\n                 JOIN university u ON u.id = sa.dst\n                 JOIN organisation_is_located_in_city ul ON ul.src = u.id\n                 JOIN city uc ON uc.id = ul.dst\n                 WHERE sa.src = p.id), '[]'::jsonb) AS \"friendUniversities\",\n       coalesce((SELECT jsonb_agg(jsonb_build_array(co.name, wa.work_from, cc.name))\n                 FROM work_at wa\n                 JOIN company co ON co.id = wa.dst\n                 JOIN organisation_is_located_in_country ol ON ol.src = co.id\n                 JOIN country cc ON cc.id = ol.dst\n                 WHERE wa.src = p.id), '[]'::jsonb) AS \"friendCompanies\"\nFROM cand c\nJOIN person p ON p.id = c.id\nJOIN person_is_located_in_city pl ON pl.src = p.id\nJOIN city ci ON ci.id = pl.dst\nORDER BY \"distanceFromPerson\" ASC, \"friendLastName\" ASC, \"friendId\" ASC\nLIMIT 20"
+        },
+        "superseded_note": "What this entry carried until 2026-09-23: text written HERE from the official Cypher against the schema `sql_schema_required` describes, which was never built -- so it never ran, and the Interactive comparator failed naming `person_is_located_in_city` and `knows.src`. Kept for the record."
+      }
+    },
+    "IC2": {
+      "title": "Recent messages by your friends",
+      "parameters": [
+        {
+          "name": "personId",
+          "type": "ID"
+        },
+        {
+          "name": "maxDate",
+          "type": "DATETIME_EPOCH_MILLIS"
+        }
+      ],
+      "projection": [
+        {
+          "name": "personId",
+          "type": "ID"
+        },
+        {
+          "name": "personFirstName",
+          "type": "STRING"
+        },
+        {
+          "name": "personLastName",
+          "type": "STRING"
+        },
+        {
+          "name": "postOrCommentId",
+          "type": "ID"
+        },
+        {
+          "name": "postOrCommentContent",
+          "type": "STRING"
+        },
+        {
+          "name": "postOrCommentCreationDate",
+          "type": "DATETIME_EPOCH_MILLIS"
+        }
+      ],
+      "order_by": [
+        "postOrCommentCreationDate DESC",
+        "postOrCommentId ASC"
+      ],
+      "limit": 20,
+      "hazards": [
+        "maxDate is INCLUSIVE here (<=) and EXCLUSIVE in IC9 (<). Both are as published."
+      ],
+      "cypher": {
+        "status": "unverified",
+        "text": "MATCH (:Person {id: ${personId} })-[:KNOWS]-(friend:Person)<-[:HAS_CREATOR]-(message:Message)\n    WHERE message.creationDate <= ${maxDate}\n    RETURN\n        friend.id AS personId,\n        friend.firstName AS personFirstName,\n        friend.lastName AS personLastName,\n        message.id AS postOrCommentId,\n        coalesce(message.content,message.imageFile) AS postOrCommentContent,\n        message.creationDate AS postOrCommentCreationDate\n    ORDER BY\n        postOrCommentCreationDate DESC,\n        toInteger(postOrCommentId) ASC\n    LIMIT 20",
+        "source_file": "https://github.com/ldbc/ldbc_snb_interactive_v1_impls/blob/main/cypher/queries/complex-2.cypher",
+        "source_sha256": "434d4215e299eb00fa4d0bfc9a5111b00f1a806c7b8220044df7963da3f06de2"
+      },
+      "cypher_ladybug": {
+        "status": "unsupported",
+        "reason": "No LadybugDB loader in this tree carries node or relationship properties: measurements/pod/embedded-lsqb.py:160 sends [r[\"s\"], r[\"d\"]] -- two columns, nothing else -- because LSQB reads no property at all. Every SNB Interactive read projects properties, so this dialect would return a full-width result of nulls and report nothing wrong (docs/bench/ldbc-coverage-plan.md section 0.3 records that exact silent failure). Two further rewrites are also unwritten: LadybugDB has no :Message supertype -- a node IS its table -- so every (m:Message) shape must be split into Post and Comment arms and re-unioned, and the IC1/IC13 shortestPath forms have no transcription here. This is a LOADER and TRANSCRIPTION gap recorded in the dialect slot because the catalogue has no other slot for it; it is NOT a claim that Kuzu's Cypher cannot express the shape. Revisit the whole dialect when a property-carrying loader lands."
+      },
+      "sql": {
+        "status": "unverified",
+        "text": "/* Q2. Recent messages by your friends\n\\set personId 10995116278009\n\\set maxDate '\\'2010-10-16\\''\n */\nselect p_personid, p_firstname, p_lastname, m_messageid, COALESCE(m_ps_imagefile, m_content), m_creationdate\nfrom person, message, knows\nwhere\n    p_personid = m_creatorid and\n    m_creationdate <= :maxDate and\n    k_person1id = :personId and\n    k_person2id = p_personid\norder by m_creationdate desc, m_messageid asc\nlimit 20\n;\n",
+        "source_file": "https://raw.githubusercontent.com/ldbc/ldbc_snb_interactive_v1_impls/main/postgres/queries/interactive-complex-2.sql",
+        "source_sha256": "70e79e4a75c486df5eddb6923daba2fb178b8ca30a311ef5bf93d3f5acf0eafc",
+        "vendored": "docs/bench/ldbc-official/interactive-v1-postgres/queries/interactive-complex-2.sql",
+        "superseded": {
+          "status": "unverified",
+          "text": "SELECT f.id                              AS \"personId\",\n       f.first_name                      AS \"personFirstName\",\n       f.last_name                       AS \"personLastName\",\n       m.id                              AS \"postOrCommentId\",\n       coalesce(m.content, m.image_file) AS \"postOrCommentContent\",\n       m.creation_date                   AS \"postOrCommentCreationDate\"\nFROM knows k\nJOIN person f ON f.id = k.dst\nJOIN has_creator hc ON hc.dst = f.id\nJOIN message m ON m.id = hc.src\nWHERE k.src = ${personId} AND m.creation_date <= ${maxDate}\nORDER BY \"postOrCommentCreationDate\" DESC, \"postOrCommentId\" ASC\nLIMIT 20"
+        },
+        "superseded_note": "What this entry carried until 2026-09-23: text written HERE from the official Cypher against the schema `sql_schema_required` describes, which was never built -- so it never ran, and the Interactive comparator failed naming `person_is_located_in_city` and `knows.src`. Kept for the record."
+      }
+    },
+    "IC3": {
+      "title": "Friends and friends of friends that have been to given countries",
+      "parameters": [
+        {
+          "name": "personId",
+          "type": "ID"
+        },
+        {
+          "name": "countryXName",
+          "type": "STRING"
+        },
+        {
+          "name": "countryYName",
+          "type": "STRING"
+        },
+        {
+          "name": "startDate",
+          "type": "DATETIME_EPOCH_MILLIS"
+        },
+        {
+          "name": "endDate",
+          "type": "DATETIME_EPOCH_MILLIS"
+        }
+      ],
+      "projection": [
+        {
+          "name": "friendId",
+          "type": "ID"
+        },
+        {
+          "name": "friendFirstName",
+          "type": "STRING"
+        },
+        {
+          "name": "friendLastName",
+          "type": "STRING"
+        },
+        {
+          "name": "xCount",
+          "type": "INTEGER"
+        },
+        {
+          "name": "yCount",
+          "type": "INTEGER"
+        },
+        {
+          "name": "xyCount",
+          "type": "INTEGER"
+        }
+      ],
+      "order_by": [
+        "xyCount DESC",
+        "friendId ASC"
+      ],
+      "limit": 20,
+      "hazards": [
+        "The window is half-open and written backwards in the reference ($endDate > message.creationDate >= $startDate). Inclusive at both ends is a different query that agrees on almost every parameter and differs on a few.",
+        "The city exclusion applies to the FRIEND's city, not to the message's country.",
+        "A friend with no IS_LOCATED_IN edge is dropped by the SQL's inner join, exactly as the Cypher's (friend)-[:IS_LOCATED_IN]->(city) drops it. That is the reference behaviour, not an oversight."
+      ],
+      "cypher": {
+        "status": "unverified",
+        "text": "MATCH (countryX:Country {name: '${countryXName}' }),\n      (countryY:Country {name: '${countryYName}' }),\n      (person:Person {id: ${personId} })\nWITH person, countryX, countryY\nLIMIT 1\nMATCH (city:City)-[:IS_PART_OF]->(country:Country)\nWHERE country IN [countryX, countryY]\nWITH person, countryX, countryY, collect(city) AS cities\nMATCH (person)-[:KNOWS*1..2]-(friend)-[:IS_LOCATED_IN]->(city)\nWHERE NOT person=friend AND NOT city IN cities\nWITH DISTINCT friend, countryX, countryY\nMATCH (friend)<-[:HAS_CREATOR]-(message),\n      (message)-[:IS_LOCATED_IN]->(country)\nWHERE ${endDate} > message.creationDate >= ${startDate} AND\n      country IN [countryX, countryY]\nWITH friend,\n     CASE WHEN country=countryX THEN 1 ELSE 0 END AS messageX,\n     CASE WHEN country=countryY THEN 1 ELSE 0 END AS messageY\nWITH friend, sum(messageX) AS xCount, sum(messageY) AS yCount\nWHERE xCount>0 AND yCount>0\nRETURN friend.id AS friendId,\n       friend.firstName AS friendFirstName,\n       friend.lastName AS friendLastName,\n       xCount,\n       yCount,\n       xCount + yCount AS xyCount\nORDER BY xyCount DESC, friendId ASC\nLIMIT 20",
+        "source_file": "https://github.com/ldbc/ldbc_snb_interactive_v1_impls/blob/main/cypher/queries/complex-3.cypher",
+        "source_sha256": "48f03b4d978d9805fedb3af234edfb30c33ed5f4da4f49a31f205a8d211fbdb0"
+      },
+      "cypher_ladybug": {
+        "status": "unsupported",
+        "reason": "No LadybugDB loader in this tree carries node or relationship properties: measurements/pod/embedded-lsqb.py:160 sends [r[\"s\"], r[\"d\"]] -- two columns, nothing else -- because LSQB reads no property at all. Every SNB Interactive read projects properties, so this dialect would return a full-width result of nulls and report nothing wrong (docs/bench/ldbc-coverage-plan.md section 0.3 records that exact silent failure). Two further rewrites are also unwritten: LadybugDB has no :Message supertype -- a node IS its table -- so every (m:Message) shape must be split into Post and Comment arms and re-unioned, and the IC1/IC13 shortestPath forms have no transcription here. This is a LOADER and TRANSCRIPTION gap recorded in the dialect slot because the catalogue has no other slot for it; it is NOT a claim that Kuzu's Cypher cannot express the shape. Revisit the whole dialect when a property-carrying loader lands."
+      },
+      "sql": {
+        "status": "unverified",
+        "text": "/* Q3. Friends and friends of friends that have been to given countries\n\\set personId 6597069766734\n\\set countryXName '\\'Angola\\''\n\\set countryYName '\\'Colombia\\''\n\\set startDate '\\'2010-06-01\\''::date\n\\set durationDays 28\n */\nselect p_personid, p_firstname, p_lastname, ct1, ct2, total as totalcount\nfrom\n ( select k_person2id\n   from knows\n   where\n   k_person1id = :personId\n   union\n   select k2.k_person2id\n   from knows k1, knows k2\n   where\n   k1.k_person1id = :personId and k1.k_person2id = k2.k_person1id and k2.k_person2id <> :personId\n ) f,  person, place p1, place p2,\n (\n  select chn.m_c_creatorid, ct1, ct2, ct1 + ct2 as total\n  from\n   (\n      select m_creatorid as m_c_creatorid, count(*) as ct1 from message, place\n      where\n        m_locationid = pl_placeid and pl_name = :countryXName and\n        m_creationdate >= :startDate and  m_creationdate < :endDate\n      group by m_c_creatorid\n   ) chn,\n   (\n      select m_creatorid as m_c_creatorid, count(*) as ct2 from message, place\n      where\n        m_locationid = pl_placeid and pl_name = :countryYName and\n        m_creationdate >= :startDate and  m_creationdate < :endDate\n      group by m_creatorid --m_c_creatorid\n   ) ind\n  where CHN.m_c_creatorid = IND.m_c_creatorid\n ) cpc\nwhere\nf.k_person2id = p_personid and p_placeid = p1.pl_placeid and\np1.pl_containerplaceid = p2.pl_placeid and p2.pl_name <> :countryXName and p2.pl_name <> :countryYName and\nf.k_person2id = cpc.m_c_creatorid\norder by totalcount desc, p_personid asc\nlimit 20\n;\n",
+        "source_file": "https://raw.githubusercontent.com/ldbc/ldbc_snb_interactive_v1_impls/main/postgres/queries/interactive-complex-3.sql",
+        "source_sha256": "f68f874752bfd147b83b988ed1f8e174c5fc0d58a1be0888f1eae12d4cac1be2",
+        "vendored": "docs/bench/ldbc-official/interactive-v1-postgres/queries/interactive-complex-3.sql",
+        "adaptation": "ONE change to LDBC's text: its window end `(:startDate + INTERVAL '1 days' * :durationDays)` is written `:endDate`. LDBC's driver passes startDate and durationDays; this catalogue's parameters, shared with the Cypher arm, are startDate and endDate. The same instant, spelled in the parameters every arm binds.",
+        "superseded": {
+          "status": "unverified",
+          "text": "WITH RECURSIVE reach (id, dist) AS (\n  SELECT CAST(${personId} AS bigint), 0\n  UNION ALL\n  SELECT k.dst, r.dist + 1 FROM reach r JOIN knows k ON k.src = r.id WHERE r.dist < 2\n),\ncities AS (\n  SELECT ipo.src AS city_id\n  FROM is_part_of ipo JOIN country c ON c.id = ipo.dst\n  WHERE c.name IN ('${countryXName}', '${countryYName}')\n),\nfriends AS (\n  SELECT DISTINCT r.id\n  FROM reach r\n  JOIN person_is_located_in_city pl ON pl.src = r.id\n  WHERE r.id <> ${personId}\n    AND pl.dst NOT IN (SELECT city_id FROM cities)\n),\nmsgs AS (\n  SELECT f.id AS friend_id,\n         CASE WHEN co.name = '${countryXName}' THEN 1 ELSE 0 END AS mx,\n         CASE WHEN co.name = '${countryYName}' THEN 1 ELSE 0 END AS my\n  FROM friends f\n  JOIN has_creator hc ON hc.dst = f.id\n  JOIN message m ON m.id = hc.src\n  JOIN message_is_located_in_country mc ON mc.src = m.id\n  JOIN country co ON co.id = mc.dst\n  WHERE m.creation_date >= ${startDate}\n    AND m.creation_date <  ${endDate}\n    AND co.name IN ('${countryXName}', '${countryYName}')\n)\nSELECT p.id                   AS \"friendId\",\n       p.first_name           AS \"friendFirstName\",\n       p.last_name            AS \"friendLastName\",\n       sum(msgs.mx)           AS \"xCount\",\n       sum(msgs.my)           AS \"yCount\",\n       sum(msgs.mx + msgs.my) AS \"xyCount\"\nFROM msgs JOIN person p ON p.id = msgs.friend_id\nGROUP BY p.id, p.first_name, p.last_name\nHAVING sum(msgs.mx) > 0 AND sum(msgs.my) > 0\nORDER BY \"xyCount\" DESC, \"friendId\" ASC\nLIMIT 20"
+        },
+        "superseded_note": "What this entry carried until 2026-09-23: text written HERE from the official Cypher against the schema `sql_schema_required` describes, which was never built -- so it never ran, and the Interactive comparator failed naming `person_is_located_in_city` and `knows.src`. Kept for the record."
+      }
+    },
+    "IC4": {
+      "title": "New topics",
+      "parameters": [
+        {
+          "name": "personId",
+          "type": "ID"
+        },
+        {
+          "name": "startDate",
+          "type": "DATETIME_EPOCH_MILLIS"
+        },
+        {
+          "name": "endDate",
+          "type": "DATETIME_EPOCH_MILLIS"
+        }
+      ],
+      "projection": [
+        {
+          "name": "tagName",
+          "type": "STRING"
+        },
+        {
+          "name": "postCount",
+          "type": "INTEGER"
+        }
+      ],
+      "order_by": [
+        "postCount DESC",
+        "tagName ASC"
+      ],
+      "limit": 10,
+      "hazards": [
+        "GROUP BY t.id, t.name, not by name alone: the Cypher groups by the tag NODE, so two Tags sharing a name stay two rows. Grouping by name merges them and changes the counts without changing the column list.",
+        "A post created at or after endDate counts towards NEITHER sum, so it neither scores the tag nor disqualifies it. Reading inValid as 'not valid' disqualifies those tags and quietly shortens the answer.",
+        "Posts only -- (post:Post) in the reference -- so is_comment = false is part of the query, not an optimisation."
+      ],
+      "cypher": {
+        "status": "unverified",
+        "text": "MATCH (person:Person {id: ${personId} })-[:KNOWS]-(friend:Person),\n      (friend)<-[:HAS_CREATOR]-(post:Post)-[:HAS_TAG]->(tag)\nWITH DISTINCT tag, post\nWITH tag,\n     CASE\n       WHEN ${startDate} <= post.creationDate < ${endDate} THEN 1\n       ELSE 0\n     END AS valid,\n     CASE\n       WHEN post.creationDate < ${startDate} THEN 1\n       ELSE 0\n     END AS inValid\nWITH tag, sum(valid) AS postCount, sum(inValid) AS inValidPostCount\nWHERE postCount>0 AND inValidPostCount=0\nRETURN tag.name AS tagName, postCount\nORDER BY postCount DESC, tagName ASC\nLIMIT 10",
+        "source_file": "https://github.com/ldbc/ldbc_snb_interactive_v1_impls/blob/main/cypher/queries/complex-4.cypher",
+        "source_sha256": "c95bdd712db43c54cfbaf47573abc5c1eb2db2d9b38d318696eadfa7721d5a5b"
+      },
+      "cypher_ladybug": {
+        "status": "unsupported",
+        "reason": "No LadybugDB loader in this tree carries node or relationship properties: measurements/pod/embedded-lsqb.py:160 sends [r[\"s\"], r[\"d\"]] -- two columns, nothing else -- because LSQB reads no property at all. Every SNB Interactive read projects properties, so this dialect would return a full-width result of nulls and report nothing wrong (docs/bench/ldbc-coverage-plan.md section 0.3 records that exact silent failure). Two further rewrites are also unwritten: LadybugDB has no :Message supertype -- a node IS its table -- so every (m:Message) shape must be split into Post and Comment arms and re-unioned, and the IC1/IC13 shortestPath forms have no transcription here. This is a LOADER and TRANSCRIPTION gap recorded in the dialect slot because the catalogue has no other slot for it; it is NOT a claim that Kuzu's Cypher cannot express the shape. Revisit the whole dialect when a property-carrying loader lands."
+      },
+      "sql": {
+        "status": "unverified",
+        "text": "/* Q4. New topics\n\\set personId 10995116277918\n\\set startDate '\\'2010-10-01\\''::date\n\\set durationDays 31\n */\nselect t_name, count(*) as postCount\nfrom tag, message, message_tag recent, knows\nwhere\n    m_messageid = mt_messageid and\n    mt_tagid = t_tagid and\n    m_creatorid = k_person2id and\n    m_c_replyof IS NULL and -- post, not comment\n    k_person1id = :personId and\n    m_creationdate >= :startDate and\n    m_creationdate < :endDate and\n    not exists (\n        select * from\n  (select distinct mt_tagid from message, message_tag, knows\n        where\n    k_person1id = :personId and\n        k_person2id = m_creatorid and\n        m_c_replyof IS NULL and -- post, not comment\n        mt_messageid = m_messageid and\n        m_creationdate < :startDate) tags\n  where  tags.mt_tagid = recent.mt_tagid)\ngroup by t_name\norder by postCount desc, t_name asc\nlimit 10\n;\n",
+        "source_file": "https://raw.githubusercontent.com/ldbc/ldbc_snb_interactive_v1_impls/main/postgres/queries/interactive-complex-4.sql",
+        "source_sha256": "c5f1e04175af1a3452cd63c0a859b5b4ad3a8f887fe4c6b0e5c0664833109774",
+        "vendored": "docs/bench/ldbc-official/interactive-v1-postgres/queries/interactive-complex-4.sql",
+        "adaptation": "ONE change to LDBC's text: its window end `(:startDate + INTERVAL '1 days' * :durationDays)` is written `:endDate`. LDBC's driver passes startDate and durationDays; this catalogue's parameters, shared with the Cypher arm, are startDate and endDate. The same instant, spelled in the parameters every arm binds.",
+        "superseded": {
+          "status": "unverified",
+          "text": "WITH friend_posts AS (\n  SELECT DISTINCT ht.dst AS tag_id, m.id AS post_id, m.creation_date\n  FROM knows k\n  JOIN has_creator hc ON hc.dst = k.dst\n  JOIN message m ON m.id = hc.src AND m.is_comment = false\n  JOIN has_tag ht ON ht.src = m.id\n  WHERE k.src = ${personId}\n)\nSELECT t.name AS \"tagName\",\n       sum(CASE WHEN fp.creation_date >= ${startDate} AND fp.creation_date < ${endDate}\n                THEN 1 ELSE 0 END) AS \"postCount\"\nFROM friend_posts fp JOIN tag t ON t.id = fp.tag_id\nGROUP BY t.id, t.name\nHAVING sum(CASE WHEN fp.creation_date >= ${startDate} AND fp.creation_date < ${endDate}\n                THEN 1 ELSE 0 END) > 0\n   AND sum(CASE WHEN fp.creation_date < ${startDate} THEN 1 ELSE 0 END) = 0\nORDER BY \"postCount\" DESC, \"tagName\" ASC\nLIMIT 10"
+        },
+        "superseded_note": "What this entry carried until 2026-09-23: text written HERE from the official Cypher against the schema `sql_schema_required` describes, which was never built -- so it never ran, and the Interactive comparator failed naming `person_is_located_in_city` and `knows.src`. Kept for the record."
+      }
+    },
+    "IC5": {
+      "title": "New groups",
+      "parameters": [
+        {
+          "name": "personId",
+          "type": "ID"
+        },
+        {
+          "name": "minDate",
+          "type": "DATETIME_EPOCH_MILLIS"
+        }
+      ],
+      "projection": [
+        {
+          "name": "forumName",
+          "type": "STRING"
+        },
+        {
+          "name": "postCount",
+          "type": "INTEGER"
+        }
+      ],
+      "order_by": [
+        "postCount DESC",
+        "forum.id ASC (a sort key that is NOT projected)"
+      ],
+      "limit": 20,
+      "requires": [
+        "HAS_MEMBER.joinDate"
+      ],
+      "hazards": [
+        "The post's author must be a friend who joined THAT forum, not any friend. The reference carries collect(friend) per forum for exactly that reason and the SQL carries the same restriction in the EXISTS. Dropping it inflates every count.",
+        "count(post) over a LEFT JOIN answers 0 for a forum with no qualifying post, and that forum must still appear. count(*) would answer 1.",
+        "ORDER BY forum.id is a sort key that is NOT in the projection, so two forums with the same title and the same count are still ordered deterministically. An arm that breaks the tie on forumName is not this query."
+      ],
+      "cypher": {
+        "status": "unverified",
+        "text": "MATCH (person:Person { id: ${personId} })-[:KNOWS*1..2]-(friend)\nWHERE\n    NOT person=friend\nWITH DISTINCT friend\nMATCH (friend)<-[membership:HAS_MEMBER]-(forum)\nWHERE\n    membership.joinDate > ${minDate}\nWITH\n    forum,\n    collect(friend) AS friends\nOPTIONAL MATCH (friend)<-[:HAS_CREATOR]-(post)<-[:CONTAINER_OF]-(forum)\nWHERE\n    friend IN friends\nWITH\n    forum,\n    count(post) AS postCount\nRETURN\n    forum.title AS forumName,\n    postCount\nORDER BY\n    postCount DESC,\n    forum.id ASC\nLIMIT 20",
+        "source_file": "https://github.com/ldbc/ldbc_snb_interactive_v1_impls/blob/main/cypher/queries/complex-5.cypher",
+        "source_sha256": "db86d129f842cf7b7f461355bd10698cf0af34b019d018d9267d8adb324e0358"
+      },
+      "cypher_ladybug": {
+        "status": "unsupported",
+        "reason": "No LadybugDB loader in this tree carries node or relationship properties: measurements/pod/embedded-lsqb.py:160 sends [r[\"s\"], r[\"d\"]] -- two columns, nothing else -- because LSQB reads no property at all. Every SNB Interactive read projects properties, so this dialect would return a full-width result of nulls and report nothing wrong (docs/bench/ldbc-coverage-plan.md section 0.3 records that exact silent failure). Two further rewrites are also unwritten: LadybugDB has no :Message supertype -- a node IS its table -- so every (m:Message) shape must be split into Post and Comment arms and re-unioned, and the IC1/IC13 shortestPath forms have no transcription here. This is a LOADER and TRANSCRIPTION gap recorded in the dialect slot because the catalogue has no other slot for it; it is NOT a claim that Kuzu's Cypher cannot express the shape. Revisit the whole dialect when a property-carrying loader lands."
+      },
+      "sql": {
+        "status": "unverified",
+        "text": "/* Q5 New groups\n\\set personId 6597069766734\n\\set minDate '\\'2010-11-01\\''::date\n */\nselect f_title, count(m_messageid) AS postCount\nfrom (\nselect f_title, f_forumid, f.k_person2id\nfrom forum, forum_person,\n ( select k_person2id\n   from knows\n   where\n   k_person1id = :personId\n   union\n   select k2.k_person2id\n   from knows k1, knows k2\n   where\n   k1.k_person1id = :personId and k1.k_person2id = k2.k_person1id and k2.k_person2id <> :personId\n ) f\nwhere f_forumid = fp_forumid and fp_personid = f.k_person2id and\n      fp_joindate >= :minDate\n) tmp left join message\non tmp.f_forumid = m_ps_forumid and m_creatorid = tmp.k_person2id\ngroup by f_forumid, f_title\norder by postCount desc, f_forumid asc\nlimit 20\n;\n",
+        "source_file": "https://raw.githubusercontent.com/ldbc/ldbc_snb_interactive_v1_impls/main/postgres/queries/interactive-complex-5.sql",
+        "source_sha256": "12f8d6dcc0c6abc48f46515126b8fca62814d1d3e1a96df37219feb79989206f",
+        "vendored": "docs/bench/ldbc-official/interactive-v1-postgres/queries/interactive-complex-5.sql",
+        "superseded": {
+          "status": "unverified",
+          "text": "WITH RECURSIVE reach (id, dist) AS (\n  SELECT CAST(${personId} AS bigint), 0\n  UNION ALL\n  SELECT k.dst, r.dist + 1 FROM reach r JOIN knows k ON k.src = r.id WHERE r.dist < 2\n),\nfriends AS (SELECT DISTINCT id FROM reach WHERE id <> ${personId}),\nfora AS (\n  SELECT hm.src AS forum_id, hm.dst AS friend_id\n  FROM has_member hm JOIN friends f ON f.id = hm.dst\n  WHERE hm.join_date > ${minDate}\n)\nSELECT fo.title    AS \"forumName\",\n       count(m.id) AS \"postCount\"\nFROM (SELECT DISTINCT forum_id FROM fora) g\nJOIN forum fo ON fo.id = g.forum_id\nLEFT JOIN (container_of co\n           JOIN message m ON m.id = co.dst\n           JOIN has_creator hc ON hc.src = m.id)\n       ON co.src = fo.id\n      AND EXISTS (SELECT 1 FROM fora x WHERE x.forum_id = fo.id AND x.friend_id = hc.dst)\nGROUP BY fo.id, fo.title\nORDER BY \"postCount\" DESC, fo.id ASC\nLIMIT 20"
+        },
+        "superseded_note": "What this entry carried until 2026-09-23: text written HERE from the official Cypher against the schema `sql_schema_required` describes, which was never built -- so it never ran, and the Interactive comparator failed naming `person_is_located_in_city` and `knows.src`. Kept for the record."
+      }
+    },
+    "IC6": {
+      "title": "Tag co-occurrence",
+      "parameters": [
+        {
+          "name": "personId",
+          "type": "ID"
+        },
+        {
+          "name": "tagName",
+          "type": "STRING"
+        }
+      ],
+      "projection": [
+        {
+          "name": "tagName",
+          "type": "STRING"
+        },
+        {
+          "name": "postCount",
+          "type": "INTEGER"
+        }
+      ],
+      "order_by": [
+        "postCount DESC",
+        "tagName ASC"
+      ],
+      "limit": 10,
+      "hazards": [
+        "The reference resolves the known tag to an ID and excludes by node identity (NOT t = tag), not by name. Excluding by name would also drop a DIFFERENT tag that happens to share the name. Whether SNB tag names are unique is NOT ESTABLISHED here.",
+        "If the name is NOT unique, the two dialects diverge structurally: the reference's MATCH (knownTag:Tag {name}) ... WITH knownTag.id keeps one row per matching tag and multiplies the whole downstream match, while the SQL's IN (SELECT id FROM known) over a DISTINCT post set does not."
+      ],
+      "cypher": {
+        "status": "unverified",
+        "text": "MATCH (knownTag:Tag { name: '${tagName}' })\nWITH knownTag.id as knownTagId\n\nMATCH (person:Person { id: ${personId} })-[:KNOWS*1..2]-(friend)\nWHERE NOT person=friend\nWITH\n    knownTagId,\n    collect(distinct friend) as friends\nUNWIND friends as f\n    MATCH (f)<-[:HAS_CREATOR]-(post:Post),\n          (post)-[:HAS_TAG]->(t:Tag{id: knownTagId}),\n          (post)-[:HAS_TAG]->(tag:Tag)\n    WHERE NOT t = tag\n    WITH\n        tag.name as tagName,\n        count(post) as postCount\nRETURN\n    tagName,\n    postCount\nORDER BY\n    postCount DESC,\n    tagName ASC\nLIMIT 10",
+        "source_file": "https://github.com/ldbc/ldbc_snb_interactive_v1_impls/blob/main/cypher/queries/complex-6.cypher",
+        "source_sha256": "ea2a20b7095c2f79f7535831b54176a55c30b9d4618589160e4a3a2abc099c6e"
+      },
+      "cypher_ladybug": {
+        "status": "unsupported",
+        "reason": "No LadybugDB loader in this tree carries node or relationship properties: measurements/pod/embedded-lsqb.py:160 sends [r[\"s\"], r[\"d\"]] -- two columns, nothing else -- because LSQB reads no property at all. Every SNB Interactive read projects properties, so this dialect would return a full-width result of nulls and report nothing wrong (docs/bench/ldbc-coverage-plan.md section 0.3 records that exact silent failure). Two further rewrites are also unwritten: LadybugDB has no :Message supertype -- a node IS its table -- so every (m:Message) shape must be split into Post and Comment arms and re-unioned, and the IC1/IC13 shortestPath forms have no transcription here. This is a LOADER and TRANSCRIPTION gap recorded in the dialect slot because the catalogue has no other slot for it; it is NOT a claim that Kuzu's Cypher cannot express the shape. Revisit the whole dialect when a property-carrying loader lands."
+      },
+      "sql": {
+        "status": "unverified",
+        "text": "/* Q6. Tag co-occurrence\n\\set personId 4398046511333\n\\set tagName '\\'Carl_Gustaf_Emil_Mannerheim\\''\n */\nselect t_name, count(*) as postcount\nfrom tag, message_tag, message,\n ( select k_person2id\n   from knows\n   where\n   k_person1id = :personId\n   union\n   select k2.k_person2id\n   from knows k1, knows k2\n   where\n   k1.k_person1id = :personId and k1.k_person2id = k2.k_person1id and k2.k_person2id <> :personId\n ) f\nwhere\nm_creatorid = f.k_person2id and\nm_c_replyof IS NULL and -- post, not comment\nm_messageid = mt_messageid and\nmt_tagid = t_tagid and\nt_name <> :tagName and\nexists (select * from tag, message_tag where mt_messageid = m_messageid and mt_tagid = t_tagid and t_name = :tagName)\ngroup by t_name\norder by postCount desc, t_name asc\nlimit 10\n;\n",
+        "source_file": "https://raw.githubusercontent.com/ldbc/ldbc_snb_interactive_v1_impls/main/postgres/queries/interactive-complex-6.sql",
+        "source_sha256": "98e5a3d06183dea67e48c5d451c6ad5d1e563170ab068413aae34a1707c62394",
+        "vendored": "docs/bench/ldbc-official/interactive-v1-postgres/queries/interactive-complex-6.sql",
+        "superseded": {
+          "status": "unverified",
+          "text": "WITH RECURSIVE reach (id, dist) AS (\n  SELECT CAST(${personId} AS bigint), 0\n  UNION ALL\n  SELECT k.dst, r.dist + 1 FROM reach r JOIN knows k ON k.src = r.id WHERE r.dist < 2\n),\nfriends AS (SELECT DISTINCT id FROM reach WHERE id <> ${personId}),\nknown AS (SELECT id FROM tag WHERE name = '${tagName}'),\nposts AS (\n  SELECT DISTINCT m.id AS post_id\n  FROM friends f\n  JOIN has_creator hc ON hc.dst = f.id\n  JOIN message m ON m.id = hc.src AND m.is_comment = false\n  WHERE EXISTS (SELECT 1 FROM has_tag ht\n                 WHERE ht.src = m.id AND ht.dst IN (SELECT id FROM known))\n)\nSELECT t.name   AS \"tagName\",\n       count(*) AS \"postCount\"\nFROM posts p\nJOIN has_tag ht ON ht.src = p.post_id\nJOIN tag t ON t.id = ht.dst\nWHERE t.id NOT IN (SELECT id FROM known)\nGROUP BY t.id, t.name\nORDER BY \"postCount\" DESC, \"tagName\" ASC\nLIMIT 10"
+        },
+        "superseded_note": "What this entry carried until 2026-09-23: text written HERE from the official Cypher against the schema `sql_schema_required` describes, which was never built -- so it never ran, and the Interactive comparator failed naming `person_is_located_in_city` and `knows.src`. Kept for the record."
+      }
+    },
+    "IC7": {
+      "title": "Recent likers",
+      "parameters": [
+        {
+          "name": "personId",
+          "type": "ID"
+        }
+      ],
+      "projection": [
+        {
+          "name": "personId",
+          "type": "ID"
+        },
+        {
+          "name": "personFirstName",
+          "type": "STRING"
+        },
+        {
+          "name": "personLastName",
+          "type": "STRING"
+        },
+        {
+          "name": "likeCreationDate",
+          "type": "DATETIME_EPOCH_MILLIS"
+        },
+        {
+          "name": "commentOrPostId",
+          "type": "ID"
+        },
+        {
+          "name": "commentOrPostContent",
+          "type": "STRING"
+        },
+        {
+          "name": "minutesLatency",
+          "type": "INTEGER"
+        },
+        {
+          "name": "isNew",
+          "type": "BOOLEAN"
+        }
+      ],
+      "order_by": [
+        "likeCreationDate DESC",
+        "personId ASC"
+      ],
+      "limit": 20,
+      "requires": [
+        "LIKES.creationDate"
+      ],
+      "hazards": [
+        "One row per LIKER, not per like: head(collect(...)) after ORDER BY likeTime DESC, toInteger(message.id) ASC keeps that liker's most recent like, ties broken by the lower message id. DISTINCT ON (l.src) with the same ORDER BY is exactly that; a max(creation_date) is not, because it does not pick the message.",
+        "minutesLatency floors at SECONDS first and then divides by 60 -- the reference is toInteger(floor(toFloat(dt)/1000.0)/60.0). Dividing milliseconds by 60000 once gives a different integer for some rows.",
+        "Cypher's toInteger truncates towards zero and SQL's floor rounds towards minus infinity. They agree only while the latency is non-negative, i.e. while no like predates the message it likes. That holds in a well-formed corpus and is an assumption about the data, not about either dialect."
+      ],
+      "cypher": {
+        "status": "unverified",
+        "text": "MATCH (person:Person {id: ${personId}})<-[:HAS_CREATOR]-(message:Message)<-[like:LIKES]-(liker:Person)\n    WITH liker, message, like.creationDate AS likeTime, person\n    ORDER BY likeTime DESC, toInteger(message.id) ASC\n    WITH liker, head(collect({msg: message, likeTime: likeTime})) AS latestLike, person\nRETURN\n    liker.id AS personId,\n    liker.firstName AS personFirstName,\n    liker.lastName AS personLastName,\n    latestLike.likeTime AS likeCreationDate,\n    latestLike.msg.id AS commentOrPostId,\n    coalesce(latestLike.msg.content, latestLike.msg.imageFile) AS commentOrPostContent,\n    toInteger(floor(toFloat(latestLike.likeTime - latestLike.msg.creationDate)/1000.0)/60.0) AS minutesLatency,\n    not((liker)-[:KNOWS]-(person)) AS isNew\nORDER BY\n    likeCreationDate DESC,\n    toInteger(personId) ASC\nLIMIT 20",
+        "source_file": "https://github.com/ldbc/ldbc_snb_interactive_v1_impls/blob/main/cypher/queries/complex-7.cypher",
+        "source_sha256": "691a4e3ee8f36053a19e7c615327b51102df43d81b2309b6052cc5ce810aec7d"
+      },
+      "cypher_ladybug": {
+        "status": "unsupported",
+        "reason": "No LadybugDB loader in this tree carries node or relationship properties: measurements/pod/embedded-lsqb.py:160 sends [r[\"s\"], r[\"d\"]] -- two columns, nothing else -- because LSQB reads no property at all. Every SNB Interactive read projects properties, so this dialect would return a full-width result of nulls and report nothing wrong (docs/bench/ldbc-coverage-plan.md section 0.3 records that exact silent failure). Two further rewrites are also unwritten: LadybugDB has no :Message supertype -- a node IS its table -- so every (m:Message) shape must be split into Post and Comment arms and re-unioned, and the IC1/IC13 shortestPath forms have no transcription here. This is a LOADER and TRANSCRIPTION gap recorded in the dialect slot because the catalogue has no other slot for it; it is NOT a claim that Kuzu's Cypher cannot express the shape. Revisit the whole dialect when a property-carrying loader lands."
+      },
+      "sql": {
+        "status": "unverified",
+        "text": "/* Q7. Recent likers\n\\set personId 4398046511268\n */\nselect p_personid, p_firstname, p_lastname, l.l_creationdate, m_messageid,\n    COALESCE(m_ps_imagefile, m_content),\n    CAST(floor(EXTRACT(EPOCH FROM (l.l_creationdate - m_creationdate))) AS INTEGER) / 60 as minutesLatency,\n    (case when exists (select 1 from knows where k_person1id = :personId and k_person2id = p_personid) then 0 else 1 end) as isnew\nfrom\n  (select l_personid, max(l_creationdate) as l_creationdate\n   from likes, message\n   where\n     m_messageid = l_messageid and\n     m_creatorid = :personId\n   group by l_personid\n   order by l_creationdate desc\n   limit 20\n  ) tmp, message, person, likes as l\nwhere\n    p_personid = tmp.l_personid and\n    tmp.l_personid = l.l_personid and\n    tmp.l_creationdate = l.l_creationdate and\n    l.l_messageid = m_messageid\norder by l_creationdate desc, p_personid asc\n;\n",
+        "source_file": "https://raw.githubusercontent.com/ldbc/ldbc_snb_interactive_v1_impls/main/postgres/queries/interactive-complex-7.sql",
+        "source_sha256": "468ec1ccbf591a5aa0ec0a74604561d025eb20e0085ce3e8de3358c659433207",
+        "vendored": "docs/bench/ldbc-official/interactive-v1-postgres/queries/interactive-complex-7.sql",
+        "superseded": {
+          "status": "unverified",
+          "text": "WITH latest AS (\n  SELECT DISTINCT ON (l.src)\n         l.src AS liker_id, l.dst AS message_id, l.creation_date AS like_time\n  FROM likes l\n  JOIN has_creator hc ON hc.src = l.dst\n  WHERE hc.dst = ${personId}\n  ORDER BY l.src, l.creation_date DESC, l.dst ASC\n)\nSELECT p.id         AS \"personId\",\n       p.first_name AS \"personFirstName\",\n       p.last_name  AS \"personLastName\",\n       la.like_time AS \"likeCreationDate\",\n       m.id         AS \"commentOrPostId\",\n       coalesce(m.content, m.image_file) AS \"commentOrPostContent\",\n       CAST(floor(floor((la.like_time - m.creation_date) / 1000.0) / 60.0) AS bigint)\n                    AS \"minutesLatency\",\n       NOT EXISTS (SELECT 1 FROM knows k WHERE k.src = p.id AND k.dst = ${personId})\n                    AS \"isNew\"\nFROM latest la\nJOIN person p ON p.id = la.liker_id\nJOIN message m ON m.id = la.message_id\nORDER BY \"likeCreationDate\" DESC, \"personId\" ASC\nLIMIT 20"
+        },
+        "superseded_note": "What this entry carried until 2026-09-23: text written HERE from the official Cypher against the schema `sql_schema_required` describes, which was never built -- so it never ran, and the Interactive comparator failed naming `person_is_located_in_city` and `knows.src`. Kept for the record."
+      }
+    },
+    "IC8": {
+      "title": "Recent replies",
+      "parameters": [
+        {
+          "name": "personId",
+          "type": "ID"
+        }
+      ],
+      "projection": [
+        {
+          "name": "personId",
+          "type": "ID"
+        },
+        {
+          "name": "personFirstName",
+          "type": "STRING"
+        },
+        {
+          "name": "personLastName",
+          "type": "STRING"
+        },
+        {
+          "name": "commentCreationDate",
+          "type": "DATETIME_EPOCH_MILLIS"
+        },
+        {
+          "name": "commentId",
+          "type": "ID"
+        },
+        {
+          "name": "commentContent",
+          "type": "STRING"
+        }
+      ],
+      "order_by": [
+        "commentCreationDate DESC",
+        "commentId ASC"
+      ],
+      "limit": 20,
+      "hazards": [
+        "SINGLE-HOP replies only (docs/bench/ldbc-coverage-plan.md section 2.1). REPLY_OF with no * is one edge; a transitive walk answers a larger, plausible, wrong set that no column list catches.",
+        "The reply's author is not excluded when it is the person themselves. The reference does not exclude it either."
+      ],
+      "cypher": {
+        "status": "unverified",
+        "text": "MATCH (start:Person {id: ${personId}})<-[:HAS_CREATOR]-(:Message)<-[:REPLY_OF]-(comment:Comment)-[:HAS_CREATOR]->(person:Person)\nRETURN\n    person.id AS personId,\n    person.firstName AS personFirstName,\n    person.lastName AS personLastName,\n    comment.creationDate AS commentCreationDate,\n    comment.id AS commentId,\n    comment.content AS commentContent\nORDER BY\n    commentCreationDate DESC,\n    commentId ASC\nLIMIT 20",
+        "source_file": "https://github.com/ldbc/ldbc_snb_interactive_v1_impls/blob/main/cypher/queries/complex-8.cypher",
+        "source_sha256": "d393a6d23e5162a4894a4629f9cc18aed69f61c1e6f683b04a2630a26135c357"
+      },
+      "cypher_ladybug": {
+        "status": "unsupported",
+        "reason": "No LadybugDB loader in this tree carries node or relationship properties: measurements/pod/embedded-lsqb.py:160 sends [r[\"s\"], r[\"d\"]] -- two columns, nothing else -- because LSQB reads no property at all. Every SNB Interactive read projects properties, so this dialect would return a full-width result of nulls and report nothing wrong (docs/bench/ldbc-coverage-plan.md section 0.3 records that exact silent failure). Two further rewrites are also unwritten: LadybugDB has no :Message supertype -- a node IS its table -- so every (m:Message) shape must be split into Post and Comment arms and re-unioned, and the IC1/IC13 shortestPath forms have no transcription here. This is a LOADER and TRANSCRIPTION gap recorded in the dialect slot because the catalogue has no other slot for it; it is NOT a claim that Kuzu's Cypher cannot express the shape. Revisit the whole dialect when a property-carrying loader lands."
+      },
+      "sql": {
+        "status": "unverified",
+        "text": "/* Q8. Recent replies\n\\set personId 143\n */\nselect p1.m_creatorid, p_firstname, p_lastname, p1.m_creationdate, p1.m_messageid, p1.m_content\n  from message p1, message p2, person\n  where\n      p1.m_c_replyof = p2.m_messageid and\n      p2.m_creatorid = :personId and\n      p_personid = p1.m_creatorid\norder by p1.m_creationdate desc, p1.m_messageid asc\nlimit 20\n;\n",
+        "source_file": "https://raw.githubusercontent.com/ldbc/ldbc_snb_interactive_v1_impls/main/postgres/queries/interactive-complex-8.sql",
+        "source_sha256": "641d33a29f0ef6bc29b4589b2f9acd30ff9c07b32774a8f4fd4a0d277d7f2bc9",
+        "vendored": "docs/bench/ldbc-official/interactive-v1-postgres/queries/interactive-complex-8.sql",
+        "superseded": {
+          "status": "unverified",
+          "text": "SELECT p.id            AS \"personId\",\n       p.first_name    AS \"personFirstName\",\n       p.last_name     AS \"personLastName\",\n       c.creation_date AS \"commentCreationDate\",\n       c.id            AS \"commentId\",\n       c.content       AS \"commentContent\"\nFROM has_creator mine\nJOIN reply_of ro ON ro.dst = mine.src\nJOIN message c ON c.id = ro.src AND c.is_comment = true\nJOIN has_creator theirs ON theirs.src = c.id\nJOIN person p ON p.id = theirs.dst\nWHERE mine.dst = ${personId}\nORDER BY \"commentCreationDate\" DESC, \"commentId\" ASC\nLIMIT 20"
+        },
+        "superseded_note": "What this entry carried until 2026-09-23: text written HERE from the official Cypher against the schema `sql_schema_required` describes, which was never built -- so it never ran, and the Interactive comparator failed naming `person_is_located_in_city` and `knows.src`. Kept for the record."
+      }
+    },
+    "IC9": {
+      "title": "Recent messages by friends or friends of friends",
+      "parameters": [
+        {
+          "name": "personId",
+          "type": "ID"
+        },
+        {
+          "name": "maxDate",
+          "type": "DATETIME_EPOCH_MILLIS"
+        }
+      ],
+      "projection": [
+        {
+          "name": "personId",
+          "type": "ID"
+        },
+        {
+          "name": "personFirstName",
+          "type": "STRING"
+        },
+        {
+          "name": "personLastName",
+          "type": "STRING"
+        },
+        {
+          "name": "commentOrPostId",
+          "type": "ID"
+        },
+        {
+          "name": "commentOrPostContent",
+          "type": "STRING"
+        },
+        {
+          "name": "commentOrPostCreationDate",
+          "type": "DATETIME_EPOCH_MILLIS"
+        }
+      ],
+      "order_by": [
+        "commentOrPostCreationDate DESC",
+        "commentOrPostId ASC"
+      ],
+      "limit": 20,
+      "hazards": [
+        "The reference's final ORDER BY names message.id, not the projected alias commentOrPostId, and does NOT wrap it in toInteger the way IC2 does. Same order on this corpus, where ids are integers; not the same text.",
+        "maxDate is EXCLUSIVE here (<) and INCLUSIVE in IC2 (<=)."
+      ],
+      "cypher": {
+        "status": "unverified",
+        "text": "MATCH (root:Person {id: ${personId} })-[:KNOWS*1..2]-(friend:Person)\nWHERE NOT friend = root\nWITH collect(distinct friend) as friends\nUNWIND friends as friend\n    MATCH (friend)<-[:HAS_CREATOR]-(message:Message)\n    WHERE message.creationDate < ${maxDate}\nRETURN\n    friend.id AS personId,\n    friend.firstName AS personFirstName,\n    friend.lastName AS personLastName,\n    message.id AS commentOrPostId,\n    coalesce(message.content,message.imageFile) AS commentOrPostContent,\n    message.creationDate AS commentOrPostCreationDate\nORDER BY\n    commentOrPostCreationDate DESC,\n    message.id ASC\nLIMIT 20",
+        "source_file": "https://github.com/ldbc/ldbc_snb_interactive_v1_impls/blob/main/cypher/queries/complex-9.cypher",
+        "source_sha256": "84d05a4cc87a0680b490fc98aa303ff211f363204cc81d936cd5d442bf85cfe7"
+      },
+      "cypher_ladybug": {
+        "status": "unsupported",
+        "reason": "No LadybugDB loader in this tree carries node or relationship properties: measurements/pod/embedded-lsqb.py:160 sends [r[\"s\"], r[\"d\"]] -- two columns, nothing else -- because LSQB reads no property at all. Every SNB Interactive read projects properties, so this dialect would return a full-width result of nulls and report nothing wrong (docs/bench/ldbc-coverage-plan.md section 0.3 records that exact silent failure). Two further rewrites are also unwritten: LadybugDB has no :Message supertype -- a node IS its table -- so every (m:Message) shape must be split into Post and Comment arms and re-unioned, and the IC1/IC13 shortestPath forms have no transcription here. This is a LOADER and TRANSCRIPTION gap recorded in the dialect slot because the catalogue has no other slot for it; it is NOT a claim that Kuzu's Cypher cannot express the shape. Revisit the whole dialect when a property-carrying loader lands."
+      },
+      "sql": {
+        "status": "unverified",
+        "text": "/* Q9. Recent messages by friends or friends of friends\n\\set personId 4398046511268\n\\set maxDate '\\'2010-11-16\\''::date\n */\nselect p_personid, p_firstname, p_lastname,\n       m_messageid, COALESCE(m_ps_imagefile, m_content), m_creationdate\nfrom\n  ( select k_person2id\n    from knows\n    where k_person1id = :personId\n    union\n    select k2.k_person2id\n    from knows k1, knows k2\n    where k1.k_person1id = :personId\n      and k1.k_person2id = k2.k_person1id\n      and k2.k_person2id <> :personId\n  ) f, person, message\nwhere\n  p_personid = m_creatorid and p_personid = f.k_person2id and\n  m_creationdate < :maxDate\norder by m_creationdate desc, m_messageid asc\nlimit 20\n;\n",
+        "source_file": "https://raw.githubusercontent.com/ldbc/ldbc_snb_interactive_v1_impls/main/postgres/queries/interactive-complex-9.sql",
+        "source_sha256": "1913c46e76696824d9ef2cfab31412d0c6e99fbbe80b85a56a47d60a3f28793d",
+        "vendored": "docs/bench/ldbc-official/interactive-v1-postgres/queries/interactive-complex-9.sql",
+        "superseded": {
+          "status": "unverified",
+          "text": "WITH RECURSIVE reach (id, dist) AS (\n  SELECT CAST(${personId} AS bigint), 0\n  UNION ALL\n  SELECT k.dst, r.dist + 1 FROM reach r JOIN knows k ON k.src = r.id WHERE r.dist < 2\n),\nfriends AS (SELECT DISTINCT id FROM reach WHERE id <> ${personId})\nSELECT p.id                              AS \"personId\",\n       p.first_name                      AS \"personFirstName\",\n       p.last_name                       AS \"personLastName\",\n       m.id                              AS \"commentOrPostId\",\n       coalesce(m.content, m.image_file) AS \"commentOrPostContent\",\n       m.creation_date                   AS \"commentOrPostCreationDate\"\nFROM friends f\nJOIN person p ON p.id = f.id\nJOIN has_creator hc ON hc.dst = f.id\nJOIN message m ON m.id = hc.src\nWHERE m.creation_date < ${maxDate}\nORDER BY \"commentOrPostCreationDate\" DESC, \"commentOrPostId\" ASC\nLIMIT 20"
+        },
+        "superseded_note": "What this entry carried until 2026-09-23: text written HERE from the official Cypher against the schema `sql_schema_required` describes, which was never built -- so it never ran, and the Interactive comparator failed naming `person_is_located_in_city` and `knows.src`. Kept for the record."
+      }
+    },
+    "IC10": {
+      "title": "Friend recommendation",
+      "parameters": [
+        {
+          "name": "personId",
+          "type": "ID"
+        },
+        {
+          "name": "month",
+          "type": "INTEGER",
+          "binds": "1..12"
+        }
+      ],
+      "projection": [
+        {
+          "name": "personId",
+          "type": "ID"
+        },
+        {
+          "name": "personFirstName",
+          "type": "STRING"
+        },
+        {
+          "name": "personLastName",
+          "type": "STRING"
+        },
+        {
+          "name": "commonInterestScore",
+          "type": "INTEGER"
+        },
+        {
+          "name": "personGender",
+          "type": "STRING"
+        },
+        {
+          "name": "personCityName",
+          "type": "STRING"
+        }
+      ],
+      "order_by": [
+        "commonInterestScore DESC",
+        "personId ASC"
+      ],
+      "limit": 10,
+      "hazards": [
+        "The birthday window straddles a year end: month M day >= 21, OR month (M%12)+1 day < 22. December plus January is the case a naive rewrite gets wrong.",
+        "The reference reads month and day through datetime({epochMillis: birthday}), which is UTC. The SQL pins AT TIME ZONE 'UTC' rather than inheriting the session's TimeZone, because a session in any other zone moves people born near midnight across the boundary and changes the answer set with nothing failing.",
+        "commonInterestScore counts POSTS (p:Post), not messages, and the arithmetic is common - (total - common), which is negative for most candidates. A score that is never negative means the Post filter was dropped or the sign was folded.",
+        "The exclusion is NOT (friend)-[:KNOWS]-(person) -- undirected -- and the SQL probes the symmetric knows table by src only, which is the same set."
+      ],
+      "cypher": {
+        "status": "unverified",
+        "text": "MATCH (person:Person {id: ${personId}})-[:KNOWS*2..2]-(friend),\n       (friend)-[:IS_LOCATED_IN]->(city:City)\nWHERE NOT friend=person AND\n      NOT (friend)-[:KNOWS]-(person)\nWITH person, city, friend, datetime({epochMillis: friend.birthday}) as birthday\nWHERE  (birthday.month=${month} AND birthday.day>=21) OR\n        (birthday.month=(${month}%12)+1 AND birthday.day<22)\nWITH DISTINCT friend, city, person\nOPTIONAL MATCH (friend)<-[:HAS_CREATOR]-(post:Post)\nWITH friend, city, collect(post) AS posts, person\nWITH friend,\n     city,\n     size(posts) AS postCount,\n     size([p IN posts WHERE (p)-[:HAS_TAG]->()<-[:HAS_INTEREST]-(person)]) AS commonPostCount\nRETURN friend.id AS personId,\n       friend.firstName AS personFirstName,\n       friend.lastName AS personLastName,\n       commonPostCount - (postCount - commonPostCount) AS commonInterestScore,\n       friend.gender AS personGender,\n       city.name AS personCityName\nORDER BY commonInterestScore DESC, personId ASC\nLIMIT 10",
+        "source_file": "https://github.com/ldbc/ldbc_snb_interactive_v1_impls/blob/main/cypher/queries/complex-10.cypher",
+        "source_sha256": "eca22afe6907cedfc77a80cbb441112ddbc71d63300496159bd070eb7b07b811"
+      },
+      "cypher_ladybug": {
+        "status": "unsupported",
+        "reason": "No LadybugDB loader in this tree carries node or relationship properties: measurements/pod/embedded-lsqb.py:160 sends [r[\"s\"], r[\"d\"]] -- two columns, nothing else -- because LSQB reads no property at all. Every SNB Interactive read projects properties, so this dialect would return a full-width result of nulls and report nothing wrong (docs/bench/ldbc-coverage-plan.md section 0.3 records that exact silent failure). Two further rewrites are also unwritten: LadybugDB has no :Message supertype -- a node IS its table -- so every (m:Message) shape must be split into Post and Comment arms and re-unioned, and the IC1/IC13 shortestPath forms have no transcription here. This is a LOADER and TRANSCRIPTION gap recorded in the dialect slot because the catalogue has no other slot for it; it is NOT a claim that Kuzu's Cypher cannot express the shape. Revisit the whole dialect when a property-carrying loader lands."
+      },
+      "sql": {
+        "status": "unverified",
+        "text": "/* Q10. Friend recommendation\n\\set personId 4398046511333\n\\set month 5\n */\nselect p_personid, p_firstname, p_lastname,\n       ( select count(distinct m_messageid)\n         from message, message_tag pt1\n         where\n         m_creatorid = p_personid and\n         m_c_replyof IS NULL and -- post, not comment\n         m_messageid = mt_messageid and\n         exists (select * from person_tag where pt_personid = :personId and pt_tagid = pt1.mt_tagid)\n       ) -\n       ( select count(*)\n         from message\n         where\n         m_creatorid = p_personid and\n         m_c_replyof IS NULL and -- post, not comment\n         not exists (select * from person_tag, message_tag where pt_personid = :personId and pt_tagid = mt_tagid and mt_messageid = m_messageid)\n       ) as score,\n       p_gender, pl_name\nfrom person, place,\n ( select distinct k2.k_person2id\n   from knows k1, knows k2\n   where\n   k1.k_person1id = :personId and k1.k_person2id = k2.k_person1id and k2.k_person2id <> :personId and\n   not exists (select * from knows where k_person1id = :personId and k_person2id = k2.k_person2id)\n ) f\nwhere\np_placeid = pl_placeid and\np_personid = f.k_person2id and\n(\n    (extract(month from p_birthday) = :month and (case when extract(day from p_birthday) >= 21 then true else false end))\n    or\n    (extract(month from p_birthday) = :month % 12 + 1 and (case when extract(day from p_birthday) <  22 then true else false end))\n)\norder by score desc, p_personid\nlimit 10\n;\n",
+        "source_file": "https://raw.githubusercontent.com/ldbc/ldbc_snb_interactive_v1_impls/main/postgres/queries/interactive-complex-10.sql",
+        "source_sha256": "09f8205c3f568817083a1b7c5b6bf8c73faf8f8d5b7d7c5e301edb6221dda24f",
+        "vendored": "docs/bench/ldbc-official/interactive-v1-postgres/queries/interactive-complex-10.sql",
+        "superseded": {
+          "status": "unverified",
+          "text": "WITH RECURSIVE reach (id, dist) AS (\n  SELECT CAST(${personId} AS bigint), 0\n  UNION ALL\n  SELECT k.dst, r.dist + 1 FROM reach r JOIN knows k ON k.src = r.id WHERE r.dist < 2\n),\nfoaf AS (\n  SELECT DISTINCT r.id\n  FROM reach r\n  WHERE r.dist = 2\n    AND r.id <> ${personId}\n    AND NOT EXISTS (SELECT 1 FROM knows k WHERE k.src = ${personId} AND k.dst = r.id)\n),\nborn AS (\n  SELECT f.id, pl.dst AS city_id\n  FROM foaf f\n  JOIN person p ON p.id = f.id\n  JOIN person_is_located_in_city pl ON pl.src = p.id\n  WHERE (EXTRACT(MONTH FROM to_timestamp(p.birthday / 1000.0) AT TIME ZONE 'UTC') = ${month}\n         AND EXTRACT(DAY FROM to_timestamp(p.birthday / 1000.0) AT TIME ZONE 'UTC') >= 21)\n     OR (EXTRACT(MONTH FROM to_timestamp(p.birthday / 1000.0) AT TIME ZONE 'UTC')\n           = (${month} % 12) + 1\n         AND EXTRACT(DAY FROM to_timestamp(p.birthday / 1000.0) AT TIME ZONE 'UTC') < 22)\n),\nscored AS (\n  SELECT b.id, b.city_id,\n         (SELECT count(*) FROM has_creator hc\n           JOIN message m ON m.id = hc.src AND m.is_comment = false\n          WHERE hc.dst = b.id) AS total_posts,\n         (SELECT count(*) FROM has_creator hc\n           JOIN message m ON m.id = hc.src AND m.is_comment = false\n          WHERE hc.dst = b.id\n            AND EXISTS (SELECT 1 FROM has_tag ht\n                        JOIN has_interest hi ON hi.dst = ht.dst\n                        WHERE ht.src = m.id AND hi.src = ${personId})) AS common_posts\n  FROM born b\n)\nSELECT p.id         AS \"personId\",\n       p.first_name AS \"personFirstName\",\n       p.last_name  AS \"personLastName\",\n       s.common_posts - (s.total_posts - s.common_posts) AS \"commonInterestScore\",\n       p.gender     AS \"personGender\",\n       ci.name      AS \"personCityName\"\nFROM scored s\nJOIN person p ON p.id = s.id\nJOIN city ci ON ci.id = s.city_id\nORDER BY \"commonInterestScore\" DESC, \"personId\" ASC\nLIMIT 10"
+        },
+        "superseded_note": "What this entry carried until 2026-09-23: text written HERE from the official Cypher against the schema `sql_schema_required` describes, which was never built -- so it never ran, and the Interactive comparator failed naming `person_is_located_in_city` and `knows.src`. Kept for the record."
+      }
+    },
+    "IC11": {
+      "title": "Job referral",
+      "parameters": [
+        {
+          "name": "personId",
+          "type": "ID"
+        },
+        {
+          "name": "countryName",
+          "type": "STRING"
+        },
+        {
+          "name": "workFromYear",
+          "type": "INTEGER"
+        }
+      ],
+      "projection": [
+        {
+          "name": "personId",
+          "type": "ID"
+        },
+        {
+          "name": "personFirstName",
+          "type": "STRING"
+        },
+        {
+          "name": "personLastName",
+          "type": "STRING"
+        },
+        {
+          "name": "organizationName",
+          "type": "STRING"
+        },
+        {
+          "name": "organizationWorkFromYear",
+          "type": "INTEGER"
+        }
+      ],
+      "order_by": [
+        "organizationWorkFromYear ASC",
+        "personId ASC",
+        "organizationName DESC"
+      ],
+      "limit": 10,
+      "requires": [
+        "WORK_AT.workFrom"
+      ],
+      "hazards": [
+        "The third sort key DESCENDS on a string while the first two ascend. It is not a typo in the reference, and it decides the answer whenever one person has two jobs starting in the same year.",
+        "workFrom is a YEAR (an integer like 2011), not an epoch timestamp. Comparing it against a millisecond parameter returns everything or nothing."
+      ],
+      "cypher": {
+        "status": "unverified",
+        "text": "MATCH (person:Person {id: ${personId} })-[:KNOWS*1..2]-(friend:Person)\nWHERE not(person=friend)\nWITH DISTINCT friend\nMATCH (friend)-[workAt:WORK_AT]->(company:Company)-[:IS_LOCATED_IN]->(:Country {name: '${countryName}' })\nWHERE workAt.workFrom < ${workFromYear}\nRETURN\n        friend.id AS personId,\n        friend.firstName AS personFirstName,\n        friend.lastName AS personLastName,\n        company.name AS organizationName,\n        workAt.workFrom AS organizationWorkFromYear\nORDER BY\n        organizationWorkFromYear ASC,\n        toInteger(personId) ASC,\n        organizationName DESC\nLIMIT 10",
+        "source_file": "https://github.com/ldbc/ldbc_snb_interactive_v1_impls/blob/main/cypher/queries/complex-11.cypher",
+        "source_sha256": "677b80887429445c5319a0d621d86b7df1c07889ae94e40447aacf853729fea1"
+      },
+      "cypher_ladybug": {
+        "status": "unsupported",
+        "reason": "No LadybugDB loader in this tree carries node or relationship properties: measurements/pod/embedded-lsqb.py:160 sends [r[\"s\"], r[\"d\"]] -- two columns, nothing else -- because LSQB reads no property at all. Every SNB Interactive read projects properties, so this dialect would return a full-width result of nulls and report nothing wrong (docs/bench/ldbc-coverage-plan.md section 0.3 records that exact silent failure). Two further rewrites are also unwritten: LadybugDB has no :Message supertype -- a node IS its table -- so every (m:Message) shape must be split into Post and Comment arms and re-unioned, and the IC1/IC13 shortestPath forms have no transcription here. This is a LOADER and TRANSCRIPTION gap recorded in the dialect slot because the catalogue has no other slot for it; it is NOT a claim that Kuzu's Cypher cannot express the shape. Revisit the whole dialect when a property-carrying loader lands."
+      },
+      "sql": {
+        "status": "unverified",
+        "text": "/* Q11. Job referral\n\\set personId 10995116277918\n\\set countryName '\\'Hungary\\''\n\\set workFromYear 2011\n */\nselect p_personid,p_firstname, p_lastname, o_name, pc_workfrom\nfrom person, person_company, organisation, place,\n ( select k_person2id\n   from knows\n   where\n   k_person1id = :personId\n   union\n   select k2.k_person2id\n   from knows k1, knows k2\n   where\n   k1.k_person1id = :personId and k1.k_person2id = k2.k_person1id and k2.k_person2id <> :personId\n ) f\nwhere\n    p_personid = f.k_person2id and\n    p_personid = pc_personid and\n    pc_organisationid = o_organisationid and\n    pc_workfrom < :workFromYear and\n    o_placeid = pl_placeid and\n    pl_name = :countryName\norder by pc_workfrom, p_personid, o_name desc\nlimit 10\n;\n",
+        "source_file": "https://raw.githubusercontent.com/ldbc/ldbc_snb_interactive_v1_impls/main/postgres/queries/interactive-complex-11.sql",
+        "source_sha256": "e6d993834f1f9f023d817d24adafd26a0c4ce0d28dc4e96002cb1fbb56706536",
+        "vendored": "docs/bench/ldbc-official/interactive-v1-postgres/queries/interactive-complex-11.sql",
+        "superseded": {
+          "status": "unverified",
+          "text": "WITH RECURSIVE reach (id, dist) AS (\n  SELECT CAST(${personId} AS bigint), 0\n  UNION ALL\n  SELECT k.dst, r.dist + 1 FROM reach r JOIN knows k ON k.src = r.id WHERE r.dist < 2\n),\nfriends AS (SELECT DISTINCT id FROM reach WHERE id <> ${personId})\nSELECT p.id         AS \"personId\",\n       p.first_name AS \"personFirstName\",\n       p.last_name  AS \"personLastName\",\n       co.name      AS \"organizationName\",\n       wa.work_from AS \"organizationWorkFromYear\"\nFROM friends f\nJOIN person p ON p.id = f.id\nJOIN work_at wa ON wa.src = p.id\nJOIN company co ON co.id = wa.dst\nJOIN organisation_is_located_in_country ol ON ol.src = co.id\nJOIN country c ON c.id = ol.dst\nWHERE c.name = '${countryName}' AND wa.work_from < ${workFromYear}\nORDER BY \"organizationWorkFromYear\" ASC, \"personId\" ASC, \"organizationName\" DESC\nLIMIT 10"
+        },
+        "superseded_note": "What this entry carried until 2026-09-23: text written HERE from the official Cypher against the schema `sql_schema_required` describes, which was never built -- so it never ran, and the Interactive comparator failed naming `person_is_located_in_city` and `knows.src`. Kept for the record."
+      }
+    },
+    "IC12": {
+      "title": "Expert search",
+      "parameters": [
+        {
+          "name": "personId",
+          "type": "ID"
+        },
+        {
+          "name": "tagClassName",
+          "type": "STRING"
+        }
+      ],
+      "projection": [
+        {
+          "name": "personId",
+          "type": "ID"
+        },
+        {
+          "name": "personFirstName",
+          "type": "STRING"
+        },
+        {
+          "name": "personLastName",
+          "type": "STRING"
+        },
+        {
+          "name": "tagNames",
+          "type": "STRING[] (DISTINCT; the reference imposes no order within the list)"
+        },
+        {
+          "name": "replyCount",
+          "type": "INTEGER"
+        }
+      ],
+      "order_by": [
+        "replyCount DESC",
+        "personId ASC"
+      ],
+      "limit": 20,
+      "hazards": [
+        "SINGLE-HOP replies, and the reply must be to a POST: the pattern is (comment:Comment)-[:REPLY_OF]->(:Post). A comment replying to a comment does not count (docs/bench/ldbc-coverage-plan.md section 2.1).",
+        "count(DISTINCT comment): a comment carrying three matching tags is ONE reply and three tagNames entries. count(*) inflates it by the tag fan-out.",
+        "The *0.. in the HAS_TYPE|IS_SUBCLASS_OF walk cannot bind a Tag to itself as a :TagClass, so the zero-length case contributes only the tag.name = $tagClassName branch. The SQL carries that branch separately and starts its recursion at HAS_TYPE.",
+        "tagNames is a SET with no ORDER BY in the reference. array_agg(DISTINCT t.name) sorts and Cypher's collect(DISTINCT ...) does not, so a comparator must compare these as sets or report a difference that is not one.",
+        "A person is counted once per friendship edge if the corpus stores KNOWS twice in one direction. The GROUP BY absorbs it for tagNames but not for count(DISTINCT comment), which is per comment and therefore safe. Stated because the reasoning, not the shape, is what makes it safe."
+      ],
+      "cypher": {
+        "status": "unverified",
+        "text": "MATCH (tag:Tag)-[:HAS_TYPE|IS_SUBCLASS_OF*0..]->(baseTagClass:TagClass)\nWHERE tag.name = '${tagClassName}' OR baseTagClass.name = '${tagClassName}'\nWITH collect(tag.id) as tags\nMATCH (:Person {id: ${personId} })-[:KNOWS]-(friend:Person)<-[:HAS_CREATOR]-(comment:Comment)-[:REPLY_OF]->(:Post)-[:HAS_TAG]->(tag:Tag)\nWHERE tag.id in tags\nRETURN\n    friend.id AS personId,\n    friend.firstName AS personFirstName,\n    friend.lastName AS personLastName,\n    collect(DISTINCT tag.name) AS tagNames,\n    count(DISTINCT comment) AS replyCount\nORDER BY\n    replyCount DESC,\n    toInteger(personId) ASC\nLIMIT 20",
+        "source_file": "https://github.com/ldbc/ldbc_snb_interactive_v1_impls/blob/main/cypher/queries/complex-12.cypher",
+        "source_sha256": "eda861f84d905e43433cd8f589212a2f934ad0bd9b6f9e58c19ade52922a9100"
+      },
+      "cypher_ladybug": {
+        "status": "unsupported",
+        "reason": "No LadybugDB loader in this tree carries node or relationship properties: measurements/pod/embedded-lsqb.py:160 sends [r[\"s\"], r[\"d\"]] -- two columns, nothing else -- because LSQB reads no property at all. Every SNB Interactive read projects properties, so this dialect would return a full-width result of nulls and report nothing wrong (docs/bench/ldbc-coverage-plan.md section 0.3 records that exact silent failure). Two further rewrites are also unwritten: LadybugDB has no :Message supertype -- a node IS its table -- so every (m:Message) shape must be split into Post and Comment arms and re-unioned, and the IC1/IC13 shortestPath forms have no transcription here. This is a LOADER and TRANSCRIPTION gap recorded in the dialect slot because the catalogue has no other slot for it; it is NOT a claim that Kuzu's Cypher cannot express the shape. Revisit the whole dialect when a property-carrying loader lands."
+      },
+      "sql": {
+        "status": "unverified",
+        "text": "/* Q12. Expert search\n\\set personId 10995116278009\n\\set tagClassName '\\'Monarch\\''\n */\nwith recursive extended_tags(s_subtagclassid,s_supertagclassid) as (\n    select tc_tagclassid, tc_tagclassid from tagclass\n    UNION\n    select tc.tc_tagclassid, t.s_supertagclassid from tagclass tc, extended_tags t\n        where tc.tc_subclassoftagclassid=t.s_subtagclassid\n)\nselect p_personid, p_firstname, p_lastname, array_agg(distinct t_name), count(*) as replyCount\nfrom person, message p1, knows, message p2, message_tag, \n    (select distinct t_tagid, t_name from tag where (t_tagclassid in (\n          select distinct s_subtagclassid from extended_tags k, tagclass\n        where tc_tagclassid = k.s_supertagclassid and tc_name = :tagClassName) \n   )) selected_tags\nwhere\n  k_person1id = :personId and \n  k_person2id = p_personid and \n  p_personid = p1.m_creatorid and \n  p1.m_c_replyof = p2.m_messageid and \n  p2.m_c_replyof is null and\n  p2.m_messageid = mt_messageid and \n  mt_tagid = t_tagid\ngroup by p_personid, p_firstname, p_lastname\norder by replyCount desc, p_personid asc\nlimit 20\n;\n",
+        "source_file": "https://raw.githubusercontent.com/ldbc/ldbc_snb_interactive_v1_impls/main/postgres/queries/interactive-complex-12.sql",
+        "source_sha256": "b9d3610a6c1cf758c2df01c6db5db59106c87a5a0609845f86cc01fddaaa703b",
+        "vendored": "docs/bench/ldbc-official/interactive-v1-postgres/queries/interactive-complex-12.sql",
+        "superseded": {
+          "status": "unverified",
+          "text": "WITH RECURSIVE tc (tag_id, class_id) AS (\n  SELECT ht.src, ht.dst FROM has_type ht\n  UNION ALL\n  SELECT t.tag_id, s.dst FROM tc t JOIN is_subclass_of s ON s.src = t.class_id\n),\ntags AS (\n  SELECT DISTINCT t.id\n  FROM tag t\n  LEFT JOIN tc ON tc.tag_id = t.id\n  LEFT JOIN tagclass c ON c.id = tc.class_id\n  WHERE t.name = '${tagClassName}' OR c.name = '${tagClassName}'\n)\nSELECT f.id                       AS \"personId\",\n       f.first_name               AS \"personFirstName\",\n       f.last_name                AS \"personLastName\",\n       array_agg(DISTINCT t.name) AS \"tagNames\",\n       count(DISTINCT c.id)       AS \"replyCount\"\nFROM knows k\nJOIN person f ON f.id = k.dst\nJOIN has_creator hc ON hc.dst = f.id\nJOIN message c ON c.id = hc.src AND c.is_comment = true\nJOIN reply_of ro ON ro.src = c.id\nJOIN message po ON po.id = ro.dst AND po.is_comment = false\nJOIN has_tag ht ON ht.src = po.id\nJOIN tag t ON t.id = ht.dst\nWHERE k.src = ${personId} AND t.id IN (SELECT id FROM tags)\nGROUP BY f.id, f.first_name, f.last_name\nORDER BY \"replyCount\" DESC, \"personId\" ASC\nLIMIT 20"
+        },
+        "superseded_note": "What this entry carried until 2026-09-23: text written HERE from the official Cypher against the schema `sql_schema_required` describes, which was never built -- so it never ran, and the Interactive comparator failed naming `person_is_located_in_city` and `knows.src`. Kept for the record."
+      }
+    },
+    "IC13": {
+      "title": "Single shortest path",
+      "parameters": [
+        {
+          "name": "person1Id",
+          "type": "ID"
+        },
+        {
+          "name": "person2Id",
+          "type": "ID"
+        }
+      ],
+      "projection": [
+        {
+          "name": "shortestPathLength",
+          "type": "INTEGER"
+        }
+      ],
+      "order_by": [],
+      "limit": null,
+      "hazards": [
+        "Exactly one row, always. -1 when there is no path, and 0 when person1 = person2 (docs/bench/ldbc-coverage-plan.md section 2.1). An arm that returns an EMPTY result for the unreachable case is wrong in a way a row count catches and a value comparison does not.",
+        "This is the one query whose SQL arm is absent, so its witness pair is thinner than every other entry's. The plan's answer is snbref.rs, an out-of-engine oracle, which does not exist yet."
+      ],
+      "cypher": {
+        "status": "unverified",
+        "text": "MATCH\n    (person1:Person {id: ${person1Id}}),\n    (person2:Person {id: ${person2Id}}),\n    path = shortestPath((person1)-[:KNOWS*]-(person2))\nRETURN\n    CASE path IS NULL\n        WHEN true THEN -1\n        ELSE length(path)\n    END AS shortestPathLength",
+        "source_file": "https://github.com/ldbc/ldbc_snb_interactive_v1_impls/blob/main/cypher/queries/complex-13.cypher",
+        "source_sha256": "1fc0927090f33b336890090b5ffe65fcd6e40ae90fb8b572173fe239f0689d07"
+      },
+      "cypher_ladybug": {
+        "status": "unsupported",
+        "reason": "No LadybugDB loader in this tree carries node or relationship properties: measurements/pod/embedded-lsqb.py:160 sends [r[\"s\"], r[\"d\"]] -- two columns, nothing else -- because LSQB reads no property at all. Every SNB Interactive read projects properties, so this dialect would return a full-width result of nulls and report nothing wrong (docs/bench/ldbc-coverage-plan.md section 0.3 records that exact silent failure). Two further rewrites are also unwritten: LadybugDB has no :Message supertype -- a node IS its table -- so every (m:Message) shape must be split into Post and Comment arms and re-unioned, and the IC1/IC13 shortestPath forms have no transcription here. This is a LOADER and TRANSCRIPTION gap recorded in the dialect slot because the catalogue has no other slot for it; it is NOT a claim that Kuzu's Cypher cannot express the shape. Revisit the whole dialect when a property-carrying loader lands."
+      },
+      "sql": {
+        "status": "unverified",
+        "text": "/* Q13. Single shortest path\n\\set person1Id 8796093022390\n\\set person2Id 8796093022357\n */\nWITH RECURSIVE search_graph(link, depth, path) AS (\n        SELECT :person1Id::bigint, 0, ARRAY[:person1Id::bigint]::bigint[]\n      UNION ALL\n          (WITH sg(link,depth) as (select * from search_graph) -- Note: sg is only the diff produced in the previous iteration\n          SELECT distinct k_person2id, x.depth+1, array_append(path, k_person2id)\n          FROM knows, sg x\n          WHERE 1=1\n          and x.link = k_person1id\n          and k_person2id <> ALL (path)\n          -- stop if we have reached person2 in the previous iteration\n          and not exists(select * from sg y where y.link = :person2Id::bigint)\n          -- skip reaching persons reached in the previous iteration\n          and not exists(select * from sg y where y.link = k_person2id)\n        )\n)\nselect max(depth) from (\nselect depth from search_graph where link = :person2Id::bigint\nunion select -1) tmp;\n;\n",
+        "source_file": "https://raw.githubusercontent.com/ldbc/ldbc_snb_interactive_v1_impls/main/postgres/queries/interactive-complex-13.sql",
+        "source_sha256": "4488b145f7737fe684406dde753db9c1e6d3c6022e1483208102789e7f028cd0",
+        "vendored": "docs/bench/ldbc-official/interactive-v1-postgres/queries/interactive-complex-13.sql",
+        "superseded": {
+          "status": "unsupported",
+          "reason": "Unbounded single-pair shortest path. PostgreSQL can express a DEPTH-BOUNDED walk (IC1 does, at 1..3) but not KNOWS* with no bound: a recursive CTE has no visited set, because the recursive reference may not appear in a subquery, so the walk revisits nodes on a cyclic graph and the working table never empties -- it fails to terminate rather than returning a wrong answer. Capping the depth would change the query: the contract is -1 for no path, and a cap turns 'farther than the cap' into 'no path'. Expressing this needs a PL/pgSQL frontier loop, which is a procedure and not a statement, and this catalogue holds statements."
+        },
+        "superseded_note": "What this entry carried until 2026-09-23: text written HERE from the official Cypher against the schema `sql_schema_required` describes, which was never built -- so it never ran, and the Interactive comparator failed naming `person_is_located_in_city` and `knows.src`. Kept for the record.",
+        "version_note": "The superseded entry refused this because a recursive CTE has no visited set. LDBC's official text works around it by reading the working table through a CTE inside the recursive term (`with sg as (select * from search_graph)`); whether that terminates at a given scale is a measurement, not an assumption."
+      }
+    },
+    "IC14": {
+      "title": "Trusted connection paths",
+      "parameters": [
+        {
+          "name": "person1Id",
+          "type": "ID"
+        },
+        {
+          "name": "person2Id",
+          "type": "ID"
+        }
+      ],
+      "projection": [
+        {
+          "name": "personIdsInPath",
+          "type": "ID[]"
+        },
+        {
+          "name": "pathWeight",
+          "type": "FLOAT (v1) / INTEGER (v2) -- the disagreement itself"
+        }
+      ],
+      "order_by": [
+        "pathWeight DESC"
+      ],
+      "limit": null,
+      "cypher": {
+        "status": "unverified",
+        "text": "MATCH path = allShortestPaths((person1:Person { id: ${person1Id} })-[:KNOWS*0..]-(person2:Person { id: ${person2Id} }))\nWITH collect(path) as paths\nUNWIND paths as path\nWITH path, relationships(path) as rels_in_path\nWITH\n    [n in nodes(path) | n.id ] as personIdsInPath,\n    [r in rels_in_path |\n        reduce(w=0.0, v in [\n            (a:Person)<-[:HAS_CREATOR]-(:Comment)-[:REPLY_OF]->(:Post)-[:HAS_CREATOR]->(b:Person)\n            WHERE\n                (a.id = startNode(r).id and b.id=endNode(r).id) OR (a.id=endNode(r).id and b.id=startNode(r).id)\n            | 1.0] | w+v)\n    ] as weight1,\n    [r in rels_in_path |\n        reduce(w=0.0,v in [\n        (a:Person)<-[:HAS_CREATOR]-(:Comment)-[:REPLY_OF]->(:Comment)-[:HAS_CREATOR]->(b:Person)\n        WHERE\n                (a.id = startNode(r).id and b.id=endNode(r).id) OR (a.id=endNode(r).id and b.id=startNode(r).id)\n        | 0.5] | w+v)\n    ] as weight2\nWITH\n    personIdsInPath,\n    reduce(w=0.0,v in weight1| w+v) as w1,\n    reduce(w=0.0,v in weight2| w+v) as w2\nRETURN\n    personIdsInPath,\n    (w1+w2) as pathWeight\nORDER BY pathWeight desc",
+        "provenance": "ldbc/ldbc_snb_interactive_v1_impls, cypher/queries/interactive-complex-14.cypher, fetched 2026-09-13",
+        "variant_note": "IC14 is two different problems sharing one number, and this entry is the v1 one ON PURPOSE: this family is SNB Interactive **v1**, so the ambiguity is resolved by SCOPE rather than by preference. v1 returns ALL unweighted shortest paths with a 64-bit FLOAT weight (a reply to a Post scores 1.0, to a Comment 0.5, summed over consecutive pairs) and that is the text carried here, taken verbatim from the published v1 implementation. v2 is a DIFFERENT query - ONE cheapest path, 64-bit INTEGER weight max(round(40 - sqrt(numInteractions)), 1) over a knows projection filtered to interacting pairs - and belongs to the v2 family, which this catalogue does not carry. Neither is a substitute for the other.",
+        "superseded_reason": "IC14 is two different problems sharing one number, and this catalogue will not pick one silently. v1 returns ALL unweighted shortest paths with a 64-bit FLOAT weight (a reply to a Post scores 1.0, to a Comment 0.5, summed over consecutive pairs); v2 returns ONE cheapest path with a 64-bit INTEGER weight max(round(40 - sqrt(numInteractions)), 1) over a knows projection filtered to interacting pairs. A v1 number and a v2 number are not comparable in either direction, so a row labelled IC14 in a cross-version table is a lie. docs/bench/ldbc-coverage-plan.md section 2.1 records this decision. The v1 reference text WAS fetched (cypher/queries/interactive-complex-14.cypher) -- this is a declared refusal, not a sourcing gap -- and the plan notes that the specification PDF's text layer drops the sqrt glyph, so the PDF alone is not a safe source for it."
+      },
+      "cypher_ladybug": {
+        "status": "unsupported",
+        "reason": "IC14 is two different problems sharing one number, and this catalogue will not pick one silently. v1 returns ALL unweighted shortest paths with a 64-bit FLOAT weight (a reply to a Post scores 1.0, to a Comment 0.5, summed over consecutive pairs); v2 returns ONE cheapest path with a 64-bit INTEGER weight max(round(40 - sqrt(numInteractions)), 1) over a knows projection filtered to interacting pairs. A v1 number and a v2 number are not comparable in either direction, so a row labelled IC14 in a cross-version table is a lie. docs/bench/ldbc-coverage-plan.md section 2.1 records this decision. The v1 reference text WAS fetched (cypher/queries/interactive-complex-14.cypher) -- this is a declared refusal, not a sourcing gap -- and the plan notes that the specification PDF's text layer drops the sqrt glyph, so the PDF alone is not a safe source for it."
+      },
+      "sql": {
+        "status": "unverified",
+        "text": "/* Q14. Trusted connection paths\n\\set person1Id 8796093022357\n\\set person2Id 8796093022390\n */\nWITH start_node(v) AS (\n    SELECT :person1Id::bigint\n)\nselect * from (\n    WITH RECURSIVE\n    search_graph(link, depth, path) AS (\n            (SELECT v::bigint, 0, ARRAY[]::bigint[][] from start_node)\n          UNION ALL\n            (WITH sg(link, depth) as (select * from search_graph)\n            SELECT distinct k_person2id, x.depth + 1, path || ARRAY[[x.link, k_person2id]]\n            FROM knows, sg x\n            WHERE x.link = k_person1id and not exists(select * from sg y where y.link = :person2Id::bigint) and not exists(select * from sg y where y.link=k_person2id)\n            )\n    ),\n    paths(pid, path) AS (\n        SELECT row_number() OVER (), path FROM search_graph where link = :person2Id::bigint\n    ),\n    edges(id, e) AS (\n        SELECT pid, array_agg(path[d1][d2])\n        FROM paths, generate_subscripts(path, 1) d1, generate_subscripts(path, 2) d2\n        GROUP BY pid, d1\n    ),\n    unique_edges(e) AS (\n        SELECT DISTINCT e from edges\n    ),\n    weights(we, score) as (\n        select e, sum(score) from (\n            select e, mid1, mid2, max(score) as score from (\n                select e, 1 as score, p1.m_messageid as mid1, p2.m_messageid as mid2 from unique_edges, message p1, message p2 where (p1.m_creatorid=e[1] and p2.m_creatorid=e[2] and p2.m_c_replyof=p1.m_messageid and p1.m_c_replyof is null)\n                union all\n                select e, 1 as score, p1.m_messageid as mid1, p2.m_messageid as mid2 from unique_edges, message p1, message p2 where (p1.m_creatorid=e[2] and p2.m_creatorid=e[1] and p2.m_c_replyof=p1.m_messageid and p1.m_c_replyof is null)\n                union all\n                select e, 0.5 as score, p1.m_messageid as mid1, p2.m_messageid as mid2 from unique_edges, message p1, message p2 where (p1.m_creatorid=e[1] and p2.m_creatorid=e[2] and p2.m_c_replyof=p1.m_messageid and p1.m_c_replyof is not null)\n                union all\n                select e, 0.5 as score, p1.m_messageid as mid1, p2.m_messageid as mid2  from unique_edges, message p1, message p2 where (p1.m_creatorid=e[2] and p2.m_creatorid=e[1] and p2.m_c_replyof=p1.m_messageid and p1.m_c_replyof is not null)\n            ) pps group by e, mid1, mid2\n        ) tmp\n        group by e\n    ),\n    weightedpaths(path, score) as (\n        select path, coalesce(sum(score), 0) from paths, edges left join weights on we=e where pid=id group by id, path\n    )\n    select path, score from weightedpaths order by score desc)\nx  order by score desc;\n;\n",
+        "source_file": "https://raw.githubusercontent.com/ldbc/ldbc_snb_interactive_v1_impls/main/postgres/queries/interactive-complex-14.sql",
+        "source_sha256": "9fb7271717ac4bb8ffdc647b63700861f303496eb1883b7ec9b95316d9ac7ee7",
+        "vendored": "docs/bench/ldbc-official/interactive-v1-postgres/queries/interactive-complex-14.sql",
+        "superseded": {
+          "status": "unsupported",
+          "reason": "IC14 is two different problems sharing one number, and this catalogue will not pick one silently. v1 returns ALL unweighted shortest paths with a 64-bit FLOAT weight (a reply to a Post scores 1.0, to a Comment 0.5, summed over consecutive pairs); v2 returns ONE cheapest path with a 64-bit INTEGER weight max(round(40 - sqrt(numInteractions)), 1) over a knows projection filtered to interacting pairs. A v1 number and a v2 number are not comparable in either direction, so a row labelled IC14 in a cross-version table is a lie. docs/bench/ldbc-coverage-plan.md section 2.1 records this decision. The v1 reference text WAS fetched (cypher/queries/interactive-complex-14.cypher) -- this is a declared refusal, not a sourcing gap -- and the plan notes that the specification PDF's text layer drops the sqrt glyph, so the PDF alone is not a safe source for it."
+        },
+        "superseded_note": "What this entry carried until 2026-09-23: text written HERE from the official Cypher against the schema `sql_schema_required` describes, which was never built -- so it never ran, and the Interactive comparator failed naming `person_is_located_in_city` and `knows.src`. Kept for the record.",
+        "version_note": "LDBC's official interactive-v1-postgres IC14 is the v1 problem -- ALL shortest paths, a reply to a Post scoring 1.0 and to a Comment 0.5 -- which is the v1 problem this catalogue's Cypher computes. The superseded entry's refusal was about mixing v1 with v2 numbers; both arms here are v1."
+      }
+    }
+  }
+}

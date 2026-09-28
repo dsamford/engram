@@ -68,7 +68,11 @@ fn corpus() -> Graph {
         let mut m = BTreeMap::new();
         m.insert(
             "status".to_string(),
-            Value::Str(if i % 3 == 0 { "pending".into() } else { "done".into() }),
+            Value::Str(if i % 3 == 0 {
+                "pending".into()
+            } else {
+                "done".into()
+            }),
         );
         m.insert("priority".to_string(), Value::Int(i % 7));
         m.insert("proposedAt".to_string(), Value::Int(1_000_000 - i));
@@ -79,13 +83,15 @@ fn corpus() -> Graph {
             let mut am = BTreeMap::new();
             am.insert("id".to_string(), Value::Str(format!("art-{i}-{k}")));
             let a = g.create_node(&["Artifact".into()], &am).expect("artifact");
-            g.create_rel(p, "HAS_ARTIFACT", a, &BTreeMap::new()).expect("has");
+            g.create_rel(p, "HAS_ARTIFACT", a, &BTreeMap::new())
+                .expect("has");
         }
         if i % 2 == 0 {
             let mut rm = BTreeMap::new();
             rm.insert("id".to_string(), Value::Str(format!("repo-{}", i % 11)));
             let r = g.create_node(&["Repo".into()], &rm).expect("repo");
-            g.create_rel(p, "FOR_REPO", r, &BTreeMap::new()).expect("for");
+            g.create_rel(p, "FOR_REPO", r, &BTreeMap::new())
+                .expect("for");
         }
     }
     g
@@ -105,8 +111,16 @@ fn a_bare_carry_into_a_topk_return_is_hydrated_for_the_survivors_only() {
     let (got, c) = traced(&g, LISTING);
     assert_eq!(got, want);
     assert!(count_of(&c, LEAN) > 0, "the WITH bound p lean: {c:?}");
-    assert_eq!(count_of(&c, HYDRATED), 25, "only the survivors are hydrated: {c:?}");
-    assert_eq!(count_of(&c, FULL), 25, "nothing else is decoded in full: {c:?}");
+    assert_eq!(
+        count_of(&c, HYDRATED),
+        25,
+        "only the survivors are hydrated: {c:?}"
+    );
+    assert_eq!(
+        count_of(&c, FULL),
+        25,
+        "nothing else is decoded in full: {c:?}"
+    );
     assert_eq!(count_of(&c, EAGER), 0, "{c:?}");
     // The output IS the full node: every property the fixture wrote.
     let Value::Node { props, .. } = &got[0][0] else {

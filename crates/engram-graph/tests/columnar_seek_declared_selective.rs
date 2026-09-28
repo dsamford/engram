@@ -59,7 +59,10 @@ fn corpus(declare: bool) -> Graph {
     let g = Graph::new(Store::new(), Realm(1), Namespace(1));
     g.set_label_scoped_indexes(true);
     if declare {
-        ddl(&g, "CREATE INDEX doc_owner IF NOT EXISTS FOR (n:Doc) ON (n.owner)");
+        ddl(
+            &g,
+            "CREATE INDEX doc_owner IF NOT EXISTS FOR (n:Doc) ON (n.owner)",
+        );
     }
     for i in 0..700i64 {
         let mut m = BTreeMap::new();
@@ -134,7 +137,10 @@ fn without_a_declared_index_the_scoped_probe_never_fires_and_rows_agree() {
 fn a_declared_but_unselective_key_still_scans() {
     let g = Graph::new(Store::new(), Realm(1), Namespace(1));
     g.set_label_scoped_indexes(true);
-    ddl(&g, "CREATE INDEX doc_kind IF NOT EXISTS FOR (n:Doc) ON (n.kind)");
+    ddl(
+        &g,
+        "CREATE INDEX doc_kind IF NOT EXISTS FOR (n:Doc) ON (n.kind)",
+    );
     for i in 0..700i64 {
         let mut m = BTreeMap::new();
         m.insert(

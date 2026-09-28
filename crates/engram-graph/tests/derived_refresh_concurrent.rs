@@ -65,7 +65,9 @@ fn setup() -> (Arc<Graph>, Vec<u64>, u32) {
             .expect("has_creator");
     }
     g.shared_store().seal();
-    let tok = g.type_tokens_peek(&["HAS_CREATOR".to_string()]).expect("minted")[0];
+    let tok = g
+        .type_tokens_peek(&["HAS_CREATOR".to_string()])
+        .expect("minted")[0];
     // Build what the race is over.
     for &p in &persons {
         let _ = g.adjacent_slim(p, Dir::In, &Some(vec![tok]));
@@ -94,8 +96,12 @@ fn race(maintenance: bool, txn_batches: bool, writers_n: usize) -> Outcome {
     let (g, persons, tok) = setup();
     let seed_per_person = (SEED_MESSAGES as usize / PERSONS) as u64;
     let c = Arc::new(Counters {
-        intent: (0..PERSONS).map(|_| AtomicU64::new(seed_per_person)).collect(),
-        done: (0..PERSONS).map(|_| AtomicU64::new(seed_per_person)).collect(),
+        intent: (0..PERSONS)
+            .map(|_| AtomicU64::new(seed_per_person))
+            .collect(),
+        done: (0..PERSONS)
+            .map(|_| AtomicU64::new(seed_per_person))
+            .collect(),
         nodes_intent: AtomicU64::new(SEED_MESSAGES),
         nodes_done: AtomicU64::new(SEED_MESSAGES),
     });
@@ -116,8 +122,10 @@ fn race(maintenance: bool, txn_batches: bool, writers_n: usize) -> Outcome {
                 let r = g.refresh_stale_derived();
                 runs.fetch_add(1, Ordering::Relaxed);
                 work.fetch_add(
-                    (r.adjacency_repaired + r.adjacency_rebuilt + r.members_caught_up + r.members_rebuilt)
-                        as u64,
+                    (r.adjacency_repaired
+                        + r.adjacency_rebuilt
+                        + r.members_caught_up
+                        + r.members_rebuilt) as u64,
                     Ordering::Relaxed,
                 );
                 std::thread::yield_now();
@@ -151,7 +159,8 @@ fn race(maintenance: bool, txn_batches: bool, writers_n: usize) -> Outcome {
                         }
                         for &p in &targets {
                             let m = g.create_node(&message, &none).expect("message");
-                            g.create_rel(m, "HAS_CREATOR", persons[p], &none).expect("rel");
+                            g.create_rel(m, "HAS_CREATOR", persons[p], &none)
+                                .expect("rel");
                         }
                         if batch > 1 {
                             match g.commit_txn() {
@@ -177,7 +186,12 @@ fn race(maintenance: bool, txn_batches: bool, writers_n: usize) -> Outcome {
     // traces prove they took the table path, not a direct walk.
     let readers: Vec<_> = (0..READERS)
         .map(|r| {
-            let (g, c, persons, stop) = (Arc::clone(&g), Arc::clone(&c), persons.clone(), Arc::clone(&stop));
+            let (g, c, persons, stop) = (
+                Arc::clone(&g),
+                Arc::clone(&c),
+                persons.clone(),
+                Arc::clone(&stop),
+            );
             std::thread::spawn(move || {
                 let mut reads = 0u64;
                 let mut adj_v = 0u64;
@@ -191,18 +205,23 @@ fn race(maintenance: bool, txn_batches: bool, writers_n: usize) -> Outcome {
                         x ^= x << 17;
                         let p = (x % PERSONS as u64) as usize;
                         let lo = c.done[p].load(Ordering::SeqCst);
-                        let got = g.adjacent_slim(persons[p], Dir::In, &Some(vec![tok])).len() as u64;
+                        let got =
+                            g.adjacent_slim(persons[p], Dir::In, &Some(vec![tok])).len() as u64;
                         let hi = c.intent[p].load(Ordering::SeqCst);
                         if !(lo <= got && got <= hi) {
                             adj_v += 1;
-                            first.get_or_insert_with(|| format!("person {p} in-row {got} outside [{lo}, {hi}]"));
+                            first.get_or_insert_with(|| {
+                                format!("person {p} in-row {got} outside [{lo}, {hi}]")
+                            });
                         }
                         let lo = c.nodes_done.load(Ordering::SeqCst);
                         let got = g.members(Some("Message")).expect("members").len() as u64;
                         let hi = c.nodes_intent.load(Ordering::SeqCst);
                         if !(lo <= got && got <= hi) {
                             mem_v += 1;
-                            first.get_or_insert_with(|| format!(":Message membership {got} outside [{lo}, {hi}]"));
+                            first.get_or_insert_with(|| {
+                                format!(":Message membership {got} outside [{lo}, {hi}]")
+                            });
                         }
                         reads += 1;
                     }
@@ -236,17 +255,34 @@ fn race(maintenance: bool, txn_batches: bool, writers_n: usize) -> Outcome {
     for r in readers {
         let (reads, adj_v, mem_v, first, trace) = r.join().expect("reader");
         if let Some(f) = first {
-            eprintln!("[concurrent maint={maintenance} txn={txn_batches} writers={writers_n}] first violation: {f}");
+            eprintln!(
+                "[concurrent maint={maintenance} txn={txn_batches} writers={writers_n}] first violation: {f}"
+            );
         }
         out.reads += reads;
         out.adj_violations += adj_v;
         out.members_violations += mem_v;
         let cnt = trace.counters();
-        out.table_path += cnt.get("graph.adjacency tables reused").copied().unwrap_or(0)
-            + cnt.get("graph.adjacency tables repaired").copied().unwrap_or(0)
-            + cnt.get("graph.adjacency tables built").copied().unwrap_or(0)
-            + cnt.get("graph.adjacency tables built by another worker").copied().unwrap_or(0);
-        out.direct += cnt.get("graph.adjacency table declined by the entry budget").copied().unwrap_or(0);
+        out.table_path += cnt
+            .get("graph.adjacency tables reused")
+            .copied()
+            .unwrap_or(0)
+            + cnt
+                .get("graph.adjacency tables repaired")
+                .copied()
+                .unwrap_or(0)
+            + cnt
+                .get("graph.adjacency tables built")
+                .copied()
+                .unwrap_or(0)
+            + cnt
+                .get("graph.adjacency tables built by another worker")
+                .copied()
+                .unwrap_or(0);
+        out.direct += cnt
+            .get("graph.adjacency table declined by the entry budget")
+            .copied()
+            .unwrap_or(0);
     }
     // The SETTLED state: every writer returned, nothing else is running. A
     // table still short here is a row the repair lost for good.
@@ -277,9 +313,16 @@ fn race(maintenance: bool, txn_batches: bool, writers_n: usize) -> Outcome {
              the store walk {} — the snapshot {} the store",
             snapshot.len(),
             walked.len(),
-            if snapshot.len() < walked.len() { "LOST rows the store has" } else { "holds rows the store does not" }
+            if snapshot.len() < walked.len() {
+                "LOST rows the store has"
+            } else {
+                "holds rows the store does not"
+            }
         );
-        assert_eq!(snapshot, walked, "settled {label:?} snapshot and store walk differ id for id");
+        assert_eq!(
+            snapshot, walked,
+            "settled {label:?} snapshot and store walk differ id for id"
+        );
     }
     assert_eq!(
         g.nodes_by_label(Some("Message")).expect("walk").len() as u64,
@@ -312,8 +355,15 @@ fn race(maintenance: bool, txn_batches: bool, writers_n: usize) -> Outcome {
 }
 
 fn assert_clean(o: &Outcome, arm: &str) {
-    assert!(o.reads >= 500, "{arm}: too few reads to have raced anything: {}", o.reads);
-    assert!(o.table_path >= o.reads / 2, "{arm}: readers did not take the table path");
+    assert!(
+        o.reads >= 500,
+        "{arm}: too few reads to have raced anything: {}",
+        o.reads
+    );
+    assert!(
+        o.table_path >= o.reads / 2,
+        "{arm}: readers did not take the table path"
+    );
     assert_eq!(o.direct, 0, "{arm}: a reader fell back to the direct walk");
     assert!(
         o.durable_adj_loss.is_empty(),
@@ -336,8 +386,15 @@ fn assert_clean(o: &Outcome, arm: &str) {
 #[test]
 fn with_the_maintenance_thread_readers_never_observe_a_torn_or_stale_table() {
     let o = race(true, true, WRITERS);
-    assert!(o.refresh_runs >= 10, "the maintenance thread barely ran: {}", o.refresh_runs);
-    assert!(o.refresh_work >= 5, "the maintenance thread brought nothing current while racing");
+    assert!(
+        o.refresh_runs >= 10,
+        "the maintenance thread barely ran: {}",
+        o.refresh_runs
+    );
+    assert!(
+        o.refresh_work >= 5,
+        "the maintenance thread brought nothing current while racing"
+    );
     assert_clean(&o, "maintenance+txn");
 }
 

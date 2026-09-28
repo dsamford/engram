@@ -13,6 +13,7 @@ use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 
 use engram_cypher::Value;
+use engram_observe::counted;
 
 use crate::packstream::{Decoder, Pack, decode_value, encode_struct};
 
@@ -32,6 +33,10 @@ pub struct Client {
     s: TcpStream,
     /// The `server` agent the peer announced in HELLO's SUCCESS.
     server_agent: String,
+    /// What the peer said it is serving under, if anything. See
+    /// [`crate::serving`] — a benchmark that asks the server cannot be told
+    /// about a different server.
+    serving_hint: Option<crate::serving::ServingHint>,
 }
 
 impl Client {
@@ -64,6 +69,7 @@ impl Client {
         let mut c = Client {
             s,
             server_agent: String::new(),
+            serving_hint: None,
         };
         // HELLO carries `bolt_agent` as well as `user_agent`.
         //
@@ -91,6 +97,7 @@ impl Client {
         if let Some(Value::Str(agent)) = meta.get("server") {
             c.server_agent = agent.clone();
         }
+        c.serving_hint = crate::serving::ServingHint::from_meta(&meta);
         c.write_msg(MSG_LOGON, &[Pack::Value(strmap(&[("scheme", "none")]))])?;
         c.expect_success("LOGON")?;
         Ok(c)
@@ -107,6 +114,18 @@ impl Client {
         &self.server_agent
     }
 
+    /// What the peer said it is SERVING under — its cache budget and its
+    /// intra-query width — or `None` when it said nothing.
+    ///
+    /// `None` is the ordinary answer from a real Neo4j and from any engram
+    /// built before [`crate::serving`] existed, and it is not an error: it
+    /// means the numbers in a result document's fairness block are a claim,
+    /// which the document then has to say.
+    #[must_use]
+    pub fn serving_hint(&self) -> Option<crate::serving::ServingHint> {
+        self.serving_hint
+    }
+
     /// Run a query, counting result rows and discarding their contents — the
     /// throughput-harness path. The RECORD is still fully decoded off the wire,
     /// so the protocol is exercised; only the per-row `Value` is not retained.
@@ -119,8 +138,21 @@ impl Client {
     /// Run a query and collect each result row as a `Value` — a list of the
     /// returned columns. The correctness/test path.
     pub fn query(&mut self, cypher: &str) -> std::io::Result<Vec<Value>> {
+        self.query_with(cypher, Default::default())
+    }
+
+    /// RUN with PARAMETERS. A statement whose behaviour depends on a
+    /// parameter — LDBC FinBench's `truncationLimit` is the case this was
+    /// added for — cannot be exercised by a client that only ever sends an
+    /// empty map, and a feature unreachable from our own tooling is a feature
+    /// nobody can check.
+    pub fn query_with(
+        &mut self,
+        cypher: &str,
+        params: std::collections::BTreeMap<String, Value>,
+    ) -> std::io::Result<Vec<Value>> {
         let mut rows = Vec::new();
-        self.exec(cypher, |mut fields| {
+        self.exec_with(cypher, params, |mut fields| {
             if !fields.is_empty() {
                 if let Ok(v) = decode_value(fields.remove(0)) {
                     rows.push(v);
@@ -133,12 +165,21 @@ impl Client {
     /// RUN + PULL, invoking `on_record` with each RECORD's fields, until both
     /// the RUN and the PULL summaries have arrived. A FAILURE clears the stream
     /// (RESET) so the connection stays reusable, then surfaces as an error.
-    fn exec(&mut self, cypher: &str, mut on_record: impl FnMut(Vec<Pack>)) -> std::io::Result<()> {
+    fn exec(&mut self, cypher: &str, on_record: impl FnMut(Vec<Pack>)) -> std::io::Result<()> {
+        self.exec_with(cypher, Default::default(), on_record)
+    }
+
+    fn exec_with(
+        &mut self,
+        cypher: &str,
+        params: std::collections::BTreeMap<String, Value>,
+        mut on_record: impl FnMut(Vec<Pack>),
+    ) -> std::io::Result<()> {
         self.write_msg(
             MSG_RUN,
             &[
                 Pack::Value(Value::Str(cypher.to_string())),
-                Pack::Value(Value::Map(Default::default())),
+                Pack::Value(Value::Map(params)),
                 Pack::Value(Value::Map(Default::default())),
             ],
         )?;
@@ -186,6 +227,17 @@ impl Client {
             self.s.read_exact(&mut len)?;
             let n = u16::from_be_bytes(len) as usize;
             if n == 0 {
+                // A zero-length chunk ends a message — unless no message has
+                // begun, in which case it is a NOOP: the keep-alive a server
+                // sends while a long request runs (Neo4j: every
+                // `server.bolt.connection_keep_alive`, one minute by
+                // default). Reading it as an empty message decoded nothing
+                // and failed with `Truncated { at: 0 }` the first time the
+                // comparison's slowest count crossed a minute on the peer.
+                if payload.is_empty() {
+                    counted!("bolt.client skipped a keep-alive NOOP chunk");
+                    continue;
+                }
                 break;
             }
             let start = payload.len();

@@ -91,7 +91,10 @@ fn create_versus_delete_conflicts_in_either_order_on_both_arms() {
             let g = graph_over(Store::new());
             g.set_volatile_guards(on);
             seed(&g);
-            let create = buffered(&g, "MATCH (a:P {id: 1}), (b:P {id: 2}) CREATE (a)-[:R]->(b)");
+            let create = buffered(
+                &g,
+                "MATCH (a:P {id: 1}), (b:P {id: 2}) CREATE (a)-[:R]->(b)",
+            );
             let del = buffered(&g, "MATCH (n:P {id: 1}) DELETE n");
             g.commit_owned(create).expect("first committer wins");
             assert!(
@@ -109,7 +112,10 @@ fn create_versus_delete_conflicts_in_either_order_on_both_arms() {
             let g = graph_over(Store::new());
             g.set_volatile_guards(on);
             seed(&g);
-            let create = buffered(&g, "MATCH (a:P {id: 1}), (b:P {id: 2}) CREATE (a)-[:R]->(b)");
+            let create = buffered(
+                &g,
+                "MATCH (a:P {id: 1}), (b:P {id: 2}) CREATE (a)-[:R]->(b)",
+            );
             let del = buffered(&g, "MATCH (n:P {id: 1}) DELETE n");
             g.commit_owned(del).expect("first committer wins");
             assert!(
@@ -137,8 +143,14 @@ fn two_relationship_writes_on_one_node_still_both_commit() {
         for i in 1..=4i64 {
             run(&g, &format!("CREATE (:P {{id: {i}}})"));
         }
-        let a = buffered(&g, "MATCH (h:P {id: 0}), (x:P {id: 1}) CREATE (h)-[:R]->(x)");
-        let b = buffered(&g, "MATCH (h:P {id: 0}), (x:P {id: 2}) CREATE (h)-[:R]->(x)");
+        let a = buffered(
+            &g,
+            "MATCH (h:P {id: 0}), (x:P {id: 1}) CREATE (h)-[:R]->(x)",
+        );
+        let b = buffered(
+            &g,
+            "MATCH (h:P {id: 0}), (x:P {id: 2}) CREATE (h)-[:R]->(x)",
+        );
         g.commit_owned(a).expect("a");
         g.commit_owned(b)
             .expect("arm: two relationship writes on one node are both valid");
@@ -211,7 +223,11 @@ fn the_lever_actually_switches_the_write() {
     g.set_volatile_guards(true);
     seed(&g);
     let (_, on) = engram_observe::with_trace(|| {
-        stmt(&g, "MATCH (a:P {id: 1}), (b:P {id: 2}) CREATE (a)-[:R]->(b)").expect("create");
+        stmt(
+            &g,
+            "MATCH (a:P {id: 1}), (b:P {id: 2}) CREATE (a)-[:R]->(b)",
+        )
+        .expect("create");
     });
     assert!(
         count(&on, "graph.guard rows written volatile") >= 2,
@@ -223,7 +239,11 @@ fn the_lever_actually_switches_the_write() {
     g2.set_volatile_guards(false);
     seed(&g2);
     let (_, off) = engram_observe::with_trace(|| {
-        stmt(&g2, "MATCH (a:P {id: 1}), (b:P {id: 2}) CREATE (a)-[:R]->(b)").expect("create");
+        stmt(
+            &g2,
+            "MATCH (a:P {id: 1}), (b:P {id: 2}) CREATE (a)-[:R]->(b)",
+        )
+        .expect("create");
     });
     assert_eq!(
         count(&off, "graph.guard rows written volatile"),
@@ -242,12 +262,18 @@ fn a_volatile_guard_produces_no_log_entry() {
         g.set_volatile_guards(on);
         seed(&g);
         let before = store.log_len();
-        stmt(&g, "MATCH (a:P {id: 1}), (b:P {id: 2}) CREATE (a)-[:R]->(b)").expect("create");
+        stmt(
+            &g,
+            "MATCH (a:P {id: 1}), (b:P {id: 2}) CREATE (a)-[:R]->(b)",
+        )
+        .expect("create");
         store.log_len() - before
     };
     let with = measure(true);
     let without = measure(false);
-    eprintln!("[volatile guards] log entries for one rel create: volatile {with}, logged {without}");
+    eprintln!(
+        "[volatile guards] log entries for one rel create: volatile {with}, logged {without}"
+    );
     assert!(
         with < without,
         "a volatile guard must not reach the log: {with} vs {without}"
@@ -309,7 +335,10 @@ fn a_reopened_store_is_correct_and_still_races_correctly() {
     );
 
     // And the race still works on the recovered store, in both orders.
-    let create = buffered(&g, "MATCH (a:P {id: 0}), (b:P {id: 7}) CREATE (a)-[:R]->(b)");
+    let create = buffered(
+        &g,
+        "MATCH (a:P {id: 0}), (b:P {id: 7}) CREATE (a)-[:R]->(b)",
+    );
     let del = buffered(&g, "MATCH (n:P {id: 0}) DETACH DELETE n");
     g.commit_owned(del).expect("first committer wins");
     assert!(

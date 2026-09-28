@@ -15,10 +15,12 @@
 //! (outer) × reverse `a`-adjacency (inner), appending `c` innermost. The
 //! TIE-GROUP test's LIMIT-kept rows are decided purely by that order; dropping
 //! the pipeline's `.rev()` diverges it (the canary), which also proves it fires.
-//! RELATIONSHIP ISOMORPHISM is PER-PATH: `run_streaming` re-seeds `Partial.used`
-//! per path, so a self-loop reused ACROSS two 1-hop paths is KEPT (the
-//! `iso_cross_path_*` tests), while a reuse WITHIN a later multi-hop path is
-//! dropped — both matched exactly.
+//! RELATIONSHIP ISOMORPHISM is scoped to ONE MATCH CLAUSE (openCypher; since
+//! rev69 `enforce_clause_rel_uniqueness` states it for comma paths). A
+//! self-loop may serve two SEPARATE clauses — `MATCH p1 MATCH p2`, which is
+//! the shape this pipeline's multi-path chain implements (fusion hands it that
+//! shape) — and not two comma paths of one MATCH, nor twice within one path;
+//! the `iso_*` tests pin all three.
 
 use std::collections::BTreeMap;
 
@@ -91,9 +93,9 @@ fn gp() -> Graph {
     g
 }
 
-/// Nn{nk} with a self-loop and a back-edge: two 1-hop paths sharing a var can
-/// REUSE the self-loop `r_self` (allowed across paths — `run_streaming` re-seeds
-/// `used` per path); a single 2-hop path forbids it (within-path isomorphism).
+/// Nn{nk} with a self-loop and a back-edge: two 1-hop MATCH CLAUSES sharing a
+/// var can REUSE the self-loop `r_self` (isomorphism is per clause); one path,
+/// or two comma paths of one MATCH, cannot.
 fn giso() -> Graph {
     let g = Graph::new(Store::new(), Realm(1), Namespace(1));
     let mk = |nk: i64| {
@@ -349,19 +351,28 @@ fn multipath_three_paths() {
     );
 }
 
-/// Relationship isomorphism is PER-PATH. Two 1-hop paths sharing `y` may REUSE
-/// the self-loop across the path boundary (`run_streaming` re-seeds `used` per
-/// path), so `(0)-[r_self]->(0), (0)-[r_self]->(0)` — the row (0,0,0) — is KEPT,
-/// whereas the single-path 2-hop forbids it. The pipeline must match BOTH.
+/// Relationship isomorphism is scoped to one MATCH CLAUSE. Two 1-hop CLAUSES
+/// sharing `y` may REUSE the self-loop, so the row (0,0,0) is KEPT; the single
+/// 2-hop path forbids it, and so does the same two paths COMMA-joined in one
+/// MATCH. The pipeline must match all three.
 #[test]
-fn iso_cross_path_reuse_is_kept() {
+fn iso_reuse_across_clauses_is_kept_and_across_comma_paths_is_not() {
     let g = giso();
-    let multi = "MATCH (x:Nn)-[:R]->(y:Nn), (y)-[:R]->(z:Nn) RETURN x.nk AS xk, y.nk AS yk, z.nk AS zk ORDER BY x.nk, y.nk, z.nk LIMIT 100";
+    let multi = "MATCH (x:Nn)-[:R]->(y:Nn) MATCH (y)-[:R]->(z:Nn) RETURN x.nk AS xk, y.nk AS yk, z.nk AS zk ORDER BY x.nk, y.nk, z.nk LIMIT 100";
     let (m_on, m_off) = both(&g, multi, BTreeMap::new());
-    assert_eq!(m_on, m_off, "cross-path iso disagree: `{multi}`");
+    assert_eq!(m_on, m_off, "separate-clause iso disagree: `{multi}`");
     assert!(
         m_on.contains(&vec![Value::Int(0), Value::Int(0), Value::Int(0)]),
-        "cross-path reuse of the self-loop must be KEPT (per-path `used`)"
+        "reuse of the self-loop across two MATCH clauses must be KEPT"
+    );
+    // The same two paths comma-joined in ONE MATCH: the two R relationships
+    // must differ, so the self-loop cannot serve both and (0,0,0) is DROPPED.
+    let comma = "MATCH (x:Nn)-[:R]->(y:Nn), (y)-[:R]->(z:Nn) RETURN x.nk AS xk, y.nk AS yk, z.nk AS zk ORDER BY x.nk, y.nk, z.nk LIMIT 100";
+    let (c_on, c_off) = both(&g, comma, BTreeMap::new());
+    assert_eq!(c_on, c_off, "comma-path iso disagree: `{comma}`");
+    assert!(
+        !c_on.contains(&vec![Value::Int(0), Value::Int(0), Value::Int(0)]),
+        "within one MATCH the self-loop may not serve both comma paths"
     );
     // The single-path 2-hop FORBIDS the same reuse (within-path isomorphism).
     let single = "MATCH (x:Nn)-[:R]->(y:Nn)-[:R]->(z:Nn) RETURN x.nk AS xk, y.nk AS yk, z.nk AS zk ORDER BY x.nk, y.nk, z.nk LIMIT 100";
@@ -373,7 +384,7 @@ fn iso_cross_path_reuse_is_kept() {
     );
     assert!(
         pipeline_fired(&g, multi),
-        "the cross-path iso shape must run through the pipeline"
+        "the separate-clause shape must run through the pipeline"
     );
 }
 
@@ -385,8 +396,8 @@ fn iso_cross_path_reuse_is_kept() {
 fn iso_within_later_path_is_enforced() {
     let g = giso();
     for src in [
-        "MATCH (x:Nn)-[:R]->(y:Nn), (y)-[:R]->(z:Nn)-[:R]->(w:Nn) RETURN x.nk AS xk, y.nk AS yk, z.nk AS zk, w.nk AS wk ORDER BY x.nk, y.nk, z.nk, w.nk LIMIT 100",
-        "MATCH (x:Nn)-[:R]->(y:Nn), (y)-[:R]->(z:Nn)-[:R]->(w:Nn) RETURN x.nk AS xk, y.nk AS yk, z.nk AS zk, w.nk AS wk",
+        "MATCH (x:Nn)-[:R]->(y:Nn) MATCH (y)-[:R]->(z:Nn)-[:R]->(w:Nn) RETURN x.nk AS xk, y.nk AS yk, z.nk AS zk, w.nk AS wk ORDER BY x.nk, y.nk, z.nk, w.nk LIMIT 100",
+        "MATCH (x:Nn)-[:R]->(y:Nn) MATCH (y)-[:R]->(z:Nn)-[:R]->(w:Nn) RETURN x.nk AS xk, y.nk AS yk, z.nk AS zk, w.nk AS wk",
     ] {
         let (on, off) = both(&g, src, BTreeMap::new());
         assert_eq!(on, off, "within-later-path iso disagree: `{src}`");
@@ -394,7 +405,7 @@ fn iso_within_later_path_is_enforced() {
     assert!(
         pipeline_fired(
             &g,
-            "MATCH (x:Nn)-[:R]->(y:Nn), (y)-[:R]->(z:Nn)-[:R]->(w:Nn) RETURN x.nk AS xk, w.nk AS wk"
+            "MATCH (x:Nn)-[:R]->(y:Nn) MATCH (y)-[:R]->(z:Nn)-[:R]->(w:Nn) RETURN x.nk AS xk, w.nk AS wk"
         ),
         "a later multi-hop path must fire through the pipeline"
     );

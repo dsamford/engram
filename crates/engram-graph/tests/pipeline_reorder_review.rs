@@ -730,7 +730,6 @@ fn the_reorder_counter_measures_the_lever() {
     assert_eq!(trace.counters().get(FOLD).copied(), None);
 }
 
-
 // ─── 7. WHERE conjuncts the fold moves INLINE onto a hop ────────────────────
 
 /// The count fold moves a WHERE conjunct onto the hop that binds its last var,
@@ -986,8 +985,9 @@ fn randomised_count_patterns_match_the_interpreter() {
             for (reorder, fold) in [(true, true), (true, false), (false, true), (false, false)] {
                 engram_graph::pipeline::set_count_only_reorder(reorder);
                 engram_graph::pipeline::set_count_fold(fold);
-                let got = run_query(&g, &q, BTreeMap::new())
-                    .unwrap_or_else(|e| panic!("columnar refused what the interpreter answered: `{src}`: {e}"));
+                let got = run_query(&g, &q, BTreeMap::new()).unwrap_or_else(|e| {
+                    panic!("columnar refused what the interpreter answered: `{src}`: {e}")
+                });
                 assert_eq!(
                     got.rows, general.rows,
                     "reorder={reorder} fold={fold} disagrees with the interpreter: `{src}`"
@@ -995,15 +995,17 @@ fn randomised_count_patterns_match_the_interpreter() {
             }
             engram_graph::pipeline::set_count_only_reorder(true);
             engram_graph::pipeline::set_count_fold(true);
-            let (_, trace) = engram_observe::with_trace(|| {
-                run_query(&g, &q, BTreeMap::new()).expect("rerun")
-            });
+            let (_, trace) =
+                engram_observe::with_trace(|| run_query(&g, &q, BTreeMap::new()).expect("rerun"));
             fired += trace.counters().get(REORDER).copied().unwrap_or(0) as usize;
             checked += 1;
         }
     }
     println!("checked={checked} reorder-fired={fired} skipped={skipped}");
-    assert!(checked > 1_000, "too few cases reached the oracle: {checked}");
+    assert!(
+        checked > 1_000,
+        "too few cases reached the oracle: {checked}"
+    );
     assert!(
         fired > 50,
         "the reorder fired on only {fired} of {checked} cases ({skipped} skipped) — the fuzz is not exercising it"
@@ -1112,7 +1114,10 @@ fn randomised_optional_statements_match_the_interpreter() {
         }
     }
     println!("checked={checked} legs-folded={folded} skipped={skipped}");
-    assert!(checked > 1_000, "too few cases reached the oracle: {checked}");
+    assert!(
+        checked > 1_000,
+        "too few cases reached the oracle: {checked}"
+    );
     assert!(
         folded > 50,
         "only {folded} legs folded over {checked} cases — the fuzz is not exercising the operator"
@@ -1340,4 +1345,3 @@ fn a_representative_optional_leg_of_every_batch_actually_folds() {
         .collect();
     assert!(silent.is_empty(), "these legs never folded: {silent:?}");
 }
-

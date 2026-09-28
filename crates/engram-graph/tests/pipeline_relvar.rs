@@ -345,6 +345,18 @@ fn rel_sparse_grouping_key_gathers_and_fires() {
     let g = gr_sparse();
     g.set_columnar_column_budget_factor(1); // force the sparse range-scan decline
     let src = "MATCH (a:At)-[r:T]->(b:Bt) RETURN r.since AS s, count(*) AS c ORDER BY s";
+    // The FIRST execution on a fresh graph falls back to the point-gather; a
+    // repeat serves those same values from the relationship-property memo
+    // (`Graph::rel_prop_aligned`) and gathers nothing. Checked in that order,
+    // before any other run fills the memo.
+    assert!(
+        counter(&g, src, "graph.column point-gather") > 0,
+        "the sparse rel grouping-key column must fall back to the point-gather"
+    );
+    assert!(
+        counter(&g, src, "graph.relationship property served from values already read") > 0,
+        "a repeat must be served the values the first run read"
+    );
     let (on, off) = both(&g, src, BTreeMap::new());
     assert_eq!(on, off, "sparse rel group-by vs general disagree");
     assert_eq!(
@@ -358,9 +370,5 @@ fn rel_sparse_grouping_key_gathers_and_fires() {
     assert!(
         pipeline_fired(&g, src),
         "the sparse rel group-by must FIRE via the Rels point-gather"
-    );
-    assert!(
-        counter(&g, src, "graph.column point-gather") > 0,
-        "the sparse rel grouping-key column must fall back to the point-gather"
     );
 }

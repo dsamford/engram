@@ -18,6 +18,7 @@ use engram_cypher::ast::{BinOp, Expr};
 use engram_cypher::eval::{Scope, apply_scalar_fn, eval_with, is_aggregate_fn};
 use engram_cypher::stmt::{Clause, RelDir, SingleQuery};
 use engram_cypher::value::{Truth, Value};
+use engram_observe::counted;
 
 use crate::interp::column_name;
 use crate::{ColumnFamily, Dir, Graph, QueryResult, RunError};
@@ -259,7 +260,9 @@ pub(crate) type ColView<'a> = BTreeMap<String, &'a [Value]>;
 
 /// A [`ColView`] over owned columns.
 pub(crate) fn view(cols: &BTreeMap<String, Vec<Value>>) -> ColView<'_> {
-    cols.iter().map(|(k, v)| (k.clone(), v.as_slice())).collect()
+    cols.iter()
+        .map(|(k, v)| (k.clone(), v.as_slice()))
+        .collect()
 }
 
 pub(crate) fn eval_column<'a>(
@@ -300,12 +303,16 @@ pub(crate) fn eval_column<'a>(
         Expr::Bin(op, l, r) if is_cmp(*op) && is_const(r) => {
             let lc = eval_column(l, b_var, n, cols, scope)?;
             let rv = eval_with(r, scope, None).ok()?;
-            Some(Col::Owned(lc.iter().map(|v| compare(*op, v, &rv)).collect()))
+            Some(Col::Owned(
+                lc.iter().map(|v| compare(*op, v, &rv)).collect(),
+            ))
         }
         Expr::Bin(op, l, r) if is_cmp(*op) && is_const(l) => {
             let lv = eval_with(l, scope, None).ok()?;
             let rc = eval_column(r, b_var, n, cols, scope)?;
-            Some(Col::Owned(rc.iter().map(|v| compare(*op, &lv, v)).collect()))
+            Some(Col::Owned(
+                rc.iter().map(|v| compare(*op, &lv, v)).collect(),
+            ))
         }
         Expr::Bin(op, l, r) if is_cmp(*op) => {
             let lc = eval_column(l, b_var, n, cols, scope)?;
@@ -402,7 +409,10 @@ pub(crate) fn eval_column<'a>(
                 star: false,
             } = rhs.as_ref()
             {
-                if name == "coalesce" && args.len() == 2 && !is_const(&args[0]) && is_const(&args[1])
+                if name == "coalesce"
+                    && args.len() == 2
+                    && !is_const(&args[0])
+                    && is_const(&args[1])
                 {
                     let lists = eval_column(&args[0], b_var, n, cols, scope)?;
                     let fallback = eval_with(&args[1], scope, None).ok()?;
@@ -577,7 +587,13 @@ pub(crate) fn eval_column<'a>(
                 .collect::<Option<Vec<_>>>()?;
             let mut out = Vec::with_capacity(n);
             for i in 0..n {
-                out.push(Value::List(item_cols.iter().map(|c| c[i].clone()).collect()));
+                out.push(Value::List(
+                    item_cols
+                        .iter()
+                        .map(|c| c[i].clone())
+                        .collect::<Vec<_>>()
+                        .into(),
+                ));
             }
             Some(Col::Owned(out))
         }
@@ -596,7 +612,7 @@ fn in_list(needle: &Value, list: &Value) -> Option<Value> {
         Value::Null => Some(Value::Null),
         Value::List(items) => {
             let mut saw_unknown = false;
-            for item in items {
+            for item in (items).iter() {
                 match needle.eq3(item) {
                     Truth::True => return Some(Value::Bool(true)),
                     Truth::Unknown => saw_unknown = true,
@@ -720,7 +736,8 @@ pub(crate) fn try_vectorized_hop_filter_count(
     let empty = engram_cypher::bindings::VarMap::new();
     let scope = Scope::over(params, &empty, graph.wall_ms(), graph.zone_provider());
     let cview = view(&cols);
-    let Some(result) = eval_column(&plan.where_, &plan.b_var, distinct.len(), &cview, &scope) else {
+    let Some(result) = eval_column(&plan.where_, &plan.b_var, distinct.len(), &cview, &scope)
+    else {
         return Ok(None);
     };
     let mut pass: Vec<u64> = Vec::with_capacity(distinct.len());
@@ -1037,6 +1054,21 @@ pub(crate) fn load_rel_columns(
     distinct: &[u64],
     props: &BTreeSet<String>,
 ) -> Result<Option<BTreeMap<String, Vec<Value>>>, RunError> {
+    // Served from the values earlier statements read, gathering only the
+    // rest (`Graph::rel_prop_aligned`): IC5 read ~4.7M `HAS_MEMBER.joinDate`
+    // records per statement for the same dates each time.
+    if !props.is_empty() && !distinct.is_empty() {
+        let mut cols: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+        for p in props {
+            match graph.rel_prop_aligned(p, distinct).map_err(RunError::Graph)? {
+                Some(col) => {
+                    cols.insert(p.clone(), col);
+                }
+                None => return load_family_columns(graph, ColumnFamily::Rels, distinct, props),
+            }
+        }
+        return Ok(Some(cols));
+    }
     load_family_columns(graph, ColumnFamily::Rels, distinct, props)
 }
 
@@ -1055,6 +1087,34 @@ fn load_family_columns(
     }
     let (lo, hi) = (distinct[0], distinct[distinct.len() - 1]);
     let budget = graph.columnar_column_budget(distinct.len());
+    // Fix 106: DECLINE BEFORE WALKING when the id span is wider than the
+    // budget. The walk visits every row of `[lo, hi]` and declines past
+    // the budget, so on a store whose ids are dense (the paged production
+    // mirror; this bench's interleaved fillers) a span over the budget can
+    // only decline — after the visits, each of which clones the row it
+    // resolved into the override map — and the gather then runs anyway.
+    // The production MENTIONS top-30's 37k ends name no label and span the
+    // whole id space; each of its two properties paid that walk, then
+    // gathered the 37k records once per property. A store with gaps in
+    // the span would have served a walk of at most a budget of visits —
+    // the gather's own cost — so skipping it never loses much and never
+    // pays twice. The gather is byte-identical to the scan (same token,
+    // bytes, decode, settle), so a skipped walk changes the work and
+    // nothing else; one pass of point reads now serves every property.
+    // (batch.rs's labelled read keeps its eight-budget rule: a walk that
+    // serves there is KEPT as the label's column for every later read.)
+    let span = hi.saturating_sub(lo).saturating_add(1) as usize;
+    if span > budget {
+        counted!("interp.columnar column read skipped the span walk for a sparse population");
+        let names: Vec<String> = props.iter().cloned().collect();
+        let gathered = graph
+            .column_entries_gather_many(family, &names, distinct)
+            .map_err(RunError::Graph)?;
+        for (prop, column) in props.iter().zip(gathered) {
+            cols.insert(prop.clone(), align(distinct, &column));
+        }
+        return Ok(Some(cols));
+    }
     for prop in props {
         // The range scan over `[lo, hi)` DECLINES (Ok(None)) when the id set is
         // SPARSE — its span holds more property entries than the budget because
@@ -1491,7 +1551,7 @@ pub(crate) fn try_vectorized_unwind_hop_topk(
     let scope = Scope::over(params, &empty_vm, graph.wall_ms(), graph.zone_provider());
     let src = eval_with(&plan.source, &scope, None).map_err(RunError::Eval)?;
     let items = match src {
-        Value::Null => Vec::new(),
+        Value::Null => Vec::new().into(),
         Value::List(items) => items,
         _ => return Ok(None), // a non-list UNWIND — the general path errors identically
     };
@@ -1508,7 +1568,9 @@ fn run_unwind_stage2(
     graph: &Graph,
     params: &BTreeMap<String, Value>,
     plan: &UnwindTopkPlan,
-    items: Vec<Value>,
+    // `Arc` rather than `Vec`: the UNWIND source is handed straight through
+    // from the bound value, so a big list is never copied to be walked.
+    items: std::sync::Arc<Vec<Value>>,
 ) -> Result<Option<QueryResult>, RunError> {
     // cap = skip + limit — the same bound the general path would raise on
     // (`eval_count`), never a wrong answer.
@@ -1528,7 +1590,7 @@ fn run_unwind_stage2(
     // makes the general path error, and a node id absent from the store makes it
     // error too — DECLINE either so it answers identically.
     let mut f_ids: Vec<u64> = Vec::with_capacity(items.len());
-    for it in &items {
+    for it in items.iter() {
         match it {
             Value::Node { id, .. } => {
                 if graph.node(*id).map_err(RunError::Graph)?.is_none() {
@@ -1732,7 +1794,7 @@ pub(crate) fn try_vectorized_collect_ic9_topk(
     }
     let items = match &result.rows[0][0] {
         Value::List(items) => items.clone(),
-        Value::Null => Vec::new(),
+        Value::Null => (Vec::new()).into(),
         _ => return Ok(None),
     };
 

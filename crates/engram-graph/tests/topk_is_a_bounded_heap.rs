@@ -39,7 +39,12 @@ fn corpus() -> Graph {
         m.insert("id".to_string(), Value::Int(i));
         m.insert(
             "createdAt".to_string(),
-            Value::Str(format!("2026-{:02}-{:02}T{:02}:00:00Z", 1 + (i * 7 % 12), 1 + (i * 13 % 28), (i * 3) % 24 / 4)),
+            Value::Str(format!(
+                "2026-{:02}-{:02}T{:02}:00:00Z",
+                1 + (i * 7 % 12),
+                1 + (i * 13 % 28),
+                (i * 3) % 24 / 4
+            )),
         );
         if i % 3 == 0 {
             m.insert("note".to_string(), Value::Str(format!("n{i}")));
@@ -51,7 +56,10 @@ fn corpus() -> Graph {
 
 fn full_sorted(g: &Graph, desc: bool) -> Vec<Vec<Value>> {
     let dir = if desc { "DESC" } else { "ASC" };
-    general(g, &format!("MATCH (n:Item) RETURN n.id AS id ORDER BY n.createdAt {dir}"))
+    general(
+        g,
+        &format!("MATCH (n:Item) RETURN n.id AS id ORDER BY n.createdAt {dir}"),
+    )
 }
 
 #[test]
@@ -59,14 +67,23 @@ fn a_deep_page_equals_the_full_sort_s_slice_ties_included() {
     let g = corpus();
     let all = full_sorted(&g, true);
     assert_eq!(all.len(), 20000);
-    for (skip, limit) in [(10000usize, 1000usize), (0, 5), (19990, 100), (7, 3), (0, 0), (20000, 10)] {
+    for (skip, limit) in [
+        (10000usize, 1000usize),
+        (0, 5),
+        (19990, 100),
+        (7, 3),
+        (0, 0),
+        (20000, 10),
+    ] {
         let src = format!(
             "MATCH (n:Item) WITH n ORDER BY n.createdAt DESC SKIP {skip} LIMIT {limit} RETURN n.id AS id"
         );
         let want: Vec<Vec<Value>> = all.iter().skip(skip).take(limit).cloned().collect();
         assert_eq!(general(&g, &src), want, "general `{src}`");
         assert_eq!(rows(&g, &src), want, "columnar `{src}`");
-        let src2 = format!("MATCH (n:Item) RETURN n.id AS id ORDER BY n.createdAt DESC SKIP {skip} LIMIT {limit}");
+        let src2 = format!(
+            "MATCH (n:Item) RETURN n.id AS id ORDER BY n.createdAt DESC SKIP {skip} LIMIT {limit}"
+        );
         assert_eq!(general(&g, &src2), want, "general `{src2}`");
         assert_eq!(rows(&g, &src2), want, "columnar `{src2}`");
     }
@@ -76,12 +93,16 @@ fn a_deep_page_equals_the_full_sort_s_slice_ties_included() {
 fn ascending_and_two_key_orders_page_the_same_way() {
     let g = corpus();
     let asc = full_sorted(&g, false);
-    let src = "MATCH (n:Item) WITH n ORDER BY n.createdAt ASC SKIP 9999 LIMIT 500 RETURN n.id AS id";
+    let src =
+        "MATCH (n:Item) WITH n ORDER BY n.createdAt ASC SKIP 9999 LIMIT 500 RETURN n.id AS id";
     let want: Vec<Vec<Value>> = asc.iter().skip(9999).take(500).cloned().collect();
     assert_eq!(general(&g, src), want);
     assert_eq!(rows(&g, src), want);
     // A second key breaks the ties: the page is then unambiguous.
-    let all2 = general(&g, "MATCH (n:Item) RETURN n.id AS id ORDER BY n.createdAt DESC, n.id DESC");
+    let all2 = general(
+        &g,
+        "MATCH (n:Item) RETURN n.id AS id ORDER BY n.createdAt DESC, n.id DESC",
+    );
     let src2 = "MATCH (n:Item) WITH n ORDER BY n.createdAt DESC, n.id DESC SKIP 12345 LIMIT 777 RETURN n.id AS id";
     let want2: Vec<Vec<Value>> = all2.iter().skip(12345).take(777).cloned().collect();
     assert_eq!(general(&g, src2), want2);
@@ -95,7 +116,12 @@ fn the_late_projecting_topk_pages_identically() {
     let g = corpus();
     let all = full_sorted(&g, true);
     let src = "MATCH (n:Item) RETURN n ORDER BY n.createdAt DESC SKIP 10000 LIMIT 50";
-    let want_ids: Vec<Value> = all.iter().skip(10000).take(50).map(|r| r[0].clone()).collect();
+    let want_ids: Vec<Value> = all
+        .iter()
+        .skip(10000)
+        .take(50)
+        .map(|r| r[0].clone())
+        .collect();
     for got in [general(&g, src), rows(&g, src)] {
         let ids: Vec<Value> = got
             .iter()

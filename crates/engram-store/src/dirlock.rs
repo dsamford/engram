@@ -265,7 +265,10 @@ mod tests {
         let d = tmp("restart");
         {
             let _l = DirLock::acquire(&d, "pid 1").expect("first");
-            assert!(d.join(LOCK_FILE).is_file(), "the lock file must exist while held");
+            assert!(
+                d.join(LOCK_FILE).is_file(),
+                "the lock file must exist while held"
+            );
         }
         assert!(
             !d.join(LOCK_FILE).exists(),
@@ -332,7 +335,9 @@ mod tests {
         fs::write(d.join(LOCK_FILE), "pid 4000000\n").expect("plant a stale lock");
         match DirLock::acquire(&d, "pid 1") {
             Err(LockError::Held { .. }) => {}
-            other => panic!("expected a refusal on a platform with no pid liveness check, got {other:?}"),
+            other => {
+                panic!("expected a refusal on a platform with no pid liveness check, got {other:?}")
+            }
         }
         let _ = fs::remove_dir_all(&d);
     }

@@ -79,12 +79,16 @@ fn a_the_loser_binds_the_winner_by_id() {
     ddl(&g, "CREATE CONSTRAINT mu FOR (n:M) REQUIRE n.u IS UNIQUE");
     ddl(&g, "CREATE INDEX m_u FOR (n:M) ON (n.u)");
     g.set_merge_race_hook_for_test(Some(winner_hook(7)));
-    let (got, trace) = engram_observe::with_trace(|| rows(&g, "MERGE (n:M {u: 7}) RETURN n.u AS u"));
+    let (got, trace) =
+        engram_observe::with_trace(|| rows(&g, "MERGE (n:M {u: 7}) RETURN n.u AS u"));
     let c = trace.counters().clone();
     assert_eq!(got, vec![vec![Value::Int(7)]]);
     assert_eq!(count_of(&c, BY_ID), 1, "{c:?}");
     assert_eq!(count_of(&c, CONVERGED), 1, "{c:?}");
-    assert_eq!(rows(&g, "MATCH (n:M) RETURN count(n) AS n"), vec![vec![Value::Int(1)]]);
+    assert_eq!(
+        rows(&g, "MATCH (n:M) RETURN count(n) AS n"),
+        vec![vec![Value::Int(1)]]
+    );
     g.set_merge_race_hook_for_test(None);
 }
 
@@ -169,9 +173,16 @@ fn d_forty_rounds_of_eight_racing_merges_all_succeed() {
             h.join().expect("merger");
         }
         let errs = errors.lock().expect("lock").clone();
-        assert!(errs.is_empty(), "round {round}: {} error(s): {errs:?}", errs.len());
+        assert!(
+            errs.is_empty(),
+            "round {round}: {} error(s): {errs:?}",
+            errs.len()
+        );
         assert_eq!(
-            rows(&g, &format!("MATCH (n:M {{u: {round}}}) RETURN count(n) AS n")),
+            rows(
+                &g,
+                &format!("MATCH (n:M {{u: {round}}}) RETURN count(n) AS n")
+            ),
             vec![vec![Value::Int(1)]],
             "round {round}: the racers must converge on ONE node"
         );

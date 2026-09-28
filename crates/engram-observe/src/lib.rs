@@ -411,6 +411,28 @@ impl Trace {
 
 thread_local! {
     static CURRENT: RefCell<Option<Trace>> = const { RefCell::new(None) };
+    /// Fix 123: whether `CURRENT` holds a trace, as a plain `Cell<bool>`.
+    ///
+    /// `count` and `record` used to reach straight for `CURRENT`, which costs
+    /// a `RefCell::borrow_mut` and an `Option` test on EVERY call whether or
+    /// not anything is recording. That is paid by counters in the hottest
+    /// paths the engine has: `adj_snap_memo_serve`'s hit arm fires two of
+    /// them per probe, and LSQB q3 makes 107,386,468 probes, so an untraced
+    /// production run was paying a quarter of a billion `RefCell` borrows to
+    /// record nothing.
+    ///
+    /// This flag is written ONLY where `CURRENT` is written, and read first
+    /// by both writers. It is a pure fast path: when it is true the borrow
+    /// happens exactly as before, and when it is false the behaviour is the
+    /// same no-op it always was.
+    static TRACING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a trace is installed on this thread — a plain flag read, so a hot
+/// path can skip building a counter name at all.
+#[inline]
+pub fn tracing() -> bool {
+    TRACING.with(std::cell::Cell::get)
 }
 
 /// Run `f` with a fresh trace installed, and return it alongside the result.
@@ -420,8 +442,10 @@ thread_local! {
 /// the scheduler.
 pub fn with_trace<T>(f: impl FnOnce() -> T) -> (T, Trace) {
     CURRENT.with(|c| *c.borrow_mut() = Some(Trace::new()));
+    TRACING.with(|t| t.set(true));
     let out = f();
     let trace = CURRENT.with(|c| c.borrow_mut().take()).unwrap_or_default();
+    TRACING.with(|t| t.set(false));
     (out, trace)
 }
 
@@ -433,8 +457,10 @@ pub fn with_trace<T>(f: impl FnOnce() -> T) -> (T, Trace) {
 /// fresh trace and takes it).
 pub fn with_suppressed_trace<T>(f: impl FnOnce() -> T) -> T {
     let saved = CURRENT.with(|c| c.borrow_mut().take());
+    let was = TRACING.with(|t| t.replace(false));
     let out = f();
     CURRENT.with(|c| *c.borrow_mut() = saved);
+    TRACING.with(|t| t.set(was));
     out
 }
 
@@ -443,6 +469,9 @@ pub fn with_suppressed_trace<T>(f: impl FnOnce() -> T) -> T {
 /// Outside [`with_trace`] this is a no-op: production code carrying assertion
 /// macros must not pay for a recorder nobody installed.
 pub fn record(tag: EventTag, name: &str) {
+    if !tracing() {
+        return;
+    }
     CURRENT.with(|c| {
         if let Some(t) = c.borrow_mut().as_mut() {
             t.record(tag, name);
@@ -452,6 +481,9 @@ pub fn record(tag: EventTag, name: &str) {
 
 /// Increment a counter in the installed trace, if there is one.
 pub fn count(name: &str, by: u64) {
+    if !tracing() {
+        return;
+    }
     CURRENT.with(|c| {
         if let Some(t) = c.borrow_mut().as_mut() {
             t.count(name, by);

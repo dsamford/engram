@@ -87,7 +87,10 @@ fn max_seq(dir: &Path) -> u64 {
                 .filter_map(|e| {
                     let name = e.file_name();
                     let n = name.to_str()?;
-                    n.strip_prefix("seg-")?.strip_suffix(".seg")?.parse::<u64>().ok()
+                    n.strip_prefix("seg-")?
+                        .strip_suffix(".seg")?
+                        .parse::<u64>()
+                        .ok()
                 })
                 .max()
                 .unwrap_or(0)
@@ -270,14 +273,32 @@ fn a_checkpoint_puts_the_tail_on_disk_and_says_so() {
         other => panic!("field {i} is {other:?}"),
     };
     assert!(n(0) >= 1, "the checkpoint spilled nothing: {fields:?}");
-    assert_eq!(n(1), n(0), "sealed {} but {} spilled by this call: {fields:?}", n(1), n(0));
-    assert_eq!(n(2), 0, "a sealed segment is still resident after the checkpoint: {fields:?}");
-    assert_eq!(n(3), 0, "the tail is not empty after the checkpoint: {fields:?}");
+    assert_eq!(
+        n(1),
+        n(0),
+        "sealed {} but {} spilled by this call: {fields:?}",
+        n(1),
+        n(0)
+    );
+    assert_eq!(
+        n(2),
+        0,
+        "a sealed segment is still resident after the checkpoint: {fields:?}"
+    );
+    assert_eq!(
+        n(3),
+        0,
+        "the tail is not empty after the checkpoint: {fields:?}"
+    );
 
     // Now the copy serves every node — the durable claim, checked by a
     // durable open rather than by the reply alone.
     let copy = tmp("checkpoint-after");
-    assert_eq!(nodes_in_copy(&dir, &copy), 300, "the checkpoint's reply said durable and the disk disagrees");
+    assert_eq!(
+        nodes_in_copy(&dir, &copy),
+        300,
+        "the checkpoint's reply said durable and the disk disagrees"
+    );
     let _ = std::fs::remove_dir_all(&copy);
 
     // Idempotent: nothing new to seal, nothing to spill, still durable.

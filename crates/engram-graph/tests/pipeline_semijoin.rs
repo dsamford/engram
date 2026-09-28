@@ -20,9 +20,9 @@
 //!     id (the `target_ok` check at depth 1).
 //!   - ROW MULTIPLICATION: one output row PER closing edge — two parallel edges
 //!     connecting the pair yield TWO rows (each edge is its own stack completion).
-//!   - PER-PATH isomorphism: a multi-hop path's closing edge may not reuse a rel
-//!     the path already walked; a later 1-hop semijoin path RE-SEEDS `used` empty
-//!     so a cross-path rel reuse is KEPT.
+//!   - Isomorphism per MATCH CLAUSE: a closing edge may not reuse a rel the
+//!     path already walked, nor one a comma path of the same MATCH walked; a
+//!     close in a SEPARATE clause may, so that reuse is KEPT.
 //!   - NO closing edge ⇒ the source row is DROPPED (non-OPTIONAL semantics).
 //!
 //! CANARY (see `semijoin_row_multiplication_is_load_bearing`): neutralising the
@@ -91,9 +91,9 @@ fn gtri() -> Graph {
     g
 }
 
-/// Nn{nk} with a self-loop and a back-edge — the per-path isomorphism fixture
-/// (shared with `pipeline_multipath`). `r_self` (n0->n0) can be reused ACROSS a
-/// path boundary but not WITHIN one path.
+/// Nn{nk} with a self-loop and a back-edge — the isomorphism fixture (shared
+/// with `pipeline_multipath`). `r_self` (n0->n0) can be reused across two MATCH
+/// clauses but not within one path or one MATCH.
 fn giso() -> Graph {
     let g = Graph::new(Store::new(), Realm(1), Namespace(1));
     let mk = |nk: i64| {
@@ -317,13 +317,13 @@ fn semijoin_triangle_aggregate() {
     );
 }
 
-/// PER-PATH isomorphism for the CLOSING edge. In the single 2-hop path
-/// `(x)-[:R]->(y)-[:R]->(x)`, the closing R may not reuse the R already walked,
-/// so the self-loop round-trip (0,0) is DROPPED. Split into two 1-hop paths
-/// `(x)-[:R]->(y), (y)-[:R]->(x)`, the closing path RE-SEEDS `used` empty, so the
-/// same self-loop reuse is KEPT and (0,0) appears. The pipeline must match BOTH.
+/// Isomorphism for the CLOSING edge, per MATCH clause. In the single 2-hop
+/// path `(x)-[:R]->(y)-[:R]->(x)`, the closing R may not reuse the R already
+/// walked, so the self-loop round-trip (0,0) is DROPPED — and likewise when the
+/// two hops are comma paths of one MATCH. Split into two MATCH CLAUSES the
+/// close may reuse it, so (0,0) appears. The pipeline must match all three.
 #[test]
-fn semijoin_per_path_isomorphism_on_the_closing_edge() {
+fn semijoin_isomorphism_on_the_closing_edge_is_per_clause() {
     let g = giso();
     // Single 2-hop path: within-path iso forbids reusing the self-loop.
     let single = "MATCH (x:Nn)-[:R]->(y:Nn)-[:R]->(x) RETURN x.nk AS xk, y.nk AS yk ORDER BY x.nk, y.nk LIMIT 100";
@@ -333,16 +333,24 @@ fn semijoin_per_path_isomorphism_on_the_closing_edge() {
         !s_on.contains(&vec![i(0), i(0)]),
         "within one path the self-loop reuse on the close must DROP (0,0)"
     );
-    // Two 1-hop paths: the closing path re-seeds `used`, so reuse is KEPT.
-    let multi = "MATCH (x:Nn)-[:R]->(y:Nn), (y)-[:R]->(x) RETURN x.nk AS xk, y.nk AS yk ORDER BY x.nk, y.nk LIMIT 100";
+    // Two MATCH clauses: the close may reuse the self-loop, so it is KEPT.
+    let multi = "MATCH (x:Nn)-[:R]->(y:Nn) MATCH (y)-[:R]->(x) RETURN x.nk AS xk, y.nk AS yk ORDER BY x.nk, y.nk LIMIT 100";
     let (m_on, m_off) = both(&g, multi, BTreeMap::new());
-    assert_eq!(m_on, m_off, "cross-path closing iso disagree: `{multi}`");
+    assert_eq!(m_on, m_off, "separate-clause closing iso disagree: `{multi}`");
     assert!(
         m_on.contains(&vec![i(0), i(0)]),
-        "across paths the self-loop reuse on the close must be KEPT (0,0)"
+        "across MATCH clauses the self-loop reuse on the close must be KEPT (0,0)"
+    );
+    // Comma-joined in ONE MATCH: the two R relationships must differ.
+    let comma = "MATCH (x:Nn)-[:R]->(y:Nn), (y)-[:R]->(x) RETURN x.nk AS xk, y.nk AS yk ORDER BY x.nk, y.nk LIMIT 100";
+    let (c_on, c_off) = both(&g, comma, BTreeMap::new());
+    assert_eq!(c_on, c_off, "comma closing iso disagree: `{comma}`");
+    assert!(
+        !c_on.contains(&vec![i(0), i(0)]),
+        "within one MATCH the self-loop may not serve both comma paths (0,0)"
     );
     assert!(pipeline_fired(&g, single), "single-path close must fire");
-    assert!(pipeline_fired(&g, multi), "cross-path close must fire");
+    assert!(pipeline_fired(&g, multi), "the separate-clause close must fire");
 }
 
 /// DECLINE shapes: each carries a feature the semijoin does not model, so the
@@ -354,7 +362,7 @@ fn semijoin_declines_and_falls_back_identically() {
     let declines: &[&str] = &[
         // A NON-final hop onto a bound var: the close is followed by another hop,
         // so it is not a path's FINAL hop (only a final close is a semijoin).
-        "MATCH (a:Aa)-[:T1]->(b:Bb), (a)-[:T2]->(c:Cc), (c)-[:T3]->(b)-[:T1]->(z:Bb) RETURN a.ak AS ak ORDER BY a.ak LIMIT 5",
+        "MATCH (a:Aa)-[:T1]->(b:Bb) MATCH (a)-[:T2]->(c:Cc) MATCH (c)-[:T3]->(b)-[:T1]->(z:Bb) RETURN a.ak AS ak ORDER BY a.ak LIMIT 5",
         // OPTIONAL on the closing path (that is Phase 4b2, not 4b1).
         "MATCH (a:Aa)-[:T1]->(b:Bb), (a)-[:T2]->(c:Cc) OPTIONAL MATCH (c)-[:T3]->(b) RETURN a.ak AS ak, b.bn AS bn ORDER BY a.ak, b.bn LIMIT 5",
         // (A bound relationship variable on the closing hop is now ACCEPTED —
@@ -409,20 +417,37 @@ fn semijoin_counted_close_keeps_the_doubled_edge() {
         Some(1),
         "a 1-hop closing path takes the counted close"
     );
+    // A 2-hop path whose hops share NO type: its close cannot meet the rel the
+    // path opened with, so isomorphism is not tracked and the close counts.
     let chained = "MATCH (a:Aa)-[:T1]->(b:Bb), (a)-[:T2]->(c:Cc)-[:T3]->(b) RETURN a.ak AS ak, b.bn AS bn, c.cn AS cn ORDER BY a.ak, b.bn, c.cn LIMIT 100";
     let (on2, off2) = both(&g, chained, BTreeMap::new());
-    assert_eq!(on2, off2, "walked close vs general disagree");
+    assert_eq!(on2, off2, "counted close vs general disagree");
     assert_eq!(on2, on, "both spellings close the same rows");
     assert_eq!(
         counter(&g, chained, "interp.pipeline semijoin counted close"),
+        Some(1),
+        "a path of disjoint types tracks no isomorphism: its close counts"
+    );
+    // A close SHARING its type with the rel its path opened with may not reuse
+    // it: that one must WALK (used-rel exclusion). `a2 -T1-> b` closes onto the
+    // `b <-T1- a2` it came by, and no pair here has two T1 edges.
+    let shared = "MATCH (a:Aa)-[:T1]->(b:Bb) MATCH (b)<-[:T1]-(a2:Aa)-[:T1]->(b) RETURN a.ak AS ak, a2.ak AS a2k ORDER BY ak, a2k LIMIT 100";
+    let (on_s, off_s) = both(&g, shared, BTreeMap::new());
+    assert_eq!(on_s, off_s, "walked close vs general disagree");
+    assert!(pipeline_fired(&g, shared), "vacuous: the pipeline declined `{shared}`");
+    assert_eq!(
+        counter(&g, shared, "interp.pipeline semijoin counted close"),
         None,
-        "a close whose path already used a rel must WALK (used-rel exclusion)"
+        "a close whose path already used a rel of its type must WALK (used-rel exclusion)"
     );
     // A bound rel var on the close needs every rel id: walked, never counted.
     let relvar = "MATCH (a:Aa)-[:T1]->(b:Bb), (a)-[:T2]->(c:Cc), (c)-[r:T3]->(b) RETURN a.ak AS ak, b.bn AS bn ORDER BY a.ak, b.bn LIMIT 100";
     let (on3, off3) = both(&g, relvar, BTreeMap::new());
     assert_eq!(on3, off3, "rel-var close vs general disagree");
-    assert_eq!(counter(&g, relvar, "interp.pipeline semijoin counted close"), None);
+    assert_eq!(
+        counter(&g, relvar, "interp.pipeline semijoin counted close"),
+        None
+    );
 }
 
 /// A TRIANGLE under `count(*)` (the fold triple: fold ON / fold OFF / general).
@@ -487,7 +512,10 @@ fn semijoin_triangle_count_folds_once_the_close_target_materialises() {
         let did_fire = counter(&g, src, "interp.pipeline count fold").is_some();
         engram_graph::pipeline::set_count_only_reorder(true);
         assert_eq!(did_fire, fires, "count fold firing: `{src}`");
-        assert!(aggregate_fired(&g, src), "the aggregate operator answers: `{src}`");
+        assert!(
+            aggregate_fired(&g, src),
+            "the aggregate operator answers: `{src}`"
+        );
     }
     // 5 closed rows (the doubled edge counted twice) — the same number whether
     // the triangle folded or not.
@@ -503,15 +531,26 @@ fn semijoin_triangle_count_folds_once_the_close_target_materialises() {
 /// A CLOSE ONTO THE SEED inside a fold: `(x)-[:R]->(y)-[:R]->(x)` under
 /// `count(*)` folds `y` with the closing edge counted by multiplicity, minus
 /// the opening rel (rel-iso) — the self-loop round trip drops, exactly as the
-/// row form above. Split into two paths the close re-seeds `used` and the
-/// reuse is kept. The fold fires on both, and both agree with the general path.
+/// row form above. Split into two MATCH clauses the close may reuse it and
+/// the reuse is kept. The fold fires on both, and both agree with the general path.
 #[test]
 fn semijoin_close_onto_seed_folds_with_rel_iso() {
     let g = giso();
     for (src, fires) in [
-        ("MATCH (x:Nn)-[:R]->(y:Nn)-[:R]->(x) RETURN count(*) AS n", true),
-        ("MATCH (x:Nn)-[:R]->(y:Nn), (y)-[:R]->(x) RETURN count(*) AS n", true),
-        ("MATCH (x:Nn)-[:R]->(y:Nn)-[:R]->(x) RETURN x.nk AS xk, count(*) AS n ORDER BY xk", true),
+        (
+            "MATCH (x:Nn)-[:R]->(y:Nn)-[:R]->(x) RETURN count(*) AS n",
+            true,
+        ),
+        (
+            // separate clauses: answered by the general path, not the fold,
+            // which folds one MATCH (see engram-gap-closure §44)
+            "MATCH (x:Nn)-[:R]->(y:Nn) MATCH (y)-[:R]->(x) RETURN count(*) AS n",
+            false,
+        ),
+        (
+            "MATCH (x:Nn)-[:R]->(y:Nn)-[:R]->(x) RETURN x.nk AS xk, count(*) AS n ORDER BY xk",
+            true,
+        ),
     ] {
         g.set_columnar_scans(true);
         engram_graph::pipeline::set_count_fold(true);
@@ -532,10 +571,26 @@ fn semijoin_close_onto_seed_folds_with_rel_iso() {
     }
     // Single path: (0→1→0) and (1→0→1) only — the self-loop round trip drops: 2.
     // Two paths: plus (0→0→0) over the reused self-loop: 3.
-    let (single, _) = both(&g, "MATCH (x:Nn)-[:R]->(y:Nn)-[:R]->(x) RETURN count(*) AS n", BTreeMap::new());
-    let (multi, _) = both(&g, "MATCH (x:Nn)-[:R]->(y:Nn), (y)-[:R]->(x) RETURN count(*) AS n", BTreeMap::new());
-    assert_eq!(single, vec![vec![i(2)]], "within-path rel-iso on the folded close");
-    assert_eq!(multi, vec![vec![i(3)]], "cross-path reuse kept on the folded close");
+    let (single, _) = both(
+        &g,
+        "MATCH (x:Nn)-[:R]->(y:Nn)-[:R]->(x) RETURN count(*) AS n",
+        BTreeMap::new(),
+    );
+    let (multi, _) = both(
+        &g,
+        "MATCH (x:Nn)-[:R]->(y:Nn) MATCH (y)-[:R]->(x) RETURN count(*) AS n",
+        BTreeMap::new(),
+    );
+    assert_eq!(
+        single,
+        vec![vec![i(2)]],
+        "within-path rel-iso on the folded close"
+    );
+    assert_eq!(
+        multi,
+        vec![vec![i(3)]],
+        "reuse across MATCH clauses kept on the folded close"
+    );
 }
 
 /// The census / unrelated shapes the semijoin generalisation must NOT perturb —

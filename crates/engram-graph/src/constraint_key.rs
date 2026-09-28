@@ -169,7 +169,7 @@ fn encode_value(v: &Value, out: &mut Vec<u8>) -> Option<()> {
         Value::List(items) => {
             out.push(0x0B);
             out.extend_from_slice(&(items.len() as u32).to_be_bytes());
-            for item in items {
+            for item in (items).iter() {
                 encode_value(item, out)?;
             }
         }

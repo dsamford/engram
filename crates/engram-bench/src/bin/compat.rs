@@ -133,7 +133,8 @@ fn main() {
                     );
                     Value::Map(m)
                 })
-                .collect(),
+                .collect::<Vec<_>>()
+                .into(),
         ),
     );
     let out = json::to_json(&Value::Map(doc));

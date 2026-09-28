@@ -54,7 +54,10 @@ fn a_create_racing_a_node_delete_conflicts_in_both_orders_on_both_arms() {
     for exempt in [true, false] {
         // Order 1: the DELETE commits first.
         let g = seeded(exempt);
-        let create = buffered(&g, "MATCH (h:Hub {id: 1}), (s:Sat {id: 2}) CREATE (s)-[:R]->(h)");
+        let create = buffered(
+            &g,
+            "MATCH (h:Hub {id: 1}), (s:Sat {id: 2}) CREATE (s)-[:R]->(h)",
+        );
         let del = buffered(&g, "MATCH (h:Hub {id: 1}) DETACH DELETE h");
         g.commit_owned(del).expect("delete commits");
         let e = g
@@ -69,7 +72,10 @@ fn a_create_racing_a_node_delete_conflicts_in_both_orders_on_both_arms() {
 
         // Order 2: the CREATE commits first.
         let g = seeded(exempt);
-        let create = buffered(&g, "MATCH (h:Hub {id: 1}), (s:Sat {id: 2}) CREATE (s)-[:R]->(h)");
+        let create = buffered(
+            &g,
+            "MATCH (h:Hub {id: 1}), (s:Sat {id: 2}) CREATE (s)-[:R]->(h)",
+        );
         let del = buffered(&g, "MATCH (h:Hub {id: 1}) DETACH DELETE h");
         g.commit_owned(create).expect("create commits");
         let e = g
@@ -158,8 +164,8 @@ fn concurrent_creates_and_node_deletes_never_leave_a_dangling_edge() {
         handles.push(std::thread::spawn(move || {
             for _ in 0..8 {
                 for _ in 0..64 {
-                    let stmt = parse_statement("MATCH (h:Hub {id: 1}) DETACH DELETE h")
-                        .expect("parse");
+                    let stmt =
+                        parse_statement("MATCH (h:Hub {id: 1}) DETACH DELETE h").expect("parse");
                     let txn = gd.open_txn();
                     let (txn, r) = gd.with_txn(txn, || run_query(&gd, &stmt, BTreeMap::new()));
                     if r.is_err() {

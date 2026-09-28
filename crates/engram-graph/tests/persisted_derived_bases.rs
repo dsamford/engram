@@ -275,7 +275,10 @@ fn a_corrupt_sidecar_is_refused_and_the_graph_is_still_correct() {
     let file = sidecar_files(dir.path()).pop().expect("a sidecar");
     // How much a CLEAN sidecar adopts — the bar the corrupt one must fall short of.
     let clean = graph_on(&store).adopt_derived_sidecar(dir.path());
-    assert!(clean > 1, "fixture: the clean sidecar must adopt several structures, got {clean}");
+    assert!(
+        clean > 1,
+        "fixture: the clean sidecar must adopt several structures, got {clean}"
+    );
 
     let mut bytes = std::fs::read(&file).expect("read");
     let mid = bytes.len() / 2;
@@ -615,13 +618,19 @@ fn bases_published_after_the_write_are_persisted_by_the_next_tick() {
         .get("graph.adjacency tables built")
         .copied()
         .unwrap_or(0);
-    eprintln!("[persist derived] late publish: restart adopted {adopted}, built {built} during the warm");
+    eprintln!(
+        "[persist derived] late publish: restart adopted {adopted}, built {built} during the warm"
+    );
     assert!(
         adopted > 1,
         "the restart must adopt the adjacency tables the second write persisted, not the          membership alone: adopted {adopted}"
     );
     assert_eq!(built, 0, "every table the warm wants was adopted");
-    assert_eq!(answers(&g2), truth, "and answers exactly what the writer answered");
+    assert_eq!(
+        answers(&g2),
+        truth,
+        "and answers exactly what the writer answered"
+    );
 }
 
 /// THE COMPACTION'S OWN WRITE records its vintage, so the very next quiescent
@@ -690,5 +699,129 @@ fn one_graphs_sidecar_is_not_anothers() {
         other.adopt_derived_sidecar(dir.path()),
         0,
         "a graph must never adopt a sidecar written by another coordinate"
+    );
+}
+
+/// AN ADOPTED FILE IS THIS PROCESS'S PERSISTED FILE: the tick after an
+/// adoption skips, and a base built after it is still written.
+///
+/// Before, adoption recorded nothing, so the first settled tick took the file
+/// it had just adopted for "never written" and rewrote it (15.7 GB at SF10).
+#[test]
+fn an_adopted_file_is_not_rewritten_by_the_next_tick() {
+    let dir = TmpDir::new("adoptnoted");
+    let (store, _truth) = compacted_with_sidecar(dir.path());
+    let g = graph_on(&store);
+    g.set_persist_growth_interval(0);
+    let adopted = g.adopt_derived_sidecar(dir.path());
+    assert!(adopted > 1, "the sidecar must hold several bases: {adopted}");
+    assert!(
+        !g.persist_derived_now(dir.path(), 0),
+        "the file on disk is what was just adopted; rewriting it is a full          rewrite to produce the same file"
+    );
+    // A base the file does not hold: the out-table of type S.
+    g.set_degree_table_after(0);
+    let s = g.type_tokens_peek(&["S".to_string()]);
+    let (_, trace) = engram_observe::with_trace(|| {
+        for i in 0..32u64 {
+            let _ = g.adjacent_slim(i, Dir::Out, &s);
+        }
+    });
+    let built = trace
+        .counters()
+        .get("graph.adjacency tables built")
+        .copied()
+        .unwrap_or(0);
+    assert!(built > 0, "the S table must be built here, or the next assert proves nothing");
+    assert!(
+        g.persist_derived_now(dir.path(), 0),
+        "a base published after the adoption must still be written: the note          records what the file holds, not a reason never to write again"
+    );
+    assert!(
+        graph_on(&store).adopt_derived_sidecar(dir.path()) > adopted,
+        "and the next start adopts the fuller file"
+    );
+}
+
+/// A TICK DURING ADOPTION WAITS FOR IT, and the whole file survives.
+///
+/// The server's maintenance tick starts before the server adopts, and adoption
+/// publishes one record at a time. On the bench pod a settled tick fired during
+/// a 55 s cold SF10 adoption, counted the bases published so far, and wrote a
+/// file of ONE structure over the one of 39 being adopted. The growth interval
+/// deferred the fuller rewrite, the server was stopped inside it, and the next
+/// start built its adjacency inside its first queries (16-40 s each).
+#[test]
+fn a_tick_during_adoption_waits_and_leaves_the_whole_file() {
+    let dir = TmpDir::new("adoptrace");
+    let (store, _truth) = compacted_with_sidecar(dir.path());
+    let full = graph_on(&store).adopt_derived_sidecar(dir.path());
+    assert!(full > 1, "an adoption of one record has no middle: {full}");
+
+    let g = graph_on(&store);
+    g.set_persist_growth_interval(0);
+    let mut tick: Option<std::thread::JoinHandle<bool>> = None;
+    let mut finished_mid_adoption = None;
+    let adopted = g.adopt_derived_sidecar_observing(dir.path(), &mut |i, _| {
+        if i == 0 {
+            let g2 = std::sync::Arc::clone(&g);
+            let d = dir.path().to_path_buf();
+            let h = std::thread::spawn(move || g2.persist_derived_now(&d, 0));
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            finished_mid_adoption = Some(h.is_finished());
+            tick = Some(h);
+        }
+    });
+    assert_eq!(
+        finished_mid_adoption,
+        Some(false),
+        "a tick that fires after the first record must WAIT for the adoption;          without the lock it wrote the one base published so far over the file"
+    );
+    let wrote = tick.expect("the tick ran").join().expect("the tick thread");
+    assert!(
+        !wrote,
+        "and once the adoption is done it must skip: the file is what was adopted"
+    );
+    assert_eq!(adopted, full, "the adoption itself is whole");
+    assert_eq!(
+        graph_on(&store).adopt_derived_sidecar(dir.path()),
+        full,
+        "the next start adopts every base, not the ones published before the tick"
+    );
+}
+
+/// A GRACEFUL STOP WRITES WHAT THE PROCESS BUILT, inside the growth interval.
+///
+/// The interval paces the recurring tick. `CALL engram.checkpoint()`'s drain is
+/// one explicit request made so the next start adopts what this process built;
+/// once an adoption records its file's vintage, a paced drain in the first ten
+/// minutes of a process would defer those bases for good.
+#[test]
+fn a_stop_inside_the_growth_interval_still_writes_what_was_built() {
+    let dir = TmpDir::new("stopgrowth");
+    let (store, _truth) = compacted_with_sidecar(dir.path());
+    let g = graph_on(&store);
+    let adopted = g.adopt_derived_sidecar(dir.path());
+    assert!(adopted > 1, "the sidecar must hold several bases: {adopted}");
+    g.set_degree_table_after(0);
+    let s = g.type_tokens_peek(&["S".to_string()]);
+    for i in 0..32u64 {
+        let _ = g.adjacent_slim(i, Dir::Out, &s);
+    }
+    assert!(
+        !g.persist_derived_now(dir.path(), 60),
+        "a tick inside the default interval defers the growth"
+    );
+    assert!(
+        g.persist_derived_at_stop(dir.path(), 60),
+        "a stop does not: it is the last chance to write what this process built"
+    );
+    assert!(
+        graph_on(&store).adopt_derived_sidecar(dir.path()) > adopted,
+        "and the next start adopts it"
+    );
+    assert!(
+        !g.persist_derived_at_stop(dir.path(), 61),
+        "a second stop with nothing new published skips"
     );
 }

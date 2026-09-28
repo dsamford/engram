@@ -1,0 +1,415 @@
+{
+  "catalogue_version": 1,
+  "family": "finbench",
+  "what_this_is": "The LDBC FinBench Transaction complex-read battery, TCR1-TCR12, in three dialects. A SEPARATE catalogue file from statements.json, and deliberately so: catalogue::digest() is FNV-1a over a whole file and report.rs refuses to compare two runs whose digests differ, so adding a family to statements.json would orphan every LSQB number already measured. A new family therefore gets a new file and its own digest, and the two never interfere.",
+
+  "why_this_family_is_worth_adopting": {
+    "summary": "FinBench is the first workload in this tree whose cost is about the STORAGE and TRAVERSAL layers rather than about comparability. Three properties of it are untouched by LSQB and by the SNB stress shapes, and each one is a place an engine can be silently wrong.",
+    "relationship_properties": "Every FinBench edge except `own` carries properties - `transfer` and `withdraw` carry `timestamp` and `amount`, `invest` carries `ratio`, `apply` carries `organization`. Every query below reads at least one of them. The loaders in this tree (snbload.rs, jsonl2neo4j.rs, embedded-lsqb.py, pg-snb-schema.sql) DISCARD edge properties: LSQB needs none, so none were kept. Nothing here can run until that changes, and no statement in this file should be read as claiming otherwise.",
+    "multi_edges": "`transfer`, `withdraw`, `signIn`, `deposit` and `repay` all declare Multiplicity N in the specification's relation table: the same ordered pair of accounts may be connected many times over. An edge is therefore NOT identified by its endpoints, and an engine (or a SQL schema) that keys adjacency on (src, dst) collapses the dataset silently - the queries still answer, with fewer edges than the corpus contains. That is why every edge table declared below carries its own `id` column: TCR8 has to sum the distinct LAST edges of distinct paths, and with (src, dst) as the key it cannot tell two of them apart.",
+    "monotone_temporal_paths": "TCR1, TCR2, TCR5 and TCR8 filter a VARIABLE-LENGTH path on a predicate that relates each hop to the PREVIOUS hop - strictly increasing `timestamp` in the first three, and `amount > previous * threshold` in TCR8. Neither LSQB nor the stress shapes contain that shape. A per-hop filter cannot express it: the predicate is not a property of one edge. In Cypher the reference implementations write it as a `reduce` over `relationships(p)` after the expansion, which means the expansion is unpruned; in SQL it falls out of a recursive CTE that carries the previous hop's value forward, which prunes. The two are not the same amount of work, and that asymmetry is itself worth measuring.",
+    "not_established": "Whether engram produces two distinct relationships (with distinct ids) for two identical `CREATE (a)-[:transfer]->(b)` statements. Value::Rel carries an id and the pattern layer handles relationship properties, but multi-edge behaviour in the store was not verified. If it collapses, every transfer-counting query here is wrong before it is slow."
+  },
+
+  "provenance": {
+    "statement_text": "Transcribed 2026-09-11 from github.com/ldbc/ldbc_finbench_transaction_impls, branch main. The BODIES come from `galaxybase-cypher/queries/transaction-complex-read-{1..12}.cypher`, not from `neo4j/queries/tcr-*.cypher`, because the neo4j set is stale against the released specification in ways that change the ANSWER: its tcr-4 returns only the top row, its tcr-9 names the ratios ratioOut/ratioIn where the specification says ratioDeposit/ratioTransfer, its tcr-6 omits the `numEdge1 > 3` predicate the specification requires, its tcr-12 filters `relationships(p)` when the path variable is `path` (which does not parse), and its tcr-11 is the DEPRECATED complex-read-11. The neo4j directory also numbers thirteen complex reads because it still carries the deprecated one; the mapping to specification numbering is neo4j tcr-1..tcr-10 = TCR1..TCR10, neo4j tcr-12 = TCR11, neo4j tcr-13 = TCR12, neo4j tcr-11 = deprecated, excluded.",
+    "renames_applied": "Two edits were applied to every galaxybase body, and nothing else. (1) The `CYPHER EXPANDCONFIG = (...)` prelude is dropped - it is a Galaxybase-specific truncation directive, see `truncation` below. (2) Edge type names are rewritten from the implementation's composite spelling to the specification's logical relation names: AccountTransferAccount -> transfer, AccountWithdrawAccount -> withdraw, LoanDepositAccount -> deposit, AccountRepayLoan -> repay, MediumSignInAccount -> signIn, PersonOwnAccount / CompanyOwnAccount -> own, PersonApplyLoan -> apply, PersonInvestCompany -> invest, PersonGuaranteePerson -> guarantee. The composite names are how the impls' loaders name PHYSICAL tables; the schema below keeps that split for SQL and collapses it for Cypher, which is the same decision statements.json records in `lsqb.table_alias`.",
+    "vendor_procedures_replaced": "Two galaxybase bodies call APOC, which is not openCypher and which engram does not have. TCR5's `size(apoc.coll.toSet(path)) = size(path)` (the specification's no-recurring-accounts rule) is rewritten as `ALL(i IN range(0, size(path) - 2) WHERE NOT path[i] IN path[i + 1..])`. TCR8's `apoc.coll.sum([e IN edges | e.amount])` is rewritten as `reduce(s = 0.0, e IN edges | s + e.amount)`. Both rewrites are transcription, not verification: neither has been executed.",
+    "chained_comparisons_expanded": "The reference bodies write `$startTime < e.timestamp < $endTime`. Chained comparison is a Neo4j extension; it is NOT established that engram's parser accepts it, and a parse error at run time is a worse outcome than a longer string. Every such term is written out as two conjuncts here. This changes no answer.",
+    "specification": "github.com/ldbc/ldbc_finbench_docs, branch main: data.tex (schema, entity and relation attribute tables), query-specifications/transaction-complex-read-{01..12}.yaml (titles, parameter names, result field names, sort orders). Parameter names in this file are the SPECIFICATION's (`startTime`, `endTime`, `pid1`), not the neo4j implementation's (`start_time`, `end_time`, `id1`)."
+  },
+
+  "status_values": {
+    "verified": "this text has been executed against the engine it names and its answer checked against another engine's",
+    "unverified": "transcribed from the specification and a reference implementation, never executed. A run that uses it is a first run, not a comparison.",
+    "unsupported": "this dialect cannot express the shape; `reason` says why. Declared, never dropped."
+  },
+  "every_entry_here_is_unverified": "No statement in this file has been run against anything. There is no FinBench corpus on any volume this project controls, no loader builds the schema below, and the loaders that exist throw relationship properties away. `unverified` here is therefore the strong form of the word: not merely unchecked against a peer, but never parsed by an engine.",
+
+  "dialects": {
+    "cypher": {
+      "engines": ["engram", "neo4j"],
+      "transport": "bolt",
+      "rel_alternation": false
+    },
+    "cypher_ladybug": {
+      "engines": ["ladybug", "kuzu"],
+      "transport": "embedded-python",
+      "rel_alternation": true,
+      "rel_alternation_note": "LadybugDB/Kuzu store one rel table per (type, src-table, dst-table) pair. FinBench makes this heavier than SNB does: `own`, `apply`, `invest` and `guarantee` each span two tail types (Person and Company), so four of the nine logical edge types become alternations, while `transfer`, `withdraw`, `deposit`, `repay` and `signIn` stay single-pair. The executor performs that substitution from the pairs manifest its own loader wrote, as it already does for LSQB; it is a property of the LOADED corpus and not of this catalogue."
+    },
+    "sql": {
+      "engines": ["postgres"],
+      "transport": "pgwire",
+      "rel_alternation": false,
+      "dialect_features_used": "Recursive CTEs (WITH RECURSIVE), arrays with `= ANY(...)` for the path-membership guard, `sum(DISTINCT ...)`, and `round(x::numeric, 3)`. All PostgreSQL; none is ANSI-portable, and nothing else in this project claims to run these on another SQL engine."
+    }
+  },
+
+  "schema": {
+    "why_declared_here": "No loader in this tree builds FinBench, so the schema these statements assume exists nowhere else. Declaring it beside the statements is the only way the two cannot drift apart before the loader is written; when one is written, THIS is the document it must satisfy. Attribute names are the specification's (data.tex), verbatim.",
+    "timestamp_encoding": "Every edge `timestamp` and every entity `createTime` is declared DateTime by the specification (millisecond precision, ISO-8601 with a +0000 offset). Both the reference implementations and this catalogue compare them to INTEGER parameters, so a loader must store them as epoch milliseconds - a 64-bit integer - and a parameter file's values are epoch milliseconds too. A loader that stores them as strings makes every window predicate in this file a lexicographic comparison that happens to be nearly right, which is the failure that fails nothing.",
+    "nodes": {
+      "Person": ["id:ID", "name:String", "isBlocked:Boolean", "createTime:DateTime", "gender:String", "birthday:Date", "country:String", "city:String"],
+      "Company": ["id:ID", "name:String", "isBlocked:Boolean", "createTime:DateTime", "country:String", "city:String", "business:String", "description:LongString", "url:String"],
+      "Account": ["id:ID", "createTime:DateTime", "isBlocked:Boolean", "type:String", "nickname:String", "phoneNumber:String", "email:String", "freqLoginType:String", "lastLoginTime:DateTime", "accountLevel:String"],
+      "Loan": ["id:ID", "loanAmount:Float64", "balance:Float64", "usage:String", "interestRate:Float32"],
+      "Medium": ["id:ID", "type:String", "createTime:DateTime", "isBlocked:Boolean", "lastLoginTime:DateTime", "riskLevel:String"]
+    },
+    "id_scope_warning": "The specification states that ids are unique WITHIN an entity type and that two different entity types may carry the same id. A loader that keys nodes on the id alone therefore merges an Account into a Person. The relational schema below avoids this by giving each entity type its own table; a graph loader has to avoid it some other way, and nothing in this file checks that it did.",
+    "edges": {
+      "transfer": {"tail": "Account", "head": "Account", "multiplicity": "N", "properties": ["timestamp:DateTime", "amount:Float64", "ordernumber:String", "comment:String", "payType:String", "goodsType:String"]},
+      "withdraw": {"tail": "Account", "head": "Account", "multiplicity": "N", "properties": ["timestamp:DateTime", "amount:Float64"], "note": "the head is always an Account of type 'card'"},
+      "deposit": {"tail": "Loan", "head": "Account", "multiplicity": "N", "properties": ["timestamp:DateTime", "amount:Float64"]},
+      "repay": {"tail": "Account", "head": "Loan", "multiplicity": "N", "properties": ["timestamp:DateTime", "amount:Float64"]},
+      "signIn": {"tail": "Medium", "head": "Account", "multiplicity": "N", "properties": ["timestamp:DateTime", "location:String"]},
+      "own": {"tail": "Person|Company", "head": "Account", "multiplicity": "1", "properties": [], "note": "the only property-free edge type in the schema, and the only one this project's existing loaders could carry unchanged"},
+      "apply": {"tail": "Person|Company", "head": "Loan", "multiplicity": "1", "properties": ["timestamp:DateTime", "organization:String"]},
+      "invest": {"tail": "Person|Company", "head": "Company", "multiplicity": "1", "properties": ["timestamp:DateTime", "ratio:Float32"]},
+      "guarantee": {"tail": "Person|Company", "head": "Person|Company", "multiplicity": "1", "properties": ["timestamp:DateTime", "relationship:String"]}
+    },
+    "sql_tables": {
+      "note": "Thirteen physical edge tables for nine logical edge types: `own`, `apply`, `invest` and `guarantee` each split by tail entity type, which is the same 5-vertex / 13-edge-file inventory the Datagen `snapshot/` directory carries. Every edge table with multiplicity N has a surrogate `id`, because (src, dst) is not a key there - see `why_this_family_is_worth_adopting.multi_edges`.",
+      "entities": [
+        "CREATE TABLE person (id bigint PRIMARY KEY, name text, is_blocked boolean, create_time bigint, gender text, birthday text, country text, city text)",
+        "CREATE TABLE company (id bigint PRIMARY KEY, name text, is_blocked boolean, create_time bigint, country text, city text, business text, description text, url text)",
+        "CREATE TABLE account (id bigint PRIMARY KEY, create_time bigint, is_blocked boolean, type text, nickname text, phone_number text, email text, freq_login_type text, last_login_time bigint, account_level text)",
+        "CREATE TABLE loan (id bigint PRIMARY KEY, loan_amount double precision, balance double precision, usage text, interest_rate real)",
+        "CREATE TABLE medium (id bigint PRIMARY KEY, type text, create_time bigint, is_blocked boolean, last_login_time bigint, risk_level text)"
+      ],
+      "relations": [
+        "CREATE TABLE transfer (id bigint PRIMARY KEY, src bigint NOT NULL, dst bigint NOT NULL, ts bigint NOT NULL, amount double precision NOT NULL, ordernumber text, comment text, pay_type text, goods_type text)",
+        "CREATE TABLE withdraw (id bigint PRIMARY KEY, src bigint NOT NULL, dst bigint NOT NULL, ts bigint NOT NULL, amount double precision NOT NULL)",
+        "CREATE TABLE deposit (id bigint PRIMARY KEY, loan_id bigint NOT NULL, account_id bigint NOT NULL, ts bigint NOT NULL, amount double precision NOT NULL)",
+        "CREATE TABLE repay (id bigint PRIMARY KEY, account_id bigint NOT NULL, loan_id bigint NOT NULL, ts bigint NOT NULL, amount double precision NOT NULL)",
+        "CREATE TABLE sign_in (id bigint PRIMARY KEY, medium_id bigint NOT NULL, account_id bigint NOT NULL, ts bigint NOT NULL, location text)",
+        "CREATE TABLE person_own_account (person_id bigint NOT NULL, account_id bigint NOT NULL)",
+        "CREATE TABLE company_own_account (company_id bigint NOT NULL, account_id bigint NOT NULL)",
+        "CREATE TABLE person_apply_loan (person_id bigint NOT NULL, loan_id bigint NOT NULL, ts bigint NOT NULL, organization text)",
+        "CREATE TABLE company_apply_loan (company_id bigint NOT NULL, loan_id bigint NOT NULL, ts bigint NOT NULL, organization text)",
+        "CREATE TABLE person_invest_company (person_id bigint NOT NULL, company_id bigint NOT NULL, ts bigint NOT NULL, ratio real)",
+        "CREATE TABLE company_invest_company (investor_id bigint NOT NULL, company_id bigint NOT NULL, ts bigint NOT NULL, ratio real)",
+        "CREATE TABLE person_guarantee_person (from_id bigint NOT NULL, to_id bigint NOT NULL, ts bigint NOT NULL, relationship text)",
+        "CREATE TABLE company_guarantee_company (from_id bigint NOT NULL, to_id bigint NOT NULL, ts bigint NOT NULL, relationship text)"
+      ],
+      "indexes": [
+        "CREATE INDEX transfer_src ON transfer (src, ts)",
+        "CREATE INDEX transfer_dst ON transfer (dst, ts)",
+        "CREATE INDEX withdraw_src ON withdraw (src, ts)",
+        "CREATE INDEX withdraw_dst ON withdraw (dst, ts)",
+        "CREATE INDEX deposit_account ON deposit (account_id, ts)",
+        "CREATE INDEX deposit_loan ON deposit (loan_id, ts)",
+        "CREATE INDEX repay_account ON repay (account_id, ts)",
+        "CREATE INDEX sign_in_account ON sign_in (account_id, ts)",
+        "CREATE INDEX person_own_account_person ON person_own_account (person_id)",
+        "CREATE INDEX company_own_account_account ON company_own_account (account_id)",
+        "CREATE INDEX person_apply_loan_person ON person_apply_loan (person_id)",
+        "CREATE INDEX person_invest_company_person ON person_invest_company (person_id, ts)",
+        "CREATE INDEX person_guarantee_person_from ON person_guarantee_person (from_id, ts)"
+      ],
+      "index_note": "These are the accesses the twelve statements below actually make, and no more. They are asserted from reading the statements, not measured: no plan was inspected, because nothing has been loaded. An index list arrived at that way is a starting point for a loader, not a tuning result."
+    }
+  },
+
+  "truncation": {
+    "what_it_is": "FinBench's specification makes truncation part of query SEMANTICS, not an optimisation: at each expansion step an engine keeps only the top `truncationLimit` edges in `truncationOrder` (the TRUNCATION_ORDER enum, e.g. TIMESTAMP_ASCENDING). Eight of the twelve complex reads take `truncationLimit` and `truncationOrder` as parameters for exactly this.",
+    "why_it_is_absent_here": "None of the statements below implements it. The reference implementations do it with vendor directives - Galaxybase's `CYPHER EXPANDCONFIG = ([transfer], timestamp, $truncationOrder, $truncationLimit)` prelude, and a comment reading `// TODO: implement truncation strategy` in every neo4j body - and neither openCypher nor SQL has a portable equivalent. Dropping it is therefore recorded, not hidden: a run of this catalogue computes the UNTRUNCATED answer, which is a different query from the one an audited FinBench run computes, and its numbers are not comparable with any published result. They are comparable between two engines that both run THESE statements.",
+    "the_tie_break_problem": "Even a faithful implementation would not settle the answer. TRUNCATION_ORDER sorts on a single non-unique key (timestamp or amount); millisecond timestamps plus permitted multi-edges make ties near-certain at a 500-edge boundary; and the reference tie-break is a vendor directive whose behaviour is unspecified. Two witnesses can therefore agree on a wrong answer, or disagree while both being right. Any future cross-engine canon for this family has to say which of those it is before it records an expected value."
+  },
+
+  "parameters": {
+    "source": "The released parameter archives `finbench/sf1_read_params.zip` and `finbench/sf10_read_params.zip` on datasets.ldbcouncil.org, which contain `complex_1_param.csv` .. `complex_12_param.csv` and nothing else.",
+    "binding": "Each statement below carries a `params` list naming the placeholders it uses, spelled `${name}`. A driver renders the text and binds from the parameter file's columns; it never invents a value. Placeholder names follow the specification's yaml, so TCR10's two person ids are `pid1`/`pid2` while TCR3's and TCR4's two account ids are `id1`/`id2` - that inconsistency is upstream's and is preserved rather than smoothed, because smoothing it would silently mis-map a column.",
+    "known_file_trap": "Eleven of the twelve SF1 files begin with a literal `...` line where a header would be; `complex_3_param.csv` does not. Skipping line 1 unconditionally therefore drops a real TCR3 parameter row. The archives are also macOS-packaged, so a loader must glob `complex_[0-9]*_param.csv` rather than list the directory, or `__MACOSX/` entries become parameter files. Both are recorded in docs/bench/ldbc-coverage-plan.md §2.3; neither has been checked against an opened archive by this file's author.",
+    "truncation_parameters_unbound": "Eight statements' specification parameter lists include `truncationLimit` and `truncationOrder`. They do NOT appear in the `params` lists below, because the statements do not use them - see `truncation`. A parameter file supplying them is not wrong; this catalogue simply ignores those columns."
+  },
+
+  "simple_reads_TSR1_TSR6": {
+    "decision": "EXCLUDED from this file, deliberately, and the reason is parameters rather than text.",
+    "text_exists": "`neo4j/queries/tsr-1.cypher` .. `tsr-8.cypher` exist in the impls repository (tsr-7 and tsr-8 correspond to the deprecated simple reads 07 and 08), and `query-specifications/transaction-simple-read-{01..06}.yaml` specify the six current ones. Transcribing them would be an afternoon.",
+    "parameters_do_not_exist": "`sf1_read_params.zip` and `sf10_read_params.zip` contain complex_1..complex_12 only. The driver's `LdbcFinBenchSimpleReadGenerator implements ChildOperationGenerator`: simple reads are spawned as CHILD operations off the results of complex reads and writes, so their parameters are produced by a run and not distributed with the corpus. A harness that derives its own TSR parameters is running a workload of its own design.",
+    "if_they_are_ever_added": "Include them only with a `parameters: derived` marker on every entry and a named, deterministic derivation (for instance: the account ids returned by a fixed TCR4 parameter row, in result order), stamped into the result document alongside the digest so a later reader can tell which derivation produced a number. What must not happen is entries that look like TCR1..TCR12 and quietly carry invented parameters, because then the only difference between a comparable number and an incomparable one is a fact nobody wrote down."
+  },
+
+  "corpus": {
+    "status": "Not present. No FinBench corpus exists on any volume this project controls, and the LDBC-hosted archives are gzip (the only LDBC family that is not zstd). SF10 is estimated at 70-90 GiB expanded, against a `/datasets` volume that already refuses an SF10 SNB load below 150 GiB free.",
+    "expected_values": "There are none, anywhere in this file, and their absence is NOT an expectation of zero. LDBC's own results page states there are no audited FinBench results, and untruncated answers (see `truncation`) would not be comparable with audited ones if there were. The first run of this battery produces candidate values and nothing more; a second engine agreeing is the earliest point at which any of them may be written down."
+  },
+
+  "census": {
+    "_note": "An empty corpus answers 0 or an empty result to every query below and would pass vacuously. Three statements rather than one: an Account count alone cannot distinguish a corpus loaded without its edges, and a transfer count of 0 beside a nonzero Account count is the exact shape of a loader that dropped the highest-volume edge file. The third statement catches the failure this family is most exposed to - a loader that loaded edges but dropped their properties - by counting transfers that carry a timestamp at all.",
+    "cypher": {
+      "status": "unverified",
+      "accounts": "MATCH (a:Account) RETURN count(a) AS c",
+      "transfers": "MATCH ()-[t:transfer]->() RETURN count(t) AS c",
+      "transfers_with_timestamp": "MATCH ()-[t:transfer]->() WHERE t.timestamp IS NOT NULL RETURN count(t) AS c"
+    },
+    "cypher_ladybug": {
+      "status": "unverified",
+      "accounts": "MATCH (a:Account) RETURN count(a) AS c",
+      "transfers": "MATCH (:Account)-[t:transfer]->(:Account) RETURN count(t) AS c",
+      "transfers_with_timestamp": "MATCH (:Account)-[t:transfer]->(:Account) WHERE t.timestamp IS NOT NULL RETURN count(t) AS c",
+      "note": "Endpoints are spelled out because a Ladybug rel table is named by its (type, src, dst) triple; an anonymous-endpoint form has nothing to resolve against."
+    },
+    "sql": {
+      "status": "unverified",
+      "accounts": "SELECT count(*) AS c FROM account",
+      "transfers": "SELECT count(*) AS c FROM transfer",
+      "transfers_with_timestamp": "SELECT count(*) AS c FROM transfer WHERE ts IS NOT NULL"
+    }
+  },
+
+  "queries": {
+    "tcr1": {
+      "title": "Blocked medium related accounts",
+      "params": ["id", "startTime", "endTime"],
+      "returns": ["otherId", "accountDistance", "mediumId", "mediumType"],
+      "shape": "variable-length transfer path (1..3) with strictly ascending timestamps, joined to a blocked Medium's signIn",
+      "cypher": {
+        "status": "unverified",
+        "text": "MATCH p=(account:Account {id: ${id}})-[transfer:transfer*1..3]->(other:Account), (other)<-[signIn:signIn]-(medium:Medium {isBlocked: true}) WITH p, [e IN relationships(p) | e.timestamp] AS ts, other, medium, transfer, signIn WHERE reduce(curr = head(ts), x IN tail(ts) | CASE WHEN curr < x THEN x ELSE 9223372036854775807 END) <> 9223372036854775807 AND all(e IN transfer WHERE e.timestamp > ${startTime} AND e.timestamp < ${endTime}) AND signIn.timestamp > ${startTime} AND signIn.timestamp < ${endTime} RETURN DISTINCT other.id AS otherId, length(p) AS accountDistance, medium.id AS mediumId, medium.type AS mediumType ORDER BY accountDistance, otherId, mediumId"
+      },
+      "cypher_ladybug": {
+        "status": "unsupported",
+        "reason": "the ascending-timestamp rule relates each hop to the previous one, which the per-hop recursive-relationship filter is the wrong shape to express; whether LadybugDB/Kuzu implements `reduce` over `relationships(p)` as a post-expansion alternative is NOT established, and declaring it supported on a guess would put a statement here that fails at parse time on a bench pod"
+      },
+      "sql": {
+        "status": "unverified",
+        "text": "WITH RECURSIVE reach(acct, ts, depth) AS (SELECT t.dst, t.ts, 1 FROM transfer t WHERE t.src = ${id} AND t.ts > ${startTime} AND t.ts < ${endTime} UNION ALL SELECT t.dst, t.ts, r.depth + 1 FROM reach r JOIN transfer t ON t.src = r.acct WHERE r.depth < 3 AND t.ts > r.ts AND t.ts < ${endTime}) SELECT DISTINCT r.acct AS otherid, r.depth AS accountdistance, m.id AS mediumid, m.type AS mediumtype FROM reach r JOIN sign_in s ON s.account_id = r.acct JOIN medium m ON m.id = s.medium_id WHERE m.is_blocked AND s.ts > ${startTime} AND s.ts < ${endTime} ORDER BY accountdistance, otherid, mediumid",
+        "note": "The recursive step prunes on `t.ts > r.ts` where the Cypher expands first and filters after; that is the same question asked with different work, which is the whole reason the pair is worth running. Two things this form relies on, stated rather than assumed. (1) `t.ts > r.ts` implies `t.ts > ${startTime}` because the base row already satisfies it, so the lower bound is not repeated. (2) The CTE carries no visited-set, and does not need one: strictly increasing timestamps make it impossible for one edge to appear twice in a path, which is exactly Cypher's relationship-uniqueness rule. A predicate that was `>=` instead of `>` would break both claims at once."
+      }
+    },
+
+    "tcr2": {
+      "title": "Fund gathered from the accounts applying loans",
+      "params": ["id", "startTime", "endTime"],
+      "returns": ["otherId", "sumLoanAmount", "sumLoanBalance"],
+      "shape": "inbound variable-length transfer path (1..3) into a Person's accounts, sources joined to Loan deposits",
+      "cypher": {
+        "status": "unverified",
+        "text": "MATCH (person:Person {id: ${id}})-[:own]->(account:Account), p=(other:Account)-[transfer:transfer*1..3]->(account) WITH p, [e IN relationships(p) | e.timestamp] AS ts, other, transfer WHERE reduce(curr = head(ts), x IN tail(ts) | CASE WHEN curr < x THEN x ELSE 9223372036854775807 END) <> 9223372036854775807 AND all(e IN transfer WHERE e.timestamp > ${startTime} AND e.timestamp < ${endTime}) WITH DISTINCT other MATCH (other)<-[deposit:deposit]-(loan:Loan) WHERE deposit.timestamp > ${startTime} AND deposit.timestamp < ${endTime} RETURN other.id AS otherId, round(sum(DISTINCT loan.loanAmount) * 1000) / 1000 AS sumLoanAmount, round(sum(DISTINCT loan.balance) * 1000) / 1000 AS sumLoanBalance ORDER BY sumLoanAmount DESC, otherId"
+      },
+      "cypher_ladybug": {
+        "status": "unsupported",
+        "reason": "same monotone-across-hops predicate as TCR1, and the same refusal for the same reason"
+      },
+      "sql": {
+        "status": "unverified",
+        "text": "WITH RECURSIVE up(acct, ts, depth) AS (SELECT t.src, t.ts, 1 FROM transfer t JOIN person_own_account o ON o.account_id = t.dst WHERE o.person_id = ${id} AND t.ts > ${startTime} AND t.ts < ${endTime} UNION ALL SELECT t.src, t.ts, u.depth + 1 FROM up u JOIN transfer t ON t.dst = u.acct WHERE u.depth < 3 AND t.ts < u.ts AND t.ts > ${startTime}) SELECT u.acct AS otherid, round(sum(DISTINCT l.loan_amount)::numeric, 3) AS sumloanamount, round(sum(DISTINCT l.balance)::numeric, 3) AS sumloanbalance FROM (SELECT DISTINCT acct FROM up) u JOIN deposit d ON d.account_id = u.acct AND d.ts > ${startTime} AND d.ts < ${endTime} JOIN loan l ON l.id = d.loan_id GROUP BY u.acct ORDER BY sumloanamount DESC, otherid",
+        "note": "The walk runs BACKWARDS from the owned accounts, so the monotone test inverts: each earlier hop must be strictly EARLIER (`t.ts < u.ts`). That is the direction the reference body asks for, reading its `ts` list in path order from `other` to `account`. It is worth saying that the specification's prose disagrees with it - the prose says ascending from upstream to downstream, which is the same direction only if `other` is read as upstream, and the reference's list order makes it the downstream end. This catalogue transcribes the reference and records the disagreement rather than choosing; a future verification has to settle it, and until it does, two engines agreeing here have only agreed with each other."
+      }
+    },
+
+    "tcr3": {
+      "title": "Shortest transfer path",
+      "params": ["id1", "id2", "startTime", "endTime"],
+      "returns": ["shortestPathLength"],
+      "shape": "bounded shortest path over window-filtered transfer edges; -1 when none exists",
+      "cypher": {
+        "status": "unverified",
+        "text": "OPTIONAL MATCH path = shortestPath((:Account {id: ${id1}})-[transfer:transfer*1..16]->(:Account {id: ${id2}})) WHERE all(e IN transfer WHERE e.timestamp > ${startTime} AND e.timestamp < ${endTime}) RETURN CASE WHEN path IS NULL THEN -1 ELSE length(path) END AS shortestPathLength",
+        "note": "The 1..16 bound is the reference implementation's, not the specification's - the specification bounds nothing. It is kept because an unbounded `shortestPath` over a window-filtered transfer graph has no stated cost ceiling and because a run must be able to end. The bound changes the answer only for pairs whose shortest window-admissible path exceeds 16 hops, where this text returns -1 and the specification would return the length. Whether that case occurs at SF1 or SF10 is not established. Whether engram implements `shortestPath` at all is also not established; if it does not, this entry becomes `unsupported` with that reason - it does not become a hand-rolled substitute, because a substitute is a different query."
+      },
+      "cypher_ladybug": {
+        "status": "unsupported",
+        "reason": "not established that LadybugDB/Kuzu's shortest-path form accepts a predicate over edge PROPERTIES on the expanded relationships; a shortest path over the unfiltered transfer graph is a different query that would answer faster and look better, which is precisely the failure this catalogue exists to prevent"
+      },
+      "sql": {
+        "status": "unverified",
+        "text": "WITH RECURSIVE bfs(acct, depth, path) AS (SELECT ${id1}::bigint, 0, ARRAY[${id1}::bigint] UNION ALL SELECT t.dst, b.depth + 1, b.path || t.dst FROM bfs b JOIN transfer t ON t.src = b.acct WHERE b.depth < 16 AND t.ts > ${startTime} AND t.ts < ${endTime} AND NOT t.dst = ANY(b.path)) SELECT COALESCE(min(depth), -1) AS shortestpathlength FROM bfs WHERE acct = ${id2}::bigint AND depth > 0",
+        "note": "Unlike TCR1 and TCR2 there is no monotone predicate to forbid revisits, so the `NOT dst = ANY(path)` guard is load-bearing: without it a cycle inside the window makes this statement non-terminating rather than slow. The guard costs an array scan per row, and this is a full enumerate-then-minimise rather than a bidirectional search - it is the most expensive statement in the file by some distance, and should be expected to be the first one that has to be abandoned at SF10."
+      }
+    },
+
+    "tcr4": {
+      "title": "Three accounts in a transfer cycle",
+      "params": ["id1", "id2", "startTime", "endTime"],
+      "returns": ["otherId", "numEdge2", "sumEdge2Amount", "maxEdge2Amount", "numEdge3", "sumEdge3Amount", "maxEdge3Amount"],
+      "shape": "two independent per-other aggregations over multi-edges, gated on the existence of a direct src->dst transfer",
+      "cypher": {
+        "status": "unverified",
+        "text": "MATCH (src:Account {id: ${id1}})-[transfer1:transfer]->(dst:Account {id: ${id2}}) WHERE transfer1.timestamp > ${startTime} AND transfer1.timestamp < ${endTime} WITH src, dst MATCH (dst)-[transfer3:transfer]->(other:Account)-[transfer2:transfer]->(src) WHERE transfer2.timestamp > ${startTime} AND transfer2.timestamp < ${endTime} AND transfer3.timestamp > ${startTime} AND transfer3.timestamp < ${endTime} WITH DISTINCT src, other, dst MATCH (src)<-[transfer2:transfer]-(other) WHERE transfer2.timestamp > ${startTime} AND transfer2.timestamp < ${endTime} WITH src, other, dst, count(transfer2) AS numEdge2, round(sum(transfer2.amount) * 1000) / 1000 AS sumEdge2Amount, round(max(transfer2.amount) * 1000) / 1000 AS maxEdge2Amount MATCH (other)<-[transfer3:transfer]-(dst) WHERE transfer3.timestamp > ${startTime} AND transfer3.timestamp < ${endTime} WITH other.id AS otherId, numEdge2, sumEdge2Amount, maxEdge2Amount, count(transfer3) AS numEdge3, round(sum(transfer3.amount) * 1000) / 1000 AS sumEdge3Amount, round(max(transfer3.amount) * 1000) / 1000 AS maxEdge3Amount RETURN otherId, numEdge2, sumEdge2Amount, maxEdge2Amount, numEdge3, sumEdge3Amount, maxEdge3Amount ORDER BY sumEdge2Amount DESC, sumEdge3Amount DESC, otherId",
+        "note": "The re-MATCH after `WITH DISTINCT` is not redundancy: aggregating edge2 and edge3 in one pattern would multiply each count by the other's cardinality, and with multiplicity-N transfer edges that product is not 1. This is the clearest place in the family where an engine that collapsed multi-edges would return SMALLER, entirely plausible numbers. Separately: the specification names edge2 as dst->other and edge3 as other->src, while the reference body binds them the other way round. The reference's binding is transcribed, so a result compared against an audited number would have two columns transposed - recorded here because a transposition of two numeric columns is invisible in a timing table."
+      },
+      "cypher_ladybug": {
+        "status": "unverified",
+        "text": "MATCH (src:Account {id: ${id1}})-[transfer1:transfer]->(dst:Account {id: ${id2}}) WHERE transfer1.timestamp > ${startTime} AND transfer1.timestamp < ${endTime} WITH src, dst MATCH (dst)-[transfer3:transfer]->(other:Account)-[transfer2:transfer]->(src) WHERE transfer2.timestamp > ${startTime} AND transfer2.timestamp < ${endTime} AND transfer3.timestamp > ${startTime} AND transfer3.timestamp < ${endTime} RETURN other.id AS otherId, count(transfer2) AS numEdge2, round(sum(transfer2.amount) * 1000) / 1000 AS sumEdge2Amount, round(max(transfer2.amount) * 1000) / 1000 AS maxEdge2Amount, count(transfer3) AS numEdge3, round(sum(transfer3.amount) * 1000) / 1000 AS sumEdge3Amount, round(max(transfer3.amount) * 1000) / 1000 AS maxEdge3Amount ORDER BY sumEdge2Amount DESC, sumEdge3Amount DESC, otherId",
+        "note": "SINGLE-PATTERN form, and it therefore asks a DIFFERENT question from the `cypher` entry above: its counts are the products described in that entry's note, not two independent counts. It is written in this form because the multi-MATCH rewrite relies on `WITH DISTINCT` re-binding that has not been checked on this engine, and a silently wrong rewrite is worse than a declared divergence. Do not compare this arm's numeric columns with the other two dialects' - compare its timing only, and only after the divergence has been resolved one way or the other."
+      },
+      "sql": {
+        "status": "unverified",
+        "text": "WITH e2 AS (SELECT t.src AS other, count(*) AS n, sum(t.amount) AS s, max(t.amount) AS m FROM transfer t WHERE t.dst = ${id1} AND t.ts > ${startTime} AND t.ts < ${endTime} GROUP BY t.src), e3 AS (SELECT t.dst AS other, count(*) AS n, sum(t.amount) AS s, max(t.amount) AS m FROM transfer t WHERE t.src = ${id2} AND t.ts > ${startTime} AND t.ts < ${endTime} GROUP BY t.dst) SELECT e2.other AS otherid, e2.n AS numedge2, round(e2.s::numeric, 3) AS sumedge2amount, round(e2.m::numeric, 3) AS maxedge2amount, e3.n AS numedge3, round(e3.s::numeric, 3) AS sumedge3amount, round(e3.m::numeric, 3) AS maxedge3amount FROM e2 JOIN e3 ON e3.other = e2.other WHERE EXISTS (SELECT 1 FROM transfer t1 WHERE t1.src = ${id1} AND t1.dst = ${id2} AND t1.ts > ${startTime} AND t1.ts < ${endTime}) ORDER BY sumedge2amount DESC, sumedge3amount DESC, otherid",
+        "note": "The two CTEs are the relational spelling of the same refusal to cross-product: aggregate each leg alone, join on `other` afterwards. The EXISTS clause is the specification's rule (1) - no direct src->dst transfer in the window means an empty result, not a result computed from the other two legs."
+      }
+    },
+
+    "tcr5": {
+      "title": "Exact account transfer trace",
+      "params": ["id", "startTime", "endTime"],
+      "returns": ["path"],
+      "shape": "variable-length transfer path (1..3) from a Person's accounts, strictly ascending timestamps, no repeated account",
+      "cypher": {
+        "status": "unverified",
+        "text": "MATCH (person:Person {id: ${id}})-[:own]->(src:Account), p=(src)-[transfer:transfer*1..3]->(dst:Account) WITH p, [e IN relationships(p) | e.timestamp] AS ts, src, dst, transfer WHERE reduce(curr = head(ts), x IN tail(ts) | CASE WHEN curr < x THEN x ELSE 9223372036854775807 END) <> 9223372036854775807 AND src <> dst AND all(e IN transfer WHERE e.timestamp > ${startTime} AND e.timestamp < ${endTime}) WITH DISTINCT [n IN nodes(p) | n.id] AS path, length(p) AS pathLength WHERE ALL(i IN range(0, size(path) - 2) WHERE NOT path[i] IN path[i + 1..]) RETURN path ORDER BY pathLength DESC",
+        "note": "The `ALL(i IN range(...))` clause is the no-recurring-accounts rule the specification states, replacing the reference's APOC set-size comparison; see provenance.vendor_procedures_replaced. It is quadratic in a path of at most four nodes, which is not a concern. The specification also says two paths differing only in WHICH parallel edge was taken are the same path - that is what projecting to `[n IN nodes(p) | n.id]` before `DISTINCT` accomplishes, and it is the one place in the family where multi-edges must be deliberately collapsed rather than preserved."
+      },
+      "cypher_ladybug": {
+        "status": "unsupported",
+        "reason": "monotone-across-hops timestamps again, and additionally the result is a PATH (a list of node ids per row) rather than scalars - the `Backend` seam in this tree carries neither today, so even a supported statement could not have its answer read back"
+      },
+      "sql": {
+        "status": "unverified",
+        "text": "WITH RECURSIVE walk(acct, ts, depth, path) AS (SELECT t.dst, t.ts, 1, ARRAY[t.src, t.dst] FROM transfer t JOIN person_own_account o ON o.account_id = t.src WHERE o.person_id = ${id} AND t.ts > ${startTime} AND t.ts < ${endTime} AND t.dst <> t.src UNION ALL SELECT t.dst, t.ts, w.depth + 1, w.path || t.dst FROM walk w JOIN transfer t ON t.src = w.acct WHERE w.depth < 3 AND t.ts > w.ts AND t.ts < ${endTime} AND NOT t.dst = ANY(w.path)) SELECT q.path AS path FROM (SELECT DISTINCT path, depth FROM walk) q ORDER BY q.depth DESC, q.path",
+        "note": "`NOT t.dst = ANY(w.path)` is the no-recurring-accounts rule, enforced DURING expansion where the Cypher enforces it after; the two find the same paths, because a prefix containing a repeat can only extend to a path containing a repeat. `SELECT DISTINCT path` collapses parallel edges the same way the Cypher's node-id projection does. The outer subquery exists only because PostgreSQL will not order a SELECT DISTINCT by an expression absent from its select list."
+      }
+    },
+
+    "tcr6": {
+      "title": "Withdrawal after many-to-one transfer",
+      "params": ["id", "threshold1", "threshold2", "startTime", "endTime"],
+      "returns": ["midId", "sumEdge1Amount", "sumEdge2Amount"],
+      "shape": "two-stage aggregation with a count predicate on the first stage",
+      "cypher": {
+        "status": "unverified",
+        "text": "MATCH (:Account {id: ${id}})<-[withdraw2:withdraw]-(mid:Account) WHERE withdraw2.timestamp > ${startTime} AND withdraw2.timestamp < ${endTime} AND withdraw2.amount > ${threshold2} WITH mid, sum(withdraw2.amount) AS sumEdge2Amount MATCH (mid)<-[transfer1:transfer]-(:Account) WHERE transfer1.timestamp > ${startTime} AND transfer1.timestamp < ${endTime} AND transfer1.amount > ${threshold1} WITH mid.id AS midId, sumEdge2Amount, sum(transfer1.amount) AS sumEdge1Amount, count(transfer1) AS numEdge1 WHERE numEdge1 > 3 RETURN midId, round(sumEdge1Amount * 1000) / 1000 AS sumEdge1Amount, round(sumEdge2Amount * 1000) / 1000 AS sumEdge2Amount ORDER BY sumEdge2Amount DESC, midId",
+        "note": "The reference body does not check `type = 'card'` on the given account, although the specification says the parameter names a card account and the (stale) neo4j body writes the check. It is left out here, matching the reference: the id identifies the account, and a check that is always true on valid parameters costs nothing only until the parameters are wrong, at which point it would change the result rather than report the problem."
+      },
+      "cypher_ladybug": {
+        "status": "unverified",
+        "text": "MATCH (:Account {id: ${id}})<-[withdraw2:withdraw]-(mid:Account) WHERE withdraw2.timestamp > ${startTime} AND withdraw2.timestamp < ${endTime} AND withdraw2.amount > ${threshold2} WITH mid, sum(withdraw2.amount) AS sumEdge2Amount MATCH (mid)<-[transfer1:transfer]-(:Account) WHERE transfer1.timestamp > ${startTime} AND transfer1.timestamp < ${endTime} AND transfer1.amount > ${threshold1} WITH mid.id AS midId, sumEdge2Amount, sum(transfer1.amount) AS sumEdge1Amount, count(transfer1) AS numEdge1 WHERE numEdge1 > 3 RETURN midId, round(sumEdge1Amount * 1000) / 1000 AS sumEdge1Amount, round(sumEdge2Amount * 1000) / 1000 AS sumEdge2Amount ORDER BY sumEdge2Amount DESC, midId"
+      },
+      "sql": {
+        "status": "unverified",
+        "text": "WITH w AS (SELECT wd.src AS mid, sum(wd.amount) AS s2 FROM withdraw wd WHERE wd.dst = ${id} AND wd.ts > ${startTime} AND wd.ts < ${endTime} AND wd.amount > ${threshold2} GROUP BY wd.src), t AS (SELECT tr.dst AS mid, sum(tr.amount) AS s1, count(*) AS n1 FROM transfer tr JOIN w ON w.mid = tr.dst WHERE tr.ts > ${startTime} AND tr.ts < ${endTime} AND tr.amount > ${threshold1} GROUP BY tr.dst) SELECT w.mid AS midid, round(t.s1::numeric, 3) AS sumedge1amount, round(w.s2::numeric, 3) AS sumedge2amount FROM w JOIN t ON t.mid = w.mid WHERE t.n1 > 3 ORDER BY sumedge2amount DESC, midid"
+      }
+    },
+
+    "tcr7": {
+      "title": "Transfer in/out ratio",
+      "params": ["id", "threshold", "startTime", "endTime"],
+      "returns": ["numSrc", "numDst", "inOutRatio"],
+      "shape": "two independent one-hop aggregations over an account, with a guarded division",
+      "cypher": {
+        "status": "unverified",
+        "text": "MATCH (mid:Account {id: ${id}}) WITH mid OPTIONAL MATCH (src:Account)-[edge1:transfer]->(mid) WHERE edge1.timestamp > ${startTime} AND edge1.timestamp < ${endTime} AND edge1.amount > ${threshold} WITH mid, count(DISTINCT src) AS numSrc, sum(edge1.amount) AS amountSrc OPTIONAL MATCH (mid)-[edge2:transfer]->(dst:Account) WHERE edge2.timestamp > ${startTime} AND edge2.timestamp < ${endTime} AND edge2.amount > ${threshold} WITH numSrc, amountSrc, count(DISTINCT dst) AS numDst, sum(edge2.amount) AS amountDst RETURN numSrc, numDst, CASE WHEN numDst = 0 THEN -1 ELSE round(1.0 * amountSrc / amountDst * 1000) / 1000 END AS inOutRatio",
+        "note": "The OPTIONAL MATCHes are what make an account with no qualifying transfers return a row of zeroes and -1 rather than no row at all. `count(DISTINCT src)` counts ACCOUNTS while `sum` sums EDGES, and with multiplicity-N transfers those two cardinalities differ - which is the point of the query, not a defect in it."
+      },
+      "cypher_ladybug": {
+        "status": "unverified",
+        "text": "MATCH (mid:Account {id: ${id}}) WITH mid OPTIONAL MATCH (src:Account)-[edge1:transfer]->(mid) WHERE edge1.timestamp > ${startTime} AND edge1.timestamp < ${endTime} AND edge1.amount > ${threshold} WITH mid, count(DISTINCT src) AS numSrc, sum(edge1.amount) AS amountSrc OPTIONAL MATCH (mid)-[edge2:transfer]->(dst:Account) WHERE edge2.timestamp > ${startTime} AND edge2.timestamp < ${endTime} AND edge2.amount > ${threshold} WITH numSrc, amountSrc, count(DISTINCT dst) AS numDst, sum(edge2.amount) AS amountDst RETURN numSrc, numDst, CASE WHEN numDst = 0 THEN -1 ELSE round(1.0 * amountSrc / amountDst * 1000) / 1000 END AS inOutRatio"
+      },
+      "sql": {
+        "status": "unverified",
+        "text": "WITH i AS (SELECT count(DISTINCT src) AS n, COALESCE(sum(amount), 0) AS amt FROM transfer WHERE dst = ${id} AND ts > ${startTime} AND ts < ${endTime} AND amount > ${threshold}), o AS (SELECT count(DISTINCT dst) AS n, COALESCE(sum(amount), 0) AS amt FROM transfer WHERE src = ${id} AND ts > ${startTime} AND ts < ${endTime} AND amount > ${threshold}) SELECT i.n AS numsrc, o.n AS numdst, CASE WHEN o.n = 0 THEN -1 ELSE round((i.amt / o.amt)::numeric, 3) END AS inoutratio FROM i, o",
+        "note": "The COALESCEs stand in for Cypher's OPTIONAL MATCH: an aggregate over no rows is NULL here, and a NULL would propagate through the ratio instead of producing the specified zeroes. The division is guarded on `o.n = 0` (no qualifying out-edges), matching the reference; guarding on `o.amt = 0` would differ only for a set of transfers summing to exactly zero, which the schema does not forbid."
+      }
+    },
+
+    "tcr8": {
+      "title": "Transfer trace after loan applied",
+      "params": ["id", "threshold", "startTime", "endTime"],
+      "returns": ["dstId", "ratio", "minDistanceFromLoan"],
+      "shape": "variable-length transfer|withdraw path (1..3) filtered on a monotone AMOUNT ratio, summed over distinct last edges",
+      "cypher": {
+        "status": "unverified",
+        "text": "MATCH (loan:Loan {id: ${id}})-[deposit:deposit]->(src:Account) WHERE deposit.timestamp > ${startTime} AND deposit.timestamp < ${endTime} WITH loan, src MATCH p=(src)-[edge:transfer|withdraw*1..3]->(dst:Account) WITH loan, p, dst, edge, [e IN relationships(p) | e.amount] AS amts WHERE all(e IN edge WHERE e.timestamp > ${startTime} AND e.timestamp < ${endTime}) AND reduce(curr = head(amts), x IN tail(amts) | CASE WHEN (curr <> -1) AND (x > curr * ${threshold}) THEN x ELSE -1 END) <> -1 WITH DISTINCT dst.id AS dstId, loan, collect(DISTINCT relationships(p)[-1]) AS edges, min(length(p) + 1) AS minDistanceFromLoan RETURN dstId, round(1.0 * reduce(s = 0.0, e IN edges | s + e.amount) / loan.loanAmount * 1000) / 1000 AS ratio, minDistanceFromLoan ORDER BY minDistanceFromLoan DESC, ratio DESC, dstId",
+        "note": "`collect(DISTINCT relationships(p)[-1])` is the expression an engine keying edges on their endpoints cannot answer: two parallel last edges into the same dst are two contributions to the inflow, and DISTINCT over relationship identity is what keeps them apart while still collapsing one edge reached by two paths. If an engine collapses multi-edges, this ratio comes out low and nothing about the result looks wrong. The reference uses `apoc.coll.sum`; the `reduce` here is its replacement, see provenance."
+      },
+      "cypher_ladybug": {
+        "status": "unsupported",
+        "reason": "the monotone predicate here compares each hop's amount to the previous hop's, which the per-hop filter cannot express, and the result additionally needs DISTINCT over relationship IDENTITY - whether LadybugDB exposes a relationship as an identity-bearing value rather than as its properties is not established"
+      },
+      "sql": {
+        "status": "unverified",
+        "text": "WITH RECURSIVE e AS (SELECT id, src, dst, ts, amount, 'transfer' AS kind FROM transfer UNION ALL SELECT id, src, dst, ts, amount, 'withdraw' AS kind FROM withdraw), flow(acct, amt, depth, last_id, last_kind) AS (SELECT e.dst, e.amount, 1, e.id, e.kind FROM e JOIN deposit d ON d.account_id = e.src WHERE d.loan_id = ${id} AND d.ts > ${startTime} AND d.ts < ${endTime} AND e.ts > ${startTime} AND e.ts < ${endTime} UNION ALL SELECT e.dst, e.amount, f.depth + 1, e.id, e.kind FROM flow f JOIN e ON e.src = f.acct WHERE f.depth < 3 AND e.ts > ${startTime} AND e.ts < ${endTime} AND e.amount > f.amt * ${threshold}), dist AS (SELECT acct, min(depth) + 1 AS mind FROM flow GROUP BY acct), amts AS (SELECT acct, sum(amt) AS inflow FROM (SELECT DISTINCT acct, last_kind, last_id, amt FROM flow) z GROUP BY acct) SELECT a.acct AS dstid, round((a.inflow / l.loan_amount)::numeric, 3) AS ratio, d.mind AS mindistancefromloan FROM amts a JOIN dist d ON d.acct = a.acct CROSS JOIN loan l WHERE l.id = ${id} ORDER BY mindistancefromloan DESC, ratio DESC, dstid",
+        "note": "The `(last_kind, last_id)` pair is the edge identity the Cypher gets from `DISTINCT relationships(p)[-1]`: a surrogate id alone is not unique across the transfer and withdraw tables, so dropping `last_kind` would silently merge one transfer with one withdraw. The union CTE `e` is the obvious place this statement will be slow; a view with the two tables' indexes still usable is the shape a loader should provide, and nothing here has measured which plan PostgreSQL actually chooses. Termination rests on `f.depth < 3` alone and not on the amount predicate, because nothing in the specification guarantees `${threshold}` is positive."
+      }
+    },
+
+    "tcr9": {
+      "title": "Money laundering with loan involved",
+      "params": ["id", "threshold", "startTime", "endTime"],
+      "returns": ["ratioRepay", "ratioDeposit", "ratioTransfer"],
+      "shape": "four independent scalar aggregations around one account, combined into three guarded ratios",
+      "cypher": {
+        "status": "unverified",
+        "text": "OPTIONAL MATCH (loan1:Loan)-[edge1:deposit]->(mid:Account {id: ${id}}) WHERE edge1.amount > ${threshold} AND edge1.timestamp > ${startTime} AND edge1.timestamp < ${endTime} WITH sum(edge1.amount) AS edge1Amount OPTIONAL MATCH (mid:Account {id: ${id}})-[edge2:repay]->(loan2:Loan) WHERE edge2.amount > ${threshold} AND edge2.timestamp > ${startTime} AND edge2.timestamp < ${endTime} WITH edge1Amount, sum(edge2.amount) AS edge2Amount OPTIONAL MATCH (up:Account)-[edge3:transfer]->(mid:Account {id: ${id}}) WHERE edge3.amount > ${threshold} AND edge3.timestamp > ${startTime} AND edge3.timestamp < ${endTime} WITH edge1Amount, edge2Amount, sum(edge3.amount) AS edge3Amount OPTIONAL MATCH (mid:Account {id: ${id}})-[edge4:transfer]->(down:Account) WHERE edge4.amount > ${threshold} AND edge4.timestamp > ${startTime} AND edge4.timestamp < ${endTime} WITH edge1Amount, edge2Amount, edge3Amount, sum(edge4.amount) AS edge4Amount RETURN CASE WHEN edge2Amount = 0 THEN -1 ELSE round(1.0 * edge1Amount / edge2Amount * 1000) / 1000 END AS ratioRepay, CASE WHEN edge4Amount = 0 THEN -1 ELSE round(1.0 * edge1Amount / edge4Amount * 1000) / 1000 END AS ratioDeposit, CASE WHEN edge4Amount = 0 THEN -1 ELSE round(1.0 * edge3Amount / edge4Amount * 1000) / 1000 END AS ratioTransfer",
+        "note": "The four legs are aggregated SEPARATELY and re-anchored on the same account id each time, rather than matched in one pattern, for the cross-product reason given in TCR4. The stale neo4j body does match them together and also names the last two ratios ratioOut/ratioIn; both differences change what is reported, which is why the galaxybase body is the one transcribed."
+      },
+      "cypher_ladybug": {
+        "status": "unverified",
+        "text": "OPTIONAL MATCH (loan1:Loan)-[edge1:deposit]->(mid:Account {id: ${id}}) WHERE edge1.amount > ${threshold} AND edge1.timestamp > ${startTime} AND edge1.timestamp < ${endTime} WITH sum(edge1.amount) AS edge1Amount OPTIONAL MATCH (mid:Account {id: ${id}})-[edge2:repay]->(loan2:Loan) WHERE edge2.amount > ${threshold} AND edge2.timestamp > ${startTime} AND edge2.timestamp < ${endTime} WITH edge1Amount, sum(edge2.amount) AS edge2Amount OPTIONAL MATCH (up:Account)-[edge3:transfer]->(mid:Account {id: ${id}}) WHERE edge3.amount > ${threshold} AND edge3.timestamp > ${startTime} AND edge3.timestamp < ${endTime} WITH edge1Amount, edge2Amount, sum(edge3.amount) AS edge3Amount OPTIONAL MATCH (mid:Account {id: ${id}})-[edge4:transfer]->(down:Account) WHERE edge4.amount > ${threshold} AND edge4.timestamp > ${startTime} AND edge4.timestamp < ${endTime} WITH edge1Amount, edge2Amount, edge3Amount, sum(edge4.amount) AS edge4Amount RETURN CASE WHEN edge2Amount = 0 THEN -1 ELSE round(1.0 * edge1Amount / edge2Amount * 1000) / 1000 END AS ratioRepay, CASE WHEN edge4Amount = 0 THEN -1 ELSE round(1.0 * edge1Amount / edge4Amount * 1000) / 1000 END AS ratioDeposit, CASE WHEN edge4Amount = 0 THEN -1 ELSE round(1.0 * edge3Amount / edge4Amount * 1000) / 1000 END AS ratioTransfer"
+      },
+      "sql": {
+        "status": "unverified",
+        "text": "WITH s AS (SELECT (SELECT COALESCE(sum(amount), 0) FROM deposit WHERE account_id = ${id} AND amount > ${threshold} AND ts > ${startTime} AND ts < ${endTime}) AS e1, (SELECT COALESCE(sum(amount), 0) FROM repay WHERE account_id = ${id} AND amount > ${threshold} AND ts > ${startTime} AND ts < ${endTime}) AS e2, (SELECT COALESCE(sum(amount), 0) FROM transfer WHERE dst = ${id} AND amount > ${threshold} AND ts > ${startTime} AND ts < ${endTime}) AS e3, (SELECT COALESCE(sum(amount), 0) FROM transfer WHERE src = ${id} AND amount > ${threshold} AND ts > ${startTime} AND ts < ${endTime}) AS e4) SELECT CASE WHEN s.e2 = 0 THEN -1 ELSE round((s.e1 / s.e2)::numeric, 3) END AS ratiorepay, CASE WHEN s.e4 = 0 THEN -1 ELSE round((s.e1 / s.e4)::numeric, 3) END AS ratiodeposit, CASE WHEN s.e4 = 0 THEN -1 ELSE round((s.e3 / s.e4)::numeric, 3) END AS ratiotransfer FROM s",
+        "note": "Four scalar subqueries rather than four joins, which is the relational form of the Cypher's four separate OPTIONAL MATCHes and carries the same reason: joined together, each leg would multiply the others' row counts."
+      }
+    },
+
+    "tcr10": {
+      "title": "Similarity of investor relationship",
+      "params": ["pid1", "pid2", "startTime", "endTime"],
+      "returns": ["jaccardSimilarity"],
+      "shape": "set intersection and union over two persons' invested companies, as a guarded ratio",
+      "cypher": {
+        "status": "unverified",
+        "text": "MATCH (p1:Person {id: ${pid1}}), (p2:Person {id: ${pid2}}) WITH p1, p2 OPTIONAL MATCH (p1)-[edge1:invest]->(p1Neighbor:Company) WHERE edge1.timestamp > ${startTime} AND edge1.timestamp < ${endTime} WITH p1, p2, count(DISTINCT p1Neighbor) AS p1Neighbors OPTIONAL MATCH (p2)-[edge2:invest]->(p2Neighbor:Company) WHERE edge2.timestamp > ${startTime} AND edge2.timestamp < ${endTime} WITH p1, p2, p1Neighbors, count(DISTINCT p2Neighbor) AS p2Neighbors OPTIONAL MATCH (p1)-[edge3:invest]->(midNeighbor:Company)<-[edge4:invest]-(p2) WHERE edge3.timestamp > ${startTime} AND edge3.timestamp < ${endTime} AND edge4.timestamp > ${startTime} AND edge4.timestamp < ${endTime} WITH p1Neighbors, p2Neighbors, count(DISTINCT midNeighbor) AS p12Neighbors WITH p12Neighbors AS intersection, p1Neighbors + p2Neighbors - p12Neighbors AS setUnion RETURN CASE WHEN setUnion = 0 THEN 0 ELSE round(1.0 * intersection / setUnion * 1000) / 1000 END AS jaccardSimilarity",
+        "note": "The reference names the union variable `union`, which is a reserved word; it is `setUnion` here. The inclusion-exclusion form is the reference's, and is why no vendor similarity function appears - the neo4j body calls `gds.similarity.jaccard`, which is a plugin, not a language."
+      },
+      "cypher_ladybug": {
+        "status": "unverified",
+        "text": "MATCH (p1:Person {id: ${pid1}}), (p2:Person {id: ${pid2}}) WITH p1, p2 OPTIONAL MATCH (p1)-[edge1:invest]->(p1Neighbor:Company) WHERE edge1.timestamp > ${startTime} AND edge1.timestamp < ${endTime} WITH p1, p2, count(DISTINCT p1Neighbor) AS p1Neighbors OPTIONAL MATCH (p2)-[edge2:invest]->(p2Neighbor:Company) WHERE edge2.timestamp > ${startTime} AND edge2.timestamp < ${endTime} WITH p1, p2, p1Neighbors, count(DISTINCT p2Neighbor) AS p2Neighbors OPTIONAL MATCH (p1)-[edge3:invest]->(midNeighbor:Company)<-[edge4:invest]-(p2) WHERE edge3.timestamp > ${startTime} AND edge3.timestamp < ${endTime} AND edge4.timestamp > ${startTime} AND edge4.timestamp < ${endTime} WITH p1Neighbors, p2Neighbors, count(DISTINCT midNeighbor) AS p12Neighbors WITH p12Neighbors AS intersection, p1Neighbors + p2Neighbors - p12Neighbors AS setUnion RETURN CASE WHEN setUnion = 0 THEN 0 ELSE round(1.0 * intersection / setUnion * 1000) / 1000 END AS jaccardSimilarity"
+      },
+      "sql": {
+        "status": "unverified",
+        "text": "WITH a AS (SELECT DISTINCT company_id FROM person_invest_company WHERE person_id = ${pid1} AND ts > ${startTime} AND ts < ${endTime}), b AS (SELECT DISTINCT company_id FROM person_invest_company WHERE person_id = ${pid2} AND ts > ${startTime} AND ts < ${endTime}), c AS (SELECT (SELECT count(*) FROM a JOIN b ON b.company_id = a.company_id) AS inter, (SELECT count(*) FROM a) AS na, (SELECT count(*) FROM b) AS nb) SELECT CASE WHEN (c.na + c.nb - c.inter) = 0 THEN 0 ELSE round(c.inter::numeric / (c.na + c.nb - c.inter), 3) END AS jaccardsimilarity FROM c",
+        "note": "`invest` is declared multiplicity 1 by the specification, so the DISTINCTs should be no-ops. They are written anyway, because a Jaccard computed over a bag rather than a set is wrong in a way that produces a plausible number, and the guard costs nothing at this cardinality."
+      }
+    },
+
+    "tcr11": {
+      "title": "Guarantee chain detection",
+      "params": ["id", "startTime", "endTime"],
+      "returns": ["sumLoanAmount", "numLoans"],
+      "shape": "variable-length guarantee chain (1..5) with a per-hop window filter, then the loans of every person on it",
+      "cypher": {
+        "status": "unverified",
+        "text": "MATCH p=(p1:Person {id: ${id}})-[guarantee:guarantee*1..5]->(pX:Person) WHERE all(e IN relationships(p) WHERE e.timestamp > ${startTime} AND e.timestamp < ${endTime}) UNWIND nodes(p)[1..] AS person MATCH (person)-[:apply]->(loan:Loan) WITH DISTINCT loan RETURN round(sum(loan.loanAmount) * 1000) / 1000 AS sumLoanAmount, count(loan) AS numLoans",
+        "note": "This is the one variable-length query in the family whose predicate is PER-HOP rather than monotone - every edge independently inside the window - which is why it is the only one of the five that every dialect here can express. The 1..5 bound is the reference implementation's; the specification bounds the chain only by 'until end'. `WITH DISTINCT loan` before the aggregate is load-bearing: the same loan is reached once per path through its applicant, and the specification asks for distinct loans."
+      },
+      "cypher_ladybug": {
+        "status": "unverified",
+        "text": "MATCH p=(p1:Person {id: ${id}})-[guarantee:guarantee*1..5]->(pX:Person) WHERE all(e IN relationships(p) WHERE e.timestamp > ${startTime} AND e.timestamp < ${endTime}) UNWIND nodes(p)[1..] AS person MATCH (person)-[:apply]->(loan:Loan) WITH DISTINCT loan RETURN round(sum(loan.loanAmount) * 1000) / 1000 AS sumLoanAmount, count(loan) AS numLoans",
+        "note": "If this engine's recursive-relationship filter syntax is required rather than a post-expansion `all(...)`, the per-hop predicate translates directly into it - unlike TCR1, TCR2, TCR5 and TCR8, where no such translation exists. That rewrite is not performed here because it has not been checked against a running engine."
+      },
+      "sql": {
+        "status": "unverified",
+        "text": "WITH RECURSIVE chain(p, depth) AS (SELECT g.to_id, 1 FROM person_guarantee_person g WHERE g.from_id = ${id} AND g.ts > ${startTime} AND g.ts < ${endTime} UNION ALL SELECT g.to_id, c.depth + 1 FROM chain c JOIN person_guarantee_person g ON g.from_id = c.p WHERE c.depth < 5 AND g.ts > ${startTime} AND g.ts < ${endTime}) SELECT round(COALESCE(sum(q.loan_amount), 0)::numeric, 3) AS sumloanamount, count(*) AS numloans FROM (SELECT DISTINCT l.id, l.loan_amount FROM chain c JOIN person_apply_loan a ON a.person_id = c.p JOIN loan l ON l.id = a.loan_id) q",
+        "note": "Guarantee chains are not declared acyclic by the specification, so `c.depth < 5` is the only thing that terminates this; it is the reference's bound and not a tuning choice. The inner SELECT DISTINCT is on (id, loan_amount) and is therefore distinct by loan id - two different loans of equal amount both count, which is what the specification asks and what a DISTINCT on the amount alone would get wrong."
+      }
+    },
+
+    "tcr12": {
+      "title": "Transfer to company amount statistics",
+      "params": ["id", "startTime", "endTime"],
+      "returns": ["compAccountId", "sumEdge2Amount"],
+      "shape": "fixed three-hop pattern with a per-destination sum over multi-edges",
+      "cypher": {
+        "status": "unverified",
+        "text": "MATCH (person:Person {id: ${id}})-[:own]->(pAcc:Account)-[edge2:transfer]->(compAcc:Account)<-[:own]-(company:Company) WHERE edge2.timestamp > ${startTime} AND edge2.timestamp < ${endTime} RETURN compAcc.id AS compAccountId, round(sum(edge2.amount) * 1000) / 1000 AS sumEdge2Amount ORDER BY sumEdge2Amount DESC, compAccountId",
+        "note": "Both `own` edges are anonymous here although the reference names them, because neither is read. They are also the two places where the Cypher spelling hides a distinction SQL must make explicit: `own` from a Person and `own` from a Company are one type here and two tables below, and the pattern is only correct because the endpoint LABELS separate them."
+      },
+      "cypher_ladybug": {
+        "status": "unverified",
+        "text": "MATCH (person:Person {id: ${id}})-[:own]->(pAcc:Account)-[edge2:transfer]->(compAcc:Account)<-[:own]-(company:Company) WHERE edge2.timestamp > ${startTime} AND edge2.timestamp < ${endTime} RETURN compAcc.id AS compAccountId, round(sum(edge2.amount) * 1000) / 1000 AS sumEdge2Amount ORDER BY sumEdge2Amount DESC, compAccountId",
+        "note": "The two `own` legs are exactly the case the rel_alternation_note describes: each resolves to ONE pair table (own_Person_Account and own_Company_Account respectively), selected by the endpoint labels, and not to their alternation. An executor that substitutes the full alternation for both legs turns this into a different query that also returns company-to-company rows."
+      },
+      "sql": {
+        "status": "unverified",
+        "text": "SELECT t.dst AS compaccountid, round(sum(t.amount)::numeric, 3) AS sumedge2amount FROM person_own_account o JOIN transfer t ON t.src = o.account_id JOIN company_own_account co ON co.account_id = t.dst WHERE o.person_id = ${id} AND t.ts > ${startTime} AND t.ts < ${endTime} GROUP BY t.dst ORDER BY sumedge2amount DESC, compaccountid",
+        "note": "The `account` table is never joined: `t.dst` already carries the id the query returns, and the Cypher's `compAcc` node is bound only to read that same id. Joining it would be a third lookup per row for a column already in hand, and would also be the only difference between this statement and one that is accidentally measuring a primary-key probe."
+      }
+    }
+  }
+}

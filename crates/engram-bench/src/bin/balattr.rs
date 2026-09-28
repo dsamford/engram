@@ -51,8 +51,8 @@
 //! ```
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use engram_graph::counters::{
@@ -360,7 +360,11 @@ fn main() {
     let interference = (mixed - predicted) / predicted * 100.0;
 
     let spec = if a.levers.is_empty() {
-        if a.disjoint { "defaults,disjoint".to_string() } else { "defaults".to_string() }
+        if a.disjoint {
+            "defaults,disjoint".to_string()
+        } else {
+            "defaults".to_string()
+        }
     } else {
         a.levers
             .iter()

@@ -28,7 +28,10 @@ fn rows(g: &Graph, src: &str) -> Vec<Vec<Value>> {
 
 fn fixture() -> Graph {
     let g = Graph::new(Store::new(), Realm(1), Namespace(1));
-    stmt(&g, "CREATE (:Person {id: 1}), (:Person {id: 2}), (:City {id: 3})");
+    stmt(
+        &g,
+        "CREATE (:Person {id: 1}), (:Person {id: 2}), (:City {id: 3})",
+    );
     stmt(
         &g,
         "MATCH (a:Person {id: 1}), (b:City {id: 3}) CREATE (a)-[:LIVES_IN]->(b)",
@@ -112,8 +115,8 @@ fn dbms_components_names_the_engine() {
 #[test]
 fn an_unknown_procedure_still_refuses_by_name() {
     let g = fixture();
-    let q = parse_statement("CALL db.schema.visualization() YIELD nodes RETURN nodes")
-        .expect("parses");
+    let q =
+        parse_statement("CALL db.schema.visualization() YIELD nodes RETURN nodes").expect("parses");
     let err = run_query(&g, &q, BTreeMap::new()).expect_err("must refuse");
     let msg = format!("{err:?}");
     assert!(

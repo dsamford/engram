@@ -41,15 +41,45 @@ fn record(i: i64) -> BTreeMap<String, Value> {
         s("repoId", format!("lore-e2e-{i:08x}{}", "a".repeat(20))),
         s("fullName", format!("org-{}/repo-{i}", i % 9)),
         s("orgId", format!("org-{}", i % 9)),
-        s("provider", if i % 4 == 0 { "github".into() } else { "lore".into() }),
-        s("syncMode", if i % 3 == 0 { "push".into() } else { "onboarding".into() }),
-        s("autonomyLevel", if i % 6 == 1 { "unmanaged".into() } else { "assisted".into() }),
+        s(
+            "provider",
+            if i % 4 == 0 {
+                "github".into()
+            } else {
+                "lore".into()
+            },
+        ),
+        s(
+            "syncMode",
+            if i % 3 == 0 {
+                "push".into()
+            } else {
+                "onboarding".into()
+            },
+        ),
+        s(
+            "autonomyLevel",
+            if i % 6 == 1 {
+                "unmanaged".into()
+            } else {
+                "assisted".into()
+            },
+        ),
         s("defaultBranch", "main".into()),
         s("cloneUrl", format!("scm://scm.example.net:41337/{i:032x}")),
-        s("htmlUrl", format!("https://github.example.com/org-{}/repo-{i}", i % 9)),
-        s("loreProjectId", format!("{i:08x}-b338-4020-ba04-31e41079{i:04x}")),
+        s(
+            "htmlUrl",
+            format!("https://github.example.com/org-{}/repo-{i}", i % 9),
+        ),
+        s(
+            "loreProjectId",
+            format!("{i:08x}-b338-4020-ba04-31e41079{i:04x}"),
+        ),
         s("loreRepoId", format!("{i:032x}")),
-        s("__mid", format!("4:92c0b34c-{i:04x}-4a5b-8c6d-{i:012x}:{i}")),
+        s(
+            "__mid",
+            format!("4:92c0b34c-{i:04x}-4a5b-8c6d-{i:012x}:{i}"),
+        ),
         s("createdAt", "2026-08-20T14:03:11.412Z".into()),
         s("updatedAt", "2026-09-04T22:17:45.001Z".into()),
         s("lastSyncedAt", "2026-09-04T22:17:45.001Z".into()),
@@ -58,15 +88,50 @@ fn record(i: i64) -> BTreeMap<String, Value> {
         s("kind", "service".into()),
         s("visibility", "private".into()),
         s("language", "TypeScript".into()),
-        s("description", format!("Repository {i}: {}", "lorem ipsum dolor sit amet ".repeat(4))),
+        s(
+            "description",
+            format!(
+                "Repository {i}: {}",
+                "lorem ipsum dolor sit amet ".repeat(4)
+            ),
+        ),
         s("installationId", format!("{}", 1_000_000 + i)),
         s("webhookSecretRef", format!("secret/webhook-{i}")),
-        s("ownerUserId", format!("{i:08x}-933d-472b-9d3a-5d2408e8a06b")),
-        s("settings", format!("{{\"ci\":true,\"lanes\":[\"native\",\"github\"],\"deadlineMin\":45,\"repo\":{i}}}")),
+        s(
+            "ownerUserId",
+            format!("{i:08x}-933d-472b-9d3a-5d2408e8a06b"),
+        ),
+        s(
+            "settings",
+            format!(
+                "{{\"ci\":true,\"lanes\":[\"native\",\"github\"],\"deadlineMin\":45,\"repo\":{i}}}"
+            ),
+        ),
     ] {
         m.insert(k, v);
     }
-    m.insert("pathAllowlist".to_string(), Value::List(Vec::new()));
+    // `RECDECODE_BLOB=<bytes>`: a README-sized string per record, the
+    // production repository listing's shape (182 multi-kilobyte records,
+    // 114 µs each in the engine on the mirror against 9 µs for this bench's
+    // 32 small properties) — where the blob's copies and validation go.
+    if let Some(n) = std::env::var("RECDECODE_BLOB")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        if n > 0 {
+            let unit = "# Repo\n\nA paragraph of readme text with some *markdown* and `code`.\n";
+            let mut blob = String::with_capacity(n + unit.len());
+            while blob.len() < n {
+                blob.push_str(unit);
+            }
+            blob.truncate(n);
+            m.insert("readme".to_string(), Value::Str(blob));
+        }
+    }
+    m.insert(
+        "pathAllowlist".to_string(),
+        Value::List((Vec::new()).into()),
+    );
     m.insert("archived".to_string(), Value::Bool(i % 17 == 0));
     m.insert("mirrorEnabled".to_string(), Value::Bool(i % 5 != 0));
     m.insert("protected".to_string(), Value::Bool(true));
@@ -86,7 +151,10 @@ fn corpus(records: i64) -> (Graph, Vec<u64>, std::path::PathBuf) {
         );
         for k in 0..40i64 {
             let mut f = BTreeMap::new();
-            f.insert("other".to_string(), Value::Str(format!("filler-{i}-{k}-{}", "x".repeat(60))));
+            f.insert(
+                "other".to_string(),
+                Value::Str(format!("filler-{i}-{k}-{}", "x".repeat(60))),
+            );
             f.insert("n".to_string(), Value::Int(k));
             g.create_node(&["Filler".into()], &f).expect("filler");
         }
@@ -95,7 +163,9 @@ fn corpus(records: i64) -> (Graph, Vec<u64>, std::path::PathBuf) {
     drop(g);
     let dir = std::env::temp_dir().join(format!("engram_recdecode_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("mkdir");
-    let _cache = store.into_paged(&dir, 256 * 1024 * 1024).expect("into_paged");
+    let _cache = store
+        .into_paged(&dir, 256 * 1024 * 1024)
+        .expect("into_paged");
     (Graph::new(store.clone(), Realm(1), Namespace(1)), ids, dir)
 }
 
@@ -121,7 +191,14 @@ fn main() {
     let iters: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(200);
     let (g, ids, dir) = corpus(records);
     let n = ids.len();
-    println!("records {n}, {} properties each, iters {iters}, paged store {}", record(0).len(), dir.display());
+    let blob = std::env::var("RECDECODE_BLOB")
+        .ok()
+        .unwrap_or_else(|| "0".into());
+    println!(
+        "records {n}, {} properties each, blob {blob} bytes, iters {iters}, paged store {}",
+        record(0).len(),
+        dir.display()
+    );
 
     // The store read plus the smallest decode there is — labels only, no
     // property named or copied (`node_projected` with nothing wanted).
@@ -181,10 +258,22 @@ fn main() {
     for (label, src) in [
         ("query-id", "MATCH (r:ManagedRepo) RETURN id(r) AS id"),
         ("query-bare", "MATCH (r:ManagedRepo) RETURN r"),
-        ("query-props", "MATCH (r:ManagedRepo) RETURN properties(r) AS r"),
-        ("query-count", "MATCH (r:ManagedRepo) RETURN count(properties(r)) AS n"),
-        ("query-3props", "MATCH (r:ManagedRepo) RETURN r.repoId AS id, r.fullName AS name, r.provider AS p"),
-        ("query-2label", "MATCH (r:Repo:ManagedRepo) RETURN properties(r) AS r"),
+        (
+            "query-props",
+            "MATCH (r:ManagedRepo) RETURN properties(r) AS r",
+        ),
+        (
+            "query-count",
+            "MATCH (r:ManagedRepo) RETURN count(properties(r)) AS n",
+        ),
+        (
+            "query-3props",
+            "MATCH (r:ManagedRepo) RETURN r.repoId AS id, r.fullName AS name, r.provider AS p",
+        ),
+        (
+            "query-2label",
+            "MATCH (r:Repo:ManagedRepo) RETURN properties(r) AS r",
+        ),
     ] {
         let q = parse_statement(src).expect("parse");
         time(label, n, iters, || {

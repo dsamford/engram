@@ -30,13 +30,23 @@ The binary lands at `target/release/engram-server`.
 It says what it did:
 
 ```text
+[engram-server] row budget: <rows> rows = <MiB> MiB ceiling (<source>) / 4 / 96 B per row
+[engram-server] memory ceiling: <MiB> MiB (<source>), queueing above 90% and resuming below 80%
 [engram-server] listening on bolt://127.0.0.1:7687
 [engram-server] durable: ./data/engram.wal
-[engram-server] warmed in 0 ms: 0 nodes, 0 out-edges, 0 in-edges, 0 adjacency table(s) holding 0 MB in 0 MB allocated
+[engram-server] warmed in 0 ms: 0 nodes, 0 out-edges, 0 in-edges, 0 adjacency table(s) holding 0 MB in 0 MB allocated; …
 ```
 
-Three lines, and each is worth reading:
+The values in angle brackets depend on the machine. Each line is worth
+reading:
 
+- **`row budget`** and **`memory ceiling`** — the two guards against running
+  out of memory, one per statement and one for the whole process, both derived
+  from the memory this process may use (the container's cgroup limit, else the
+  machine's `MemTotal`), with the source named in brackets. See
+  [Result paging](../using/result-paging.md). On a platform where the process
+  cannot read its own resident set, a `WARNING` line says the ceiling cannot be
+  enforced.
 - **`listening on`** — the address it actually bound, not the one you asked
   for, so `:0` or a shorthand resolves visibly.
 - **`durable:`** — the write-ahead log's path. Every acknowledged write is
@@ -66,8 +76,25 @@ can verify — after both have already acknowledged writes.
 
 In-memory is a legitimate mode for tests and for comparison runs, but it is a
 footgun as a silent default, so it is announced loudly. See
-[Durability and recovery](../using/durability.md) for the three storage modes
-and what each one loses on a crash.
+[Durability and recovery](../using/durability.md) for the storage modes and
+what each one loses on a crash.
+
+### Query parallelism is off unless you ask for it
+
+Nothing above installs morsel parallelism, and there is no flag for it.
+`ENGRAM_QUERY_PARALLELISM=6` installs a morsel pool of that width and arms
+parallel `expand` and the parallel count fold; a value of 1 or less installs
+nothing at all. So the server you just started runs each statement on one
+thread, whatever `--workers` is set to.
+
+That is a choice rather than an oversight: the deterministic lane runs with no
+executor installed at all, which it can only do if *absent* stays a supported
+configuration. It is also worth knowing before you benchmark: every Engram
+figure in [Three engines at SF3 and SF10](../measurements/three-engines-sf3-sf10.md)
+was taken with the pool installed at the container's CPU quota, and a default
+install runs each statement on one core. Parallelism does not help every query
+equally, so measure your own workload at both settings rather than assuming
+either. See [Tuning](../reference/tuning.md).
 
 ## Connect
 
@@ -120,17 +147,18 @@ RETURN name, versions, edition
 
 ```text
 name     versions     edition
-Engram   ["0.1.0"]    engram
+Engram   ["0.2.0"]    engram
 ```
 
 If that returns, the wire, the parser, the interpreter and the procedure
 surface are all working.
 
-> **Note the `YIELD … RETURN`.** Unlike Neo4j, Engram does not support a
-> *standalone* `CALL proc()` — a bare call, with or without `YIELD`, produces
-> no rows rather than the procedure's own columns. Every procedure call needs
-> an explicit `YIELD` followed by a `RETURN`. See
-> [Cypher support](../using/cypher-support.md#procedure-calls).
+> **`YIELD` is optional when the `CALL` ends the query.** Such a call answers
+> with the procedure's declared columns, so `CALL dbms.components()` on its own
+> returns the same three. `YIELD` is required only where the call is followed
+> by another clause: `CALL db.labels() RETURN label` is refused rather than
+> bind a variable nobody named. See
+> [Cypher procedures](../reference/procedures.md).
 
 ## Write something and prove it survives
 

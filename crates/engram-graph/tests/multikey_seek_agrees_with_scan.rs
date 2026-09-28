@@ -53,7 +53,10 @@ fn count(t: &engram_observe::Trace, k: &str) -> u64 {
 /// A corpus big enough that a scan and a seek are genuinely different plans,
 /// with a declared index on `id` and NONE on `nonce` — the churn shape.
 fn seeded(g: &Graph) {
-    ddl(g, "CREATE INDEX churn_id IF NOT EXISTS FOR (n:Churn) ON (n.id)");
+    ddl(
+        g,
+        "CREATE INDEX churn_id IF NOT EXISTS FOR (n:Churn) ON (n.id)",
+    );
     for i in 0..600i64 {
         let nonce = i % 7;
         let tag = i % 3;
@@ -154,8 +157,26 @@ fn the_lever_actually_switches_the_plan() {
     // enters the transaction's OCC read set. Validation then walks that set
     // under the global commit latch — so this count IS the per-statement cost
     // that made more workers slower rather than faster.
-    let on_decodes = count(&on, "graph.nodes materialised in full");
-    let off_decodes = count(&off, "graph.nodes materialised in full");
+    // COUNT PROJECTED READS TOO. A candidate is materialised either in full
+    // (`Record::decode` + `decode_props`) or by a PROJECTED read of just the
+    // demanded properties; both touch the record and both enter the read set.
+    // Once a writing statement can bind leanly this shape stopped decoding in
+    // full — the scan arm went to ONE full decode and 600 projected ones — so
+    // counting only full decodes measured the encoding of the read rather
+    // than the number of candidates, and the control read as a 99% win that
+    // was not there.
+    //
+    // The read set itself is NOT narrowed by that change, which is the
+    // property this control actually cares about: measured directly, the same
+    // writing statement records 400 entries before and after, where omitting
+    // the binding records drops it to 251
+    // (`z_read_set_size_under_a_lean_bind.rs`).
+    let materialised = |t: &engram_observe::Trace| {
+        count(t, "graph.nodes materialised in full")
+            + count(t, "graph.projected node materialisations")
+    };
+    let on_decodes = materialised(&on);
+    let off_decodes = materialised(&off);
     eprintln!(
         "[multikey seek] nodes materialised: seek {on_decodes}, scan {off_decodes} (600 :Churn)"
     );
@@ -205,7 +226,10 @@ fn an_undeclared_key_is_never_probed() {
 fn an_index_on_another_label_does_not_apply() {
     let g = graph();
     g.set_pattern_map_seek(true);
-    ddl(&g, "CREATE INDEX other_id IF NOT EXISTS FOR (n:Other) ON (n.id)");
+    ddl(
+        &g,
+        "CREATE INDEX other_id IF NOT EXISTS FOR (n:Other) ON (n.id)",
+    );
     for i in 0..600i64 {
         let nonce = i % 7;
         run(&g, &format!("CREATE (:Churn {{id: {i}, nonce: {nonce}}})"));
@@ -284,7 +308,10 @@ fn an_index_declared_after_the_first_read_is_still_seen() {
         "nothing is declared yet, so there is nothing to seek"
     );
 
-    ddl(&g, "CREATE INDEX churn_id IF NOT EXISTS FOR (n:Churn) ON (n.id)");
+    ddl(
+        &g,
+        "CREATE INDEX churn_id IF NOT EXISTS FOR (n:Churn) ON (n.id)",
+    );
 
     let (_, after) = engram_observe::with_trace(|| {
         run(&g, "MATCH (n:Churn {id: 2, nonce: 2}) SET n.touched = 1");
@@ -306,4 +333,24 @@ fn an_index_declared_after_the_first_read_is_still_seen() {
         0,
         "a dropped index must stop being consulted"
     );
+}
+
+#[test]
+#[ignore = "diagnostic — run with --ignored --nocapture"]
+fn what_now_distinguishes_the_seek_arm_from_the_scan_arm() {
+    let write = "MATCH (n:Churn {id: 17, nonce: 3}) SET n.touched = 1";
+    for on in [true, false] {
+        let g = graph();
+        g.set_pattern_map_seek(on);
+        seeded(&g);
+        let (_, t) = engram_observe::with_trace(|| run(&g, write));
+        let mut ks: Vec<(String, u64)> =
+            t.counters().iter().map(|(k, v)| (k.clone(), *v)).collect();
+        ks.retain(|(_, v)| *v > 0);
+        ks.sort();
+        println!("--- pattern_map_seek = {on} ---");
+        for (k, v) in ks {
+            println!("   {v:>8}  {k}");
+        }
+    }
 }

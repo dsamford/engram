@@ -71,6 +71,13 @@ fn count_of(c: &BTreeMap<String, u64>, key: &str) -> u64 {
 }
 
 const LEAN_REL: &str = "interp.matcher bound a lean relationship";
+/// Fix 103: a peer outside the resolved end set is skipped BEFORE its frame
+/// (no lean relationship is bound for it), and a relationship read by
+/// property binds lean with its properties by a projected record read.
+const CUT_TO_PEER: &str = "interp.expansion read only the edges to a known peer";
+const SKIPPED_END: &str =
+    "interp.expansion skipped a peer outside the resolved end set before its frame";
+const PROJ_REL: &str = "interp.matcher bound a relationship by a projected read";
 const RESOLVED: &str = "interp.matcher bound a hop end from the resolved end set";
 const SET_RESOLVED: &str = "graph.constant end set resolved";
 const SET_MEMO: &str = "graph.constant end set served from the memo";
@@ -100,17 +107,33 @@ fn corpus() -> Graph {
         let mut pm = BTreeMap::new();
         pm.insert("id".into(), s(&format!("post-{pi}")));
         pm.insert("title".into(), s(&format!("Post number {pi}")));
-        pm.insert("body".into(), s(&format!("body of post {pi}: {}", "lorem ipsum ".repeat(40))));
+        pm.insert(
+            "body".into(),
+            s(&format!("body of post {pi}: {}", "lorem ipsum ".repeat(40))),
+        );
         pm.insert("author".into(), s(&format!("u{}", pi % 50)));
-        pm.insert("createdAt".into(), s(&format!("2026-0{}-{:02}T{:02}:{:02}:00Z", 1 + (pi / 700) % 9, 1 + (pi / 24) % 28, pi % 24, (pi * 7) % 60)));
+        pm.insert(
+            "createdAt".into(),
+            s(&format!(
+                "2026-0{}-{:02}T{:02}:{:02}:00Z",
+                1 + (pi / 700) % 9,
+                1 + (pi / 24) % 28,
+                pi % 24,
+                (pi * 7) % 60
+            )),
+        );
         let p = g.create_node(&["CommunityPost".into()], &pm).expect("post");
         for k in 0..3 {
             let u = users[((pi * 3 + k) % 50) as usize];
-            g.create_rel(p, "RELEVANT_TO", u, &BTreeMap::new()).expect("rel");
+            g.create_rel(p, "RELEVANT_TO", u, &BTreeMap::new())
+                .expect("rel");
         }
         if pi % 40 == 0 {
             let mut rm = BTreeMap::new();
-            rm.insert("since".into(), s(&format!("2026-08-{:02}", 1 + (pi / 40) % 28)));
+            rm.insert(
+                "since".into(),
+                s(&format!("2026-08-{:02}", 1 + (pi / 40) % 28)),
+            );
             g.create_rel(p, "RELEVANT_TO", users[7], &rm).expect("rel");
         }
     }
@@ -132,13 +155,30 @@ fn a_the_listing_resolves_its_end_once_and_binds_lean() {
     // Every top row is a relevant post with its full property map.
     for r in &got {
         assert_eq!(r[1], Value::Bool(true), "{r:?}");
-        let Value::Map(m) = &r[0] else { panic!("not a map: {r:?}") };
+        let Value::Map(m) = &r[0] else {
+            panic!("not a map: {r:?}")
+        };
         assert!(m.contains_key("body") && m.contains_key("title"), "{m:?}");
     }
-    // 12,100 edges, each a lean relationship; 340 of their ends are the
-    // sought user, bound from the resolved set; the set was memoised by
-    // the first run; the eight survivors are the only full decodes.
-    assert_eq!(count_of(&c, LEAN_REL), 12_100, "{c:?}");
+    // 12,100 edges; 340 of their ends are the sought user, bound from the
+    // resolved set, and only those get a frame and a lean relationship. The
+    // set was memoised by the first run; the eight survivors are the only
+    // full decodes.
+    //
+    // THESE NUMBERS CHANGED, and downward. Fix 103 skipped the 11,760
+    // non-matching peers before their frame, which meant READING them first.
+    // A resolved end set of exactly ONE id now cuts the adjacency row to that
+    // peer (`edges_to_peer_slim`, two `partition_point`s), so those 11,760 are
+    // never read: the skip counter reads 0 and the cut fires once per
+    // expansion instead. The row assertions above are what guarantee the
+    // answer is unchanged.
+    assert_eq!(count_of(&c, LEAN_REL), 340, "{c:?}");
+    assert_eq!(
+        count_of(&c, SKIPPED_END),
+        0,
+        "never read, not skipped: {c:?}"
+    );
+    assert!(count_of(&c, CUT_TO_PEER) >= 1, "the row was cut: {c:?}");
     assert_eq!(count_of(&c, RESOLVED), 340, "{c:?}");
     assert!(count_of(&c, SET_MEMO) >= 1, "{c:?}");
     assert!(count_of(&c, SET_RESOLVED) <= 1, "{c:?}");
@@ -159,8 +199,10 @@ fn a_the_listing_resolves_its_end_once_and_binds_lean() {
     assert_eq!(count_of(&c, PROJECTED), 0, "{c:?}");
 }
 
-/// A relationship or end that IS read keeps its record (or its columns):
-/// `r.since` reads the relationship, `u.name` reads the end.
+/// A relationship or end that IS read keeps its properties: `r.since`
+/// reads the relationship — fix 103 binds it lean with `since` by a
+/// projected record read per frame, never a full decode — and `u.name`
+/// reads the end.
 #[test]
 fn b_a_read_relationship_or_end_keeps_the_record() {
     let g = corpus();
@@ -172,11 +214,19 @@ fn b_a_read_relationship_or_end_keeps_the_record() {
     let (got, c) = traced(&g, src, "u7");
     assert_eq!(got, want);
     assert_eq!(got.len(), 8);
-    assert_eq!(count_of(&c, LEAN_REL), 0, "a read relationship is never lean: {c:?}");
-    assert!(count_of(&c, REL_FULL) >= 12_100, "{c:?}");
+    assert_eq!(
+        count_of(&c, LEAN_REL),
+        340,
+        "a read relationship binds lean with its properties: {c:?}"
+    );
+    assert_eq!(count_of(&c, PROJ_REL), 340, "{c:?}");
+    assert_eq!(count_of(&c, REL_FULL), 0, "{c:?}");
     // The end set still resolves the map (the relationship is what is read).
     assert_eq!(count_of(&c, RESOLVED), 340, "{c:?}");
-    assert!(got[0][2] != Value::Null, "the top rows carry `since`: {got:?}");
+    assert!(
+        got[0][2] != Value::Null,
+        "the top rows carry `since`: {got:?}"
+    );
 
     let src = "MATCH (p:CommunityPost) \
         OPTIONAL MATCH (p)-[r:RELEVANT_TO]->(u:User {userId: $userId}) \
@@ -186,7 +236,16 @@ fn b_a_read_relationship_or_end_keeps_the_record() {
     let (got, c) = traced(&g, src, "u7");
     assert_eq!(got, want);
     assert_eq!(got[0][2], s("User 7"), "{got:?}");
-    assert_eq!(count_of(&c, LEAN_REL), 12_100, "{c:?}");
+    // The set still names the peers, but the ones outside it are no longer
+    // READ to be skipped — a one-id set cuts the row to its peer. The 340
+    // inside still get a lean relationship.
+    assert_eq!(count_of(&c, LEAN_REL), 340, "{c:?}");
+    assert_eq!(
+        count_of(&c, SKIPPED_END),
+        0,
+        "never read, not skipped: {c:?}"
+    );
+    assert!(count_of(&c, CUT_TO_PEER) >= 1, "the row was cut: {c:?}");
     // The set proves the map; the name is read through `mat_end` (a
     // projected get or the cached column), never a bare bind.
     assert_eq!(count_of(&c, RESOLVED), 0, "{c:?}");
@@ -194,42 +253,62 @@ fn b_a_read_relationship_or_end_keeps_the_record() {
 }
 
 /// Shapes outside the class keep the per-peer test and agree: an integer
-/// map value, a correlated map, a two-key map, an undeclared key, an
-/// undirected hop.
+/// map value, a correlated map, a two-key map, an undeclared key. An
+/// undirected hop is inside it (its end set resolves, its relationship binds
+/// lean) and agrees.
 #[test]
 fn c_shapes_outside_the_class_decline_and_agree() {
     let g = corpus();
     for (src, lean_expected) in [
         // An integer value: the index probe and `=` disagree on 7 vs 7.0.
-        ("MATCH (p:CommunityPost) OPTIONAL MATCH (p)-[r:RELEVANT_TO]->(:User {rank: $rank}) \
-          WITH p, r IS NOT NULL AS relevant RETURN p.id AS id, relevant ORDER BY relevant DESC, id ASC LIMIT toInteger($limit)", 12_100),
+        (
+            "MATCH (p:CommunityPost) OPTIONAL MATCH (p)-[r:RELEVANT_TO]->(:User {rank: $rank}) \
+          WITH p, r IS NOT NULL AS relevant RETURN p.id AS id, relevant ORDER BY relevant DESC, id ASC LIMIT toInteger($limit)",
+            12_100,
+        ),
         // A correlated map: the value differs per row.
-        ("MATCH (p:CommunityPost) OPTIONAL MATCH (p)-[r:RELEVANT_TO]->(:User {userId: p.author}) \
-          WITH p, r IS NOT NULL AS relevant RETURN p.id AS id, relevant ORDER BY relevant DESC, id ASC LIMIT toInteger($limit)", 12_100),
+        (
+            "MATCH (p:CommunityPost) OPTIONAL MATCH (p)-[r:RELEVANT_TO]->(:User {userId: p.author}) \
+          WITH p, r IS NOT NULL AS relevant RETURN p.id AS id, relevant ORDER BY relevant DESC, id ASC LIMIT toInteger($limit)",
+            12_100,
+        ),
         // Two keys.
-        ("MATCH (p:CommunityPost) OPTIONAL MATCH (p)-[r:RELEVANT_TO]->(:User {userId: $userId, rank: $rank}) \
-          WITH p, r IS NOT NULL AS relevant RETURN p.id AS id, relevant ORDER BY relevant DESC, id ASC LIMIT toInteger($limit)", 12_100),
+        (
+            "MATCH (p:CommunityPost) OPTIONAL MATCH (p)-[r:RELEVANT_TO]->(:User {userId: $userId, rank: $rank}) \
+          WITH p, r IS NOT NULL AS relevant RETURN p.id AS id, relevant ORDER BY relevant DESC, id ASC LIMIT toInteger($limit)",
+            12_100,
+        ),
         // An undeclared key.
-        ("MATCH (p:CommunityPost) OPTIONAL MATCH (p)-[r:RELEVANT_TO]->(:User {name: 'User 7'}) \
-          WITH p, r IS NOT NULL AS relevant RETURN p.id AS id, relevant ORDER BY relevant DESC, id ASC LIMIT toInteger($limit)", 12_100),
+        (
+            "MATCH (p:CommunityPost) OPTIONAL MATCH (p)-[r:RELEVANT_TO]->(:User {name: 'User 7'}) \
+          WITH p, r IS NOT NULL AS relevant RETURN p.id AS id, relevant ORDER BY relevant DESC, id ASC LIMIT toInteger($limit)",
+            12_100,
+        ),
     ] {
         let want = controls(&g, src, "u7");
         let (got, c) = traced(&g, src, "u7");
         assert_eq!(got, want, "{src}");
         assert_eq!(got.len(), 8, "{src}");
         assert_eq!(count_of(&c, RESOLVED), 0, "{src}: {c:?}");
-        assert_eq!(count_of(&c, SET_RESOLVED) + count_of(&c, SET_MEMO), 0, "{src}: {c:?}");
+        assert_eq!(
+            count_of(&c, SET_RESOLVED) + count_of(&c, SET_MEMO),
+            0,
+            "{src}: {c:?}"
+        );
         assert_eq!(count_of(&c, LEAN_REL), lean_expected, "{src}: {c:?}");
     }
-    // An undirected hop: the adjacency entry does not say which side it
-    // came from, so the relationship keeps its record — the end set (a
-    // property of the peer, not of the direction) still applies.
+    // An undirected hop. The adjacency entry does not say which side it
+    // came from, so the relationship used to keep its record; its two sides
+    // are now visited one after the other (O then I, as a `Both` visit
+    // delivers them), each entry knows its side, and it binds lean like a
+    // directed hop's. The end set (a property of the peer, not of the
+    // direction) applies either way.
     let src = "MATCH (p:CommunityPost) OPTIONAL MATCH (p)-[r:RELEVANT_TO]-(:User {userId: $userId}) \
         WITH p, r IS NOT NULL AS relevant RETURN p.id AS id, relevant ORDER BY relevant DESC, id ASC LIMIT toInteger($limit)";
     let want = controls(&g, src, "u7");
     let (got, c) = traced(&g, src, "u7");
     assert_eq!(got, want, "{src}");
-    assert_eq!(count_of(&c, LEAN_REL), 0, "{c:?}");
+    assert_eq!(count_of(&c, LEAN_REL), 340, "{c:?}");
     assert_eq!(count_of(&c, RESOLVED), 340, "{c:?}");
     assert_eq!(count_of(&c, PROJECTED), 0, "{c:?}");
 }
@@ -248,8 +327,14 @@ fn e_a_relationship_property_read_by_the_top_k_is_not_deferred() {
     let (got, c) = traced(&g, src, "u7");
     assert_eq!(got, want);
     assert_eq!(got.len(), 8);
-    assert!(got.iter().all(|r| r[1] != Value::Null), "every top row carries `since`: {got:?}");
-    assert_eq!(count_of(&c, LEAN_REL), 0, "{c:?}");
+    assert!(
+        got.iter().all(|r| r[1] != Value::Null),
+        "every top row carries `since`: {got:?}"
+    );
+    // Fix 103: `since` arrives by the projected read per frame, never a
+    // deferral the projector could not hydrate.
+    assert_eq!(count_of(&c, LEAN_REL), 340, "{c:?}");
+    assert_eq!(count_of(&c, PROJ_REL), 340, "{c:?}");
     // The general path alone (no columnar stage) answers the same.
     g.set_columnar_scans(false);
     let general = rows(&g, src, "u7");

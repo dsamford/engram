@@ -51,7 +51,8 @@ fn deferred_sync_owes_one_fsync_for_many_commits() {
     let ((), t) = engram_observe::with_trace(|| {
         for i in 0..8u64 {
             log.append(header(i), vec![i as u8]);
-            log.sync().expect("a deferred sync cannot fail — it does nothing");
+            log.sync()
+                .expect("a deferred sync cannot fail — it does nothing");
         }
     });
     assert_eq!(
@@ -74,7 +75,11 @@ fn deferred_sync_owes_one_fsync_for_many_commits() {
     // which does not trust the code under test.
     drop(log);
     let (entries, _) = Wal::open(&path).expect("reopen");
-    assert_eq!(entries.len(), 8, "all 8 entries must be readable after one fsync");
+    assert_eq!(
+        entries.len(),
+        8,
+        "all 8 entries must be readable after one fsync"
+    );
     let _ = std::fs::remove_file(&path);
 }
 
@@ -114,7 +119,8 @@ fn an_in_memory_log_never_owes_anything() {
     log.sync().expect("sync");
     assert!(!log.is_dirty(), "no sink, nothing owed");
     let ((), t) = engram_observe::with_trace(|| {
-        log.sync_now().expect("sync_now on an in-memory log is a no-op");
+        log.sync_now()
+            .expect("sync_now on an in-memory log is a no-op");
     });
     assert_eq!(fsyncs(&t), 0);
 }

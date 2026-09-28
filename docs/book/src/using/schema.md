@@ -4,7 +4,8 @@ Engram is schema-optional: you can write nodes and relationships without
 declaring anything. What you declare buys two things — **faster lookups**
 (indexes) and **enforced invariants** (constraints).
 
-Every statement on this page was run against a live server.
+The statements on this page are the forms the parser accepts, and the messages
+quoted below them are the engine's own text.
 
 ## Indexes
 
@@ -20,11 +21,19 @@ CREATE INDEX person_name FOR (p:Person) ON (p.name)
 Composite, conditional, and the relationship form:
 
 ```cypher
-CREATE INDEX person_name_born IF NOT EXISTS FOR (p:Person) ON (p.name, p.born)
+CREATE INDEX person_name_city IF NOT EXISTS FOR (p:Person) ON (p.name, p.city)
 CREATE INDEX rel_since FOR ()-[r:KNOWS]-() ON (r.since)
 ```
 
 Range indexes serve equality, prefix and range predicates, and `IN` lists.
+
+**Every component of a composite must be a string.** A composite is derived by
+joining its components' own indexes into tuple keys, and a component value that
+is not a string contributes no tuple at all — so `ON (p.name, p.born)`, with an
+integer `born`, is accepted as DDL and then never serves a composite seek. It
+does still serve seeks on its leading string property, because a seek looks for
+a declared range index whose *first* property is the one it wants. Index a
+numeric property on its own.
 
 **Label scoping matters here.** By default an index is scoped to its label, so
 `Person.id` and `Company.id` are separate. Unscoped, they would share one index
@@ -78,10 +87,51 @@ YIELD node, score
 RETURN node.title AS title, score
 ```
 
-**Scoring is term frequency, not BM25.** The tokenizer splits on
-non-alphanumerics and lowercases; there is no stemming, no stopword list and no
-configurable analyzer. Scores are comparable within one query and should not be
-read as BM25-like relevance.
+**Scoring is Okapi BM25** for any index created today — Lucene's `k1 = 1.2` and
+`b = 0.75`, with idf, and neither parameter tunable. The stamp travels with the
+index rather than with the server: an index created before BM25 existed keeps
+term-frequency scoring for ever, and `SHOW INDEXES` does not report which of the
+two an index uses. `--no-bm25-by-default` stamps a newly created index for term
+frequency instead.
+
+The tokenizer splits on non-alphanumerics and lowercases; there is no stemming,
+no stopword list and no configurable analyzer.
+
+### Trigram indexes
+
+```cypher
+CREATE TRIGRAM INDEX file_content FOR (f:File) ON (f.content)
+```
+
+This is the index that makes four predicates seekable that are otherwise
+scans: `=~`, `CONTAINS`, `ENDS WITH`, and `STARTS WITH` where no range index is
+declared. The middle two are the ones that matter most, because a range index
+cannot answer either at any price: neither is a contiguous span of any sort
+order.
+
+Four things to know:
+
+- **Nodes only, one label, one property.** There are no lists here as there are
+  in the full-text form: a per-property inverted structure spanning several
+  properties would make the write hook read the whole node on every write to any
+  of them.
+- **The declaration survives a restart; the structure does not.** Only range
+  indexes are written to on-disk sidecars, so a trigram index is rebuilt on the
+  first query that needs it.
+- **One non-string value in the indexed property disables it**, and the scan
+  answers instead. This is the one place it diverges from the range index, which
+  reports an honest floor over the rows it could order and says so. Here the
+  answer is a candidate set, and a candidate set that is a floor is simply a
+  wrong answer — the row it skipped might have matched.
+- **The answer is a superset.** Candidates are whatever satisfies the trigram
+  condition derived from the pattern, and the real predicate is then run against
+  every one of them; a condition wider than necessary costs time, and one
+  narrower than necessary would lose rows silently, so every rule in the
+  analysis returns "scan instead" the moment it is unsure.
+
+On by default; `--no-trigram-indexes` makes those four predicates scan their
+label, as the A/B arm. See [Trigram index](../reference/trigram-index.md) for
+what the analysis can constrain and when it declines.
 
 ## Constraints
 
@@ -155,8 +205,9 @@ CALL db.relationshipTypes() YIELD relationshipType RETURN relationshipType
 CALL db.propertyKeys()      YIELD propertyKey      RETURN propertyKey
 ```
 
-Remember the `YIELD … RETURN` — Engram has no standalone `CALL`. See
-[Cypher support](./cypher-support.md).
+`YIELD … RETURN` lets you narrow and rename the columns; a bare `CALL` that
+ends the query returns the procedure's declared outputs. See
+[Cypher procedures](../reference/procedures.md).
 
 ## Dropping
 
@@ -172,14 +223,23 @@ DROP CONSTRAINT person_id IF EXISTS
 | `MATCH (p:Person {email: $e})` | range on `Person.email` |
 | `MATCH (p:Person) WHERE p.born > 1800` | range on `Person.born` |
 | `MATCH (p:Person) WHERE p.name STARTS WITH 'A'` | range on `Person.name` |
+| `MATCH (d:Doc) WHERE d.body CONTAINS '…'` or `d.body =~ '…'` | trigram index on `Doc.body` |
 | semantic similarity over embeddings | vector index |
 | keyword search over text | full-text index |
 | a business identity that must not duplicate | uniqueness constraint |
 
 An anchored `MATCH` seeks a range index when the planner judges it worthwhile —
-gated on the label being large enough (512 nodes) and the predicate selective
-enough (16×), because seeking an index that is not selective is slower than
-scanning it. `--no-property-seek` forces the scan, as the control.
+gated on the label being large enough (512 nodes), the predicate selective
+enough (16×), and the match set small in absolute terms (2,048 rows), because
+seeking an index that is not selective is slower than scanning it.
+
+That third gate is the one most people meet. A full node decode costs far more
+than reading a column entry, so even a selective predicate over a very large
+label is more decodes than the scan it would replace: 5% of a 600,000-node label
+passes both of the first two gates and is still refused. The three numbers are the
+defaults for the paths that materialise a node per id; a path that walks the
+sought ids reading columns costs about a column entry per id and takes a wider
+seek. `--no-property-seek` forces the scan, as the control.
 
 ## Building on existing data
 

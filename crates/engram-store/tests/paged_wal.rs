@@ -128,7 +128,11 @@ fn b_a_spill_checkpoints_the_wal_behind_the_segments_it_wrote() {
             .spill_sealed_into_reporting(dir.path(), &cache)
             .expect("spill");
         assert_eq!(converted, 1);
-        assert_eq!(below, Some(60), "the seal's log boundary: 60 logged records");
+        assert_eq!(
+            below,
+            Some(60),
+            "the seal's log boundary: 60 logged records"
+        );
         let dropped = s.checkpoint_wal(60).expect("checkpoint");
         assert_eq!(dropped, 60);
         let anchor = Wal::read_anchor(&dir.wal()).expect("anchor");
@@ -141,12 +145,18 @@ fn b_a_spill_checkpoints_the_wal_behind_the_segments_it_wrote() {
     }
     let (s, _cache) =
         Store::open_paged_dir_with_wal(dir.path(), 8 << 20, &dir.wal()).expect("reopen");
-    assert_eq!(s.tail_versions(), 5, "only the records since the checkpoint replay");
+    assert_eq!(
+        s.tail_versions(),
+        5,
+        "only the records since the checkpoint replay"
+    );
     assert_eq!(s.log_len(), 65, "the sequence resumes at the anchor");
     assert_present(&s, 0..665, "after the checkpoint and a crash");
     // And the rotated file is small: header + five records, not sixty-five.
-    let size = std::fs::metadata(dir.wal()).expect("meta").len();
-    assert!(size < 64 + 5 * 200, "rotated WAL is {size} bytes");
+    // Its LOGICAL length — the file runs on in zero-filled space the WAL
+    // writes ahead of its end, so the metadata length says nothing here.
+    let size = Wal::logical_len(&dir.wal()).expect("a WAL");
+    assert!(size < 64 + 5 * 200, "rotated WAL holds {size} bytes of log");
 }
 
 /// A crash BETWEEN a spill and its checkpoint leaves the WAL holding records a
@@ -169,7 +179,11 @@ fn c_a_crash_between_spill_and_checkpoint_replays_no_row_twice() {
     }
     let (s, _cache) =
         Store::open_paged_dir_with_wal(dir.path(), 8 << 20, &dir.wal()).expect("reopen");
-    assert_eq!(s.tail_versions(), 0, "every WAL record is already in a segment on disk");
+    assert_eq!(
+        s.tail_versions(),
+        0,
+        "every WAL record is already in a segment on disk"
+    );
     assert_eq!(s.log_len(), 30, "the chain still runs through them");
     assert_present(&s, 0..630, "after the between-crash");
     put(&s, 630);
@@ -194,7 +208,8 @@ fn d_a_rotated_wal_is_refused_by_the_whole_history_open() {
         let (_, below) = s
             .spill_sealed_into_reporting(dir.path(), &cache)
             .expect("spill");
-        s.checkpoint_wal(below.expect("boundary")).expect("checkpoint");
+        s.checkpoint_wal(below.expect("boundary"))
+            .expect("checkpoint");
     }
     match Store::open_wal(&dir.wal()) {
         Err(OpenWalError::Format(engram_log::WalError::Rotated { first_seq })) => {
@@ -221,22 +236,36 @@ fn e_a_torn_tail_after_a_rotation_is_dropped_not_the_prefix() {
         let (_, below) = s
             .spill_sealed_into_reporting(dir.path(), &cache)
             .expect("spill");
-        s.checkpoint_wal(below.expect("boundary")).expect("checkpoint");
+        s.checkpoint_wal(below.expect("boundary"))
+            .expect("checkpoint");
         for i in 601..611u32 {
             put(&s, i);
         }
     }
-    // Tear the last record: drop five bytes off the file.
+    // Tear the last record: cut the file five bytes short of its LOGICAL end
+    // (the zero-filled space past the end goes with it — cutting only that
+    // would tear nothing).
     let path = dir.wal();
-    let len = std::fs::metadata(&path).expect("meta").len();
-    let f = std::fs::OpenOptions::new().write(true).open(&path).expect("open");
+    let len = Wal::logical_len(&path).expect("a WAL");
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("open");
     f.set_len(len - 5).expect("tear");
     drop(f);
     let (s, _cache) =
         Store::open_paged_dir_with_wal(dir.path(), 8 << 20, &dir.wal()).expect("reopen torn");
-    assert_eq!(s.tail_versions(), 9, "nine complete records replay, the torn tenth is dropped");
+    assert_eq!(
+        s.tail_versions(),
+        9,
+        "nine complete records replay, the torn tenth is dropped"
+    );
     assert_present(&s, 0..610, "the intact prefix");
-    assert_eq!(s.get(&pfx(), &610u32.to_be_bytes()), None, "the torn record is gone");
+    assert_eq!(
+        s.get(&pfx(), &610u32.to_be_bytes()),
+        None,
+        "the torn record is gone"
+    );
     assert_eq!(s.log_len(), 10, "anchor 1 + nine records");
 }
 
@@ -255,7 +284,8 @@ fn f_group_commit_fsyncs_the_rotated_file() {
         let (_, below) = s
             .spill_sealed_into_reporting(dir.path(), &cache)
             .expect("spill");
-        s.checkpoint_wal(below.expect("boundary")).expect("checkpoint");
+        s.checkpoint_wal(below.expect("boundary"))
+            .expect("checkpoint");
         for i in 601..604u32 {
             put(&s, i);
         }

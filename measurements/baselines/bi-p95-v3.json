@@ -1,0 +1,142 @@
+{
+  "_temporal_encoding": "typed",
+  "_note": "Derived from the corpus by snbparams. Every value was checked to match a non-zero number of rows. These are NOT LDBC's curated parameters: LDBC selects by percentile so each substitution costs about the same, which needs its paramgen. A number measured with these may be compared with another ENGINE on the same parameters, and may NOT be compared with a published LDBC figure.",
+  "bi1": {
+    "datetime": "2011-05-09T06:21:15.141Z"
+  },
+  "bi10a": {
+    "country": "China",
+    "maxPathDistance": "4",
+    "minPathDistance": "3",
+    "personId": "17049",
+    "personId@ldbc": "15393162799074",
+    "tagClass": "Country"
+  },
+  "bi10b": {
+    "country": "China",
+    "maxPathDistance": "4",
+    "minPathDistance": "3",
+    "personId": "17049",
+    "personId@ldbc": "15393162799074",
+    "tagClass": "Country"
+  },
+  "bi11": {
+    "country": "China",
+    "endDate": "2012-01-10T19:58:29.414Z",
+    "startDate": "2010-09-04T16:44:00.867Z"
+  },
+  "bi12": {
+    "languages": "uz",
+    "lengthThreshold": "20",
+    "startDate": "2010-09-04T16:44:00.867Z"
+  },
+  "bi13": {
+    "country": "China",
+    "endDate": "2012-01-10T19:58:29.414Z"
+  },
+  "bi14a": {
+    "country1": "China",
+    "country2": "India"
+  },
+  "bi14b": {
+    "country1": "China",
+    "country2": "India"
+  },
+  "bi15a": {
+    "endDate": "2012-01-10T19:58:29.414Z",
+    "person1Id": "17049",
+    "person1Id@ldbc": "15393162799074",
+    "person2Id": "16128",
+    "person2Id@ldbc": "19791209302403",
+    "startDate": "2010-09-04T16:44:00.867Z"
+  },
+  "bi15b": {
+    "endDate": "2012-01-10T19:58:29.414Z",
+    "person1Id": "17049",
+    "person1Id@ldbc": "15393162799074",
+    "person2Id": "16128",
+    "person2Id@ldbc": "19791209302403",
+    "startDate": "2010-09-04T16:44:00.867Z"
+  },
+  "bi16a": {
+    "dateA": "2011-10-12",
+    "dateB": "2011-10-16",
+    "maxKnowsLimit": "4",
+    "tagA": "Louis_IX_of_France",
+    "tagB": "P._G._Wodehouse"
+  },
+  "bi16b": {
+    "dateA": "2011-10-12",
+    "dateB": "2011-10-16",
+    "maxKnowsLimit": "4",
+    "tagA": "Louis_IX_of_France",
+    "tagB": "P._G._Wodehouse"
+  },
+  "bi17": {
+    "delta": "4",
+    "tag": "Louis_IX_of_France"
+  },
+  "bi18": {
+    "tag": "Louis_IX_of_France"
+  },
+  "bi19a": {
+    "city1Id": "1049",
+    "city1Id@ldbc": "1160",
+    "city2Id": "1057",
+    "city2Id@ldbc": "1168"
+  },
+  "bi19b": {
+    "city1Id": "1049",
+    "city1Id@ldbc": "1160",
+    "city2Id": "1057",
+    "city2Id@ldbc": "1168"
+  },
+  "bi20a": {
+    "company": "Air_India",
+    "person2Id": "6",
+    "person2Id@ldbc": "10027"
+  },
+  "bi20b": {
+    "company": "Air_India",
+    "person2Id": "6",
+    "person2Id@ldbc": "10027"
+  },
+  "bi2a": {
+    "date": "2011-05-09T06:21:15.141Z",
+    "tagClass": "Country"
+  },
+  "bi2b": {
+    "date": "2011-05-09T06:21:15.141Z",
+    "tagClass": "Country"
+  },
+  "bi3": {
+    "country": "China",
+    "tagClass": "Country"
+  },
+  "bi4": {
+    "date": "2011-05-09T06:21:15.141Z"
+  },
+  "bi5": {
+    "tag": "Louis_IX_of_France"
+  },
+  "bi6": {
+    "tag": "Louis_IX_of_France"
+  },
+  "bi7": {
+    "tag": "Louis_IX_of_France"
+  },
+  "bi8a": {
+    "endDate": "2012-01-10T19:58:29.414Z",
+    "startDate": "2010-09-04T16:44:00.867Z",
+    "tag": "Louis_IX_of_France"
+  },
+  "bi8b": {
+    "endDate": "2012-01-10T19:58:29.414Z",
+    "startDate": "2010-09-04T16:44:00.867Z",
+    "tag": "Louis_IX_of_France"
+  },
+  "bi9": {
+    "endDate": "2012-01-10T19:58:29.414Z",
+    "startDate": "2010-09-04T16:44:00.867Z"
+  }
+}

@@ -30,7 +30,12 @@ fn params() -> BTreeMap<String, Value> {
     let mut p = BTreeMap::new();
     p.insert(
         "names".to_string(),
-        Value::List((0..5).map(|i| s(&format!("entity-{}", i * 37))).collect()),
+        Value::List(
+            (0..5)
+                .map(|i| s(&format!("entity-{}", i * 37)))
+                .collect::<Vec<_>>()
+                .into(),
+        ),
     );
     p
 }
@@ -62,6 +67,10 @@ fn count_of(c: &BTreeMap<String, u64>, key: &str) -> u64 {
 }
 
 const REJECTED: &str = "interp.matcher rejected a non-member hop end from membership";
+/// Fix 96: a fixed single-label hop with a lean demand skips a non-member
+/// peer BEFORE its frame — the same membership answer, one step earlier —
+/// so the shapes here count their non-members under this name now.
+const SKIPPED: &str = "interp.expansion skipped a non-member peer before its frame";
 const BARE: &str = "interp.matcher bound a hop end bare";
 const PROJECTED: &str = "graph.projected node materialisations";
 const NODE_FULL: &str = "graph.nodes materialised in full";
@@ -89,7 +98,8 @@ fn corpus() -> Graph {
         let a = g.create_node(&["NewsArticle".into()], &m).expect("article");
         for k in 0..3 {
             let e = entities[((i * 3 + k) % 200) as usize];
-            g.create_rel(a, "MENTIONS", e, &BTreeMap::new()).expect("rel");
+            g.create_rel(a, "MENTIONS", e, &BTreeMap::new())
+                .expect("rel");
         }
     }
     for i in 0..2_400i64 {
@@ -101,7 +111,8 @@ fn corpus() -> Graph {
         let n = g.create_node(&["UserDataNode".into()], &m).expect("email");
         for k in 0..3 {
             let e = entities[((i * 3 + k) % 200) as usize];
-            g.create_rel(n, "MENTIONS", e, &BTreeMap::new()).expect("rel");
+            g.create_rel(n, "MENTIONS", e, &BTreeMap::new())
+                .expect("rel");
         }
     }
     g
@@ -121,12 +132,23 @@ fn a_the_non_member_ends_are_rejected_without_a_record() {
     assert_eq!(want, vec![vec![Value::Int(45)]]);
     let (got, c) = traced(&g, ORIG);
     assert_eq!(got, want);
-    assert_eq!(count_of(&c, REJECTED), 180, "{c:?}");
+    assert_eq!(count_of(&c, REJECTED) + count_of(&c, SKIPPED), 180, "{c:?}");
+    assert_eq!(
+        count_of(&c, SKIPPED),
+        180,
+        "fix 96 skips them before a frame: {c:?}"
+    );
     assert_eq!(count_of(&c, BARE), 45, "{c:?}");
     // The five entity seeds are the only projected reads — no end is read.
-    assert!(count_of(&c, PROJECTED) <= 5, "no projected read for an end the label rejects: {c:?}");
+    assert!(
+        count_of(&c, PROJECTED) <= 5,
+        "no projected read for an end the label rejects: {c:?}"
+    );
     assert_eq!(count_of(&c, NODE_FULL), 0, "{c:?}");
-    assert!(count_of(&c, GETS) < 45, "fewer record reads than the 45 articles alone: {c:?}");
+    assert!(
+        count_of(&c, GETS) < 45,
+        "fewer record reads than the 45 articles alone: {c:?}"
+    );
 }
 
 /// An end whose property is READ: the members bind from the label's
@@ -142,9 +164,12 @@ fn b_a_demanded_end_still_rejects_non_members_first() {
     assert_eq!(want.len(), 5);
     let (got, c) = traced(&g, src);
     assert_eq!(got, want);
-    assert_eq!(count_of(&c, REJECTED), 180, "{c:?}");
+    assert_eq!(count_of(&c, REJECTED) + count_of(&c, SKIPPED), 180, "{c:?}");
     // The five seeds and at most the 45 articles are read — no email.
-    assert!(count_of(&c, PROJECTED) <= 50, "at most the seeds and the 45 articles are read: {c:?}");
+    assert!(
+        count_of(&c, PROJECTED) <= 50,
+        "at most the seeds and the 45 articles are read: {c:?}"
+    );
     assert_eq!(count_of(&c, NODE_FULL), 0, "{c:?}");
 }
 
@@ -176,7 +201,10 @@ fn c_shapes_outside_the_class_decline_and_agree() {
     g.set_columnar_scans(true);
     assert_eq!(got, vec![vec![Value::Int(45)]]);
     assert_eq!(count_of(&c, REJECTED), 0, "{c:?}");
-    assert!(count_of(&c, PROJECTED) + count_of(&c, NODE_FULL) >= 225, "the control reads every end: {c:?}");
+    assert!(
+        count_of(&c, PROJECTED) + count_of(&c, NODE_FULL) >= 225,
+        "the control reads every end: {c:?}"
+    );
 }
 
 /// A statement's OWN writes are visible to the membership the sentinel
@@ -188,19 +216,27 @@ fn c_shapes_outside_the_class_decline_and_agree() {
 #[test]
 fn d_a_statements_own_created_member_is_seen_by_the_sentinel() {
     let g = corpus();
-    let src = "MATCH (e:Entity {name: 'entity-0'})<-[:MENTIONS]-(a:NewsArticle) RETURN count(a) AS n";
+    let src =
+        "MATCH (e:Entity {name: 'entity-0'})<-[:MENTIONS]-(a:NewsArticle) RETURN count(a) AS n";
     let before = rows(&g, src);
     assert_eq!(before, vec![vec![Value::Int(9)]]);
     let txn = "MATCH (e:Entity {name: 'entity-0'}) \
         CREATE (fresh:NewsArticle {articleId: 'article-fresh'})-[:MENTIONS]->(e) \
         WITH e MATCH (e)<-[:MENTIONS]-(a:NewsArticle) RETURN count(a) AS n";
     let q = parse_statement(txn).expect("parse");
-    let (got, trace) = engram_observe::with_trace(|| {
-        run_query(&g, &q, params()).expect("run").rows
-    });
+    let (got, trace) =
+        engram_observe::with_trace(|| run_query(&g, &q, params()).expect("run").rows);
     let c = trace.counters().clone();
-    assert_eq!(got, vec![vec![Value::Int(10)]], "the just-created article counts: {c:?}");
-    assert_eq!(count_of(&c, REJECTED), 36, "the 36 emails, not the fresh article: {c:?}");
+    assert_eq!(
+        got,
+        vec![vec![Value::Int(10)]],
+        "the just-created article counts: {c:?}"
+    );
+    assert_eq!(
+        count_of(&c, REJECTED) + count_of(&c, SKIPPED),
+        36,
+        "the 36 emails, not the fresh article: {c:?}"
+    );
     // Committed, the new article is a member the snapshot knows.
     assert_eq!(rows(&g, src), vec![vec![Value::Int(10)]]);
 }

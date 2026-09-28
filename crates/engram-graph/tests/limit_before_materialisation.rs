@@ -82,12 +82,15 @@ fn full_decodes(g: &Graph, src: &str) -> u64 {
 fn a_limited_projection_decodes_only_the_rows_it_returns() {
     let g = fixture();
     const LIMIT: usize = 25;
-    let src = format!(
-        "MATCH (p:Person {{id: 0}})<-[:HAS_CREATOR]-(m:Message) RETURN m.id LIMIT {LIMIT}"
-    );
+    let src =
+        format!("MATCH (p:Person {{id: 0}})<-[:HAS_CREATOR]-(m:Message) RETURN m.id LIMIT {LIMIT}");
 
     let answer = rows(&g, &src);
-    assert_eq!(answer.len(), LIMIT, "the fixture must actually hit the limit");
+    assert_eq!(
+        answer.len(),
+        LIMIT,
+        "the fixture must actually hit the limit"
+    );
 
     let decodes = full_decodes(&g, &src);
     eprintln!("[limit] {MSGS} messages, LIMIT {LIMIT} -> {decodes} full node decode(s)");

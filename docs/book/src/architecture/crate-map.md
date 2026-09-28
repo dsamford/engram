@@ -1,7 +1,8 @@
 # Crate map and dependency rules
 
-Sixteen crates plus `xtask`, in a strictly acyclic graph with
-`engram-observe` — which has no dependencies of its own — at the root.
+Seventeen crates plus `xtask`, in a strictly acyclic graph with two roots:
+`engram-observe` and `engram-proc`, neither of which has a dependency of its
+own.
 
 The boundaries are not conventions. Each is enforced by something that fails a
 build.
@@ -17,6 +18,7 @@ flowchart TB
     BOLT["engram-bolt<br/>sans-io"]
     GRAPH["engram-graph<br/>model, planner, execution"]
     CYPHER["engram-cypher<br/>knows NOTHING of the store"]
+    PROC["engram-proc<br/>the procedure catalogue, as data"]
     STORE["engram-store<br/>MVCC LSM"]
     LOG["engram-log"]
     KEY["engram-key"]
@@ -28,6 +30,8 @@ flowchart TB
     SRV --> BOLT
     BOLT --> GRAPH
     GRAPH --> CYPHER
+    GRAPH --> PROC
+    CYPHER --> PROC
     GRAPH --> STORE
     GRAPH --> KEY
     STORE --> LOG
@@ -41,22 +45,30 @@ flowchart TB
 The four seam crates — `engram-exec`, `engram-crypto`, `engram-objstore`,
 `engram-blob` — sit outside this path entirely. See [Seams](./seams.md).
 
-`engram-runtime` is a **dev-dependency** of every engine crate; only
-`engram-sim` depends on it for real. It is the simulation lane's executor, not
-the serving path's.
+`engram-runtime` is a **dev-dependency** of the crates that simulate —
+`engram-store`, `engram-graph`, `engram-exec`, `engram-objstore` and
+`engram-blob`; only `engram-sim` depends on it for real. It is the simulation
+lane's executor, not the serving path's.
 
 ## The rules, and what enforces each
 
-### 1. `engram-cypher` has exactly one dependency
+### 1. `engram-cypher` depends on no store and no graph
 
-`engram-observe`. No store, no graph.
+Its internal dependencies are `engram-observe` and `engram-proc` — the
+assertion vocabulary and the procedure catalogue, both of which are
+declarations and neither of which can read a row. (`regex`, `regex-syntax`,
+`tz-rs` and `tzdb` are the third-party four.)
 
-Graph access during evaluation happens through a **`GraphHooks` trait** that
-`engram-graph` implements. That is what lets the parser, the value model and the
-TCK harness be tested without a store existing.
+The rule is not a count, and stating it as one has already gone stale once:
+`engram-proc` was added and the boundary held, because what the boundary
+forbids is a dependency that can reach data. Graph access during evaluation
+happens through a **`GraphHooks` trait** that `engram-graph` implements. That
+is what lets the parser, the value model and the TCK harness be tested without
+a store existing.
 
-*Enforced by:* the dependency graph. Adding `engram-store` to that manifest is
-the whole violation.
+*Enforced by:* the dependency graph. Adding `engram-store` or `engram-graph` to
+that manifest is the violation; adding a leaf crate that holds only
+declarations is not.
 
 ### 2. `engram-bolt` is sans-io
 
@@ -72,7 +84,14 @@ with byte arrays.
 ### 3. The engine never spawns a thread
 
 `clippy.toml` denies `std::thread::spawn` and `std::thread::sleep`
-workspace-wide. `engram-server` is the only crate that opts out.
+workspace-wide. `engram-server` is the only crate **on the serving path** that
+opts out wholesale. The benchmark binaries and many integration tests carry the same
+waiver — they need real threads and a real clock, which is the point of them —
+so a grep finds dozens of hits and none of them is on the path a client's bytes
+take. Inside the engine one function waives the `thread::sleep` rule at item
+level — the memory-admission queue's bounded poll, which sleeps the waiting
+statement's own thread — and nothing waives `thread::spawn`; see
+[The three decisions](./three-decisions.md#where-the-clock-actually-enters).
 
 Parallelism re-enters through the `ScopedExec` seam, whose only production
 implementor is the server.
@@ -84,7 +103,9 @@ what the lint cannot see.
 
 `clippy.toml` denies `Instant::now` and `SystemTime::now`. The adapter calls
 `graph.set_wall_ms(now)` immediately before feeding bytes; anything needing
-ordering uses the store's commit counter.
+ordering uses the store's commit counter. The one engine clock read, the
+algorithm phase report behind `ENGRAM_ALGO_TIMING=1`, prints to stderr and is
+never an input to an answer.
 
 *Enforced by:* the lints, then the determinism gate — two processes, one seed,
 one identical trace digest.
@@ -135,6 +156,7 @@ one below:
 | crate | testable without |
 |---|---|
 | `engram-observe` | anything |
+| `engram-proc` | anything |
 | `engram-key` | a store |
 | `engram-log` | a store |
 | `engram-cypher` | a store or a graph |
@@ -142,24 +164,31 @@ one below:
 | `engram-graph` | a network |
 | `engram-server` | — it is the adapter |
 
-That is why `engram-graph` has 196 integration test files and no network in any
-of them.
+That is why `engram-graph` has over 360 integration test files and no network
+in any of them.
 
 ## The two crates that are not published
 
 `engram-tck` (`publish = false`) vendors the openCypher TCK, which is Apache-2.0
 and copyright Neo4j Sweden AB, redistributed under its own terms.
 
-`engram-bench` (`publish = false`) holds nineteen harness binaries.
+`engram-bench` (`publish = false`) holds thirty-two harness binaries: the LSQB,
+SNB, FinBench and Graphalytics drivers, the corpus loaders and generators, the
+stress and concurrency rigs, and a probe per mechanism. Nothing gates that
+count and it has been wrong three times, so read `crates/engram-bench/src/bin/`
+rather than this sentence if it matters.
 
 ## Where the size is
 
-`engram-graph` is **52% of the engine's source lines and 71% of its test
-files** — the centre of gravity by a wide margin. `interp.rs`, `pipeline.rs`
-and `lib.rs` are each over 10,000 lines.
+`engram-graph` is about two-thirds of the engine's source lines and roughly
+three-quarters of its test files — the centre of gravity by a wide margin.
+`interp.rs` is about 24,000 lines, `pipeline.rs` and `lib.rs` each about
+16,000, and `batch.rs` — the columnar recognisers — over 7,000. (Exact percentages
+used to stand here; nothing gates them, they drifted twice, and the shape of
+the claim never depended on the second digit.)
 
 Worth knowing before you go looking: if it concerns the graph model, the planner
-or execution, it is almost certainly in one of those three.
+or execution, it is almost certainly in one of those four.
 
 ## Next
 

@@ -12,6 +12,15 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # The benchmark harness is a MEASURING INSTRUMENT, and an instrument nobody
+  # exercises drifts without saying so. Every sweep in `docs/bench/` is a
+  # hand-invoked pod script, so until this schedule existed the only thing
+  # standing between a broken lane and a wrong number was somebody noticing.
+  # `bench-smoke` below runs the harness end to end against a corpus small
+  # enough for a hosted runner -- it is not a performance measurement and must
+  # never be quoted as one.
+  schedule:
+    - cron: "17 4 * * *"
 
 permissions:
   contents: read
@@ -74,6 +83,91 @@ jobs:
       # No `examples/` may rot: every runnable snippet the book promises is a
       # real example target, so this is what keeps the documentation honest.
       - run: cargo test --workspace --examples
+
+  # ── The instrument's own smoke test ──────────────────────────────────
+  #
+  # NOT a benchmark. It asserts that the lanes RUN and that their refusals
+  # still fire, on a corpus two orders of magnitude below anything measured.
+  # Timings from a shared hosted runner are meaningless and are deliberately
+  # not recorded: the failure this guards is a lane that stopped working, not
+  # a regression in speed.
+  #
+  # The three read batteries need a corpus that is not in the repository, so
+  # they are exercised here through their REFUSAL paths -- which is the part
+  # most likely to rot, because it is the part no pod script ever reaches.
+  bench-smoke:
+    name: benchmark harness smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: The harness and its lanes build
+        run: cargo build -p engram-bench --bins
+      - name: Every catalogue parses, and every family's digest is stable
+        run: cargo test -p engram-bench --lib catalogue
+      - name: Parameter binding and coercion hold
+        run: "cargo test -p engram-bench --lib -- params:: backend::bind_tests"
+      - name: A read battery still refuses to run without its parameters
+        run: >-
+          cargo test -p engram-bench
+          --test a_read_battery_refuses_to_run_without_its_parameters
+      - name: The stress lane's shapes all render
+        run: cargo test -p engram-bench --bin stress
+      # The regression gate is the half of the scheduled lane that has TEETH:
+      # `compare` asks whether two documents may be set beside each other,
+      # this asks whether the newer one got WORSE. Its direction case is the
+      # one worth running here -- `Row::value` is ops/s for stress and
+      # MILLISECONDS on every other lane, so a gate with the sign backwards
+      # would pass every real regression on half the lanes and fail every
+      # speed-up on the other half, looking green either way.
+      - name: The regression gate fires, and fires in the right direction
+        run: cargo test -p engram-bench --lib regression_gate
+      # A catalogue nothing checks against the code is decoration: it would go
+      # on stamping a digest while the lane ran something else, which is
+      # exactly the claim the digest exists to make checkable.
+      - name: The Graphalytics catalogue matches the kernels the lane runs
+        run: cargo test -p engram-bench --bin graphalytics catalogue_agrees
+      # END TO END, because every step above this one is a unit test and the
+      # regression gate passed nine of them while being INERT: `--baseline b.json`
+      # loaded `b.json` as a second RESULT document and the gate compared the
+      # baseline with itself. Only running the whole chain found that.
+      #
+      # This is NOT a performance measurement and must never be quoted as one --
+      # two clients for five seconds on a hosted runner. What it proves is that
+      # the lane still runs, still stamps rig and fairness, still writes a
+      # document the reporter accepts, and that the gate is still WIRED.
+      - name: A battery runs end to end and the regression gate is live
+        run: |
+          set -euo pipefail
+          cargo build --release -p engram-server -p engram-bench --bin harness
+          STORE="$(mktemp -d)"
+          # The fairness stamp must match the ENGINE, not the machine: the
+          # harness refuses a run whose stamp contradicts the served width.
+          ENGRAM_QUERY_PARALLELISM=1 ./target/release/engram-server 127.0.0.1:7899             --paged-dir "$STORE" --paged-cache-mb 256 --workers 2             --read-timeout-secs 0 > server.log 2>&1 &
+          for _ in $(seq 1 180); do grep -q 'warmed in' server.log && break; sleep 1; done
+          grep -q 'warmed in' server.log || { echo "server never warmed"; cat server.log; exit 1; }
+          # Describe THIS runner rather than borrowing a rig name it has not
+          # earned -- a wrong stamp compares, an absent one does not.
+          RIG="ci-runner:gh-hosted:$(nproc):none:$(free -m | awk '/^Mem:/{print $2}')"
+          ./target/release/harness stress 127.0.0.1:7899 balanced 2 5             --writes single --rig "$RIG" --thread-cap 1 --cache-mb 256             --keys 500 --json run.json
+          # The gate must PASS against itself...
+          ./target/release/harness report run.json --baseline run.json
+          # ...and must FAIL on an injected regression. A gate nobody has seen
+          # fail is not known to be a gate.
+          python3 - <<'EOF'
+          import re
+          t = open('run.json').read()
+          m = re.search(r'"ops_per_sec"\s*:\s*([0-9.]+)', t)
+          assert m, "no ops_per_sec in the document"
+          open('fast.json', 'w').write(t[:m.start(1)] + str(float(m.group(1)) * 4) + t[m.end(1):])
+          EOF
+          if ./target/release/harness report run.json --baseline fast.json; then
+            echo "THE REGRESSION GATE DID NOT FIRE on a 4x-faster baseline"
+            exit 1
+          fi
+          echo "regression gate fired as expected"
 
   gates:
     name: xtask gates
@@ -150,13 +244,17 @@ jobs:
         if: steps.src.outputs.source == 'true'
         run: |
           cd "${RUNNER_TEMP}/engram-public"
-          test ! -e measurements
+          # measurements/ ships only the checked-in regression baselines.
+          if [ -e measurements ]; then
+            extra=$(find measurements -mindepth 1 -maxdepth 1 ! -name baselines)
+            test -z "$extra" || { echo "unexpected under measurements/: $extra"; exit 1; }
+          fi
           test ! -e datasets
           # The allow-list is closed, so the only dot-entries that may survive
-          # are the two that have a rule.
+          # are the ones that have a rule.
           for e in .[!.]*; do
             case "$e" in
-              .github|.gitignore|.gitattributes|'.[!.]*') ;;
+              .cargo|.github|.gitignore|.gitattributes|'.[!.]*') ;;
               *) echo "unexpected dot-entry in the publishable tree: $e"; exit 1 ;;
             esac
           done

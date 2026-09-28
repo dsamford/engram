@@ -11,6 +11,7 @@ blake3 = "1"
 engram-cypher.workspace = true
 engram-key.workspace = true
 engram-observe.workspace = true
+engram-proc.workspace = true
 engram-store.workspace = true
 # Lock-free atomic-Arc swap for the epoch-keyed read caches: readers load the
 # built cache with no lock (the D2-revision read-scaling refactor), so many
@@ -18,6 +19,7 @@ engram-store.workspace = true
 arc-swap = "1"
 
 [dev-dependencies]
+engram-proc.workspace = true
 engram-runtime.workspace = true
 
 [lints]

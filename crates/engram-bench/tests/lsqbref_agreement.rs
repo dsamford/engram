@@ -16,9 +16,10 @@
 //! `CARGO_BIN_EXE_*`, which cargo sets for integration tests of the package
 //! that owns them.
 //!
-//! The query texts are copied verbatim from `lsqb.rs`'s table and a test
-//! pins them to that source file, so this cannot drift into comparing the
-//! oracle against a different query than the lane measures.
+//! The query texts are copied verbatim from the shared statement catalogue
+//! the lane renders from, and a test pins them to it, so this cannot drift
+//! into comparing the oracle against a different query than the lane
+//! measures.
 
 // A real clock for the per-query timings the table reports — the same waiver
 // the other bench targets carry; the engine crates keep the lint.
@@ -35,7 +36,8 @@ use engram_graph::{Graph, run_query};
 use engram_key::{Namespace, Realm};
 use engram_store::Store;
 
-/// The nine, verbatim from `lsqb.rs` (pinned by `queries_are_the_lane_table`).
+/// The nine, verbatim from the statement catalogue (pinned by
+/// `queries_are_the_lane_table`).
 const QUERIES: [(&str, &str); 9] = [
     (
         "q1",
@@ -99,10 +101,7 @@ const QUERIES: [(&str, &str); 9] = [
 
 /// A fresh, process-unique corpus directory under the system temp dir.
 fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "lsqbref-agreement-{}-{name}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("lsqbref-agreement-{}-{name}", std::process::id()));
     if dir.exists() {
         std::fs::remove_dir_all(&dir).expect("clear stale scratch dir");
     }
@@ -138,10 +137,16 @@ fn oracle(dir: &Path) -> BTreeMap<String, i64> {
     };
     let mut counts = BTreeMap::new();
     for (k, v) in m {
-        let Value::Int(n) = v else { panic!("{k}: non-integer count {v:?}") };
+        let Value::Int(n) = v else {
+            panic!("{k}: non-integer count {v:?}")
+        };
         counts.insert(k, n);
     }
-    assert_eq!(counts.len(), 9, "the oracle must answer all nine: {counts:?}");
+    assert_eq!(
+        counts.len(),
+        9,
+        "the oracle must answer all nine: {counts:?}"
+    );
     counts
 }
 
@@ -150,8 +155,14 @@ fn oracle(dir: &Path) -> BTreeMap<String, i64> {
 fn engine(dir: &Path, columnar: bool) -> BTreeMap<String, i64> {
     let g = Graph::new(Store::new(), Realm(1), Namespace(1));
     let stats = engram_bench::load_export(&g, dir);
-    assert!(stats.nodes > 0 && stats.rels > 0, "engine loaded nothing: {stats:?}");
-    assert_eq!(stats.dangling, 0, "a corpus with dangling rels is not the one snbgen wrote");
+    assert!(
+        stats.nodes > 0 && stats.rels > 0,
+        "engine loaded nothing: {stats:?}"
+    );
+    assert_eq!(
+        stats.dangling, 0,
+        "a corpus with dangling rels is not the one snbgen wrote"
+    );
     let store = g.shared_store();
     store.seal();
     store.compact();
@@ -161,7 +172,8 @@ fn engine(dir: &Path, columnar: bool) -> BTreeMap<String, i64> {
     for (name, text) in QUERIES {
         let q = parse_statement(text).unwrap_or_else(|e| panic!("{name}: parse: {e:?}"));
         let t = Instant::now();
-        let res = run_query(&g, &q, BTreeMap::new()).unwrap_or_else(|e| panic!("{name}: run: {e:?}"));
+        let res =
+            run_query(&g, &q, BTreeMap::new()).unwrap_or_else(|e| panic!("{name}: run: {e:?}"));
         eprintln!(
             "[lsqbref-agreement] engine {path:<8} {name} in {:.1}s",
             t.elapsed().as_secs_f64()
@@ -187,7 +199,10 @@ fn agree(persons: u64) {
     let columnar = engine(&dir, true);
 
     eprintln!("[lsqbref-agreement] snbgen persons={persons} seed=1");
-    eprintln!("[lsqbref-agreement] {:<4} {:>12} {:>12} {:>12}  verdict", "q", "oracle", "general", "columnar");
+    eprintln!(
+        "[lsqbref-agreement] {:<4} {:>12} {:>12} {:>12}  verdict",
+        "q", "oracle", "general", "columnar"
+    );
     let mut disagreements = Vec::new();
     for (name, _) in QUERIES {
         let (o, ge, co) = (oracle[name], general[name], columnar[name]);
@@ -249,19 +264,37 @@ fn oracle_agrees_with_engine_on_1000_persons() {
     full_or_skip(1000);
 }
 
-/// The texts above ARE the lane's table: read `lsqb.rs`'s source with its
-/// `\`-continuations joined and require every text to appear in it.
+/// The texts above ARE the ones the lane measures: compared byte for byte
+/// against the shared statement catalogue.
+///
+/// This used to read `lsqb.rs`'s source and join its `\`-continuations,
+/// because the lane carried its own copy of the text. The lane now renders
+/// from `catalogue/statements.json` and carries none, so the pin moved to the
+/// catalogue — the same claim, made against the thing that actually decides
+/// what gets sent, and now an equality rather than a `contains`.
 #[test]
 fn queries_are_the_lane_table() {
-    let src: String = include_str!("../src/bin/lsqb.rs").chars().filter(|&c| c != '\r').collect();
-    let mut joined = String::with_capacity(src.len());
-    let mut rest = src.as_str();
-    while let Some(i) = rest.find("\\\n") {
-        joined.push_str(&rest[..i]);
-        rest = rest[i + 2..].trim_start_matches([' ', '\t']);
-    }
-    joined.push_str(rest);
+    use engram_bench::catalogue::{Catalogue, Dialect};
+
+    let cat = Catalogue::load().expect("the compiled-in statement catalogue");
+    let mut checked = 0usize;
     for (name, text) in QUERIES {
-        assert!(joined.contains(text), "{name}: differs from lsqb.rs:\n{text}");
+        let entry = cat
+            .lsqb(name, Dialect::Cypher)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(
+            entry.text, text,
+            "\n{name}: this differential compares a DIFFERENT query from the one the \
+             lane measures.\n  catalogue: {}\n  here:      {text}",
+            entry.text
+        );
+        checked += 1;
     }
+    // A loop that checked nothing passes every assertion it never made.
+    assert_eq!(checked, 9, "all nine texts must have been compared");
+    assert_eq!(
+        cat.lsqb_names().expect("lsqb names").len(),
+        QUERIES.len(),
+        "the catalogue and this file disagree on how many queries exist"
+    );
 }

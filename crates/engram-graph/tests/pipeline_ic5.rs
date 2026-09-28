@@ -287,7 +287,11 @@ fn non_order_safe_return_declines() {
         "a non-total ORDER BY must DECLINE the composite"
     );
     assert_eq!(
-        counter(&g, src, "interp.consecutive matches fused for the recognisers"),
+        counter(
+            &g,
+            src,
+            "interp.consecutive matches fused for the recognisers"
+        ),
         1,
         "the trailing MATCHes are re-offered fused after the composite declines"
     );

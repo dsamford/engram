@@ -71,7 +71,9 @@ fn seeded(paged: Option<std::path::PathBuf>) -> (Graph, World, u32, u32) {
     g.set_single_node_stale_walk(false);
     let label = vec!["N".to_string()];
     let none = BTreeMap::new();
-    let nodes: Vec<u64> = (0..NODES).map(|_| g.create_node(&label, &none).expect("node")).collect();
+    let nodes: Vec<u64> = (0..NODES)
+        .map(|_| g.create_node(&label, &none).expect("node"))
+        .collect();
     let mut rng = Lcg(0xC0FF_EE00_D15E_A5E5);
     let mut rels = Vec::new();
     for &src in &nodes {
@@ -191,7 +193,12 @@ fn check_against_oracles(g: &Graph, world: &World, t: u32, u: u32, round: u64) {
             }
         }
     }
-    assert_eq!(mismatches, 0, "round {round}: {mismatches} row(s) differ; first: {}", first.unwrap_or_default());
+    assert_eq!(
+        mismatches,
+        0,
+        "round {round}: {mismatches} row(s) differ; first: {}",
+        first.unwrap_or_default()
+    );
     g.set_adj_table_max_entries(0);
     for (dir, tt) in keys(t, u) {
         for &n in world.nodes.iter().step_by(13) {
@@ -203,8 +210,16 @@ fn check_against_oracles(g: &Graph, world: &World, t: u32, u: u32, round: u64) {
         }
     }
     g.set_adj_table_max_entries(64 << 20);
-    let total: usize = world.nodes.iter().map(|&n| g.adjacent_slim(n, Dir::Out, &None).len()).sum();
-    assert_eq!(total, world.rels.len(), "round {round}: live relationship count drifted");
+    let total: usize = world
+        .nodes
+        .iter()
+        .map(|&n| g.adjacent_slim(n, Dir::Out, &None).len())
+        .sum();
+    assert_eq!(
+        total,
+        world.rels.len(),
+        "round {round}: live relationship count drifted"
+    );
 }
 
 fn run(paged: Option<std::path::PathBuf>, seed: u64) {
@@ -217,7 +232,10 @@ fn run(paged: Option<std::path::PathBuf>, seed: u64) {
         let (_, trace) = engram_observe::with_trace(|| {
             if round == 1 {
                 let r = g.refresh_stale_derived();
-                assert!(r.any(), "round {round}: the refresh brought nothing current: {r:?}");
+                assert!(
+                    r.any(),
+                    "round {round}: the refresh brought nothing current: {r:?}"
+                );
             } else {
                 read_all_keys(&g, &world, t, u);
             }
@@ -233,13 +251,19 @@ fn run(paged: Option<std::path::PathBuf>, seed: u64) {
         }
         check_against_oracles(&g, &world, t, u, round);
     }
-    eprintln!("[over-cap differential] paged={} totals={totals:?}", paged.is_some());
+    eprintln!(
+        "[over-cap differential] paged={} totals={totals:?}",
+        paged.is_some()
+    );
     assert!(
         totals["graph.adjacency repair admitted by cost over the node cap"] >= 2,
         "the over-cap admission path was not exercised: {totals:?}"
     );
     assert!(totals["graph.adjacency tables repaired"] >= 2, "{totals:?}");
-    assert!(totals["graph.adjacency table overlay folded"] >= 1, "no fold across repairs: {totals:?}");
+    assert!(
+        totals["graph.adjacency table overlay folded"] >= 1,
+        "no fold across repairs: {totals:?}"
+    );
     if let Some(dir) = paged {
         drop(g);
         let _ = std::fs::remove_dir_all(dir);

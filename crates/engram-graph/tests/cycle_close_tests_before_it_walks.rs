@@ -122,10 +122,8 @@ fn the_closing_hop_skips_the_walk_when_no_edge_exists() {
     // EXACTNESS. The short circuit may only remove work. Same fixture, same
     // query, run through the path that does NOT track isomorphism — a
     // single-hop close — must agree about which pairs are connected.
-    let pairs = parse_statement(
-        "MATCH (a:Person)-[:KNOWS]-(b:Person) RETURN count(*) AS count",
-    )
-    .expect("parse");
+    let pairs = parse_statement("MATCH (a:Person)-[:KNOWS]-(b:Person) RETURN count(*) AS count")
+        .expect("parse");
     let pr = run_query(&g, &pairs, BTreeMap::new()).expect("run pairs");
     let npairs = match pr.rows.first().and_then(|row| row.first()) {
         Some(Value::Int(n)) => *n,

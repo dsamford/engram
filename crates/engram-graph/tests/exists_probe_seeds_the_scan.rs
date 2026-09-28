@@ -83,9 +83,15 @@ fn corpus() -> Graph {
         let mut m = BTreeMap::new();
         m.insert("itemId".to_string(), Value::Str(format!("item-{i:04}")));
         m.insert("sortOrder".to_string(), Value::Int((i * 7) % 101));
-        m.insert("title".to_string(), Value::Str(format!("item {i} of {}", i % 30)));
+        m.insert(
+            "title".to_string(),
+            Value::Str(format!("item {i} of {}", i % 30)),
+        );
         // Every fifth item OF EACH PROJECT is done (20 of its 100).
-        m.insert("status".to_string(), Value::Str(if (i / 30) % 5 == 0 { "done" } else { "open" }.to_string()));
+        m.insert(
+            "status".to_string(),
+            Value::Str(if (i / 30) % 5 == 0 { "done" } else { "open" }.to_string()),
+        );
         let w = g.create_node(&["Item".into()], &m).expect("item");
         g.create_rel(w, "BELONGS_TO", projs[(i % 30) as usize], &BTreeMap::new())
             .expect("belongs");
@@ -133,7 +139,10 @@ fn the_listing_is_seeded_from_the_projects_incoming_edges() {
         let (got, c) = traced(&g, written);
         g.set_columnar_scans(true);
         assert_eq!(got, want, "`{written}`");
-        assert!(count_of(&c, SEEDED) > 0, "`{written}` seeds from the probe: {c:?}");
+        assert!(
+            count_of(&c, SEEDED) > 0,
+            "`{written}` seeds from the probe: {c:?}"
+        );
         // The probe walk, the start, the re-checked conjunct and the
         // comprehension each read a candidate — a handful of reads per
         // candidate for the project's 100 items, never the 3,000-item label
@@ -187,10 +196,20 @@ fn the_seed_never_answers_by_itself() {
     assert!(r.rows.is_empty(), "no item belongs to proj-99");
     assert!(count_of(trace.counters(), SEEDED) > 0);
     // Every item of proj-07 is 'open' or 'done'; the status conjunct prunes.
-    let open = general(&g, "MATCH (w:Item) WHERE EXISTS { (w)-[:BELONGS_TO]->(:Proj {id: $pid}) } AND w.status = 'done' RETURN count(w) AS n");
-    assert_eq!(open, vec![vec![Value::Int(20)]], "fixture: 20 of proj-07's 100 items are done");
+    let open = general(
+        &g,
+        "MATCH (w:Item) WHERE EXISTS { (w)-[:BELONGS_TO]->(:Proj {id: $pid}) } AND w.status = 'done' RETURN count(w) AS n",
+    );
+    assert_eq!(
+        open,
+        vec![vec![Value::Int(20)]],
+        "fixture: 20 of proj-07's 100 items are done"
+    );
     g.set_columnar_scans(false);
-    let got = rows(&g, "MATCH (w:Item) WHERE EXISTS { (w)-[:BELONGS_TO]->(:Proj {id: $pid}) } AND w.status = 'done' RETURN count(w) AS n");
+    let got = rows(
+        &g,
+        "MATCH (w:Item) WHERE EXISTS { (w)-[:BELONGS_TO]->(:Proj {id: $pid}) } AND w.status = 'done' RETURN count(w) AS n",
+    );
     g.set_columnar_scans(true);
     assert_eq!(got, open);
 }

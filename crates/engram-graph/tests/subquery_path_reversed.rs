@@ -63,7 +63,10 @@ fn corpus(declare: bool) -> Graph {
     let g = Graph::new(Store::new(), Realm(1), Namespace(1));
     g.set_label_scoped_indexes(true);
     if declare {
-        ddl(&g, "CREATE INDEX co_ticker IF NOT EXISTS FOR (n:Co) ON (n.primaryTicker)");
+        ddl(
+            &g,
+            "CREATE INDEX co_ticker IF NOT EXISTS FOR (n:Co) ON (n.primaryTicker)",
+        );
     }
     let mut cos = Vec::with_capacity(600);
     for i in 0..600i64 {
@@ -72,7 +75,8 @@ fn corpus(declare: bool) -> Graph {
         cos.push(g.create_node(&["Co".into()], &m).expect("co"));
     }
     for i in 0..599usize {
-        g.create_rel(cos[i], "SUPPLIES", cos[i + 1], &BTreeMap::new()).expect("supplies");
+        g.create_rel(cos[i], "SUPPLIES", cos[i + 1], &BTreeMap::new())
+            .expect("supplies");
     }
     for k in 0..3i64 {
         let mut m = BTreeMap::new();
@@ -82,7 +86,8 @@ fn corpus(declare: bool) -> Graph {
             let mut t = BTreeMap::new();
             t.insert("symbol".to_string(), Value::Str(format!("T{}", 10 * k + j)));
             let tk = g.create_node(&["Tk".into()], &t).expect("tk");
-            g.create_rel(o, "WATCHES", tk, &BTreeMap::new()).expect("watches");
+            g.create_rel(o, "WATCHES", tk, &BTreeMap::new())
+                .expect("watches");
         }
     }
     g
@@ -108,8 +113,15 @@ fn a_correlated_start_and_a_constant_declared_end_reverse_and_agree() {
         let (want, c_off) = traced(&off, src);
         let (got, c_on) = traced(&on, src);
         assert_eq!(got, want, "reversed vs as written disagree on `{src}`");
-        assert!(count_of(&c_on, REVERSED) > 0, "`{src}` must reverse: {c_on:?}");
-        assert_eq!(count_of(&c_off, REVERSED), 0, "undeclared: kept as written: {c_off:?}");
+        assert!(
+            count_of(&c_on, REVERSED) > 0,
+            "`{src}` must reverse: {c_on:?}"
+        );
+        assert_eq!(
+            count_of(&c_off, REVERSED),
+            0,
+            "undeclared: kept as written: {c_off:?}"
+        );
     }
     // The production asymmetry: the constant end names NOTHING. Driven from
     // it, the body reads no record at all; as written it seeks and expands
@@ -122,9 +134,12 @@ fn a_correlated_start_and_a_constant_declared_end_reverse_and_agree() {
         let (got, c_on) = traced(&on, &src);
         assert_eq!(got, want, "`{src}`");
         assert!(count_of(&c_on, REVERSED) > 0, "{c_on:?}");
+        // Fewer, not "a quarter": fix 87 warms the as-written expansion's
+        // far-end columns after its sixty-fourth miss, so that side reads
+        // sixty-odd records now instead of one per watched ticker.
         assert!(
-            count_of(&c_on, "store.gets") < count_of(&c_off, "store.gets") / 4,
-            "`{src}` reads far fewer records from its empty constant end: {} vs {}\nreversed: {c_on:?}\nas written: {c_off:?}",
+            count_of(&c_on, "store.gets") < count_of(&c_off, "store.gets"),
+            "`{src}` reads fewer records from its empty constant end: {} vs {}\nreversed: {c_on:?}\nas written: {c_off:?}",
             count_of(&c_on, "store.gets"),
             count_of(&c_off, "store.gets")
         );
@@ -164,5 +179,9 @@ fn a_constant_start_is_kept_as_written() {
     let named = "MATCH (o:Orch)-[:WATCHES]->(wt:Tk) WHERE EXISTS { p = (wc:Co {primaryTicker: wt.symbol})-[:SUPPLIES*1..2]-(c:Co {primaryTicker: $t}) } RETURN count(*) AS n";
     let (got, c) = traced(&g, named);
     assert_eq!(got, vec![vec![Value::Int(4)]]);
-    assert_eq!(count_of(&c, REVERSED), 0, "a named path keeps its direction: {c:?}");
+    assert_eq!(
+        count_of(&c, REVERSED),
+        0,
+        "a named path keeps its direction: {c:?}"
+    );
 }

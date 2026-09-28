@@ -1,7 +1,11 @@
 # Testing
 
-About **1,700 test functions across 276 integration test files**, plus the
-vendored openCypher TCK and a deterministic simulation sweep.
+About **3,100 test functions across 500 integration test files**, plus the
+vendored openCypher TCK and a deterministic simulation sweep. The most recent
+full workspace run: **3,081 passed, 0 failed, 23 ignored.** The counts move
+with every feature, so they are rounded and re-derived rather than maintained:
+`ls crates/*/tests/*.rs | wc -l` and
+`grep -rn '#\[test\]' --include=*.rs crates/ | wc -l` are what produce them.
 
 Stock `cargo test`. No `criterion`, no `proptest`, no `benches/` directories —
 performance is measured by the [benchmark harness](./benchmarking.md) instead,
@@ -16,8 +20,8 @@ cargo test -p engram-graph --test adjacency_cost_repair
 cargo test -p engram-tck --test baseline -- --nocapture   # conformance
 ```
 
-The full suite links 276 binaries and moves real data. Raise the optimisation
-level and keep the assertions:
+The full suite links roughly 500 binaries and moves real data. Raise the
+optimisation level and keep the assertions:
 
 ```sh
 CARGO_PROFILE_TEST_OPT_LEVEL=2 CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=true \
@@ -27,16 +31,25 @@ CARGO_PROFILE_TEST_OPT_LEVEL=2 CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=true \
 ## How it is organised
 
 One file per **property or behaviour**, not one per module. `engram-graph` has
-196 such files, and the names are sentences —
+369 such files, and the names are sentences —
 `chain_count_folds_to_degrees.rs`, `hop_count_memo_keys_on_two_clocks.rs`,
 `merge_lost_race_binds_the_winner.rs`.
 
 | crate | integration files |
 |---|---|
-| `engram-graph` | 196 |
-| `engram-store` | 28 |
-| `engram-server` | 19 |
-| everything else | 1–5 each |
+| `engram-graph` | 369 |
+| `engram-store` | 39 |
+| `engram-server` | 29 |
+| `engram-bench` | 24 |
+| `engram-cypher` | 13 |
+| `engram-bolt` | 7 |
+| everything else | 1–3 each |
+
+`engram-cypher` earned its own row when the regex and trigram suites landed,
+and `engram-bench` when the benchmark harness did: its files pin the statement
+catalogue's digests, the golden statement and op-sequence files, the
+quotability rules, the PostgreSQL wire client and the checked-in regression
+baselines. See [Benchmarking](./benchmarking.md).
 
 Unit tests live in `#[cfg(test)] mod tests` inside the source, near what they
 test.
@@ -84,6 +97,13 @@ test to run before trusting a change to the write fence.
 Tests needing an external corpus skip when their directory variable is unset,
 rather than failing for the wrong reason or silently passing.
 
+The benchmark crate's live-engine tests follow the same rule and add a way to
+make the skip fatal. The PostgreSQL wire client is tested against a real server
+only when `ENGRAM_PGWIRE_TEST_ADDR` names one; every behaviour it asserts is
+also asserted against a scripted backend that always runs; and
+`ENGRAM_PGWIRE_TEST_REQUIRE_LIVE=1` turns a missing address from a skip into a
+failure, wherever the live run is meant to happen.
+
 ### Cross-platform means passing for the right reason
 
 A test can pass on one platform *because a feature is missing there*, and that
@@ -101,7 +121,7 @@ the feature did not exist. Now it names a live process.
 cargo test --release -p engram-tck --test baseline -- --nocapture
 ```
 
-**3,772 of 3,773 evaluated scenarios pass** — 99.97%.
+**3,769 of 3,773 evaluated scenarios pass** — 99.9%.
 
 Each scenario runs in its own thread with a 5-second timeout, against a fresh
 graph. The fixture uses a fixed wall clock so temporal scenarios are
@@ -126,13 +146,22 @@ A timeout is a Skip; a panic is a Fail.
 ### The ratchet
 
 `MIN_PASS = 3768`, `MAX_FAIL = 4`, asserted in the test. A regression fails CI,
-which is what makes "CI-ratcheted" true rather than aspirational.
+which is what makes "CI-ratcheted" true rather than aspirational. The pass floor
+sits one below the current count, for the one scenario that rides the
+five-second timeout; the failure ceiling equals the current count, so a fifth
+failure fails CI.
 
-The single failure is a time-zone-database expectation where this engine is
+Of the four failures, three are scenarios in which the TCK expects a bare
+pattern used as a value — in a `RETURN` or `WITH` projection, or on the
+right-hand side of a `SET` — to be refused as a syntax error, and Engram accepts
+the query. The fourth is a time-zone-database expectation where this engine is
 arguably the more correct of the two.
 
-A second arm runs with `ENGRAM_TCK_PRECISION_LOCKING=1`, since that flag changes
-which statements commit.
+`ENGRAM_TCK_PRECISION_LOCKING=1` runs the suite with precision locking on, which
+changes which statements commit. **Nothing runs it automatically.** The
+conformance job is the one command above and there is no second arm, so a
+regression that appears only under precision locking is not currently gated. It
+is a hand-run arm until a second CI step exists.
 
 ## The book's claims are tested
 
@@ -143,13 +172,25 @@ reader:
 | example | asserts |
 |---|---|
 | `first_graph` | every result the tutorial page prints, including that `DISTINCT` collapses the two routes and `count(r)` gives 0 for a node with no matches |
-| `documented_gaps` | every documented refusal still refuses — `=~`, `UNION` in `CALL {}`, the standalone `CALL` that yields nothing, and null-versus-absent |
+| `documented_gaps` | that the behaviours the pages document around former gaps still hold — `=~` evaluates, `UNION` inside `CALL {}` answers, a standalone `CALL` returns the procedure's declared columns, `YIELD … RETURN` works, and an explicit null is indistinguishable from an absent property |
 | `row_budget_and_folds` | that 2,500 rows are refused under a 100-row budget and `count(*)` answers them anyway |
 
 `documented_gaps` is the one worth understanding. A **gap** page rots in the
 more embarrassing direction: a limitation quietly fixed leaves the
-documentation telling people not to use something that works. So the refusals
-are asserted as refusals, and each failure message names the pages to update.
+documentation telling people not to use something that works. So the example
+asserted every documented refusal *as* a refusal, with each failure message
+naming the pages to update.
+
+Three of them have since closed — `=~`, `UNION` inside `CALL {}` and the
+standalone `CALL` all answer now — and each assertion was inverted rather than
+deleted: it pins the behaviour, so if any of them stops answering, the example
+fails and names the pages — [Getting started](../intro/getting-started.md),
+[Cypher support](../using/cypher-support.md),
+[Cypher procedures](../reference/procedures.md),
+[Regular expressions](../reference/regex.md) and
+[Known limits](../known-limits.md) among them — that would then describe a
+feature the engine no longer has. The example and the book are meant to move in
+one change rather than four.
 
 Each example carries a `#[test]` that calls its own body, because
 `cargo test --examples` **compiles** an example without running its `main` —
@@ -185,7 +226,15 @@ Two processes, one seed, one identical trace digest. See
 Stated as absences:
 
 - **No fuzzing** of the wire protocol or the parser.
-- **No property-based testing** — no `proptest`, no `quickcheck`.
+- **No property-testing framework** — no `proptest` and no `quickcheck`
+  anywhere in `Cargo.lock`. Generated-input testing is hand-rolled instead,
+  and only where a mechanism's failure mode is a *silent wrong answer*:
+  `pipeline_reorder_review.rs` compares 8,000 generated `count(*)` patterns and
+  8,000 generated `OPTIONAL` statements against the interpreter as oracle, and
+  `a_symmetry_broken_count_agrees_on_random_graphs.rs` asks one count three ways
+  — symmetry on, symmetry off, fold off — over 180 generated graphs. Both
+  drive their generator from a fixed seed rather than from `rand`, so a
+  failure reproduces exactly; the symmetry suite prints the seed behind it.
 - **No fuzz or property testing of the examples** — they assert fixed shapes,
   not generated ones.
 - **No multi-node testing**, because there is no multi-node.

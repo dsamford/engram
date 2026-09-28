@@ -220,20 +220,89 @@ const SNB_SHAPES: &[Shape] = &[
 enum Dataset {
     Synthetic,
     Snb,
+    /// The SNB corpus again, read through the PLATFORM's access shapes — the
+    /// ones the production shadow reads (v163–v174) found engram behind Neo4j
+    /// on, transcribed onto the SNB schema so both engines answer them from
+    /// the same bytes in the same window: a two-key seek under a DECLARED
+    /// COMPOSITE index, a bare-`LIMIT` listing, a sought pick with a `NOT …
+    /// IN` list, an `IN`-list seek, a grouped hop aggregate and an `OPTIONAL
+    /// MATCH … count` per end. Writes, seeding, the hot counter and the
+    /// integrity check are the SNB dataset's own (`family`); only the read
+    /// shapes and the declared indexes differ, so `--dataset snb` stays
+    /// byte-for-byte the mix the 2026-09-01 verdict measured.
+    SnbPlatform,
+    /// LDBC FinBench: the transaction corpus `fbgen` emits, read through the
+    /// traversal shapes its complex reads impose — an indexed account lookup,
+    /// one hop out and the same hop walked in REVERSE, a two-hop transfer
+    /// chain, the ownership edge from a Person, and a whole-graph aggregate.
+    ///
+    /// Its own family: nothing about SNB's writes, seeding or hot counter
+    /// applies, because no label is shared. `:Person` exists in both and means
+    /// different things, which is exactly why this must not fall through to
+    /// the SNB arms on a `_ =>`.
+    Finbench,
+    /// LDBC Graphalytics: the `.v`/`.e` graphs `ga2jsonl` converts, read
+    /// through the access paths its six kernels impose.
+    ///
+    /// # Why a concurrency lane for an ALGORITHM benchmark
+    ///
+    /// Graphalytics itself measures one kernel at a time on an idle engine,
+    /// and that is the number its ranking uses. It says nothing about what
+    /// happens when an algorithm runs while the graph underneath it is being
+    /// written — which is the regime a database actually serves, and the one
+    /// engram's projection cache makes interesting: the projection is keyed on
+    /// the adjacency epoch, so ANY write invalidates it and the next kernel
+    /// rebuilds the CSR from scratch.
+    ///
+    /// `algo-read`/`algo-mixed`/`algo-churn` already measured that on the
+    /// SYNTHETIC corpus and found an algorithm under a 50% write stream costs
+    /// ~3.3x its uncontended latency. This variant asks the same question on a
+    /// real Graphalytics graph, where the projection is millions of vertices
+    /// rather than thousands and the rebuild is not cheap.
+    ///
+    /// Its own family, like `Finbench`: the corpus is one `Vertex` label and
+    /// one `LINK` type with nothing else in it, so none of SNB's writes,
+    /// seeding or hot counter apply. `:Person` does not exist here at all,
+    /// which is why this must not fall through to an SNB arm on a `_ =>`.
+    Graphalytics,
 }
+
+/// `fbgen` mints account ids from 2^62 and NOT densely from zero, so an
+/// account key is `FINBENCH_ACCOUNT_ID_BASE + n`. A harness that keyed
+/// accounts by `n` alone would look healthy and measure nothing: every lookup
+/// would miss, and a run whose reads all return zero rows reports the index's
+/// NEGATIVE path as throughput. The attach probe below asserts this base
+/// rather than trusting it.
+const FINBENCH_ACCOUNT_ID_BASE: u64 = 1 << 62;
 
 impl Dataset {
     fn parse(s: &str) -> Option<Dataset> {
         match s {
             "synthetic" => Some(Dataset::Synthetic),
             "snb" | "ldbc-snb" => Some(Dataset::Snb),
+            "snb-platform" | "platform" => Some(Dataset::SnbPlatform),
+            "finbench" | "fb" | "ldbc-finbench" => Some(Dataset::Finbench),
+            "graphalytics" | "ga" | "ldbc-graphalytics" => Some(Dataset::Graphalytics),
             _ => None,
+        }
+    }
+
+    /// The corpus a dataset is loaded from: everything that is not a READ
+    /// SHAPE (writes, seeding, the hot counter, the stress relationship type)
+    /// dispatches on this, so a shape set never has to restate them.
+    fn family(self) -> Dataset {
+        match self {
+            Dataset::SnbPlatform => Dataset::Snb,
+            d => d,
         }
     }
     fn shapes(self) -> &'static [Shape] {
         match self {
             Dataset::Synthetic => SYNTHETIC_SHAPES,
             Dataset::Snb => SNB_SHAPES,
+            Dataset::SnbPlatform => SNB_PLATFORM_SHAPES,
+            Dataset::Finbench => FINBENCH_SHAPES,
+            Dataset::Graphalytics => GRAPHALYTICS_SHAPES,
         }
     }
     /// Indexes the read shapes require. Creating these is not tuning the
@@ -242,13 +311,36 @@ impl Dataset {
     /// trap the synthetic lane already documents.
     fn indexes(self) -> &'static [&'static str] {
         match self {
-            Dataset::Synthetic => {
-                &["CREATE INDEX stress_k IF NOT EXISTS FOR (n:Stress) ON (n.k)"]
-            }
+            Dataset::Synthetic => &["CREATE INDEX stress_k IF NOT EXISTS FOR (n:Stress) ON (n.k)"],
             Dataset::Snb => &[
                 "CREATE INDEX snb_person_id IF NOT EXISTS FOR (n:Person) ON (n.id)",
                 "CREATE INDEX snb_message_id IF NOT EXISTS FOR (n:Message) ON (n.id)",
             ],
+            // The platform declares COMPOSITE indexes (`UserDataNode(userId,
+            // nodeType)`, `Commitment(userId, status)`, …) and single-key
+            // ones beside them; the mirror loads that catalogue verbatim. The
+            // same two kinds are declared here so a two-key seek is measured
+            // as production runs it on BOTH engines, not as a scan.
+            Dataset::SnbPlatform => &[
+                "CREATE INDEX snb_person_id IF NOT EXISTS FOR (n:Person) ON (n.id)",
+                "CREATE INDEX snb_message_id IF NOT EXISTS FOR (n:Message) ON (n.id)",
+                "CREATE INDEX snb_person_first IF NOT EXISTS FOR (n:Person) ON (n.firstName)",
+                "CREATE INDEX snb_person_name IF NOT EXISTS FOR (n:Person) ON (n.firstName, n.lastName)",
+            ],
+            // Account.id carries every point lookup; Person.id anchors the
+            // ownership and loan shapes.
+            Dataset::Finbench => &[
+                "CREATE INDEX fb_account_id IF NOT EXISTS FOR (n:Account) ON (n.id)",
+                "CREATE INDEX fb_person_id IF NOT EXISTS FOR (n:Person) ON (n.id)",
+            ],
+            // `vid` is the graph's OWN vertex id, which `ga2jsonl` writes as a
+            // property because `gid` is reserved for the loader's key. Every
+            // seeded read anchors on it, so without this index a "point
+            // lookup" is a scan of the whole vertex set and the fixture is the
+            // measurement.
+            Dataset::Graphalytics => {
+                &["CREATE INDEX ga_vertex_vid IF NOT EXISTS FOR (n:Vertex) ON (n.vid)"]
+            }
         }
     }
 
@@ -266,11 +358,410 @@ impl Dataset {
                 "MATCH (p:Person {id: 1}) RETURN p.id",
                 "MATCH (m:Message {id: 1}) RETURN m.id",
             ],
+            Dataset::SnbPlatform => &[
+                "MATCH (p:Person {id: 1}) RETURN p.id",
+                "MATCH (m:Message {id: 1}) RETURN m.id",
+                "MATCH (p:Person {firstName: 'Jan'}) RETURN count(p)",
+                "MATCH (p:Person {firstName: 'Jan', lastName: 'Chen'}) RETURN count(p)",
+            ],
+            Dataset::Finbench => &[
+                "MATCH (a:Account {id: 4611686018427387904}) RETURN a.id",
+                "MATCH (p:Person {id: 1}) RETURN p.id",
+            ],
+            Dataset::Graphalytics => &["MATCH (v:Vertex {vid: 1}) RETURN v.vid"],
         }
     }
 }
 
+/// Person names to seek by, cycled from the probe key. SNB Datagen draws
+/// names from real place-weighted distributions, so these common ones each
+/// name a handful of persons at SF1 and some pairs name none — a zero answer
+/// is still a full index probe on both engines, and the same one.
+const PLATFORM_FIRST: [&str; 8] = ["Jan", "Wei", "Chen", "Jun", "Ali", "Amit", "Hans", "Jose"];
+const PLATFORM_LAST: [&str; 8] = [
+    "Li", "Wang", "Zhang", "Khan", "Kumar", "Singh", "Silva", "Yang",
+];
+
+/// Fifty literal ids from `key` up — the `NOT s.storyId IN $existingIds` and
+/// `p.id IN [...]` lists the platform sends (fix 110's held list, fix 114's
+/// newest-first pick). Rendered as a literal because the harness renders
+/// statements, not parameters, on both engines alike.
+fn platform_id_list(key: u64, space: u64) -> String {
+    let space = space.max(1);
+    let ids: Vec<String> = (0..50u64)
+        .map(|i| ((key + 1 + i * 13) % space).to_string())
+        .collect();
+    format!("[{}]", ids.join(", "))
+}
+
+/// The platform's read shapes on the SNB schema — see `Dataset::SnbPlatform`.
+/// Each names the production fix it exercises so a regression in the
+/// per-shape table points at a mechanism.
+const SNB_PLATFORM_SHAPES: &[Shape] = &[
+    // `MATCH (n:UserDataNode {userId, nodeType: 'contact'}) RETURN count(n)`
+    // — one probe of a declared composite (fix 115).
+    Shape {
+        name: "plat-composite-count",
+        weight: 20,
+        locality: Locality::Zipfian,
+    },
+    // The same two-key seek as a listing (fix 115's columnar seek).
+    Shape {
+        name: "plat-composite-list",
+        weight: 10,
+        locality: Locality::Zipfian,
+    },
+    // `MATCH (a:NewsArticle) RETURN a.articleId, a.title LIMIT 5000` — the
+    // bare-LIMIT listing whose walk keeps its columns (fixes 82, 112) and
+    // which returned null rows through v168 (fix 109).
+    Shape {
+        name: "plat-limit-listing",
+        weight: 10,
+        locality: Locality::Uniform,
+    },
+    // The story pick: a sought population, an inequality, and `NOT id IN
+    // [50 ids]`, five wanted (fixes 110, 114).
+    Shape {
+        name: "plat-notin-pick",
+        weight: 15,
+        locality: Locality::Zipfian,
+    },
+    // `WHERE p.id IN [50 ids]` — an IN-list seek over the declared key.
+    Shape {
+        name: "plat-in-list-seek",
+        weight: 15,
+        locality: Locality::Zipfian,
+    },
+    // The MENTIONS aggregate: a two-hop fan-out grouped by the end's
+    // property, top 20 (fixes 105–107).
+    Shape {
+        name: "plat-hop-group",
+        weight: 15,
+        locality: Locality::Zipfian,
+    },
+    // The chat-membership shape: a hop, then `OPTIONAL MATCH … WHERE` and a
+    // count per end (fix 113's fan-out probe; the per-end column binding).
+    Shape {
+        name: "plat-optional-count",
+        weight: 15,
+        locality: Locality::Zipfian,
+    },
+];
+
+/// The graph-algorithm read shapes.
+///
+/// # Why a separate set rather than four more entries in `SYNTHETIC_SHAPES`
+///
+/// An algorithm is two to four ORDERS of magnitude more expensive than a point
+/// lookup — PageRank over the default 20,000-node corpus is tens of
+/// milliseconds against tens of microseconds. Mixed into the ordinary shape
+/// table at any weight that made it appear at all, one call in a hundred would
+/// dominate the wall clock and every existing level's throughput number would
+/// become a measurement of how often an algorithm happened to be drawn.
+///
+/// That is not a reason to leave algorithms unstressed. It is a reason to
+/// stress them in their OWN profiles, where their cost is the subject rather
+/// than the noise — and to mark those profiles diagnostic, so the headline
+/// sweep keeps its profile count and its mutation history unchanged.
+///
+/// # What the three profiles measured
+///
+/// ```text
+///   algo-read  @2 / 4,000 nodes   213 ops/s   p50  9.31 ms   p99  28.77 ms   0 errors
+///   algo-mixed @4 / 3,000 nodes   173 ops/s   p50 22.38 ms   p99  58.70 ms   0 errors
+///   algo-churn @4 / 2,500 nodes   ~140 ops/s  p50 ~28 ms     p99  ~66 ms     0 errors
+/// ```
+///
+/// The three differ in what the writers do to the PROJECTION, which is the
+/// only thing that distinguishes them:
+///
+/// - `algo-read` leaves it alone.
+/// - `algo-mixed` invalidates it AND changes its topology — the projections
+///   name `['LINK', 'SLINK']` and the writer creates `SLINK`, which was not
+///   true of the first version: it wrote `SLINK` while the projections named
+///   `LINK` alone, so every write bumped the adjacency epoch and none of them
+///   ever changed a single edge the algorithm could see. The cache-invalidation
+///   cost was measured; the recomputation over genuinely different topology
+///   was not.
+/// - `algo-churn` DELETES nodes out from under it, and its integrity checks
+///   reconcile: every survivor's anchor relationship still binds.
+///
+/// **An algorithm under a 50% write stream costs about 3.3x its uncontended
+/// latency**, and the reason is structural rather than contention: the
+/// projection is keyed on the adjacency epoch, so every write invalidates it
+/// and each run rebuilds the CSR from scratch. There is no incremental
+/// maintenance of a projection and this is what its absence costs.
+///
+/// That number is the one thing neither the unit tests nor `algowidth` can
+/// produce. The tests run one algorithm on a quiet graph; `algowidth` measures
+/// the width split on a static one. Only a concurrent mix shows what the cache
+/// discipline costs when the graph is moving, which is the state a production
+/// caller is actually in.
+/// LDBC FinBench read shapes, named for the traversal each complex read
+/// imposes rather than claiming to BE that read — the same honesty
+/// `SNB_SHAPES` states: the official tcr reads bind parameters from a
+/// substitution file and nine of the twelve are defined WITH truncation, so a
+/// mix that reproduced them without it would be measuring a different query.
+///
+/// What a concurrency mix needs is the spread of access PATHS, and these are
+/// FinBench's: an indexed account point lookup, a transfer hop out, the same
+/// hop walked against its stored direction, a two-hop chain, the ownership
+/// edge from a Person, the busiest edge type in the corpus (`withdraw`, at
+/// 918k it outnumbers `transfer`), and one whole-graph aggregate.
+const FINBENCH_SHAPES: &[Shape] = &[
+    Shape {
+        name: "fb-account",
+        weight: 30,
+        locality: Locality::Zipfian,
+    },
+    Shape {
+        name: "fb-transfer-out",
+        weight: 20,
+        locality: Locality::Zipfian,
+    },
+    // The REVERSE of `fb-transfer-out`: the same logical edge, walked against
+    // its stored direction. Both name one indexed Account; a planner that
+    // anchors on the bound endpoint answers them alike, so a divergence here
+    // is a standing measurement rather than something a reader must know to
+    // look for.
+    Shape {
+        name: "fb-transfer-in",
+        weight: 15,
+        locality: Locality::Zipfian,
+    },
+    Shape {
+        name: "fb-transfer-2hop",
+        weight: 10,
+        locality: Locality::Zipfian,
+    },
+    Shape {
+        name: "fb-owner",
+        weight: 8,
+        locality: Locality::Zipfian,
+    },
+    Shape {
+        name: "fb-withdraw",
+        weight: 7,
+        locality: Locality::Zipfian,
+    },
+    Shape {
+        name: "fb-signin",
+        weight: 5,
+        locality: Locality::Uniform,
+    },
+    Shape {
+        name: "fb-loan-apply",
+        weight: 3,
+        locality: Locality::Zipfian,
+    },
+    // WEIGHT 1, AND IT STILL DOMINATES. Measured on the SF1 corpus: this
+    // shape is ~450 ms where every other shape here is sub-millisecond, so at
+    // weight 2 it took 95.3% of all read time and the mix's headline ops/s was
+    // really reporting this one aggregate. That is not a defect — grouping
+    // 813k transfer edges by account level is genuinely that much work — but
+    // it means the PER-SHAPE table is the thing to read in this dataset, not
+    // the throughput line. Kept because a whole-graph aggregate is a real
+    // access path and dropping it would hide the cost entirely.
+    Shape {
+        name: "fb-amount-agg",
+        weight: 1,
+        locality: Locality::Uniform,
+    },
+];
+
+/// Graphalytics read shapes: the access paths its six kernels impose, plus the
+/// kernels themselves.
+///
+/// # Why the kernels carry so little weight
+///
+/// A Graphalytics kernel on a real graph is two to four ORDERS OF MAGNITUDE
+/// more expensive than a vertex lookup — `kgs` BFS is 82 s where a seek is
+/// sub-millisecond. `FINBENCH_SHAPES` already recorded what happens when that
+/// is not respected: `fb-amount-agg` at weight 2 took 95.3% of all read time
+/// and the headline ops/s was really reporting one aggregate.
+///
+/// So the kernels sit at weight 1 and the traversal shapes carry the mix. The
+/// ops/s line then describes the traversal load, and the PER-SHAPE table is
+/// where a kernel's cost is read. Dropping the kernels entirely would be
+/// worse: the whole point of this dataset is what a projection rebuild costs
+/// when writes are invalidating it, and only a kernel pays that.
+const GRAPHALYTICS_SHAPES: &[Shape] = &[
+    Shape {
+        name: "ga-vertex",
+        weight: 34,
+        locality: Locality::Zipfian,
+    },
+    Shape {
+        name: "ga-out",
+        weight: 22,
+        locality: Locality::Zipfian,
+    },
+    // The REVERSE of `ga-out`, against the stored direction. Graphalytics
+    // reads several of its graphs undirected, so both directions are real
+    // access paths and a divergence between them is worth standing evidence.
+    Shape {
+        name: "ga-in",
+        weight: 16,
+        locality: Locality::Zipfian,
+    },
+    Shape {
+        name: "ga-2hop",
+        weight: 12,
+        locality: Locality::Zipfian,
+    },
+    Shape {
+        name: "ga-degree",
+        weight: 8,
+        locality: Locality::Zipfian,
+    },
+    // The neighbourhood a triangle count walks -- LCC's inner loop, issued as
+    // an ordinary query so its cost is visible without running the kernel.
+    Shape {
+        name: "ga-triangle-probe",
+        weight: 5,
+        locality: Locality::Zipfian,
+    },
+    // WEIGHT 1 EACH, for the reason in the doc comment above. These are the
+    // shapes that pay the projection rebuild under a write stream.
+    Shape {
+        name: "ga-bfs",
+        weight: 1,
+        locality: Locality::Zipfian,
+    },
+    Shape {
+        name: "ga-wcc",
+        weight: 1,
+        locality: Locality::Uniform,
+    },
+];
+
+const ALGO_SHAPES: &[Shape] = &[
+    Shape {
+        name: "algo-pagerank",
+        weight: 30,
+        locality: Locality::Uniform,
+    },
+    Shape {
+        name: "algo-wcc",
+        weight: 30,
+        locality: Locality::Uniform,
+    },
+    // The PATH procedures, which are the ones with an endpoint that a
+    // concurrent writer can move under them.
+    Shape {
+        name: "algo-kshortest",
+        weight: 20,
+        locality: Locality::Zipfian,
+    },
+    Shape {
+        name: "algo-allshortest",
+        weight: 15,
+        locality: Locality::Zipfian,
+    },
+    // ── The modes that are not `stream` ───────────────────────────────────
+    //
+    // `stream` was the only mode any harness issued, which left the three
+    // that do something else entirely untested under load:
+    //
+    // - `stats` runs the same computation and returns one row, so it is the
+    //   arm that shows how much of a `stream` call is the COMPUTATION and how
+    //   much is materialising a row per node.
+    // - `mutate` publishes into the result cache, which has a byte budget and
+    //   an eviction path. The key varies with the driving key, so repeated
+    //   calls ACCUMULATE distinct results and the eviction actually fires —
+    //   one fixed key would overwrite in place and never reach it.
+    // - `write` is the only algorithm operation that touches the KEYSPACE. It
+    //   writes a property to every projected node through the ordinary write
+    //   path in short transactions, so under `algo-mixed` it runs concurrently
+    //   with the harness's own writers. That is the contention case no other
+    //   shape produces: two writers, one of them holding a computation's worth
+    //   of results.
+    Shape {
+        name: "algo-stats",
+        weight: 15,
+        locality: Locality::Uniform,
+    },
+    Shape {
+        name: "algo-mutate",
+        weight: 15,
+        locality: Locality::Zipfian,
+    },
+    Shape {
+        name: "algo-result",
+        weight: 10,
+        locality: Locality::Zipfian,
+    },
+    // The heaviest shape here by far — one property per projected node — so
+    // its weight is the smallest. It is present because it is the only one
+    // that writes, not because it is representative.
+    Shape {
+        name: "algo-write",
+        weight: 5,
+        locality: Locality::Uniform,
+    },
+];
+
+/// Render one graph-algorithm read.
+///
+/// Every one is bounded so a single call cannot run away under a profile that
+/// is measuring throughput: the projection is the `:Stress` label the harness
+/// seeds, `k` is small, and the path shapes name two concrete endpoints.
+fn render_algo(shape: &Shape, key: u64, space: u64) -> String {
+    let other = (key + space / 3 + 1) % space.max(1);
+    match shape.name {
+        "algo-pagerank" => "CALL engram.algo.pagerank.stream({nodeLabels: ['Stress'],              relationshipTypes: ['LINK', 'SLINK'], maxIterations: 5})              YIELD score RETURN count(score) AS c"
+            .to_string(),
+        "algo-wcc" => "CALL engram.algo.wcc.stream({nodeLabels: ['Stress'],              relationshipTypes: ['LINK', 'SLINK']}) YIELD componentId RETURN count(componentId) AS c"
+            .to_string(),
+        "algo-kshortest" => format!(
+            "MATCH (a:Stress {{k: {key}}}), (b:Stress {{k: {other}}})              CALL engram.algo.kshortestpaths.stream({{nodeLabels: ['Stress'],              relationshipTypes: ['LINK', 'SLINK'], sourceNode: id(a), targetNode: id(b), k: 3}})              YIELD totalCost RETURN count(totalCost) AS c"
+        ),
+        // `stats` over the same projection: the computation without the rows.
+        "algo-stats" => "CALL engram.algo.wcc.stats({nodeLabels: ['Stress'],              relationshipTypes: ['LINK', 'SLINK']}) YIELD nodeCount, relationshipCount              RETURN nodeCount"
+            .to_string(),
+        // A VARYING key, so results accumulate in the cache and its byte
+        // budget is reached. A fixed key would overwrite in place and the
+        // eviction path would never run.
+        "algo-mutate" => format!(
+            "CALL engram.algo.degree.mutate({{nodeLabels: ['Stress'],              relationshipTypes: ['LINK', 'SLINK'], mutateKey: 'm{}'}})              YIELD mutateKey RETURN mutateKey",
+            key % 32
+        ),
+        // Read the cache back. `result.list()` and nothing else, deliberately.
+        //
+        // The comment here used to claim that `result.stream` on an
+        // unpublished key was "exercised on purpose" — a claim of coverage in
+        // a comment above code that did not provide it, which is the quietest
+        // kind of wrong. It cannot be provided here either: a refusal is
+        // counted by this harness as an error and fails the level, so a shape
+        // that deliberately refused would make every run red and hide the real
+        // failures it exists to find. The refusal path belongs in a functional
+        // test, and is in one.
+        //
+        // `result.list()` under load is still worth having: it reads the cache
+        // while `algo-mutate` is publishing into it and evicting from it,
+        // which is the only concurrent reader that path gets.
+        "algo-result" => format!(
+            "CALL engram.algo.result.list() YIELD mutateKey, stale              RETURN count(mutateKey) AS c, {}",
+            key % 2
+        ),
+        // THE ONLY ALGORITHM OPERATION THAT WRITES. A property per projected
+        // node, through the ordinary write path, in short transactions —
+        // concurrent with the harness's own writers under `algo-mixed`.
+        "algo-write" => format!(
+            "CALL engram.algo.degree.write({{nodeLabels: ['Stress'],              relationshipTypes: ['LINK', 'SLINK'], writeProperty: 'deg{}',              writeBatchSize: 256}}) YIELD nodesWritten RETURN nodesWritten",
+            key % 4
+        ),
+        "algo-allshortest" => format!(
+            "MATCH p = allShortestPaths((a:Stress {{k: {key}}})-[:LINK*1..4]->             (b:Stress {{k: {other}}})) RETURN count(p) AS c"
+        ),
+        other => unreachable!("unknown algorithm shape {other}"),
+    }
+}
+
 fn render_read(ds: Dataset, shape: &Shape, key: u64, space: u64) -> String {
+    if shape.name.starts_with("algo-") {
+        return render_algo(shape, key, space);
+    }
     match ds {
         Dataset::Synthetic => match shape.name {
             "point-lookup" => format!("MATCH (n:Stress {{k: {key}}}) RETURN n.k, n.pad"),
@@ -340,6 +831,121 @@ fn render_read(ds: Dataset, shape: &Shape, key: u64, space: u64) -> String {
                 .to_string(),
             other => unreachable!("unknown snb shape {other}"),
         },
+        // Every account key is BASE + n (see `FINBENCH_ACCOUNT_ID_BASE`).
+        // Person keys are dense from 1, so a person shape takes `key % persons
+        // + 1` and never asks for id 0, which the corpus does not carry.
+        Dataset::Finbench => {
+            let acct = FINBENCH_ACCOUNT_ID_BASE + (key % space.max(1));
+            let person = (key % space.max(1)) + 1;
+            match shape.name {
+                "fb-account" => format!(
+                    "MATCH (a:Account {{id: {acct}}})                      RETURN a.accountLevel, a.createTime, a.isBlocked, a.nickname"
+                ),
+                "fb-transfer-out" => format!(
+                    "MATCH (a:Account {{id: {acct}}})-[t:transfer]->(b:Account)                      RETURN b.id, t.amount LIMIT 25"
+                ),
+                "fb-transfer-in" => format!(
+                    "MATCH (a:Account)-[t:transfer]->(b:Account {{id: {acct}}})                      RETURN a.id, t.amount LIMIT 25"
+                ),
+                "fb-transfer-2hop" => format!(
+                    "MATCH (a:Account {{id: {acct}}})-[:transfer]->()-[:transfer]->(c:Account)                      RETURN count(DISTINCT c) AS c"
+                ),
+                "fb-owner" => format!(
+                    "MATCH (p:Person {{id: {person}}})-[:own]->(a:Account)                      RETURN a.id LIMIT 25"
+                ),
+                "fb-withdraw" => format!(
+                    "MATCH (a:Account {{id: {acct}}})-[w:withdraw]->(b:Account)                      RETURN b.id, w.amount LIMIT 25"
+                ),
+                // `count(m)` and not `m.id`: the Medium and Loan property sets
+                // were never probed on the corpus, and a shape that names a
+                // property the store does not carry returns null columns while
+                // looking healthy. Counting binds the pattern without
+                // asserting a schema this harness has not verified.
+                "fb-signin" => format!(
+                    "MATCH (m:Medium)-[:signIn]->(a:Account {{id: {acct}}}) RETURN count(m) AS c"
+                ),
+                "fb-loan-apply" => format!(
+                    "MATCH (p:Person {{id: {person}}})-[:apply]->(l:Loan) RETURN count(l) AS c"
+                ),
+                "fb-amount-agg" => "MATCH (a:Account)-[t:transfer]->()                      RETURN a.accountLevel AS lvl, count(t) AS n ORDER BY n DESC LIMIT 10"
+                    .to_string(),
+                other => unreachable!("unknown finbench shape {other}"),
+            }
+        }
+        Dataset::Graphalytics => {
+            // `vid` is the graph's own vertex id and the corpus numbers them
+            // from 0, so the key is used directly rather than offset the way
+            // FinBench's accounts are.
+            let vid = key % space.max(1);
+            match shape.name {
+                "ga-vertex" => format!("MATCH (v:Vertex {{vid: {vid}}}) RETURN v.vid"),
+                "ga-out" => format!(
+                    "MATCH (v:Vertex {{vid: {vid}}})-[:LINK]->(w) RETURN w.vid LIMIT 25"
+                ),
+                "ga-in" => format!(
+                    "MATCH (v:Vertex {{vid: {vid}}})<-[:LINK]-(w) RETURN w.vid LIMIT 25"
+                ),
+                "ga-2hop" => format!(
+                    "MATCH (v:Vertex {{vid: {vid}}})-[:LINK]->()-[:LINK]->(w)                      RETURN count(DISTINCT w) AS c"
+                ),
+                "ga-degree" => format!(
+                    "MATCH (v:Vertex {{vid: {vid}}})-[e:LINK]-() RETURN count(e) AS d"
+                ),
+                // Two neighbours of one vertex that are themselves joined --
+                // the membership test LCC performs per neighbour pair.
+                "ga-triangle-probe" => format!(
+                    "MATCH (v:Vertex {{vid: {vid}}})-[:LINK]-(a)-[:LINK]-(b)-[:LINK]-(v)                      RETURN count(*) AS t"
+                ),
+                // The kernels. `graphalytics: true` is NOT passed: this lane
+                // measures the SHIPPED procedure surface under load, and the
+                // conformance gate changes what the kernel computes. A
+                // throughput number taken under one semantics and a
+                // conformance result taken under the other are two different
+                // measurements and must not be blended.
+                "ga-bfs" => format!(
+                    "MATCH (s:Vertex {{vid: {vid}}})                      CALL engram.algo.bfs.stream({{nodeLabels: ['Vertex'],                      relationshipTypes: ['LINK'], sourceNode: id(s)}})                      YIELD depth RETURN count(depth) AS c"
+                ),
+                "ga-wcc" => "CALL engram.algo.wcc.stream({nodeLabels: ['Vertex'],                              relationshipTypes: ['LINK']})                              YIELD componentId RETURN count(DISTINCT componentId) AS c"
+                    .to_string(),
+                other => unreachable!("unknown graphalytics shape {other}"),
+            }
+        }
+        Dataset::SnbPlatform => {
+            let first = PLATFORM_FIRST[(key % 8) as usize];
+            let last = PLATFORM_LAST[((key / 8) % 8) as usize];
+            match shape.name {
+                "plat-composite-count" => format!(
+                    "MATCH (p:Person {{firstName: '{first}', lastName: '{last}'}}) RETURN count(p) AS n"
+                ),
+                "plat-composite-list" => format!(
+                    "MATCH (p:Person {{firstName: '{first}', lastName: '{last}'}}) \
+                     RETURN p.id, p.birthday, p.locationIP"
+                ),
+                "plat-limit-listing" => {
+                    "MATCH (p:Person) RETURN p.id AS id, p.firstName AS name LIMIT 5000".to_string()
+                }
+                "plat-notin-pick" => format!(
+                    "MATCH (p:Person {{firstName: '{first}'}}) \
+                     WHERE p.browserUsed <> 'Safari' AND NOT p.id IN {} \
+                     RETURN p.id, p.lastName, p.birthday LIMIT 5",
+                    platform_id_list(key, space)
+                ),
+                "plat-in-list-seek" => format!(
+                    "MATCH (p:Person) WHERE p.id IN {} RETURN p.id, p.firstName",
+                    platform_id_list(key, space)
+                ),
+                "plat-hop-group" => format!(
+                    "MATCH (p:Person {{id: {key}}})-[:KNOWS]-(f:Person)<-[:HAS_CREATOR]-(m:Message) \
+                     RETURN f.firstName AS name, count(*) AS c ORDER BY c DESC LIMIT 20"
+                ),
+                "plat-optional-count" => format!(
+                    "MATCH (p:Person {{id: {key}}})-[:KNOWS]-(f:Person) \
+                     OPTIONAL MATCH (f)<-[:HAS_CREATOR]-(m:Message) WHERE m.browserUsed = 'Chrome' \
+                     WITH f, count(m) AS n RETURN f.id, n ORDER BY n DESC LIMIT 25"
+                ),
+                other => unreachable!("unknown snb-platform shape {other}"),
+            }
+        }
     }
 }
 
@@ -410,18 +1016,41 @@ fn render_write(
             } else {
                 1 + ((a + 1 + seq % 97) % (space - 1))
             };
-            return match ds {
-                Dataset::Synthetic => format!(
-                    "MATCH (a:Stress {{k: {a}}}), (b:Stress {{k: {b}}}) CREATE (a)-[:SLINK]->(b)"
-                ),
+            return match ds.family() {
                 Dataset::Snb => format!(
                     "MATCH (a:Person {{id: {a}}}), (b:Person {{id: {b}}}) \
                      CREATE (a)-[:STRESSED]->(b)"
                 ),
+                // Between two ACCOUNTS, which is what a transfer is. The edge
+                // type stays `STRESSED` so the dangling-edge integrity check
+                // covers this family unchanged.
+                Dataset::Finbench => format!(
+                    "MATCH (a:Account {{id: {}}}), (b:Account {{id: {}}}) CREATE (a)-[:STRESSED]->(b)",
+                    FINBENCH_ACCOUNT_ID_BASE + a,
+                    FINBENCH_ACCOUNT_ID_BASE + b
+                ),
+                // Between two VERTICES, which is the only node a Graphalytics
+                // corpus has. Without this arm it fell to the catch-all below
+                // and tried to match `:Stress` nodes, WHICH THAT CORPUS DOES
+                // NOT CONTAIN — so every "write" matched nothing and created
+                // nothing, and `algo-mixed`'s 50 % write stream was 50 %
+                // no-ops. The throughput line still counted them, and the
+                // rel-integrity probe then looked for the `:STRESSED` edges
+                // that were never made, found no rows at all, and reported
+                // "unreadable row" at every level.
+                //
+                // The edge type stays `STRESSED` so the dangling-edge check
+                // covers this family unchanged, exactly as FinBench's does.
+                Dataset::Graphalytics => format!(
+                    "MATCH (a:Vertex {{vid: {a}}}), (b:Vertex {{vid: {b}}})                      CREATE (a)-[:STRESSED]->(b)"
+                ),
+                _ => format!(
+                    "MATCH (a:Stress {{k: {a}}}), (b:Stress {{k: {b}}}) CREATE (a)-[:SLINK]->(b)"
+                ),
             };
         }
     }
-    match (ds, locality) {
+    match (ds.family(), locality) {
         (Dataset::Synthetic, Locality::Hot) => {
             "MATCH (n:Stress {k: 0}) SET n.hits = coalesce(n.hits, 0) + 1".to_string()
         }
@@ -429,7 +1058,17 @@ fn render_write(
         (Dataset::Snb, Locality::Hot) => {
             "MATCH (p:Person {id: 0}) SET p.hits = coalesce(p.hits, 0) + 1".to_string()
         }
-        (Dataset::Snb, _) => {
+        // Person ids are dense from ONE here, so the contended node is id 1.
+        // `{id: 0}` would match nothing and the contention profile would report
+        // a clean pass having contended over nothing at all.
+        (Dataset::Finbench, Locality::Hot) => {
+            "MATCH (p:Person {id: 1}) SET p.hits = coalesce(p.hits, 0) + 1".to_string()
+        }
+        // A standalone node, as the synthetic lane writes: it exercises the
+        // write path without inventing FinBench entities whose schema this
+        // harness would then be asserting.
+        (Dataset::Finbench, _) => format!("CREATE (:StressW {{c: {cid}, s: {seq}}})"),
+        (_, _) => {
             let author = seq % space.max(1);
             format!(
                 "MATCH (p:Person {{id: {author}}}) \
@@ -614,6 +1253,12 @@ struct Profile {
     /// inserting three profiles makes every profile after them a different
     /// measurement. Runnable by name; never part of the headline set.
     diagnostic: bool,
+    /// Read shapes to use INSTEAD of the dataset's, when this profile is
+    /// measuring something the ordinary mix cannot express.
+    ///
+    /// `None` for every profile that predates graph algorithms, so their
+    /// numbers are byte-for-byte the numbers they were.
+    shapes: Option<&'static [Shape]>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -686,6 +1331,7 @@ const PROFILES: &[Profile] = &[
         write_kind: WriteKind::Node,
         what: "the concurrency ceiling with no write interference",
         diagnostic: false,
+        shapes: None,
     },
     Profile {
         name: "read-heavy",
@@ -694,6 +1340,7 @@ const PROFILES: &[Profile] = &[
         write_kind: WriteKind::Node,
         what: "high read, low write — the common production shape",
         diagnostic: false,
+        shapes: None,
     },
     Profile {
         name: "balanced",
@@ -702,6 +1349,7 @@ const PROFILES: &[Profile] = &[
         write_kind: WriteKind::Node,
         what: "high read, high write — both paths contending",
         diagnostic: false,
+        shapes: None,
     },
     Profile {
         name: "write-heavy",
@@ -710,6 +1358,7 @@ const PROFILES: &[Profile] = &[
         write_kind: WriteKind::Node,
         what: "high write, low read — ingest under query load",
         diagnostic: false,
+        shapes: None,
     },
     Profile {
         name: "write-only",
@@ -718,6 +1367,7 @@ const PROFILES: &[Profile] = &[
         write_kind: WriteKind::Node,
         what: "raw insert throughput",
         diagnostic: false,
+        shapes: None,
     },
     Profile {
         name: "contention",
@@ -726,6 +1376,7 @@ const PROFILES: &[Profile] = &[
         write_kind: WriteKind::Node,
         what: "write-WRITE conflict on one hot node — not insert throughput",
         diagnostic: false,
+        shapes: None,
     },
     // The rel profiles run LAST so the six classic profiles' corpus
     // trajectory stays comparable with pre-W1.1 sweeps.
@@ -752,6 +1403,7 @@ const PROFILES: &[Profile] = &[
         write_kind: WriteKind::NodeOnly,
         what: "50/50 with a node-only write — isolates index/membership churn from adjacency churn",
         diagnostic: true,
+        shapes: None,
     },
     Profile {
         name: "balanced-freshprops",
@@ -760,6 +1412,7 @@ const PROFILES: &[Profile] = &[
         write_kind: WriteKind::NodeOnlyFreshProps,
         what: "50/50 node-only write on property names no read seeks — isolates the property-epoch collision",
         diagnostic: true,
+        shapes: None,
     },
     Profile {
         name: "balanced-nolabels",
@@ -768,6 +1421,7 @@ const PROFILES: &[Profile] = &[
         write_kind: WriteKind::NodeOnlyNoLabels,
         what: "50/50 node-only write with no labels — isolates named-label membership churn",
         diagnostic: true,
+        shapes: None,
     },
     Profile {
         name: "balanced-disjoint",
@@ -776,6 +1430,7 @@ const PROFILES: &[Profile] = &[
         write_kind: WriteKind::RelSpread,
         what: "50/50 with writes on a relationship type no read traverses — the interference control",
         diagnostic: true,
+        shapes: None,
     },
     Profile {
         name: "rel-create",
@@ -784,6 +1439,7 @@ const PROFILES: &[Profile] = &[
         write_kind: WriteKind::RelSpread,
         what: "distinct-endpoint relationship inserts — the guard-row overhead, spread",
         diagnostic: false,
+        shapes: None,
     },
     Profile {
         name: "rel-hub",
@@ -792,6 +1448,7 @@ const PROFILES: &[Profile] = &[
         write_kind: WriteKind::RelHub,
         what: "every relationship lands on ONE endpoint — guard serialisation, measured",
         diagnostic: false,
+        shapes: None,
     },
     Profile {
         name: "unique-create",
@@ -800,10 +1457,41 @@ const PROFILES: &[Profile] = &[
         write_kind: WriteKind::UniqueCreate,
         what: "every client races the same UNIQUE values — one winner each, zero duplicates",
         diagnostic: false,
+        shapes: None,
     },
     // LAST, for the same corpus-trajectory reason as the rel profiles — and
     // doubly so: churn is the one profile that REMOVES data, so anything
     // running after it would see a corpus no earlier sweep ever saw.
+    // ── The graph-algorithm profiles ──────────────────────────────────────
+    // Diagnostic, so the headline sweep keeps its profile COUNT and the
+    // mutation history each later profile inherits. Runnable by name.
+    Profile {
+        name: "algo-read",
+        write_pct: 0,
+        write_locality: Locality::Uniform,
+        write_kind: WriteKind::Node,
+        what: "graph algorithms, no write interference — the computation's own cost",
+        diagnostic: true,
+        shapes: Some(ALGO_SHAPES),
+    },
+    Profile {
+        name: "algo-churn",
+        write_pct: 60,
+        write_locality: Locality::Uniform,
+        write_kind: WriteKind::DeleteChurn,
+        what: "algorithms while nodes are being DELETED out from under the projection",
+        diagnostic: true,
+        shapes: Some(ALGO_SHAPES),
+    },
+    Profile {
+        name: "algo-mixed",
+        write_pct: 50,
+        write_locality: Locality::Uniform,
+        write_kind: WriteKind::RelSpread,
+        what: "algorithms CONCURRENT with writes — every write invalidates the projection",
+        diagnostic: true,
+        shapes: Some(ALGO_SHAPES),
+    },
     Profile {
         name: "delete-churn",
         write_pct: 100,
@@ -811,6 +1499,7 @@ const PROFILES: &[Profile] = &[
         write_kind: WriteKind::DeleteChurn,
         what: "create-then-delete churn per worker — DETACH DELETE and rel cleanup under load",
         diagnostic: false,
+        shapes: None,
     },
 ];
 
@@ -822,9 +1511,10 @@ const PROFILES: &[Profile] = &[
 /// plan): the incumbent's contention figure documents exactly that failure,
 /// and this harness must not be able to reproduce it silently.
 fn hot_counter(ds: Dataset, c: &mut Client) -> Option<i64> {
-    let q = match ds {
+    let q = match ds.family() {
         Dataset::Synthetic => "MATCH (n:Stress {k: 0}) RETURN coalesce(n.hits, 0)",
-        Dataset::Snb => "MATCH (p:Person {id: 0}) RETURN coalesce(p.hits, 0)",
+        Dataset::Finbench => "MATCH (p:Person {id: 1}) RETURN coalesce(p.hits, 0)",
+        _ => "MATCH (p:Person {id: 0}) RETURN coalesce(p.hits, 0)",
     };
     // Loud on every failure mode: a verification that silently skips reads
     // as a PASS, which is exactly the lie this check exists to prevent.
@@ -890,6 +1580,34 @@ struct LevelResult {
     /// a single average hides — a run that does 10k/s then 200/s averages to
     /// something that looks healthy and is not.
     per_sec: Vec<u64>,
+    /// Fix 86: when this level's workers were released, as unix milliseconds
+    /// — the same clock the server stamps its maintenance lines with, so
+    /// `per_sec[i]` is the second `[started_unix_ms + 1000*i, +1000*(i+1))`
+    /// and a stalled second can be aligned with the server's events.
+    started_unix_ms: u64,
+}
+
+/// Fix 86: the wall clock, unix milliseconds. `0` if the clock is before the
+/// epoch, which is a broken host rather than a case to handle.
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Fix 86: the latency past which a statement is logged individually, with
+/// its unix-ms start, so the stalled seconds of a level can be attributed to
+/// WHICH statements stalled — writes (a lock) or reads (the read path) — and
+/// to which shape. `STRESS_SLOW_MS` overrides the default of 250.
+fn slow_ms() -> u64 {
+    static SLOW: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SLOW.get_or_init(|| {
+        std::env::var("STRESS_SLOW_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(250)
+    })
 }
 
 impl LevelResult {
@@ -933,7 +1651,11 @@ impl LevelResult {
         v.sort_unstable();
         let p10 = v[(v.len() as f64 * 0.10) as usize];
         let median = v[v.len() / 2];
-        if median == 0 { 1.0 } else { p10 as f64 / median as f64 }
+        if median == 0 {
+            1.0
+        } else {
+            p10 as f64 / median as f64
+        }
     }
 
     /// Why this level's throughput may NOT be quoted, if it may not.
@@ -1008,12 +1730,21 @@ fn main() {
     if args.len() < 5 {
         eprintln!(
             "usage: stress <addr> <profile|all> <clients-csv> <seconds>
-              [--seed N] [--keys N] [--dataset synthetic|snb] [--json PATH]
+              [--seed N] [--keys N] [--json PATH]
+              [--dataset synthetic|snb|snb-platform|finbench|graphalytics] [--shape NAME]
 
 datasets:
    synthetic   the harness seeds its own world (default) — runs anywhere, incl. CI
    snb         ATTACH to a server already holding an LDBC SNB corpus
                (`portserve <corpus dir> <addr>`); --keys is probed, not seeded
+   snb-platform  the SNB corpus read through the PLATFORM's access shapes
+   finbench    LDBC FinBench; account ids are 2^62-based and the attach probe
+               asserts that base rather than trusting it
+   graphalytics  an LDBC Graphalytics graph (`ga2jsonl` then `snbload`), read
+               through the access paths its kernels impose. --keys is the
+               vertex count. The two KERNEL shapes sit at weight 1 because a
+               kernel is orders of magnitude dearer than a seek; read the
+               per-shape table, not the throughput line
 
 profiles:"
         );
@@ -1052,7 +1783,7 @@ profiles:"
         Some(s) => match Dataset::parse(s) {
             Some(d) => d,
             None => {
-                eprintln!("unknown dataset `{s}`; try `synthetic` or `snb`");
+                eprintln!("unknown dataset `{s}`; try `synthetic`, `snb` or `snb-platform`");
                 std::process::exit(2);
             }
         },
@@ -1119,7 +1850,7 @@ profiles:"
         );
     }
 
-    match dataset {
+    match dataset.family() {
         Dataset::Synthetic => {
             eprintln!("[stress] seeding {keys} nodes at {addr}");
             // UNWIND-batched so seeding is not itself the bottleneck.
@@ -1155,7 +1886,83 @@ profiles:"
             }
             eprintln!("[stress] seeded in {:.1}s", t0.elapsed().as_secs_f64());
         }
-        Dataset::Snb => {
+        Dataset::Finbench => {
+            // ATTACH, and ASSERT THE ID BASE rather than trusting it.
+            //
+            // `fbgen` mints account ids from 2^62. If that ever changes, every
+            // account lookup in the mix misses, every read returns zero rows,
+            // and the run reports the index's NEGATIVE path as throughput — a
+            // green benchmark measuring nothing. One probe turns that silent
+            // failure into a loud one.
+            let accounts = match c.run("MATCH (a:Account) RETURN a.id") {
+                Ok(rows) => rows,
+                Err(e) => {
+                    eprintln!("[stress] could not probe the FinBench corpus at {addr}: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if accounts == 0 {
+                eprintln!(
+                    "[stress] {addr} holds no :Account nodes — the finbench dataset ATTACHES to                      an already-loaded corpus."
+                );
+                std::process::exit(1);
+            }
+            let base_probe =
+                format!("MATCH (a:Account {{id: {FINBENCH_ACCOUNT_ID_BASE}}}) RETURN a.id");
+            match c.run(&base_probe) {
+                Ok(1) => {}
+                Ok(n) => {
+                    eprintln!(
+                        "[stress] {addr}: account id base {FINBENCH_ACCOUNT_ID_BASE} matched {n}                          node(s), expected exactly 1 — this corpus does not use the id scheme                          the harness keys on, so every lookup would miss. Refusing to measure."
+                    );
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("[stress] could not verify the FinBench account id base: {e}");
+                    std::process::exit(1);
+                }
+            }
+            keys = accounts;
+            eprintln!(
+                "[stress] attached to a FinBench corpus at {addr}: {accounts} accounts (probed                  in {:.1}s); id base verified; --keys set from the corpus",
+                t0.elapsed().as_secs_f64()
+            );
+        }
+        Dataset::Graphalytics => {
+            // ATTACH, and probe the VERTEX COUNT rather than trusting `--keys`.
+            //
+            // `ga2jsonl` writes the graph's own vertex id as `vid`, numbered
+            // from 0, and every read shape anchors on it. A key space larger
+            // than the graph makes most lookups miss, and a run whose reads
+            // mostly return nothing reports the index's NEGATIVE path as
+            // throughput — a green benchmark measuring nothing.
+            //
+            // This arm exists because the SNB probe below is a `_ =>`
+            // catch-all: without it, a Graphalytics corpus was probed for
+            // `:Person`, found none, and exited telling the operator to load
+            // an SNB corpus. That is the fall-through the `Finbench` variant's
+            // own doc comment warns about, arriving for the second time.
+            let vertices = match c.run("MATCH (v:Vertex) RETURN v.vid") {
+                Ok(rows) => rows,
+                Err(e) => {
+                    eprintln!("[stress] could not probe the Graphalytics corpus at {addr}: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if vertices == 0 {
+                eprintln!(
+                    "[stress] {addr} holds no :Vertex nodes — the graphalytics dataset ATTACHES                      to an already-loaded graph.
+          Convert and load one with:                      ga2jsonl <graph dir> <out> --name G  &&  snbload <out> {addr} --match-on gid"
+                );
+                std::process::exit(1);
+            }
+            keys = vertices;
+            eprintln!(
+                "[stress] attached to a Graphalytics graph at {addr}: {vertices} vertices                  (probed in {:.1}s); --keys set from the graph",
+                t0.elapsed().as_secs_f64()
+            );
+        }
+        _ => {
             // ATTACH: the corpus is already there. Probe its size rather than
             // trusting `--keys` — a key space larger than the corpus makes most
             // lookups miss, and a run whose reads mostly return nothing measures
@@ -1222,7 +2029,10 @@ profiles:"
     // process, and a table of a handful of shapes is the cheapest possible way
     // to hand them a `'static` slice without an Arc on every operation.
     let read_shapes: &'static [Shape] = Box::leak(read_shapes.into_boxed_slice());
-    let total_weight: u32 = read_shapes.iter().map(|s| s.weight).sum();
+    // The dataset's total is no longer used directly: a profile may override
+    // the shape set (the algorithm levels do), so the weight total is computed
+    // per profile from whichever set is in force.
+    let _ = read_shapes;
     let mut all_rows: Vec<(String, LevelResult)> = Vec::new();
     // Integrity failures found by the self-verification reads — merged into
     // the verdict, so a lossy run FAILS regardless of its throughput.
@@ -1232,6 +2042,8 @@ profiles:"
     let mut level_counter: u64 = 0;
 
     for prof in &profiles {
+        // Whichever shape set this profile measures — see `Profile::shapes`.
+        let prof_shapes: &'static [Shape] = prof.shapes.unwrap_or(read_shapes);
         println!(
             "\n=== profile: {} ({}% writes, {} writes) — {}",
             prof.name,
@@ -1334,12 +2146,19 @@ profiles:"
             let stop = Arc::new(AtomicBool::new(false));
             let ticker = Arc::new(AtomicU64::new(0));
             let mut handles = Vec::with_capacity(k);
+            // Fix 86: the level's identity for the slow-statement log, and
+            // its start on the wall clock. Printed once so a reader of the
+            // log can bracket the level without the JSON.
+            let level_tag: Arc<String> = Arc::new(format!("{}@{k}", prof.name));
+            let started_unix_ms = unix_ms();
+            eprintln!("[stress] level {level_tag} started t={started_unix_ms}");
 
             for cid in 0..k {
                 let addr = addr.clone();
                 let stop = Arc::clone(&stop);
                 let ticker = Arc::clone(&ticker);
                 let prof = **prof;
+                let level_tag = Arc::clone(&level_tag);
                 handles.push(std::thread::spawn(move || {
                     // Per-client seed: same global seed reproduces the run, but
                     // clients do not all issue the identical sequence (which
@@ -1420,9 +2239,20 @@ profiles:"
                             (stmt, true)
                         } else {
                             // Weighted shape choice, then a locality-aware key.
-                            let mut pickw = rng.below(u64::from(total_weight)) as u32;
-                            let mut chosen = &read_shapes[0];
-                            for sh in read_shapes {
+                            //
+                            // A profile may override the dataset's shapes —
+                            // the algorithm levels do — so the weight total is
+                            // recomputed from whichever set is in force rather
+                            // than taken from the dataset's. Using the
+                            // dataset's total against an overridden set would
+                            // skew the draw toward the first shape and, if the
+                            // override's total were smaller, could leave
+                            // `chosen` at its initial value for most picks.
+                            let shapes: &[Shape] = prof_shapes;
+                            let weight: u32 = shapes.iter().map(|s| s.weight).sum();
+                            let mut pickw = rng.below(u64::from(weight.max(1))) as u32;
+                            let mut chosen = &shapes[0];
+                            for sh in shapes {
                                 if pickw < sh.weight {
                                     chosen = sh;
                                     break;
@@ -1431,13 +2261,52 @@ profiles:"
                             }
                             let key = chosen.locality.pick(&mut rng, keys);
                             shape_name = Some(chosen.name);
-                            (render_read(dataset, chosen, key, keys), false)
+                            let stmt = render_read(dataset, chosen, key, keys);
+                            // `STRESS_TRACE=1` prefixes every READ with the engine's
+                            // per-statement trace marker, so a slow shape's counters
+                            // land in the SERVER log for the statement AS THE HARNESS
+                            // ISSUED IT — on its connection, in its mix, after its
+                            // writes. The v174 is7-replies stall (5 s per call in the
+                            // read-heavy level) reproduced under no hand-issued
+                            // statement, traced or not; only the harness's own calls
+                            // were slow. Reads only: a traced write would trace the
+                            // commit path, which is not what a stall in a read mix asks.
+                            // The SERVER must permit the marker (`ENGRAM_TRACE_MARKER=1`);
+                            // without it the marker is an ordinary comment and the server
+                            // log says so once (security plan §2.13).
+                            static TRACE_READS: std::sync::OnceLock<bool> =
+                                std::sync::OnceLock::new();
+                            let traced = *TRACE_READS
+                                .get_or_init(|| std::env::var_os("STRESS_TRACE").is_some());
+                            (
+                                if traced {
+                                    format!("/* engram:trace */ {stmt}")
+                                } else {
+                                    stmt
+                                },
+                                false,
+                            )
                         };
 
                         let t = Instant::now();
+                        let issued_ms = unix_ms();
                         match cn.run(&stmt) {
                             Ok(_) => {
                                 let us = t.elapsed().as_micros() as u64;
+                                // Fix 86: a statement over the slow line is
+                                // logged with its start on the wall clock,
+                                // its kind and its shape — the evidence that
+                                // says whether a stalled second stalled the
+                                // WRITERS (a lock) or the READERS (the read
+                                // path), and which shape paid.
+                                if us / 1000 >= slow_ms() {
+                                    eprintln!(
+                                        "[slow] t={issued_ms} {}ms {level_tag} c{cid} {} {}",
+                                        us / 1000,
+                                        if is_write { "write" } else { "read" },
+                                        shape_name.unwrap_or("-"),
+                                    );
+                                }
                                 if is_write {
                                     s.writes.push(us);
                                     if let Some(p) = churn_plan {
@@ -1535,6 +2404,7 @@ profiles:"
                 errors: agg.errors,
                 refusals: agg.refusals,
                 per_sec,
+                started_unix_ms,
             };
             println!(
                 "{:>7} {:>10.0} {:>10.0} {:>9.2} {:>9.2} {:>9.2} {:>10.2} {:>9.2} {:>7} {:>7.2} {:>7.2}",
@@ -1646,9 +2516,9 @@ profiles:"
             // bind BOTH endpoints. A dangling edge (the W1.1 corruption
             // class) shows as a count divergence or an error here.
             if prof.write_kind != WriteKind::Node {
-                let ty = match dataset {
+                let ty = match dataset.family() {
                     Dataset::Synthetic => "SLINK",
-                    Dataset::Snb => "STRESSED",
+                    _ => "STRESSED",
                 };
                 // ONE STATEMENT, so ONE SNAPSHOT.
                 //
@@ -1717,9 +2587,8 @@ profiles:"
                 }
                 let mut worker_mismatch = false;
                 for &(wid, cr, de) in &churn_ledgers {
-                    let probe = format!(
-                        "MATCH (n:Churn {{nonce: {level_nonce}, cid: {wid}}}) RETURN n.id"
-                    );
+                    let probe =
+                        format!("MATCH (n:Churn {{nonce: {level_nonce}, cid: {wid}}}) RETURN n.id");
                     match c.run(&probe) {
                         Ok(survivors) => {
                             if let Reconciliation::Mismatch { expected, measured } =
@@ -1926,7 +2795,39 @@ profiles:"
     // the two failures that matter and that a table hides: transport errors
     // (the server broke) and a throughput collapse within a level (it stopped
     // serving part way, which an average conceals).
+    //
+    // WHAT THIS BLOCK CANNOT SAY, and why it is not fixed here. Both checks
+    // below require four one-second buckets, because `trend` halves them and
+    // `floor` takes a 10th percentile over them. On a level of three seconds or
+    // less they DO NOT RUN, and both statistics return 1.0 -- the value of a
+    // perfectly steady level -- so the level does not merely go unjudged, it is
+    // guaranteed to look clean.
+    //
+    // The converged harness closes that by REFUSING such a level
+    // (`report::NotQuotable::TooShortToJudge`) and by refusing `--seconds` below
+    // the threshold at the command line. This binary deliberately does not: it
+    // stays in the tree to REPRODUCE the recorded `stress.rs` series
+    // (docs/converged-harness.md 7.1), and a changed verdict here would change
+    // what it reproduces -- which is the one thing it exists not to do.
+    //
+    // So the silence is REPORTED and not acted on. `unjudged` never enters
+    // `bad`, so no PASS becomes a FAIL and no exit code moves; it only stops
+    // the summary from claiming a check that did not happen. For a judged
+    // verdict, run the converged harness.
+    let mut unjudged: Vec<String> = Vec::new();
     let mut bad = integrity;
+    for (p, r) in &all_rows {
+        if r.per_sec.len() <= 3 {
+            unjudged.push(format!(
+                "{p} @ {} clients: a {:.1} s level produced {} one-second bucket(s); the \
+                 DEGRADED and STALLED checks need at least 4 and DID NOT RUN. The \
+                 trend/floor of 1.00 below is a default, not a measurement",
+                r.clients,
+                r.secs,
+                r.per_sec.len()
+            ));
+        }
+    }
     for (p, r) in &all_rows {
         if r.errors > 0 {
             bad.push(format!(
@@ -1967,11 +2868,28 @@ profiles:"
         }
     }
     println!();
+    for u in &unjudged {
+        println!("NOT JUDGED — {u}");
+    }
     if bad.is_empty() {
+        // The sentence has to be true of the levels it covers. "No throughput
+        // collapse" over a set that includes an unjudged level is a claim
+        // nothing checked.
+        let judged = all_rows.len() - unjudged.len();
         println!(
-            "PASS — {} level(s) across {} profile(s): no transport errors, no throughput collapse",
+            "PASS — {judged} judged level(s) of {} across {} profile(s): no transport \
+             errors, no throughput collapse{}",
             all_rows.len(),
-            profiles.len()
+            profiles.len(),
+            if unjudged.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ". {} level(s) were NOT JUDGED (see above) and this sentence says \
+                     nothing about them",
+                    unjudged.len()
+                )
+            }
         );
     } else {
         println!("FAIL");
@@ -2005,7 +2923,7 @@ profiles:"
                 "{{\"profile\":\"{p}\",\"clients\":{},\"seconds\":{:.3},\"read_ops\":{},\
                  \"write_ops\":{},\"ops_per_sec\":{:.2},\"p50_us\":{},\"p95_us\":{},\
                  \"p99_us\":{},\"p999_us\":{},\"max_us\":{},\"errors\":{},\"refusals\":{},\
-                 \"trend\":{:.4},\"floor\":{:.4},\"quotable\":{quotable_json},\"per_sec\":{:?}}}",
+                 \"trend\":{:.4},\"floor\":{:.4},\"quotable\":{quotable_json},\"started_unix_ms\":{},\"per_sec\":{:?}}}",
                 r.clients,
                 r.secs,
                 r.r_ops,
@@ -2020,6 +2938,7 @@ profiles:"
                 r.refusals,
                 r.trend(),
                 r.floor(),
+                r.started_unix_ms,
                 r.per_sec
             ));
         }
@@ -2247,6 +3166,7 @@ mod tests {
             errors: 0,
             refusals,
             per_sec,
+            started_unix_ms: 0,
         }
     }
 
@@ -2310,6 +3230,330 @@ mod tests {
             r.not_quotable_because(622_082),
             None,
             "refusals alongside acked writes are the profile working, not a fault"
+        );
+    }
+}
+
+#[cfg(test)]
+mod finbench_tests {
+    use super::*;
+
+    /// Every shape in the table must RENDER. `render_read` ends its match in
+    /// `unreachable!`, so a name in the table with no arm is a panic the
+    /// moment the mix picks it — at 32 clients, minutes into a run.
+    #[test]
+    fn every_declared_shape_renders() {
+        for shape in FINBENCH_SHAPES {
+            for key in [0u64, 1, 7, 12_345, 205_499] {
+                let q = render_read(Dataset::Finbench, shape, key, 205_500);
+                assert!(
+                    q.contains("MATCH"),
+                    "shape {} rendered no MATCH: {q}",
+                    shape.name
+                );
+            }
+        }
+    }
+
+    /// THE TRAP THIS DATASET EXISTS AROUND. `fbgen` mints account ids from
+    /// 2^62; a shape keyed by a bare `n` would look healthy and match nothing,
+    /// reporting the index's negative path as throughput. Every rendered
+    /// account lookup must carry the base.
+    #[test]
+    fn account_lookups_carry_the_two_to_the_sixtytwo_id_base() {
+        let base = FINBENCH_ACCOUNT_ID_BASE;
+        assert_eq!(base, 4_611_686_018_427_387_904, "the id base moved");
+        for shape in FINBENCH_SHAPES {
+            let q = render_read(Dataset::Finbench, shape, 7, 205_500);
+            if q.contains("Account {id:") {
+                assert!(
+                    q.contains(&format!("{}", base + 7)),
+                    "shape {} keys an account without the id base: {q}",
+                    shape.name
+                );
+            }
+        }
+    }
+
+    /// FinBench persons are dense from ONE. A shape asking for id 0 matches
+    /// nothing, and a mix of misses reports as throughput.
+    #[test]
+    fn person_shapes_never_ask_for_id_zero() {
+        for shape in FINBENCH_SHAPES {
+            for key in [0u64, 205_500, 411_000] {
+                let q = render_read(Dataset::Finbench, shape, key, 205_500);
+                assert!(
+                    !q.contains("Person {id: 0}"),
+                    "shape {} asked for Person id 0 at key {key}: {q}",
+                    shape.name
+                );
+            }
+        }
+    }
+
+    /// Only labels and edge types the corpus actually carries, probed on the
+    /// SF1 store: Account/Loan/Medium/Person/Company and transfer/withdraw/
+    /// deposit/repay/signIn/own/invest/apply/guarantee. A typo here is a
+    /// silent zero-row shape.
+    #[test]
+    fn shapes_name_only_types_the_corpus_carries() {
+        const LABELS: &[&str] = &["Account", "Loan", "Medium", "Person", "Company"];
+        const EDGES: &[&str] = &[
+            "transfer",
+            "withdraw",
+            "deposit",
+            "repay",
+            "signIn",
+            "own",
+            "invest",
+            "apply",
+            "guarantee",
+        ];
+        for shape in FINBENCH_SHAPES {
+            let q = render_read(Dataset::Finbench, shape, 3, 205_500);
+            for tok in q.split(|c: char| !c.is_ascii_alphanumeric()) {
+                if tok.starts_with(|c: char| c.is_ascii_uppercase()) && tok.len() > 2 {
+                    assert!(
+                        LABELS.contains(&tok) || !q.contains(&format!(":{tok}")),
+                        "shape {} names label {tok}, which the corpus does not carry: {q}",
+                        shape.name
+                    );
+                }
+            }
+            for e in q.split("-[").skip(1) {
+                let ty = e
+                    .split(']')
+                    .next()
+                    .unwrap_or("")
+                    .trim_start_matches(|c: char| c != ':')
+                    .trim_start_matches(':');
+                if !ty.is_empty() {
+                    assert!(
+                        EDGES.contains(&ty),
+                        "shape {} walks edge type {ty}, which the corpus does not carry: {q}",
+                        shape.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// The dataset must be reachable from the command line, and must NOT fall
+    /// through to the SNB arms — `:Person` exists in both corpora and means
+    /// different things, so a `_ =>` catch-all would silently key FinBench
+    /// runs off SNB's assumptions.
+    #[test]
+    fn the_dataset_parses_and_keeps_its_own_family() {
+        assert_eq!(Dataset::parse("finbench"), Some(Dataset::Finbench));
+        assert_eq!(Dataset::parse("fb"), Some(Dataset::Finbench));
+        assert_eq!(Dataset::Finbench.family(), Dataset::Finbench);
+        assert_ne!(Dataset::Finbench.family(), Dataset::Snb);
+        assert!(!Dataset::Finbench.shapes().is_empty());
+        assert!(
+            Dataset::Finbench
+                .indexes()
+                .iter()
+                .any(|i| i.contains("Account")),
+            "Account.id carries every point lookup and must be declared"
+        );
+    }
+}
+
+/// The Graphalytics dataset's shapes, and the two traps it shares with
+/// FinBench.
+#[cfg(test)]
+mod graphalytics_tests {
+    use super::*;
+
+    /// Every shape in the table must RENDER. `render_read` ends its match in
+    /// `unreachable!`, so a name in the table with no arm is a panic the
+    /// moment the mix picks it — at 32 clients, minutes into a run, after the
+    /// corpus has been loaded and the level released.
+    #[test]
+    fn every_declared_shape_renders() {
+        for shape in GRAPHALYTICS_SHAPES {
+            for key in [0u64, 1, 7, 12_345, 832_246] {
+                let q = render_read(Dataset::Graphalytics, shape, key, 832_247);
+                assert!(
+                    q.contains("MATCH") || q.contains("CALL"),
+                    "shape {} rendered neither MATCH nor CALL: {q}",
+                    shape.name
+                );
+            }
+        }
+    }
+
+    /// A rendered vertex key must lie inside the graph.
+    ///
+    /// Graphalytics vertex ids are the graph's own and `ga2jsonl` writes them
+    /// as `vid`. A shape keyed past the end matches nothing, and a mix of
+    /// misses reports the index's NEGATIVE path as throughput — the same trap
+    /// FinBench's 2^62 id base exists around, arriving from the other
+    /// direction.
+    #[test]
+    fn a_rendered_vertex_key_is_inside_the_graph() {
+        let space = 1_000u64;
+        for shape in GRAPHALYTICS_SHAPES {
+            for key in [0u64, 999, 1_000, 5_000, u64::MAX / 2] {
+                let q = render_read(Dataset::Graphalytics, shape, key, space);
+                for cap in q.split("vid: ").skip(1) {
+                    let digits: String = cap.chars().take_while(char::is_ascii_digit).collect();
+                    if digits.is_empty() {
+                        continue;
+                    }
+                    let v: u64 = digits.parse().expect("a vid is numeric");
+                    assert!(
+                        v < space,
+                        "shape {} keyed vid {v} outside a {space}-vertex graph: {q}",
+                        shape.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// The kernels must NOT ask for conformance semantics.
+    ///
+    /// `graphalytics: true` changes what BFS and WCC compute — sentinels for
+    /// unreachable vertices, separate in/out counting, a fixed iteration
+    /// count. That is the right mode for a CONFORMANCE run and the wrong one
+    /// here: this lane measures the shipped procedure surface under write
+    /// load. A throughput number taken under one semantics and a conformance
+    /// result taken under the other are two different measurements, and
+    /// blending them is how a table comes to compare two things.
+    #[test]
+    fn the_kernels_measure_the_shipped_semantics_not_the_conformance_gate() {
+        for shape in GRAPHALYTICS_SHAPES {
+            let q = render_read(Dataset::Graphalytics, shape, 7, 1_000);
+            assert!(
+                !q.contains("graphalytics"),
+                "shape {} passes the conformance gate: {q}",
+                shape.name
+            );
+        }
+    }
+
+    /// The kernels are weight 1, and that is load-bearing.
+    ///
+    /// A Graphalytics kernel on a real graph is two to four orders of
+    /// magnitude dearer than a vertex seek — `kgs` BFS is 82 s against a
+    /// sub-millisecond lookup. `FINBENCH_SHAPES` already recorded what happens
+    /// when that is not respected: `fb-amount-agg` at weight 2 consumed 95.3%
+    /// of all read time, and the headline ops/s was really reporting one
+    /// aggregate. This asserts the arrangement rather than trusting the
+    /// comment above the table.
+    #[test]
+    fn the_kernels_carry_the_smallest_weight_in_the_mix() {
+        let kernels: Vec<&Shape> = GRAPHALYTICS_SHAPES
+            .iter()
+            .filter(|s| matches!(s.name, "ga-bfs" | "ga-wcc"))
+            .collect();
+        assert_eq!(kernels.len(), 2, "both kernels are declared");
+        let lightest_traversal = GRAPHALYTICS_SHAPES
+            .iter()
+            .filter(|s| !matches!(s.name, "ga-bfs" | "ga-wcc"))
+            .map(|s| s.weight)
+            .min()
+            .expect("the mix has traversal shapes");
+        for k in kernels {
+            assert!(
+                k.weight <= lightest_traversal,
+                "{} at weight {} outweighs the lightest traversal ({lightest_traversal})",
+                k.name,
+                k.weight
+            );
+        }
+    }
+
+    /// Graphalytics is its OWN family and must never fall through to SNB's
+    /// writes, seeding or hot counter. Its corpus has one label and one type;
+    /// `:Person` does not exist in it at all.
+    #[test]
+    fn graphalytics_is_its_own_family() {
+        assert_eq!(Dataset::Graphalytics.family(), Dataset::Graphalytics);
+        assert_eq!(Dataset::parse("graphalytics"), Some(Dataset::Graphalytics));
+        assert_eq!(Dataset::parse("ga"), Some(Dataset::Graphalytics));
+        // Its declared index is on the vertex key the shapes actually seek.
+        assert!(
+            Dataset::Graphalytics
+                .indexes()
+                .iter()
+                .any(|i| i.contains("Vertex") && i.contains("vid")),
+            "the vertex key is unindexed, so every lookup is a scan"
+        );
+    }
+}
+
+/// A write must address the nodes the DATASET ACTUALLY HAS.
+///
+/// `render_write`'s relationship arms were written per family with a `_`
+/// catch-all, and Graphalytics fell into it: the catch-all matches
+/// `(a:Stress {k: …})`, and a Graphalytics corpus has no `:Stress` node — it
+/// has `:Vertex`. So every relationship write matched nothing and created
+/// nothing, while the throughput line counted each one. `algo-mixed`'s 50 %
+/// write stream was 50 % no-ops, and the rel-integrity probe — which looks for
+/// the `:STRESSED` edges those writes were supposed to make — found NO ROWS
+/// and reported "unreadable row" at every client level.
+///
+/// The read side is already guarded (`every_declared_shape_renders`, and the
+/// `Dataset` enum is deliberately not `_`-matched there). The write side was
+/// not, which is how a silent no-op survived a lane that reports numbers.
+#[cfg(test)]
+mod writes_address_the_datasets_own_nodes {
+    use super::{Dataset, Locality, WriteKind, render_write};
+
+    /// The node label each dataset's own reads bind.
+    fn node_label(ds: Dataset) -> &'static str {
+        match ds {
+            Dataset::Synthetic => "Stress",
+            Dataset::Snb | Dataset::SnbPlatform => "Person",
+            Dataset::Finbench => "Account",
+            Dataset::Graphalytics => "Vertex",
+        }
+    }
+
+    #[test]
+    fn every_datasets_relationship_write_matches_a_label_that_dataset_has() {
+        for ds in [
+            Dataset::Synthetic,
+            Dataset::Snb,
+            Dataset::SnbPlatform,
+            Dataset::Finbench,
+            Dataset::Graphalytics,
+        ] {
+            for kind in [WriteKind::RelSpread, WriteKind::RelHub] {
+                let w = render_write(ds, Locality::Uniform, kind, 0, 7, 10_000, 1);
+                let _ = kind;
+                let want = node_label(ds);
+                assert!(
+                    w.contains(&format!(":{want}")),
+                    "{ds:?} writes against a label this corpus does not have —                      it must address `:{want}`, got: {w}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_graphalytics_relationship_write_creates_the_edge_the_probe_looks_for() {
+        // The rel-integrity probe queries `:STRESSED` for every non-synthetic
+        // dataset. A family whose writes create a different type — or none —
+        // makes that probe report a finding about nothing.
+        let w = render_write(
+            Dataset::Graphalytics,
+            Locality::Uniform,
+            WriteKind::RelSpread,
+            0,
+            7,
+            10_000,
+            1,
+        );
+        assert!(
+            w.contains(":Vertex"),
+            "must bind the corpus's own nodes: {w}"
+        );
+        assert!(
+            w.contains(":STRESSED"),
+            "must create the type the integrity probe checks: {w}"
         );
     }
 }

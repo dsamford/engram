@@ -94,9 +94,12 @@ fn corpus() -> Graph {
     active.insert("state".to_string(), Value::Str("active".to_string()));
     let mut left = BTreeMap::new();
     left.insert("state".to_string(), Value::Str("left".to_string()));
-    g.create_rel(people["u1"], "MEMBER", projects[0], &active).expect("m");
-    g.create_rel(people["u2"], "MEMBER", projects[1], &BTreeMap::new()).expect("m");
-    g.create_rel(people["u2"], "MEMBER", projects[2], &left).expect("m");
+    g.create_rel(people["u1"], "MEMBER", projects[0], &active)
+        .expect("m");
+    g.create_rel(people["u2"], "MEMBER", projects[1], &BTreeMap::new())
+        .expect("m");
+    g.create_rel(people["u2"], "MEMBER", projects[2], &left)
+        .expect("m");
     for i in 0..N {
         let mut m = BTreeMap::new();
         m.insert("n".to_string(), Value::Int(i));
@@ -145,7 +148,10 @@ fn the_visibility_listing_answers_the_rules_and_skips_the_bodies_its_cheap_side_
         assert!(!want.is_empty());
         let (got, c) = traced(&g, LISTING, me);
         assert_eq!(ints(&got), want, "{me}");
-        assert!(count_of(&c, ORDERED) >= 1, "{me}: the WHERE was reordered: {c:?}");
+        assert!(
+            count_of(&c, ORDERED) >= 1,
+            "{me}: the WHERE was reordered: {c:?}"
+        );
         // Every org-scoped survivor decides the OR from its first disjunct;
         // the membership body never runs for it.
         let org_rows = want.iter().filter(|&&i| org_scoped(i)).count() as u64;
@@ -153,7 +159,7 @@ fn the_visibility_listing_answers_the_rules_and_skips_the_bodies_its_cheap_side_
             count_of(&c, SKIPPED) >= org_rows,
             "{me}: {org_rows} rows decided the OR without the body: {c:?}"
         );
-        let (gp,_) = general(&g, LISTING, me);
+        let (gp, _) = general(&g, LISTING, me);
         assert_eq!(ints(&gp), want, "general path, {me}");
     }
 }
@@ -166,13 +172,15 @@ fn a_body_written_first_is_evaluated_after_the_cheap_conjunct() {
     let g = corpus();
     let src = "MATCH (w:Item) WHERE EXISTS { MATCH (w)-[:IN]->(:Proj)<-[:MEMBER]-(:Person {pid: $me}) } AND w.assignee = $me RETURN count(w) AS n";
     let want = (0..N)
-        .filter(|&i| assignee(i) == "u1" && [0, 1, 2].contains(&project(i)) && matches!(project(i), 0))
+        .filter(|&i| {
+            assignee(i) == "u1" && [0, 1, 2].contains(&project(i)) && matches!(project(i), 0)
+        })
         .count() as i64;
     let (got, c) = traced(&g, src, "u1");
     assert_eq!(got, vec![vec![Value::Int(want)]]);
     assert!(count_of(&c, ORDERED) >= 1, "{c:?}");
-    let (gp,cg) = general(&g, src, "u1");
-    assert_eq!(gp,vec![vec![Value::Int(want)]]);
+    let (gp, cg) = general(&g, src, "u1");
+    assert_eq!(gp, vec![vec![Value::Int(want)]]);
     let not_mine = (0..N).filter(|&i| assignee(i) != "u1").count() as u64;
     assert!(
         count_of(&cg, SKIPPED) >= not_mine,
@@ -191,8 +199,8 @@ fn a_with_where_and_a_negated_body_reorder_alike() {
     let (got, c) = traced(&g, src, "u2");
     assert_eq!(got, vec![vec![Value::Int(want)]]);
     assert!(count_of(&c, ORDERED) >= 1, "{c:?}");
-    let (gp,_) = general(&g, src, "u2");
-    assert_eq!(gp,vec![vec![Value::Int(want)]]);
+    let (gp, _) = general(&g, src, "u2");
+    assert_eq!(gp, vec![vec![Value::Int(want)]]);
 }
 
 /// CONTROLS: a scalar operand is never skipped — `false AND 1` and `true OR

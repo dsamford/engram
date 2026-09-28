@@ -51,8 +51,12 @@ struct Book {
 impl Book {
     fn new(seed_per_person: u64) -> Book {
         Book {
-            intent_add: (0..PERSONS).map(|_| AtomicU64::new(seed_per_person)).collect(),
-            done_add: (0..PERSONS).map(|_| AtomicU64::new(seed_per_person)).collect(),
+            intent_add: (0..PERSONS)
+                .map(|_| AtomicU64::new(seed_per_person))
+                .collect(),
+            done_add: (0..PERSONS)
+                .map(|_| AtomicU64::new(seed_per_person))
+                .collect(),
             intent_del: (0..PERSONS).map(|_| AtomicU64::new(0)).collect(),
             done_del: (0..PERSONS).map(|_| AtomicU64::new(0)).collect(),
             nodes_intent_add: AtomicU64::new(SEED_MESSAGES),
@@ -64,21 +68,31 @@ impl Book {
     /// The counters a bound needs BEFORE the read: adds done and deletes
     /// done by then are certainly reflected in the row.
     fn person_before(&self, p: usize) -> (u64, u64) {
-        (self.done_add[p].load(Ordering::SeqCst), self.done_del[p].load(Ordering::SeqCst))
+        (
+            self.done_add[p].load(Ordering::SeqCst),
+            self.done_del[p].load(Ordering::SeqCst),
+        )
     }
     /// The bound, closed AFTER the read: at every instant of the read the
     /// row held at least `done_add(before) - intent_del(after)` and at most
     /// `intent_add(after) - done_del(before)`.
     fn person_bounds(&self, p: usize, before: (u64, u64)) -> (u64, u64) {
-        let lo = before.0.saturating_sub(self.intent_del[p].load(Ordering::SeqCst));
+        let lo = before
+            .0
+            .saturating_sub(self.intent_del[p].load(Ordering::SeqCst));
         let hi = self.intent_add[p].load(Ordering::SeqCst) - before.1;
         (lo, hi)
     }
     fn nodes_before(&self) -> (u64, u64) {
-        (self.nodes_done_add.load(Ordering::SeqCst), self.nodes_done_del.load(Ordering::SeqCst))
+        (
+            self.nodes_done_add.load(Ordering::SeqCst),
+            self.nodes_done_del.load(Ordering::SeqCst),
+        )
     }
     fn nodes_bounds(&self, before: (u64, u64)) -> (u64, u64) {
-        let lo = before.0.saturating_sub(self.nodes_intent_del.load(Ordering::SeqCst));
+        let lo = before
+            .0
+            .saturating_sub(self.nodes_intent_del.load(Ordering::SeqCst));
         let hi = self.nodes_intent_add.load(Ordering::SeqCst) - before.1;
         (lo, hi)
     }
@@ -107,7 +121,9 @@ fn setup() -> (Arc<Graph>, Vec<u64>, u32, u64) {
             .expect("has_creator");
     }
     g.shared_store().seal();
-    let tok = g.type_tokens_peek(&["HAS_CREATOR".to_string()]).expect("minted")[0];
+    let tok = g
+        .type_tokens_peek(&["HAS_CREATOR".to_string()])
+        .expect("minted")[0];
     for &p in &persons {
         let _ = g.adjacent_slim(p, Dir::In, &Some(vec![tok]));
     }
@@ -156,7 +172,8 @@ fn hammer(deletes: bool, txn_batches: bool) {
                 // A seed MIXER, so the multiply is meant to wrap: for `w >= 2`
                 // the plain `*` overflows u64 and, in a debug build, panics
                 // the writer thread before it writes anything.
-                let mut x = 0xA5A5_5A5A_1234_5678u64 ^ (w as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                let mut x =
+                    0xA5A5_5A5A_1234_5678u64 ^ (w as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
                 let mut i = 0u64;
                 let (_, trace) = engram_observe::with_trace(|| {
                     while i < OPS_PER_WRITER {
@@ -197,7 +214,9 @@ fn hammer(deletes: bool, txn_batches: bool) {
                             }
                             for &p in &targets {
                                 let m = g.create_node(&message, &none).expect("message");
-                                let r = g.create_rel(m, "HAS_CREATOR", persons[p], &none).expect("rel");
+                                let r = g
+                                    .create_rel(m, "HAS_CREATOR", persons[p], &none)
+                                    .expect("rel");
                                 made.push((m, p, r));
                             }
                             if batch > 1 {
@@ -224,7 +243,12 @@ fn hammer(deletes: bool, txn_batches: bool) {
 
     let readers: Vec<_> = (0..READERS)
         .map(|r| {
-            let (g, book, persons, stop) = (Arc::clone(&g), Arc::clone(&book), persons.clone(), Arc::clone(&stop));
+            let (g, book, persons, stop) = (
+                Arc::clone(&g),
+                Arc::clone(&book),
+                persons.clone(),
+                Arc::clone(&stop),
+            );
             std::thread::spawn(move || {
                 let mut reads = 0u64;
                 let mut violations = 0u64;
@@ -237,18 +261,23 @@ fn hammer(deletes: bool, txn_batches: bool) {
                         x ^= x << 17;
                         let p = (x % PERSONS as u64) as usize;
                         let before = book.person_before(p);
-                        let got = g.adjacent_slim(persons[p], Dir::In, &Some(vec![tok])).len() as u64;
+                        let got =
+                            g.adjacent_slim(persons[p], Dir::In, &Some(vec![tok])).len() as u64;
                         let (lo, hi) = book.person_bounds(p, before);
                         if !(lo <= got && got <= hi) {
                             violations += 1;
-                            first.get_or_insert_with(|| format!("person {p} in-row {got} outside [{lo}, {hi}]"));
+                            first.get_or_insert_with(|| {
+                                format!("person {p} in-row {got} outside [{lo}, {hi}]")
+                            });
                         }
                         let before = book.nodes_before();
                         let got = g.members(Some("Message")).expect("members").len() as u64;
                         let (lo, hi) = book.nodes_bounds(before);
                         if !(lo <= got && got <= hi) {
                             violations += 1;
-                            first.get_or_insert_with(|| format!(":Message membership {got} outside [{lo}, {hi}]"));
+                            first.get_or_insert_with(|| {
+                                format!(":Message membership {got} outside [{lo}, {hi}]")
+                            });
                         }
                         // Keep the OUT table alive and racing too.
                         let _ = g.adjacent_slim(probe_message, Dir::Out, &Some(vec![tok]));
@@ -292,13 +321,24 @@ fn hammer(deletes: bool, txn_batches: bool) {
         violations += v;
         let c = trace.counters();
         table_path += c.get("graph.adjacency tables reused").copied().unwrap_or(0)
-            + c.get("graph.adjacency tables repaired").copied().unwrap_or(0)
+            + c.get("graph.adjacency tables repaired")
+                .copied()
+                .unwrap_or(0)
             + c.get("graph.adjacency tables built").copied().unwrap_or(0)
-            + c.get("graph.adjacency tables built by another worker").copied().unwrap_or(0);
-        direct += c.get("graph.adjacency table declined by the entry budget").copied().unwrap_or(0);
-        fenced += c.get("graph.publish stamp fenced below an in-flight writer").copied().unwrap_or(0);
+            + c.get("graph.adjacency tables built by another worker")
+                .copied()
+                .unwrap_or(0);
+        direct += c
+            .get("graph.adjacency table declined by the entry budget")
+            .copied()
+            .unwrap_or(0);
+        fenced += c
+            .get("graph.publish stamp fenced below an in-flight writer")
+            .copied()
+            .unwrap_or(0);
     }
-    let poisoned = engram_graph::counters::DERIVED_LOG_POISONED.load(Ordering::Relaxed) - poisoned_before;
+    let poisoned =
+        engram_graph::counters::DERIVED_LOG_POISONED.load(Ordering::Relaxed) - poisoned_before;
     eprintln!(
         "[hammer deletes={deletes} txn={txn_batches}] reads={reads} table_path={table_path} direct={direct} \
          violations={violations} refresh_runs={runs} fenced={fenced} txn_replays={txn_replays} poisoned={poisoned} \
@@ -316,7 +356,11 @@ fn hammer(deletes: bool, txn_batches: bool) {
     for &p in &persons {
         person_rows.push(g.adjacent_slim(p, Dir::In, &Some(vec![tok])));
     }
-    let messages: Vec<u64> = g.members(Some("Message")).expect("members").iter().collect();
+    let messages: Vec<u64> = g
+        .members(Some("Message"))
+        .expect("members")
+        .iter()
+        .collect();
     let mut message_rows: Vec<Vec<SlimAdj>> = Vec::with_capacity(messages.len());
     for &m in &messages {
         message_rows.push(g.adjacent_slim(m, Dir::Out, &Some(vec![tok])));
@@ -333,11 +377,18 @@ fn hammer(deletes: bool, txn_batches: bool) {
             snapshot.len(),
             walked.len()
         );
-        assert_eq!(snapshot, walked, "settled {label:?} membership differs from the store walk id for id");
+        assert_eq!(
+            snapshot, walked,
+            "settled {label:?} membership differs from the store walk id for id"
+        );
     }
     let (nlo, nhi) = book.nodes_bounds(book.nodes_before());
     assert_eq!(nlo, nhi, "bookkeeping did not settle");
-    assert_eq!(messages.len() as u64, nlo, "settled :Message count != acknowledged");
+    assert_eq!(
+        messages.len() as u64,
+        nlo,
+        "settled :Message count != acknowledged"
+    );
     // Now the direct walk (tables declined) against every table row.
     g.set_adj_table_max_entries(0);
     let mut short_persons = Vec::new();
@@ -345,8 +396,16 @@ fn hammer(deletes: bool, txn_batches: bool) {
         let direct = g.adjacent_slim(p, Dir::In, &Some(vec![tok]));
         let (lo, hi) = book.person_bounds(i, book.person_before(i));
         assert_eq!(lo, hi, "person {i} bookkeeping did not settle");
-        assert_eq!(direct.len() as u64, lo, "the STORE is short for person {i} — the writer, not the table");
-        assert_eq!(direct.len() as u64, live_per_person[i], "writer-side live count disagrees with the store for person {i}");
+        assert_eq!(
+            direct.len() as u64,
+            lo,
+            "the STORE is short for person {i} — the writer, not the table"
+        );
+        assert_eq!(
+            direct.len() as u64,
+            live_per_person[i],
+            "writer-side live count disagrees with the store for person {i}"
+        );
         if key(&person_rows[i]) != key(&direct) {
             short_persons.push((i, person_rows[i].len(), direct.len()));
         }
@@ -362,18 +421,36 @@ fn hammer(deletes: bool, txn_batches: bool) {
             bad_messages += 1;
         }
     }
-    assert_eq!(bad_messages, 0, "settled OUT tables differ from the store for {bad_messages} messages");
+    assert_eq!(
+        bad_messages, 0,
+        "settled OUT tables differ from the store for {bad_messages} messages"
+    );
     // The instrument: enough racing, the table path taken, the fence exercised,
     // no poison, no transient violation.
-    assert!(reads >= 500, "too few reads to have raced anything: {reads}");
-    assert!(table_path >= reads / 2, "readers did not take the table path");
+    assert!(
+        reads >= 500,
+        "too few reads to have raced anything: {reads}"
+    );
+    assert!(
+        table_path >= reads / 2,
+        "readers did not take the table path"
+    );
     assert_eq!(direct, 0, "a reader fell back to the direct walk");
-    assert!(fenced > 0, "the fence never clamped a publish — the mechanism was not exercised");
+    assert!(
+        fenced > 0,
+        "the fence never clamped a publish — the mechanism was not exercised"
+    );
     if txn_batches {
         assert!(txn_replays > 0, "no transaction ever committed");
     }
-    assert_eq!(poisoned, 0, "the change log was POISONED {poisoned} time(s) — the fence has a hole");
-    assert_eq!(violations, 0, "reads outside their acknowledged/attempted bounds");
+    assert_eq!(
+        poisoned, 0,
+        "the change log was POISONED {poisoned} time(s) — the fence has a hole"
+    );
+    assert_eq!(
+        violations, 0,
+        "reads outside their acknowledged/attempted bounds"
+    );
 }
 
 #[test]

@@ -15,7 +15,7 @@ declaration, not a grant.
 
 ## Dependencies
 
-**39 third-party crates, every one permissively licensed. No copyleft anywhere
+**44 third-party crates, every one permissively licensed. No copyleft anywhere
 in the tree.**
 
 That is enforced rather than asserted: `cargo deny check` runs against an
@@ -31,10 +31,20 @@ in `NOTICE`, which is the file to ship alongside a compiled artifact.
 
 ### Banned by name
 
-`aws-lc-rs` and `aws-lc-sys` are denied in `deny.toml`, which also records what
-that costs: they are FIPS-validated and `ring`, which Engram uses instead, is
-not. The reason is the one-`cc`-invocation rule — AWS-LC needs cmake — and the
-trade is written down rather than left implicit.
+Three crates are denied in `deny.toml`: `aws-lc-rs`, `aws-lc-sys` and
+`openssl-sys`.
+
+For the first two the file also records what the ban costs: they are
+FIPS-validated and `ring`, which Engram uses instead, is not. The reason is the
+one-`cc`-invocation rule — AWS-LC builds vendored C and assembly through several
+`cc` invocations — and, because `rustls` pulls `aws-lc-rs` by default, the ban is
+what stops that arriving as a transitive default rather than as a decision. The
+trade is written down rather than left implicit, so a compliance regime that
+needs FIPS knows exactly which line to reopen.
+
+`openssl-sys` carries no such note. It is denied by name and the file does not
+say why, which is the one place this section's own standard — a ban is a
+recorded decision, not an accident — is not met.
 
 ## The vendored openCypher TCK
 

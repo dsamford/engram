@@ -60,12 +60,21 @@ fn corpus() -> Graph {
     let body: String = "b".repeat(3072);
     let mut interest = BTreeMap::new();
     interest.insert("id".to_string(), Value::Str("int-1".into()));
-    let interest = g.create_node(&["Interest".into()], &interest).expect("interest");
+    let interest = g
+        .create_node(&["Interest".into()], &interest)
+        .expect("interest");
     let mut ents = Vec::new();
     for k in 0..6i64 {
         let mut m = BTreeMap::new();
         m.insert("name".to_string(), Value::Str(format!("Entity {k}")));
-        m.insert("type".to_string(), Value::Str(if k % 2 == 0 { "org".into() } else { "person".into() }));
+        m.insert(
+            "type".to_string(),
+            Value::Str(if k % 2 == 0 {
+                "org".into()
+            } else {
+                "person".into()
+            }),
+        );
         ents.push(g.create_node(&["Entity".into()], &m).expect("entity"));
     }
     for i in 0..2000i64 {
@@ -75,18 +84,28 @@ fn corpus() -> Graph {
         m.insert("userId".to_string(), Value::Str(format!("u{}", i % 40)));
         m.insert("nodeId".to_string(), Value::Str(format!("mail-{i:05}")));
         m.insert("subject".to_string(), Value::Str(format!("subject {i}")));
-        m.insert("createdAt".to_string(), Value::Str(format!("2026-08-{:02}T{:02}:00:00Z", 1 + i % 28, i % 24)));
+        m.insert(
+            "createdAt".to_string(),
+            Value::Str(format!("2026-08-{:02}T{:02}:00:00Z", 1 + i % 28, i % 24)),
+        );
         if i % 4 != 0 {
             m.insert("reinforceRevivals".to_string(), Value::Int(i % 5));
         }
         m.insert("rawData".to_string(), Value::Str(body.clone()));
         let n = g.create_node(&["UserDataNode".into()], &m).expect("email");
         if i % 3 == 0 {
-            g.create_rel(n, "MENTIONS_INTEREST", interest, &BTreeMap::new()).expect("mi");
+            g.create_rel(n, "MENTIONS_INTEREST", interest, &BTreeMap::new())
+                .expect("mi");
         }
         if i % 5 == 0 {
             for k in 0..2 {
-                g.create_rel(n, "MENTIONS", ents[((i / 5 + k) % 6) as usize], &BTreeMap::new()).expect("m");
+                g.create_rel(
+                    n,
+                    "MENTIONS",
+                    ents[((i / 5 + k) % 6) as usize],
+                    &BTreeMap::new(),
+                )
+                .expect("m");
             }
         }
     }
@@ -115,7 +134,10 @@ fn the_revival_pick_binds_its_carry_lean() {
     // the one survivor; both decode the survivor, never the population.
     assert!(
         count_of(&c, BESIDE) > 0
-            || count_of(&c, "interp.columnar stage hydrated a bare node for a survivor") > 0,
+            || count_of(
+                &c,
+                "interp.columnar stage hydrated a bare node for a survivor"
+            ) > 0,
         "{c:?}"
     );
     assert!(

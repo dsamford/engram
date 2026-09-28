@@ -68,9 +68,21 @@ fn crossg() -> Graph {
         p.insert(key.to_string(), Value::Int(v));
         g.create_node(&[label.into()], &p).expect("node")
     };
-    let f = [mk("Forum", "fid", 0), mk("Forum", "fid", 1), mk("Forum", "fid", 2)];
-    let p = [mk("Post", "len", 10), mk("Post", "len", 20), mk("Post", "len", 30)];
-    let m = [mk("Person", "pid", 0), mk("Person", "pid", 1), mk("Person", "pid", 2)];
+    let f = [
+        mk("Forum", "fid", 0),
+        mk("Forum", "fid", 1),
+        mk("Forum", "fid", 2),
+    ];
+    let p = [
+        mk("Post", "len", 10),
+        mk("Post", "len", 20),
+        mk("Post", "len", 30),
+    ];
+    let m = [
+        mk("Person", "pid", 0),
+        mk("Person", "pid", 1),
+        mk("Person", "pid", 2),
+    ];
     let e = BTreeMap::new();
     g.create_rel(p[0], "CONTAINER_OF", f[0], &e).unwrap();
     g.create_rel(p[1], "CONTAINER_OF", f[0], &e).unwrap();
@@ -254,7 +266,12 @@ fn adv_rel_reuse_across_multi_hop_legs_is_allowed() {
     );
     assert_eq!(
         on.unwrap(),
-        vec![vec![Value::Int(0), Value::Int(1), Value::Int(1), Value::Int(1)]],
+        vec![vec![
+            Value::Int(0),
+            Value::Int(1),
+            Value::Int(1),
+            Value::Int(1)
+        ]],
         "both legs match despite sharing every rel"
     );
     // Single-hop twins over the same rels: n^2 per forum.

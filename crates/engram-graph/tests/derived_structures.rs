@@ -80,9 +80,15 @@ fn a_committed_transaction_is_caught_up_with_not_rebuilt_from() {
     let _ = g.members(None).expect("all nodes");
     let _ = g.members(Some("Person")).expect("Person");
     assert_eq!(ids(&g, "MATCH (p:Person {id: 5}) RETURN id(p)").len(), 1);
-    assert_eq!(ids(&g, "MATCH (p:Person)-[:KNOWS]->(q) RETURN id(q)").len(), 500);
+    assert_eq!(
+        ids(&g, "MATCH (p:Person)-[:KNOWS]->(q) RETURN id(q)").len(),
+        500
+    );
     // The count-over-type shape is what builds a per-type adjacency table.
-    assert_eq!(ids(&g, "MATCH (:Person)-[:KNOWS]->(q:Person) RETURN count(*)"), vec![500]);
+    assert_eq!(
+        ids(&g, "MATCH (:Person)-[:KNOWS]->(q:Person) RETURN count(*)"),
+        vec![500]
+    );
     assert_eq!(g.count_label_nodes("Person"), 1000);
 
     let ((), t) = engram_observe::with_trace(|| {
@@ -93,21 +99,50 @@ fn a_committed_transaction_is_caught_up_with_not_rebuilt_from() {
              creationDate: 1, content: 'x', length: 1})-[:HAS_CREATOR]->(p)",
         );
         // An edge of an EXISTING type between existing nodes: its table repairs.
-        in_txn(&g, "MATCH (a:Person {id: 7}), (b:Person {id: 900}) CREATE (a)-[:KNOWS]->(b)");
+        in_txn(
+            &g,
+            "MATCH (a:Person {id: 7}), (b:Person {id: 900}) CREATE (a)-[:KNOWS]->(b)",
+        );
         assert_eq!(g.members(None).expect("all nodes").len(), 1001);
         assert_eq!(g.members(Some("Person")).expect("Person").len(), 1000);
         assert_eq!(ids(&g, "MATCH (p:Person {id: 7}) RETURN id(p)").len(), 1);
-        assert_eq!(ids(&g, "MATCH (:Person)-[:KNOWS]->(q:Person) RETURN count(*)"), vec![501]);
-        assert_eq!(ids(&g, "MATCH (p:Person)-[:KNOWS]->(q) RETURN id(q)").len(), 501);
+        assert_eq!(
+            ids(&g, "MATCH (:Person)-[:KNOWS]->(q:Person) RETURN count(*)"),
+            vec![501]
+        );
+        assert_eq!(
+            ids(&g, "MATCH (p:Person)-[:KNOWS]->(q) RETURN id(q)").len(),
+            501
+        );
         assert_eq!(g.count_label_nodes("Person"), 1000);
         assert_eq!(g.count_all_nodes(), 1001);
     });
     let c = t.counters();
-    assert_eq!(counter(&t, "derived.change log touched"), 0, "nothing may be touched: {c:?}");
-    assert_eq!(counter(&t, "graph.membership snapshots built"), 0, "no membership rebuild: {c:?}");
-    assert_eq!(counter(&t, "graph.range index builds"), 0, "no index rebuild: {c:?}");
-    assert_eq!(counter(&t, "graph.adjacency tables built"), 0, "no adjacency rebuild: {c:?}");
-    assert_eq!(counter(&t, "graph.stats rebuilt"), 0, "no stats rebuild: {c:?}");
+    assert_eq!(
+        counter(&t, "derived.change log touched"),
+        0,
+        "nothing may be touched: {c:?}"
+    );
+    assert_eq!(
+        counter(&t, "graph.membership snapshots built"),
+        0,
+        "no membership rebuild: {c:?}"
+    );
+    assert_eq!(
+        counter(&t, "graph.range index builds"),
+        0,
+        "no index rebuild: {c:?}"
+    );
+    assert_eq!(
+        counter(&t, "graph.adjacency tables built"),
+        0,
+        "no adjacency rebuild: {c:?}"
+    );
+    assert_eq!(
+        counter(&t, "graph.stats rebuilt"),
+        0,
+        "no stats rebuild: {c:?}"
+    );
     assert!(
         counter(&t, "graph.membership snapshots caught up") >= 1,
         "the memberships caught up from their logs: {c:?}"
@@ -174,7 +209,10 @@ fn a_rolled_back_transaction_leaves_the_snapshot_exactly_as_it_was() {
     let ((), t) = engram_observe::with_trace(|| {
         let m = g.members(Some("L")).expect("members");
         assert_eq!(m.len(), 100);
-        assert_eq!(m.iter().collect::<Vec<_>>(), ids(&g, "MATCH (n:L) RETURN id(n)"));
+        assert_eq!(
+            m.iter().collect::<Vec<_>>(),
+            ids(&g, "MATCH (n:L) RETURN id(n)")
+        );
     });
     assert_eq!(
         counter(&t, "graph.membership snapshots built"),
@@ -228,7 +266,10 @@ fn a_write_to_one_label_costs_the_others_nothing_and_its_own_an_o_delta_catch_up
 #[test]
 fn a_slice_consumer_materialises_a_snapshot_once_not_per_read() {
     let g = graph();
-    run(&g, "UNWIND range(0, 4999) AS i CREATE (:L {id: i, v: i % 7})");
+    run(
+        &g,
+        "UNWIND range(0, 4999) AS i CREATE (:L {id: i, v: i % 7})",
+    );
     run(&g, "MATCH (n:L) RETURN count(n.v)"); // warm: snapshot built, no overlay
     run(&g, "CREATE (:L {id: 5000, v: 1})"); // one change: the overlay is live
     let ((), t) = engram_observe::with_trace(|| {
@@ -239,7 +280,12 @@ fn a_slice_consumer_materialises_a_snapshot_once_not_per_read() {
             );
         }
     });
-    assert_eq!(counter(&t, "graph.membership snapshots built"), 0, "{:?}", t.counters());
+    assert_eq!(
+        counter(&t, "graph.membership snapshots built"),
+        0,
+        "{:?}",
+        t.counters()
+    );
     assert!(
         counter(&t, "derived.members view materialised") <= 1,
         "twenty reads over one snapshot must materialise it at most once: {:?}",
@@ -258,11 +304,19 @@ fn label_add_and_remove_flow_through_the_snapshot_without_a_rebuild() {
         run(&g, "MATCH (n:X) SET n:L"); // re-add: a no-op for membership
         let m = g.members(Some("L")).expect("L");
         assert_eq!(m.len(), 150);
-        assert_eq!(m.iter().collect::<Vec<_>>(), ids(&g, "MATCH (n:L) RETURN id(n)"));
+        assert_eq!(
+            m.iter().collect::<Vec<_>>(),
+            ids(&g, "MATCH (n:L) RETURN id(n)")
+        );
         assert!(!m.contains(0));
         assert!(m.contains(199));
     });
-    assert_eq!(counter(&t, "graph.membership snapshots built"), 0, "{:?}", t.counters());
+    assert_eq!(
+        counter(&t, "graph.membership snapshots built"),
+        0,
+        "{:?}",
+        t.counters()
+    );
 }
 
 // ── Range indexes ───────────────────────────────────────────────────────────
@@ -271,7 +325,10 @@ fn label_add_and_remove_flow_through_the_snapshot_without_a_rebuild() {
 fn an_index_catches_up_from_its_log_and_ignores_writes_to_other_properties() {
     let g = graph();
     ddl(&g, "CREATE INDEX l_id FOR (n:L) ON (n.id)");
-    run(&g, "UNWIND range(0, 999) AS i CREATE (:L {id: i, name: 'n' + toString(i)})");
+    run(
+        &g,
+        "UNWIND range(0, 999) AS i CREATE (:L {id: i, name: 'n' + toString(i)})",
+    );
     assert_eq!(run(&g, "MATCH (n:L {id: 5}) RETURN n.name").rows.len(), 1); // warm
     // Warm the LABEL-SCOPED index explicitly, because that is the one the
     // anchored seek now uses and the read above does not necessarily build it:
@@ -309,7 +366,12 @@ fn an_index_catches_up_from_its_log_and_ignores_writes_to_other_properties() {
         run(&g, "MATCH (n:L {id: 7}) SET n.name = 'renamed'");
         assert_eq!(run(&g, "MATCH (n:L {id: 5}) RETURN n.name").rows.len(), 1);
     });
-    assert_eq!(counter(&t, "graph.range index builds"), 0, "{:?}", t.counters());
+    assert_eq!(
+        counter(&t, "graph.range index builds"),
+        0,
+        "{:?}",
+        t.counters()
+    );
     assert!(
         counter(&t, "graph.range index still current") + counter(&t, "graph.range index cache hit")
             >= 1,
@@ -326,7 +388,10 @@ fn an_index_catches_up_from_its_log_and_ignores_writes_to_other_properties() {
             vec![vec![Value::Str("new".into())]]
         );
         assert_eq!(run(&g, "MATCH (n:L {id: 5}) RETURN n.name").rows.len(), 0);
-        assert_eq!(run(&g, "MATCH (n:L {id: 6000}) RETURN n.name").rows.len(), 1);
+        assert_eq!(
+            run(&g, "MATCH (n:L {id: 6000}) RETURN n.name").rows.len(),
+            1
+        );
     });
     // Back to an exact 0: `set_scoped_seek` ships OFF, so a property has one
     // index again and the fixture can enumerate what it warms. The bound this
@@ -349,8 +414,17 @@ fn an_index_catches_up_from_its_log_and_ignores_writes_to_other_properties() {
     //
     // The catch-up semantics this weakens are covered directly, and on the
     // index rather than on the answer, by `scoped_index_catch_up.rs`.
-    assert_eq!(counter(&t, "graph.range index builds"), 0, "{:?}", t.counters());
-    assert!(counter(&t, "graph.range index caught up") >= 1, "{:?}", t.counters());
+    assert_eq!(
+        counter(&t, "graph.range index builds"),
+        0,
+        "{:?}",
+        t.counters()
+    );
+    assert!(
+        counter(&t, "graph.range index caught up") >= 1,
+        "{:?}",
+        t.counters()
+    );
 }
 
 // ── Adjacency ───────────────────────────────────────────────────────────────
@@ -358,7 +432,10 @@ fn an_index_catches_up_from_its_log_and_ignores_writes_to_other_properties() {
 fn persons_in_cities(persons: i64) -> Graph {
     let g = graph();
     ddl(&g, "CREATE INDEX p_id FOR (n:Person) ON (n.id)");
-    run(&g, "UNWIND range(0, 99) AS i CREATE (:City {id: i, name: 'City' + toString(i)})");
+    run(
+        &g,
+        "UNWIND range(0, 99) AS i CREATE (:City {id: i, name: 'City' + toString(i)})",
+    );
     run(
         &g,
         &format!(
@@ -370,8 +447,7 @@ fn persons_in_cities(persons: i64) -> Graph {
     g
 }
 
-const AGG_BY_CITY: &str =
-    "MATCH (p:Person)-[:IS_LOCATED_IN]->(c:City) RETURN c.name, count(p) AS n ORDER BY n DESC, c.name LIMIT 3";
+const AGG_BY_CITY: &str = "MATCH (p:Person)-[:IS_LOCATED_IN]->(c:City) RETURN c.name, count(p) AS n ORDER BY n DESC, c.name LIMIT 3";
 
 #[test]
 fn a_node_write_or_another_types_edge_leaves_an_adjacency_table_current() {
@@ -384,15 +460,29 @@ fn a_node_write_or_another_types_edge_leaves_an_adjacency_table_current() {
         run(&g, AGG_BY_CITY);
     });
     let reused_alone = counter(&t, "graph.adjacency tables reused");
-    assert!(reused_alone >= 2_000, "the warm run must serve every hop from the table: {:?}", t.counters());
+    assert!(
+        reused_alone >= 2_000,
+        "the warm run must serve every hop from the table: {:?}",
+        t.counters()
+    );
 
     // A NODE write.
     let ((), t) = engram_observe::with_trace(|| {
         run(&g, "CREATE (:Message {id: 1})");
         run(&g, AGG_BY_CITY);
     });
-    assert_eq!(counter(&t, "graph.adjacency tables built"), 0, "{:?}", t.counters());
-    assert_eq!(counter(&t, "graph.adjacency tables repaired"), 0, "{:?}", t.counters());
+    assert_eq!(
+        counter(&t, "graph.adjacency tables built"),
+        0,
+        "{:?}",
+        t.counters()
+    );
+    assert_eq!(
+        counter(&t, "graph.adjacency tables repaired"),
+        0,
+        "{:?}",
+        t.counters()
+    );
     assert!(
         counter(&t, "graph.adjacency tables reused") >= reused_alone,
         "after a node write every hop must still come from the table — the probe \
@@ -403,28 +493,69 @@ fn a_node_write_or_another_types_edge_leaves_an_adjacency_table_current() {
 
     // An edge of ANOTHER type.
     let ((), t) = engram_observe::with_trace(|| {
-        run(&g, "MATCH (p:Person {id: 0}) CREATE (:Message {id: 2})-[:HAS_CREATOR]->(p)");
+        run(
+            &g,
+            "MATCH (p:Person {id: 0}) CREATE (:Message {id: 2})-[:HAS_CREATOR]->(p)",
+        );
         run(&g, AGG_BY_CITY);
     });
-    assert_eq!(counter(&t, "graph.adjacency tables built"), 0, "{:?}", t.counters());
-    assert_eq!(counter(&t, "graph.adjacency tables repaired"), 0, "{:?}", t.counters());
-    assert!(counter(&t, "graph.adjacency tables reused") >= reused_alone, "{:?}", t.counters());
+    assert_eq!(
+        counter(&t, "graph.adjacency tables built"),
+        0,
+        "{:?}",
+        t.counters()
+    );
+    assert_eq!(
+        counter(&t, "graph.adjacency tables repaired"),
+        0,
+        "{:?}",
+        t.counters()
+    );
+    assert!(
+        counter(&t, "graph.adjacency tables reused") >= reused_alone,
+        "{:?}",
+        t.counters()
+    );
 
     // An edge of THIS type: the table is repaired over the one row that moved,
     // and answers the new count.
-    let before = run(&g, "MATCH (p:Person)-[:IS_LOCATED_IN]->(c:City {id: 1}) RETURN count(p)").rows;
+    let before = run(
+        &g,
+        "MATCH (p:Person)-[:IS_LOCATED_IN]->(c:City {id: 1}) RETURN count(p)",
+    )
+    .rows;
     let ((), t) = engram_observe::with_trace(|| {
-        run(&g, "MATCH (p:Person {id: 0}), (c:City {id: 1}) CREATE (p)-[:IS_LOCATED_IN]->(c)");
+        run(
+            &g,
+            "MATCH (p:Person {id: 0}), (c:City {id: 1}) CREATE (p)-[:IS_LOCATED_IN]->(c)",
+        );
         run(&g, AGG_BY_CITY);
     });
-    assert_eq!(counter(&t, "graph.adjacency tables built"), 0, "{:?}", t.counters());
-    assert!(counter(&t, "graph.adjacency tables repaired") >= 1, "{:?}", t.counters());
-    let after = run(&g, "MATCH (p:Person)-[:IS_LOCATED_IN]->(c:City {id: 1}) RETURN count(p)").rows;
+    assert_eq!(
+        counter(&t, "graph.adjacency tables built"),
+        0,
+        "{:?}",
+        t.counters()
+    );
+    assert!(
+        counter(&t, "graph.adjacency tables repaired") >= 1,
+        "{:?}",
+        t.counters()
+    );
+    let after = run(
+        &g,
+        "MATCH (p:Person)-[:IS_LOCATED_IN]->(c:City {id: 1}) RETURN count(p)",
+    )
+    .rows;
     let n = |rows: &Vec<Vec<Value>>| match &rows[0][0] {
         Value::Int(i) => *i,
         _ => panic!("count"),
     };
-    assert_eq!(n(&after), n(&before) + 1, "the repaired table carries the new edge");
+    assert_eq!(
+        n(&after),
+        n(&before) + 1,
+        "the repaired table carries the new edge"
+    );
 }
 
 // ── Concurrency ─────────────────────────────────────────────────────────────
@@ -448,8 +579,14 @@ fn concurrent_readers_racing_a_writer_agree_with_a_scan() {
                     let m = g.members(Some("L")).expect("members");
                     // Monotone in this test: ids are only added to L, so a
                     // snapshot can never be smaller than the warm one.
-                    assert!(m.len() >= baseline - 100, "a torn or stale snapshot: {}", m.len());
-                    let both = g.members_all(&["L".to_string(), "M".to_string()]).expect("all");
+                    assert!(
+                        m.len() >= baseline - 100,
+                        "a torn or stale snapshot: {}",
+                        m.len()
+                    );
+                    let both = g
+                        .members_all(&["L".to_string(), "M".to_string()])
+                        .expect("all");
                     assert!(both.len() <= m.len());
                 }
             });
@@ -462,7 +599,15 @@ fn concurrent_readers_racing_a_writer_agree_with_a_scan() {
         }
     });
     let m = g.members(Some("L")).expect("members");
-    assert_eq!(m.iter().collect::<Vec<_>>(), ids(&g, "MATCH (n:L) RETURN id(n)"));
-    let both = g.members_all(&["L".to_string(), "M".to_string()]).expect("all");
-    assert_eq!(both.iter().collect::<Vec<_>>(), ids(&g, "MATCH (n:L:M) RETURN id(n)"));
+    assert_eq!(
+        m.iter().collect::<Vec<_>>(),
+        ids(&g, "MATCH (n:L) RETURN id(n)")
+    );
+    let both = g
+        .members_all(&["L".to_string(), "M".to_string()])
+        .expect("all");
+    assert_eq!(
+        both.iter().collect::<Vec<_>>(),
+        ids(&g, "MATCH (n:L:M) RETURN id(n)")
+    );
 }

@@ -90,10 +90,23 @@ thread_local! {
     /// The COUNT FOLD (operator A of `docs/lsqb-completeness-plan.md`): ON by
     /// default. OFF = every hop materialises, the honest differential twin.
     static COUNT_FOLD: Cell<bool> = const { Cell::new(true) };
+    /// Fix 90, the fold's SYMMETRY BREAKING: ON by default. OFF = every
+    /// symmetric var order is enumerated and nothing is multiplied.
+    static FOLD_SYMMETRY: Cell<bool> = const { Cell::new(true) };
     /// The per-level MEMO inside the fold: ON by default. OFF = every level is
     /// re-enumerated per parent node — same count, so a differential test proves
     /// the memo is a pure cache.
     static COUNT_FOLD_MEMO: Cell<bool> = const { Cell::new(true) };
+    /// The fold's SEMIJOIN-FIRST child ordering (fix 120): ON by default.
+    /// OFF = each level's children are multiplied in hop-index order, the
+    /// state before the fix, so a differential proves the reordering is a
+    /// pure cost change and never an answer change.
+    static FOLD_CHILD_ORDER: Cell<bool> = const { Cell::new(true) };
+    /// Fix 121's bounded END GATHER in the subquery hop: ON by default.
+    /// OFF = a label past the whole-read ceiling declines the vectorised path
+    /// exactly as before, so a differential proves the gather is a pure cost
+    /// change and never an answer change.
+    static SUBQUERY_END_GATHER: Cell<bool> = const { Cell::new(true) };
     /// The COUNT-ONLY JOIN REORDER (operator C): ON by default. OFF = the
     /// pattern is planned in SOURCE order, the honest differential twin (the
     /// rewrite is unobservable, so ON and OFF must agree row-for-row).
@@ -102,7 +115,29 @@ thread_local! {
     /// the greedy alone, which is the arm that prices the search. Both orderings
     /// answer the same `count(*)`, so ON and OFF must agree row-for-row.
     static ORDER_PEAK_SEARCH: Cell<bool> = const { Cell::new(true) };
+    /// Fix 84: a fold CLOSE probes a HOISTED copy of the bound node's row —
+    /// materialised once per binding of that node, sorted by peer — instead
+    /// of going through `edges_to_peer_slim` per probe. ON by default. OFF =
+    /// every close probes the table, the arm that prices the hoist. Both
+    /// count the same edges, so ON and OFF must agree row-for-row.
+    static FOLD_HOISTED_CLOSE: Cell<bool> = const { Cell::new(true) };
+    /// Fix 84's THRESHOLD: how many probes a binding of the bound node must
+    /// have answered through the table before its row is hoisted. A hoist
+    /// costs O(deg) — the row is copied and sorted — and a table probe costs
+    /// O(log deg) plus the per-call machinery, so a binding probed once or
+    /// twice must never pay a whole row for it (a fan-out-1 path under a
+    /// high-degree bound row would have cost a row per probe). Past the first
+    /// hoist the threshold follows the row: max(this, deg / 4). `0` hoists
+    /// on the first probe — the test forcing for the differential.
+    static FOLD_HOIST_AFTER: Cell<usize> = const { Cell::new(FOLD_HOIST_AFTER_DEFAULT) };
 }
+
+/// The default for `FOLD_HOIST_AFTER`: probes a binding answers through the
+/// table before its row is hoisted. Eight is under the ~36 a LSQB q3 KNOWS
+/// close answers per binding of `person1` (~1,021 probes per hoisted read on
+/// SF1, so the threshold costs it under 1%) and over the one or two a
+/// binding sees when the ordering binds the close's bound var afresh per row.
+pub const FOLD_HOIST_AFTER_DEFAULT: usize = 8;
 
 /// The honest test forcing for the COUNT FOLD: with it off, a `count(*)`-only
 /// aggregate materialises every hop and reduces one row per walk instead of
@@ -127,6 +162,70 @@ pub fn set_count_fold_memo(enabled: bool) {
 /// Whether the fold's per-level memo is on (this thread).
 pub fn count_fold_memo_enabled() -> bool {
     COUNT_FOLD_MEMO.with(Cell::get)
+}
+
+/// The honest test forcing for the fold's SEMIJOIN-FIRST child ordering
+/// (fix 120): with it off, each level's children are multiplied in hop-index
+/// order. The ordering changes only WHICH factor of a product is computed
+/// first, so ON and OFF must agree on every count, byte for byte.
+pub fn set_fold_child_order(enabled: bool) {
+    FOLD_CHILD_ORDER.with(|c| c.set(enabled));
+}
+
+/// Whether the fold's semijoin-first child ordering is on (this thread).
+pub fn fold_child_order_enabled() -> bool {
+    FOLD_CHILD_ORDER.with(Cell::get)
+}
+
+/// The honest test forcing for the fold's SYMMETRY BREAKING (fix 90): with
+/// it off, a symmetric pattern is enumerated in every var order and each
+/// walk counted once; with it on, one order is enumerated and the count
+/// multiplied by the symmetric set's size factorial. Same count, so a
+/// differential proves the multiplier exact. Pipeline-local.
+pub fn set_fold_symmetry_breaking(enabled: bool) {
+    FOLD_SYMMETRY.with(|c| c.set(enabled));
+}
+
+/// Whether the fold's symmetry breaking is on (this thread).
+pub fn fold_symmetry_breaking_enabled() -> bool {
+    FOLD_SYMMETRY.with(Cell::get)
+}
+
+/// The honest test forcing for fix 121's bounded end gather: with it off, a
+/// label past the whole-read ceiling declines the vectorised subquery hop and
+/// falls to one projected record read per end, exactly as before the fix.
+pub fn set_subquery_end_gather(enabled: bool) {
+    SUBQUERY_END_GATHER.with(|c| c.set(enabled));
+}
+
+/// Whether fix 121's bounded end gather is on (this thread).
+pub fn subquery_end_gather_enabled() -> bool {
+    SUBQUERY_END_GATHER.with(Cell::get)
+}
+
+/// The honest test forcing for fix 84's hoisted close: with it off, every
+/// fold close probes the adjacency table through `edges_to_peer_slim`, as
+/// before. The hoist reads the same edge set from a local copy, so ON and
+/// OFF must agree on every count, byte for byte.
+pub fn set_fold_hoisted_close(enabled: bool) {
+    FOLD_HOISTED_CLOSE.with(|c| c.set(enabled));
+}
+
+/// Whether fix 84's hoisted close is on (this thread).
+pub fn fold_hoisted_close_enabled() -> bool {
+    FOLD_HOISTED_CLOSE.with(Cell::get)
+}
+
+/// Fix 84's hoist threshold (this thread): the probes a binding of the bound
+/// node answers through the table before its row is hoisted. `0` hoists on
+/// the first probe. See `FOLD_HOIST_AFTER`.
+pub fn set_fold_hoist_after(n: usize) {
+    FOLD_HOIST_AFTER.with(|c| c.set(n));
+}
+
+/// Fix 84's hoist threshold (this thread).
+pub fn fold_hoist_after() -> usize {
+    FOLD_HOIST_AFTER.with(Cell::get)
 }
 
 /// The honest test forcing for the COUNT-ONLY JOIN REORDER: with it off the
@@ -236,6 +335,17 @@ pub(crate) fn load_var_columns_labelled(
         .filter(|l| !l.is_empty())
         .and_then(|l| l.iter().min_by_key(|x| graph.count_label_nodes(x)))
         .map(String::as_str);
+    // Fix 93: a var the pattern left UNLABELLED (`-[:MENTIONS]->(e)`) reads
+    // through the label its members all carry, discovered from the store.
+    let discovered: Option<String> = match (kind, label) {
+        (VarKind::Node, None)
+            if graph.columnar_scans_enabled() && distinct.len() >= UNLABELLED_DISCOVERY_FLOOR =>
+        {
+            discover_covering_label(graph, distinct)?
+        }
+        _ => None,
+    };
+    let label = label.or(discovered.as_deref());
     if let (VarKind::Node, Some(label)) = (kind, label) {
         if graph.columnar_scans_enabled() && !distinct.is_empty() {
             let real: Vec<String> = props
@@ -248,8 +358,49 @@ pub(crate) fn load_var_columns_labelled(
                     .iter()
                     .all(|p| graph.prop_column(label, p, false).is_some());
             let label_n = graph.count_label_nodes(label);
+            // A FEW IDS AGAINST A CACHED COLUMN ARE LOOKED UP IN IT, not
+            // copied out of it: the read below takes the label's WHOLE column
+            // (a clone of every entry) and walks it to the last id. FinBench
+            // tcr12 read two accounts' ids through the 2.1M-entry Account
+            // column at SF10 -- ~30 of its 36 ms against Neo4j's 2. Binary
+            // search answers exactly what the aligned walk answers (`Null`
+            // for an id the column does not carry); a column evicted since
+            // the check above falls back to the read below.
+            if cached && !whole_label_worth(distinct.len(), label_n) {
+                let mut out: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+                for p in &real {
+                    let Some(crate::PropColumn::Values(col)) = graph.prop_column(label, p, false)
+                    else {
+                        break;
+                    };
+                    let vals: Vec<Value> = distinct
+                        .iter()
+                        .map(|&id| match col.binary_search_by_key(&id, |e| e.0) {
+                            Ok(i) => col[i].1.clone(),
+                            Err(_) => Value::Null,
+                        })
+                        .collect();
+                    out.insert(p.clone(), vals);
+                }
+                if out.len() == real.len() {
+                    counted!("interp.pipeline bound-var columns looked up in the cached label column");
+                    if props.contains(NODE_IDENTITY_KEY) {
+                        let id_col: Vec<Value> = distinct
+                            .iter()
+                            .map(|&id| Value::Node {
+                                id,
+                                labels: Vec::new(),
+                                props: BTreeMap::new(),
+                            })
+                            .collect();
+                        out.insert(NODE_IDENTITY_KEY.to_string(), id_col);
+                    }
+                    return Ok(Some(out));
+                }
+            }
             if !real.is_empty() && (cached || whole_label_worth(distinct.len(), label_n)) {
-                if let Some(cols) = crate::batch::label_value_columns(graph, label, &real, params)? {
+                if let Some(cols) = crate::batch::label_value_columns(graph, label, &real, params)?
+                {
                     counted!("interp.pipeline bound-var columns read from the label column");
                     let mut out: BTreeMap<String, Vec<Value>> = BTreeMap::new();
                     for (j, p) in real.iter().enumerate() {
@@ -273,6 +424,65 @@ pub(crate) fn load_var_columns_labelled(
     }
     load_var_columns(graph, kind, distinct, props)
 }
+
+/// Fix 93: the label EVERY one of `distinct` (node ids) carries, smallest
+/// first — or `None`. The production MENTIONS aggregate, `MATCH
+/// (n:UserDataNode {userId: $u})-[:MENTIONS]->(e) RETURN e.name, coalesce(
+/// e.type, 'unknown'), count(*) … LIMIT 30`, names no label for its 37,270
+/// distinct ends, so their two properties were gathered by a record read
+/// each on every execution (277 ms against Neo4j's 208 on the mirror) —
+/// though every end is an `Entity`, whose `name` and `type` columns the
+/// cache serves. The candidates are the labels three sampled members (the
+/// first, the middle, the last id) all carry; a candidate whose count can
+/// hold the population is confirmed by its membership over EVERY id, and
+/// the smallest confirmed one is the answer. Exact: a member's property is
+/// in its label's column whichever pattern label the statement wrote. A
+/// population with a member outside every candidate declines here after
+/// three record reads and at most one membership walk per candidate.
+fn discover_covering_label(graph: &Graph, distinct: &[u64]) -> Result<Option<String>, RunError> {
+    let Some(&first) = distinct.first() else {
+        return Ok(None);
+    };
+    let no_props = BTreeSet::new();
+    let mut candidates: Option<Vec<String>> = None;
+    for &id in &[
+        first,
+        distinct[distinct.len() / 2],
+        distinct[distinct.len() - 1],
+    ] {
+        let labels = match graph
+            .node_projected(id, &no_props)
+            .map_err(RunError::Graph)?
+        {
+            Some(Value::Node { labels, .. }) => labels,
+            _ => return Ok(None),
+        };
+        candidates = Some(match candidates {
+            None => labels,
+            Some(c) => c.into_iter().filter(|l| labels.contains(l)).collect(),
+        });
+    }
+    let mut candidates = candidates.unwrap_or_default();
+    candidates.sort_by_key(|l| graph.count_label_nodes(l));
+    for l in candidates {
+        if graph.count_label_nodes(&l) < distinct.len() as u64 {
+            continue;
+        }
+        let members = graph.members(Some(&l)).map_err(RunError::Graph)?;
+        if distinct
+            .iter()
+            .all(|&id| graph.members_contains(&members, id))
+        {
+            counted!("interp.pipeline unlabelled var's label discovered from its members");
+            return Ok(Some(l));
+        }
+    }
+    Ok(None)
+}
+
+/// The population from which an unlabelled var's label is worth
+/// discovering (fix 93): below it the record reads are the cheaper gather.
+const UNLABELLED_DISCOVERY_FLOOR: usize = 256;
 
 /// Whether a column over a bound var's `distinct_n` live ids is worth
 /// reading over its WHOLE label (`label_n` members) so the property-column
@@ -364,7 +574,7 @@ pub(crate) struct DataChunk {
     prov: Vec<usize>,
     /// COUNT-FOLD WEIGHTS (aligned to the row index, NOT the selection): how many
     /// walks of the FOLDED subtrees each row stands for — the multiplicity a
-    /// `count(*)` site adds instead of 1 (`fold_row_weighted`). EMPTY = every row
+    /// `count(*)` site adds instead of 1 (`fold_row_mult`). EMPTY = every row
     /// weighs 1, which is every chunk that never met a folded hop, so the
     /// existing operators pay only an `is_empty` check. Non-empty only after
     /// `fold_tail` ran; `expand`/`semijoin` then copy a row's weight to each
@@ -508,6 +718,10 @@ impl DataChunk {
         b_members: Option<&crate::MembersView>,
         track_rels: bool,
         reset_rels: bool,
+        // The sorted peers the NEXT hop can close from (`closing_peer_filter`):
+        // a peer outside it has no closing edge, so its row would only be
+        // built here to be dropped there.
+        closes: Option<&[u64]>,
     ) -> Result<DataChunk, RunError> {
         // Morsel-parallel path (opt-in lever, default OFF). Split the driving
         // rows into morsels, expand each independently through the graph's
@@ -522,18 +736,24 @@ impl DataChunk {
         //     thread-local, so a worker thread would silently read committed
         //     state and record nothing;
         //   - enough driving rows for the split to beat its own overhead;
-        //   - NO fold weights on the driving rows: the morsel body does not
-        //     carry the weight column (a weighted chunk only ever arises in the
-        //     count-only aggregate, which is small by then), so it stays serial.
+        //   - fold weights ARE carried now. Until 2026-09-11 a weighted chunk
+        //     stayed serial, on the reasoning that "a weighted chunk only ever
+        //     arises in the count-only aggregate, which is small by then". The
+        //     first half is right and the second is false at scale: EVERY LSQB
+        //     query is `RETURN count(*)`, so every one of them was weighted,
+        //     and at SF10 those aggregates are 3.1-20.5 BILLION rows. The
+        //     effect was that the entire benchmark ran on one core of 44 while
+        //     `query parallelism ON: width 44` sat in the log above it — q6
+        //     took 487 s with 43 cores idle. The morsel body carries the weight
+        //     column now, the same way it has always carried `prov`.
         if graph.parallel_expand_enabled()
             && self.selection.len() >= graph.parallel_min_rows()
             && !graph.in_txn()
-            && self.weights.is_empty()
         {
             if let Some(exec) = graph.exec() {
                 return self.expand_parallel(
                     graph, &*exec, src_vi, new_var, rel_var, dir, tokens, b_members, track_rels,
-                    reset_rels,
+                    reset_rels, closes,
                 );
             }
         }
@@ -576,6 +796,9 @@ impl DataChunk {
                 if !graph.members_contains(m, peer) {
                     return new_col.len();
                 }
+            }
+            if closes.is_some_and(|c| c.binary_search(&peer).is_err()) {
+                return new_col.len();
             }
             if track_rels && base.contains(&e.rel) {
                 return new_col.len(); // relationship isomorphism — this walk already used it
@@ -696,6 +919,7 @@ impl DataChunk {
         b_members: Option<&crate::MembersView>,
         track_rels: bool,
         reset_rels: bool,
+        closes: Option<&[u64]>,
     ) -> Result<DataChunk, RunError> {
         let DataChunk {
             mut vars,
@@ -706,9 +930,9 @@ impl DataChunk {
             prov,
             weights,
         } = self;
-        // The gate above admits only an UNWEIGHTED chunk to this path.
-        debug_assert!(weights.is_empty(), "the parallel expand never carries fold weights");
         let carry_prov = !prov.is_empty();
+        // Same rule as `prov`: carry it only when the driving chunk has one.
+        let carry_w = !weights.is_empty();
         let want_rel_col = rel_var.is_some();
         let ncols = ids.len();
         counted!("interp.expand parallel");
@@ -724,8 +948,11 @@ impl DataChunk {
         let ids_ref: &[Vec<u64>] = &ids;
         let used_ref: &[Vec<u64>] = &used_rels;
         let prov_ref: &[usize] = &prov;
-        let slots: Vec<std::sync::Mutex<Option<ExpandCols>>> =
-            morsels.iter().map(|_| std::sync::Mutex::new(None)).collect();
+        let w_ref: &[u64] = &weights;
+        let slots: Vec<std::sync::Mutex<Option<ExpandCols>>> = morsels
+            .iter()
+            .map(|_| std::sync::Mutex::new(None))
+            .collect();
         // The workers' shared row-budget account (see `expand_row_slice`): the
         // serial loop refuses while producing; the workers must too, or the
         // refusal arrives only after the memory it exists to prevent is spent.
@@ -743,10 +970,13 @@ impl DataChunk {
                 dir,
                 tokens,
                 b_members,
+                closes,
                 track_rels,
                 reset_rels,
                 carry_prov,
                 want_rel_col,
+                w_ref,
+                carry_w,
                 &produced,
                 &over,
                 budget,
@@ -774,7 +1004,8 @@ impl DataChunk {
         let mut rel_col: Option<Vec<u64>> = if want_rel_col { Some(Vec::new()) } else { None };
         let mut out_used: Vec<Vec<u64>> = Vec::new();
         let mut out_prov: Vec<usize> = Vec::new();
-        for (p_ids, p_new, p_rel, p_used, p_prov) in parts {
+        let mut out_w: Vec<u64> = Vec::new();
+        for (p_ids, p_new, p_rel, p_used, p_prov, p_w) in parts {
             for (vi, col) in p_ids.into_iter().enumerate() {
                 out_ids[vi].extend(col);
             }
@@ -784,6 +1015,7 @@ impl DataChunk {
             }
             out_used.extend(p_used);
             out_prov.extend(p_prov);
+            out_w.extend(p_w);
         }
         budget_check(graph, new_col.len())?;
         out_ids.push(new_col);
@@ -802,7 +1034,7 @@ impl DataChunk {
             selection: (0..n).collect(),
             used_rels: out_used,
             prov: out_prov,
-            weights: Vec::new(),
+            weights: out_w,
         })
     }
 
@@ -990,61 +1222,82 @@ impl DataChunk {
         tokens: &Option<Vec<u32>>,
         b_members: Option<&crate::MembersView>,
         max: u64,
+        // `*0..`: the source itself is reached at depth 0 — emitted first when
+        // it carries the end's labels, and never again.
+        from_zero: bool,
     ) -> Result<DataChunk, RunError> {
         counted!("interp.pipeline var-length BFS ran");
+        let walk = BfsWalk {
+            src_vi,
+            dir,
+            tokens,
+            b_members,
+            max,
+            from_zero,
+        };
+        let budget = graph.row_budget().unwrap_or(usize::MAX);
+        let produced = std::sync::atomic::AtomicUsize::new(0);
+        let over = std::sync::atomic::AtomicBool::new(false);
+        // Each driving row walks alone, so the rows split across the executor
+        // as `expand`'s do, the partials concatenated IN ORDER — byte-identical
+        // to the serial walk. SNB BI bi9's walk runs from ~1M posts at SF3:
+        // serial, it made the pipeline SLOWER than the general path it
+        // replaced (18.6 s -> 20.8 s).
+        let parts: Vec<BfsCols> = match graph.exec() {
+            Some(exec)
+                if graph.parallel_expand_enabled()
+                    && self.selection.len() >= graph.parallel_min_rows()
+                    && !graph.in_txn() =>
+            {
+                counted!("interp.pipeline var-length BFS parallel");
+                let workers = exec.width().min(self.selection.len()).max(1);
+                let per = self.selection.len().div_ceil(workers);
+                let morsels: Vec<&[usize]> = self.selection.chunks(per).collect();
+                let slots: Vec<std::sync::Mutex<Option<BfsCols>>> =
+                    morsels.iter().map(|_| std::sync::Mutex::new(None)).collect();
+                let chunk = &self;
+                exec.for_each(morsels.len(), &|i| {
+                    let part =
+                        bfs_row_slice(graph, chunk, morsels[i], &walk, &produced, &over, budget);
+                    *slots[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(part);
+                });
+                slots
+                    .into_iter()
+                    .map(|m| {
+                        m.into_inner()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .expect("every morsel ran — ScopedExec::for_each returns only when all have")
+                    })
+                    .collect()
+            }
+            _ => vec![bfs_row_slice(
+                graph,
+                &self,
+                &self.selection,
+                &walk,
+                &produced,
+                &over,
+                budget,
+            )],
+        };
+        if over.load(std::sync::atomic::Ordering::Relaxed) {
+            // The walk passed the budget while producing: refuse with the SAME
+            // error the budget raises everywhere, before merging anything.
+            budget_check(graph, produced.load(std::sync::atomic::Ordering::Relaxed))?;
+        }
         let mut out_ids: Vec<Vec<u64>> = (0..self.ids.len()).map(|_| Vec::new()).collect();
         let mut new_col: Vec<u64> = Vec::new();
-        // Carry OPTIONAL provenance only when present (see `expand`).
-        let carry_prov = !self.prov.is_empty();
         let mut out_prov: Vec<usize> = Vec::new();
-        // Carry fold weights only when present (see `weights`).
-        let carry_w = !self.weights.is_empty();
         let mut out_w: Vec<u64> = Vec::new();
-        for &r in &self.selection {
-            let src = self.ids[src_vi][r];
-            // `seen` is the visited set — a node enters it the first time it is
-            // reached, which fixes both its shortest depth and its single emission.
-            let mut seen: BTreeSet<u64> = BTreeSet::new();
-            let mut frontier: Vec<u64> = vec![src];
-            let mut depth = 0u64;
-            while depth < max && !frontier.is_empty() {
-                depth += 1;
-                let mut next: Vec<u64> = Vec::new();
-                for &u in &frontier {
-                    budget_check(graph, new_col.len() + next.len())?;
-                    // FORWARD adjacency order (canary: reversing it diverges an
-                    // order-sensitive DISTINCT reach set), fed zero-copy from the
-                    // cached CSR slice — no per-node Vec.
-                    graph.adjacent_slim_for_each(u, dir, tokens, |e| {
-                        let v = e.peer;
-                        if !seen.insert(v) {
-                            return; // already reached at its shortest depth
-                        }
-                        if depth < max {
-                            next.push(v); // room for a further hop
-                        }
-                        // The end-label filter gates EMISSION only — a non-member
-                        // is still seen and still (above) queued for a next hop.
-                        if let Some(m) = b_members {
-                            if !m.contains(v) {
-                                return;
-                            }
-                        }
-                        for (vi, col) in out_ids.iter_mut().enumerate() {
-                            col.push(self.ids[vi][r]);
-                        }
-                        new_col.push(v);
-                        if carry_prov {
-                            out_prov.push(self.prov[r]);
-                        }
-                        if carry_w {
-                            out_w.push(self.weights[r]);
-                        }
-                    });
-                }
-                frontier = next;
+        for (p_ids, p_new, p_prov, p_w) in parts {
+            for (vi, col) in p_ids.into_iter().enumerate() {
+                out_ids[vi].extend(col);
             }
+            new_col.extend(p_new);
+            out_prov.extend(p_prov);
+            out_w.extend(p_w);
         }
+        budget_check(graph, new_col.len())?;
         out_ids.push(new_col);
         let mut vars = self.vars;
         let mut var_kinds = self.var_kinds;
@@ -1116,7 +1369,8 @@ impl DataChunk {
             let negate = ep.negate;
             counted!("interp.pipeline edge pred filter");
             self.selection.retain(|&r| {
-                let hit = graph.edge_count_slim(self.ids[va][r], ep.dir, &tokens, self.ids[vb][r]) > 0;
+                let hit =
+                    graph.edge_count_slim(self.ids[va][r], ep.dir, &tokens, self.ids[vb][r]) > 0;
                 hit != negate
             });
             return Ok(Some(()));
@@ -1175,7 +1429,8 @@ impl DataChunk {
                     .map(|l| graph.count_label_nodes(l))
                     .min()
                     .unwrap_or(0);
-                let whole = single.is_some() && !cached && whole_label_worth(distinct.len(), label_n);
+                let whole =
+                    single.is_some() && !cached && whole_label_worth(distinct.len(), label_n);
                 let over = if whole {
                     None
                 } else {
@@ -1385,7 +1640,7 @@ fn edge_pred_of(w: &Expr, vars: &[String]) -> Option<EdgePred> {
         },
         _ => return None,
     };
-    if path.var.is_some() || path.shortest || path.hops.len() != 1 {
+    if path.var.is_some() || path.shortest.is_some() || path.hops.len() != 1 {
         return None;
     }
     let (rel, end) = &path.hops[0];
@@ -1454,6 +1709,10 @@ struct Hop {
     /// min 1, bounded, no rel var/props, a NEW end var); every other var-length
     /// shape declines the whole query to the general path.
     varlen: Option<u64>,
+    /// A frontier-BFS hop of minimum length ZERO (`*0..`): each source row's own
+    /// node is reached at depth 0 and emitted before the walk. `false` for every
+    /// other hop.
+    from_zero: bool,
     /// The index (into the binding order) of the NODE var an EXPAND hop binds;
     /// `None` for a close (which binds no node). Recorded at recognition so the
     /// count fold can walk the var↔hop tree without re-deriving names.
@@ -1486,6 +1745,12 @@ enum InlinePred {
     NeBound(usize),
     /// `level = other`.
     EqBound(usize),
+    /// Fix 90: `id(level) > id(other)` — the SYMMETRY-BREAKING order the
+    /// planner adds between two vars it has proven interchangeable
+    /// (`plan_symmetry_breaking`); never from the query text. The fold then
+    /// enumerates one order of the symmetric set and multiplies by its size
+    /// factorial (`FoldPlan::multiplier`).
+    GtBound(usize),
     /// `[NOT] (level)-[:types]->(other)` — `dir` is from the LEVEL var's side
     /// (flipped from the source text when the level var is the pattern's far
     /// end), answered by `Graph::edge_count_slim` (operator B).
@@ -1738,6 +2003,28 @@ struct Hops {
     node_anchors: Vec<Expr>,
 }
 
+/// Whether no two hops of `path` share a relationship type — then no two can
+/// traverse the same relationship, and relationship isomorphism has nothing to
+/// refuse. A typeless hop may traverse any relationship, so it answers no.
+fn path_types_disjoint(path: &PathPattern) -> bool {
+    let mut seen: Vec<&str> = Vec::new();
+    for (rel, _) in &path.hops {
+        if rel.types.is_empty() {
+            return false;
+        }
+        let mut own: Vec<&str> = rel.types.iter().map(String::as_str).collect();
+        own.sort_unstable();
+        own.dedup();
+        for t in own {
+            if seen.contains(&t) {
+                return false;
+            }
+            seen.push(t);
+        }
+    }
+    true
+}
+
 /// The already-bound context handed to [`collect_hops`] for an OPTIONAL pattern:
 /// the outer vars in binding order, and the labels known per var (so a restated
 /// label is checked, not re-applied). `None` in `collect_hops` is the read-chain
@@ -1806,7 +2093,7 @@ fn collect_hops(
         }
     };
     for (pi, path) in pattern.paths.iter().enumerate() {
-        if path.var.is_some() || path.shortest {
+        if path.var.is_some() || path.shortest.is_some() {
             return None;
         }
         // The path's source var: in the read chain path 1 introduces a labelled
@@ -1878,7 +2165,10 @@ fn collect_hops(
             }
             idx
         };
-        let track = path.hops.len() > 1;
+        // Relationship isomorphism is tracked only where it can refuse
+        // something: a path whose hops share no type can never traverse one
+        // relationship twice, and tracking it cost a `Vec` per produced row.
+        let track = path.hops.len() > 1 && !path_types_disjoint(path);
         for (hi, (rel, node)) in path.hops.iter().enumerate() {
             if rel.props.is_some() || rel.types.is_empty() {
                 // Still declined: an inline rel property MAP (`-[r {k: v}]->`,
@@ -1901,13 +2191,30 @@ fn collect_hops(
             // declines the whole query to the enumerating general path.
             if let Some(vl) = rel.length {
                 let end_var = node.var.as_deref()?.to_string();
-                let eligible = pattern.paths.len() == 1
+                let min = vl.min.unwrap_or(1);
+                // THE SOLE HOP OF THE SOLE PATH, `*1..max`: the shape
+                // `run_streaming`'s `frontier_ok` runs.
+                let sole = pattern.paths.len() == 1
                     && path.hops.len() == 1
-                    && rel.var.is_none()
+                    && min == 1
+                    && vl.max.is_some();
+                // ANYWHERE IN A PATH, `*0..` or `*1..`, bounded or not — SNB BI
+                // bi3's and bi9's `(post)<-[:REPLY_OF*0..]-(message)` between
+                // fixed hops. A BFS records no isomorphism set, so the walk's
+                // rows reach the path's later hops with none: sound when NO TWO
+                // hops of the path share a relationship type (then no two can
+                // traverse the same relationship, and isomorphism has nothing to
+                // refuse), and directed (an undirected walk re-reaches its start
+                // through the edge it left by, which isomorphism forbids).
+                // Multiplicity is the breaker's to excuse:
+                // `varlen_distinct_consumed` requires it to be set-semantic.
+                let within = rel.dir != RelDir::Undirected
+                    && min <= 1
+                    && path_types_disjoint(path);
+                let eligible = rel.var.is_none()
                     && node.props.is_none()
-                    && vl.min.unwrap_or(1) == 1
-                    && vl.max.is_some()
-                    && !vars.iter().any(|v| v == &end_var);
+                    && !vars.iter().any(|v| v == &end_var)
+                    && (sole || within);
                 if !eligible {
                     return None;
                 }
@@ -1932,12 +2239,16 @@ fn collect_hops(
                     track: false,
                     reset: false,
                     tgt: None,
-                    varlen: vl.max,
+                    // An unbounded walk ends where the frontier empties; the
+                    // visited set bounds it by the reachable nodes.
+                    varlen: Some(vl.max.unwrap_or(u64::MAX)),
+                    from_zero: min == 0,
                     end_vi: Some(vars.len() - 1),
                     fold: false,
                     inline: Vec::new(),
                 });
-                // The sole hop of the sole path — the loops end here.
+                // The next hop, if any, continues from the node it reached.
+                src = vars.len() - 1;
                 continue;
             }
             // A bound RELATIONSHIP variable (`-[r:T]->`) is now accepted — it
@@ -2037,6 +2348,7 @@ fn collect_hops(
                     reset,
                     tgt: Some(tgt_vi),
                     varlen: None,
+                    from_zero: false,
                     end_vi: None,
                     fold: false,
                     inline: Vec::new(),
@@ -2065,6 +2377,7 @@ fn collect_hops(
                     reset,
                     tgt: None,
                     varlen: None,
+                    from_zero: false,
                     end_vi: Some(node_idx),
                     fold: false,
                     inline: Vec::new(),
@@ -2476,6 +2789,10 @@ struct AggPlan {
     /// to the aggregating projection's items.
     agg_items: Vec<AggItem>,
     form: AggForm,
+    /// Fix 90: the symmetry the count fold breaks, if `plan_count_fold`
+    /// proved one (`plan_symmetry_breaking`); applied at execution, behind
+    /// the live self-loop gate (`build_chunk_sym`).
+    symmetry: Option<SymmetryPlan>,
 }
 
 /// Recognise a trailing aggregating projection over the read chain — the
@@ -2725,6 +3042,7 @@ fn aggregate_over_chain(
         sites,
         site_args,
         agg_items,
+        symmetry: None,
         form,
     })
 }
@@ -2737,37 +3055,41 @@ fn aggregate_over_chain(
 /// (multi-stage) has a different clause shape and declines here. `None` = DECLINE
 /// (not DISTINCT, or a shape `distinct_over_chain` cannot own).
 fn recognise_distinct(sq: &SingleQuery) -> Option<AggPlan> {
-    let (pattern, where_opt, proj, with_form): (_, _, &Projection, Option<(Option<&Expr>, &Projection)>) =
-        match sq.clauses.as_slice() {
-            [
-                Clause::Match {
-                    optional: false,
-                    pattern,
-                    where_,
-                },
-                Clause::Return { proj },
-            ] => (pattern, where_.as_ref(), proj, None),
-            // Fix 29: `MATCH … WITH DISTINCT <keys> [WHERE] RETURN <over the
-            // keys> [ORDER BY … LIMIT …]` — the Form-A DISTINCT tail that only
-            // the multistage tails reached. The KMProject listing (`… WITH
-            // DISTINCT lore RETURN lore.orgId, … ORDER BY lore.repoId LIMIT
-            // toInteger($limit)`) ran on the general path: two stages, every
-            // TRACKS_REPO relationship decoded in full, each repo projected
-            // twice — 2.1–2.6 ms on the mirror against Neo4j's 1.2.
-            [
-                Clause::Match {
-                    optional: false,
-                    pattern,
-                    where_,
-                },
-                Clause::With {
-                    proj: wp,
-                    where_: post,
-                },
-                Clause::Return { proj: rp },
-            ] if wp.distinct => (pattern, where_.as_ref(), wp, Some((post.as_ref(), rp))),
-            _ => return None,
-        };
+    let (pattern, where_opt, proj, with_form): (
+        _,
+        _,
+        &Projection,
+        Option<(Option<&Expr>, &Projection)>,
+    ) = match sq.clauses.as_slice() {
+        [
+            Clause::Match {
+                optional: false,
+                pattern,
+                where_,
+            },
+            Clause::Return { proj },
+        ] => (pattern, where_.as_ref(), proj, None),
+        // Fix 29: `MATCH … WITH DISTINCT <keys> [WHERE] RETURN <over the
+        // keys> [ORDER BY … LIMIT …]` — the Form-A DISTINCT tail that only
+        // the multistage tails reached. The KMProject listing (`… WITH
+        // DISTINCT lore RETURN lore.orgId, … ORDER BY lore.repoId LIMIT
+        // toInteger($limit)`) ran on the general path: two stages, every
+        // TRACKS_REPO relationship decoded in full, each repo projected
+        // twice — 2.1–2.6 ms on the mirror against Neo4j's 1.2.
+        [
+            Clause::Match {
+                optional: false,
+                pattern,
+                where_,
+            },
+            Clause::With {
+                proj: wp,
+                where_: post,
+            },
+            Clause::Return { proj: rp },
+        ] if wp.distinct => (pattern, where_.as_ref(), wp, Some((post.as_ref(), rp))),
+        _ => return None,
+    };
     if !proj.distinct {
         return None;
     }
@@ -2897,6 +3219,7 @@ fn distinct_over_chain(chain: Chain, proj: &Projection) -> Option<AggPlan> {
         sites,
         site_args: Vec::new(),
         agg_items,
+        symmetry: None,
         form: AggForm::Return(Box::new(proj.clone())),
     })
 }
@@ -2981,6 +3304,7 @@ fn distinct_form_a_over_chain(
         sites,
         site_args: Vec::new(),
         agg_items,
+        symmetry: None,
         form: AggForm::With(Box::new(WithForm {
             with_proj: with_proj.clone(),
             post_where: having.cloned(),
@@ -3237,11 +3561,25 @@ fn creator_sorted_messages(
     date_prop: &str,
     creator_types: &[String],
 ) -> Result<Option<std::sync::Arc<crate::CreatorMsgs>>, RunError> {
-    if let Some(c) = graph.creator_msgs_get() {
+    let key: crate::CreatorMsgsKey = (
+        msg_labels.to_vec(),
+        date_prop.to_string(),
+        creator_types.to_vec(),
+    );
+    if let Some(c) = graph.creator_msgs_get(&key) {
         return Ok(Some(c));
     }
-    let members = graph.members_all(msg_labels).map_err(RunError::Graph)?.to_arc_vec();
-    let mut map: crate::CreatorMsgs = crate::CreatorMsgs::new();
+    counted!("interp.pipeline date index built");
+    let members = graph
+        .members_all(msg_labels)
+        .map_err(RunError::Graph)?
+        .to_arc_vec();
+    let mut map: BTreeMap<u64, Vec<(engram_store::IndexKey, i64, u64)>> = BTreeMap::new();
+    let mut floats = false;
+    // Creator relationships starting at a member: all of the types' when
+    // every one starts at a member (`covers_every_source`).
+    let mut from_members = 0u64;
+    let creator_tokens = graph.type_tokens_peek(creator_types);
     if !members.is_empty() {
         let mut props: BTreeSet<String> = BTreeSet::new();
         props.insert(date_prop.to_string());
@@ -3252,13 +3590,20 @@ fn creator_sorted_messages(
         let (Some(date_col), Some(id_col)) = (cols.get(date_prop), cols.get("id")) else {
             return Ok(None);
         };
-        let creator_tokens = graph.type_tokens_peek(creator_types);
         for (i, &msg) in members.iter().enumerate() {
-            let date = match &date_col[i] {
-                Value::Int(x) => *x,
-                Value::Date(x) => *x,
-                _ => continue,
+            let mut creator: Option<u64> = None;
+            graph.adjacent_slim_for_each(msg, Dir::Out, &creator_tokens, |e| {
+                from_members += 1;
+                if creator.is_none() {
+                    creator = Some(e.peer);
+                }
+            });
+            // A null or an unorderable value is never a candidate: every
+            // comparison with it is null, and the WHERE drops the row.
+            let Some(date) = Graph::index_key_of(&date_col[i]) else {
+                continue;
             };
+            floats |= matches!(date, engram_store::IndexKey::Float(_));
             // `mid` is ONLY a sort tiebreaker (the seek ignores it, and the
             // aggregate is order-independent) — so a message without an `id`
             // property must NOT be dropped, or the fast path silently counts
@@ -3268,12 +3613,6 @@ fn creator_sorted_messages(
                 Value::Int(x) => *x,
                 _ => msg as i64,
             };
-            let mut creator: Option<u64> = None;
-            graph.adjacent_slim_for_each(msg, Dir::Out, &creator_tokens, |e| {
-                if creator.is_none() {
-                    creator = Some(e.peer);
-                }
-            });
             if let Some(c) = creator {
                 map.entry(c).or_default().push((date, mid, msg));
             }
@@ -3282,9 +3621,58 @@ fn creator_sorted_messages(
             v.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         }
     }
-    let arc = std::sync::Arc::new(map);
-    graph.creator_msgs_set(std::sync::Arc::clone(&arc));
+    let covers_every_source = msg_labels.is_empty()
+        || !matches!(&creator_tokens, Some(t) if t.is_empty())
+            && from_members == graph.type_edge_count(&creator_tokens);
+    let arc = std::sync::Arc::new(crate::CreatorMsgs {
+        by_creator: map,
+        floats,
+        labels: msg_labels.to_vec(),
+        covers_every_source,
+    });
+    graph.creator_msgs_set(key, std::sync::Arc::clone(&arc));
     Ok(Some(arc))
+}
+
+/// The membership an index's messages must pass for a query over `labels`,
+/// when it was built over other labels (`CreatorMsgs::answers`); `None` when
+/// every message it holds qualifies — built over exactly these labels, or a
+/// query that names none.
+fn creator_index_filter(
+    graph: &Graph,
+    index: &crate::CreatorMsgs,
+    labels: &[String],
+) -> Result<Option<crate::MembersView>, RunError> {
+    let mut built = index.labels.clone();
+    built.sort();
+    built.dedup();
+    let mut asked = labels.to_vec();
+    asked.sort();
+    asked.dedup();
+    if asked.is_empty() || asked == built {
+        return Ok(None);
+    }
+    counted!("interp.pipeline date index answered other labels, filtered to them");
+    Ok(Some(graph.members_all(labels).map_err(RunError::Graph)?))
+}
+
+/// The key a date BOUND orders the index by, when every comparison against it
+/// is one the index reproduces: a temporal (Cypher compares one only with its
+/// own type — the index's class), or an integer when no date is a FLOAT (an
+/// integer compares with a float numerically, across a class boundary the
+/// index does not interleave). A float or string bound declines, as IC9's
+/// operator does.
+fn date_bound_key(bound: &Value, index: &crate::CreatorMsgs) -> Option<engram_store::IndexKey> {
+    use engram_store::IndexKey;
+    match Graph::index_key_of(bound)? {
+        k @ IndexKey::Int(_) if !index.floats => Some(k),
+        k @ (IndexKey::Date(_)
+        | IndexKey::Time(_)
+        | IndexKey::LocalTime(_)
+        | IndexKey::DateTime(..)
+        | IndexKey::LocalDateTime(..)) => Some(k),
+        _ => None,
+    }
 }
 
 /// Resolve a RETURN-alias reference to the expression it names (else the expr as-is).
@@ -3313,14 +3701,15 @@ fn ic2_date_order(proj: &Projection, message_var: &str) -> Option<String> {
     None
 }
 
-/// The upper bound `T` from a `message.<date_prop> <= T` WHERE conjunct, if present.
+/// The upper bound `T` from a `message.<date_prop> <= T` WHERE conjunct, if
+/// present — the VALUE; `date_bound_key` decides whether the index can rank it.
 fn ic2_date_upper_bound(
     wheres: &[WherePred],
     message_var: &str,
     date_prop: &str,
     graph: &Graph,
     params: &BTreeMap<String, Value>,
-) -> Result<Option<i64>, RunError> {
+) -> Result<Option<Value>, RunError> {
     for w in wheres {
         if let Expr::Bin(engram_cypher::ast::BinOp::Le, l, r) = &w.expr {
             let reads_date = matches!(l.as_ref(), Expr::Prop(b, p)
@@ -3328,11 +3717,7 @@ fn ic2_date_upper_bound(
             if reads_date {
                 let empty_vm = VarMap::new();
                 let scope = Scope::over(params, &empty_vm, graph.wall_ms(), graph.zone_provider());
-                match eval_with(r, &scope, None).map_err(RunError::Eval)? {
-                    Value::Int(x) => return Ok(Some(x)),
-                    Value::Date(x) => return Ok(Some(x)),
-                    _ => return Ok(None),
-                }
+                return Ok(Some(eval_with(r, &scope, None).map_err(RunError::Eval)?));
             }
         }
     }
@@ -3378,7 +3763,7 @@ fn try_ic2_ordered(
     let Some(date_prop) = ic2_date_order(&plan.proj, &h_creator.var) else {
         return Ok(None);
     };
-    let Some(t_bound) =
+    let Some(bound) =
         ic2_date_upper_bound(&plan.wheres, &h_creator.var, &date_prop, graph, params)?
     else {
         return Ok(None);
@@ -3389,9 +3774,14 @@ fn try_ic2_ordered(
     else {
         return Ok(None);
     };
+    let Some(t_bound) = date_bound_key(&bound, &index) else {
+        counted!("interp.pipeline ic2 ordered merge declined a bound it cannot rank");
+        return Ok(None);
+    };
 
     // Anchor person + its KNOWS friends (label-filtered, distinct).
-    let (persons, _) = anchored_seed_ids(graph, &plan.a_labels, plan.start_anchor.as_ref(), params)?;
+    let (persons, _) =
+        anchored_seed_ids(graph, &plan.a_labels, plan.start_anchor.as_ref(), params)?;
     let knows_tokens = graph.type_tokens_peek(&h_knows.types);
     // Collect friends WITH KNOWS-edge MULTIPLICITY — do NOT dedup. A single-hop
     // `(person)-[:KNOWS]-(friend)` is undirected, and SNB stores KNOWS as a pair of
@@ -3416,12 +3806,21 @@ fn try_ic2_ordered(
 
     // Each friend's newest `cap` messages with date <= T (a suffix of the
     // date-DESC stream), then the global top-`cap` by (date DESC, id ASC).
-    let mut cands: Vec<(i64, i64, u64, u64)> = Vec::new(); // (date, id, friend, msg)
+    // Date DESC, class-major: everything above the bound comes first (a later
+    // date of its class, or a higher class), then its class at or below it, then
+    // lower classes — which, like the higher ones, compare null with the bound.
+    let admits = creator_index_filter(graph, &index, &h_creator.labels)?;
+    let mut cands: Vec<(engram_store::IndexKey, i64, u64, u64)> = Vec::new(); // (date, id, friend, msg)
     for &f in &friends {
-        if let Some(msgs) = index.get(&f) {
-            let start = msgs.partition_point(|&(d, _, _)| d > t_bound);
-            for &(d, mid, node) in msgs[start..].iter().take(cap) {
-                cands.push((d, mid, f, node));
+        if let Some(msgs) = index.by_creator.get(&f) {
+            let start = msgs.partition_point(|(d, _, _)| *d > t_bound);
+            for (d, mid, node) in msgs[start..]
+                .iter()
+                .take_while(|(d, _, _)| d.class() == t_bound.class())
+                .filter(|(_, _, node)| admits.as_ref().is_none_or(|m| m.contains(*node)))
+                .take(cap)
+            {
+                cands.push((d.clone(), *mid, f, *node));
             }
         }
     }
@@ -3431,7 +3830,7 @@ fn try_ic2_ordered(
     counted!("interp.pipeline ic2 ordered merge");
     let person = persons.first().copied().unwrap_or(NULL_ID);
     let mut rows: Vec<Vec<u64>> = Vec::with_capacity(cands.len());
-    for &(_, _, f, msg) in &cands {
+    for &(_, _, f, msg) in cands.iter() {
         let mut row = vec![NULL_ID; plan.vars.len()];
         row[a_vi] = person;
         row[friend_vi] = f;
@@ -3559,12 +3958,66 @@ fn try_ic11_semijoin(
         return Ok(None);
     };
     let loc_tokens = graph.type_tokens_peek(&h_loc.types);
+    let countries: Vec<u64> = country_members
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| name_col[*i] == cname_val)
+        .map(|(_, &c)| c)
+        .collect();
+    // ONLY THE COMPANIES, AND FROM THE COMPANY SIDE WHEN THAT IS SMALLER.
+    // `IS_LOCATED_IN` into a country is not only companies': at SNB SF10 every
+    // MESSAGE is located in a country too, and China's in-adjacency (millions
+    // of entries) was inserted whole into this set to keep the companies a
+    // WORK_AT can reach -- 300 of IC11's 337 ms against Neo4j's 205. The
+    // pattern names the far end `(company:Company)`, so the set holds members
+    // of that label; the answer is the one the unfiltered set gave (a WORK_AT
+    // lands on companies), and a WORK_AT onto a non-company is now refused as
+    // the pattern says. Walked from whichever side is smaller: the label's
+    // members out, or the countries' adjacency in.
+    let company_members = if h_work.labels.is_empty() {
+        None
+    } else {
+        Some(graph.members_all(&h_work.labels).map_err(RunError::Graph)?)
+    };
+    let company_count: Option<u64> = h_work
+        .labels
+        .iter()
+        .map(|l| graph.count_label_nodes(l))
+        .min();
+    // A country whose adjacency has no resident table to read a length from
+    // counts as large: walking the label's members is bounded by the label,
+    // walking an unknown in-adjacency is not.
+    let in_degree: u64 = countries
+        .iter()
+        .map(|&c| {
+            graph
+                .adjacent_slim_len_hint(c, Dir::In, &loc_tokens)
+                .map_or(u64::MAX, |n| n as u64)
+        })
+        .fold(0, u64::saturating_add);
     let mut company_set: BTreeSet<u64> = BTreeSet::new();
-    for (i, &c0) in country_members.iter().enumerate() {
-        if name_col[i] == cname_val {
-            graph.adjacent_slim_for_each(c0, Dir::In, &loc_tokens, |e| {
-                company_set.insert(e.peer);
-            });
+    match (&company_members, company_count) {
+        (Some(members), Some(n)) if n < in_degree => {
+            counted!("interp.pipeline ic11 companies found from the company side");
+            for comp in members.iter() {
+                graph.adjacent_slim_for_each(comp, Dir::Out, &loc_tokens, |e| {
+                    if countries.contains(&e.peer) {
+                        company_set.insert(comp);
+                    }
+                });
+            }
+        }
+        _ => {
+            for &c0 in &countries {
+                graph.adjacent_slim_for_each(c0, Dir::In, &loc_tokens, |e| {
+                    if company_members
+                        .as_ref()
+                        .is_none_or(|m| graph.members_contains(m, e.peer))
+                    {
+                        company_set.insert(e.peer);
+                    }
+                });
+            }
         }
     }
 
@@ -3661,6 +4114,25 @@ fn try_ic11_semijoin(
         rows.push(row);
     }
     counted!("interp.pipeline ic11 semijoin");
+    // RANKED BEFORE PROJECTED. The tail below decodes every row's friend and
+    // company whole, then keeps ten: SNB Interactive IC11 at SF3 read 11,374
+    // nodes in full for its 10-row answer (152 ms against Neo4j's 109). The
+    // bounded top-k ranks the id rows on their key columns and projects the
+    // winners alone; it declines (a key it cannot load as a column) to the
+    // tail, which answers alike.
+    if core.proj.limit.is_some() && !core.proj.order.is_empty() {
+        let mut cols: Vec<Vec<u64>> = vec![Vec::with_capacity(rows.len()); core.vars.len()];
+        for row in &rows {
+            for (c, id) in row.iter().enumerate() {
+                cols[c].push(*id);
+            }
+        }
+        let chunk = DataChunk::from_columns(core.vars.clone(), core.var_kinds.clone(), cols);
+        if let Some(res) = native_topk(graph, params, core, &chunk)? {
+            counted!("interp.pipeline ic11 semijoin ranked its rows before projecting them");
+            return Ok(Some(res));
+        }
+    }
     Ok(Some(project_rows_tail(
         graph,
         &core.proj,
@@ -3799,13 +4271,9 @@ impl TopKAcc {
                 }
                 KeyRef::Var(vi) => {
                     let view = crate::vectorized::view(&cols[*vi]);
-                    let Some(col) = eval_column(
-                        key,
-                        &plan.vars[*vi],
-                        distinct[*vi].len(),
-                        &view,
-                        &scope,
-                    ) else {
+                    let Some(col) =
+                        eval_column(key, &plan.vars[*vi], distinct[*vi].len(), &view, &scope)
+                    else {
                         return Ok(false);
                     };
                     keycols.push(KeyCol::Var(*vi, col.into_owned()));
@@ -3959,46 +4427,162 @@ fn fold_row(
     Ok(())
 }
 
-/// [`fold_row`] for a chunk that MAY carry COUNT-FOLD weights: a `count(*)`
-/// site adds the row's weight — the number of folded walks the row stands for —
-/// instead of 1, in the SAME production order, so the running total is the
-/// general path's total. An unweighted chunk folds exactly as before. A
-/// weighted chunk only ever reaches an all-`count(*)` reduction
-/// (`plan_count_fold` folds nothing otherwise); should any other site meet a
-/// weight it would count 1 where `w` is due, so that DECLINES (`Ok(None)`)
-/// rather than miscount. A total that would leave `i64` is NOT a decline: the
-/// general path's own `i64` accumulator could not represent it either and it
-/// could never enumerate that many rows, so it REFUSES
+/// [`fold_row`] for a row that stands for `mult` rows: a COUNT-FOLD weight
+/// (`chunk.weights` — the folded walks the row stands for) or fix 107's
+/// per-distinct-id multiplicity. `mult == 1` folds exactly as before; a
+/// larger one folds through `SiteAcc::push_times` in the SAME production
+/// order, so the running totals are the general path's. A site that cannot
+/// fold a multiplicity exactly DECLINES (`Ok(None)`) rather than miscount —
+/// under a count-fold only `count(*)` sites exist (`plan_count_fold` folds
+/// nothing otherwise), and the per-distinct fold admits only sites that
+/// fold exactly. A total that would leave `i64` is NOT a decline: the
+/// general path's own `i64` accumulator could not represent it either and
+/// it could never enumerate that many rows, so it REFUSES
 /// (`count_fold_overflow`), exactly as the fold's own arithmetic does.
-fn fold_row_weighted(
+fn fold_row_mult(
     accs: &mut [SiteAcc],
     arg_vals: &[SiteArgVal],
     distinct: &[Vec<u64>],
     chunk: &DataChunk,
     r: usize,
+    mult: u64,
 ) -> Result<Option<()>, RunError> {
-    if chunk.weights.is_empty() {
+    if mult == 1 {
         fold_row(accs, arg_vals, distinct, chunk, r)?;
         return Ok(Some(()));
     }
-    let w = chunk.weights[r];
-    for acc in accs.iter_mut() {
-        match acc {
-            SiteAcc::CountStar(n) => {
-                let Ok(wi) = i64::try_from(w) else {
-                    return Err(count_fold_overflow());
-                };
-                let Some(next) = n.checked_add(wi) else {
-                    return Err(count_fold_overflow());
-                };
-                *n = next;
-            }
-            // Unreachable by construction (`plan_count_fold` folds only under
-            // all-`count(*)` sites); declining keeps it impossible to miscount.
-            _ => return Ok(None),
+    let Ok(times) = i64::try_from(mult) else {
+        return Err(count_fold_overflow());
+    };
+    for (acc, av) in accs.iter_mut().zip(arg_vals) {
+        if !acc.folds_multiplicity() {
+            return Ok(None);
+        }
+        if !acc.push_times(site_push_value(av, distinct, chunk, r), times)? {
+            return Err(count_fold_overflow());
         }
     }
     Ok(Some(()))
+}
+
+/// The rows a reduce folds, each with its multiplicity: fix 107's
+/// per-distinct-id fold, or the chunk's live rows with their count-fold
+/// weights (1 where the chunk carries none).
+enum ReduceRows<'a> {
+    PerDistinct(std::slice::Iter<'a, (usize, u64)>),
+    Live(std::slice::Iter<'a, usize>, &'a [u64]),
+}
+
+impl Iterator for ReduceRows<'_> {
+    type Item = (usize, u64);
+    fn next(&mut self) -> Option<(usize, u64)> {
+        match self {
+            ReduceRows::PerDistinct(it) => it.next().copied(),
+            ReduceRows::Live(it, w) => it.next().map(|&r| (r, if w.is_empty() { 1 } else { w[r] })),
+        }
+    }
+}
+
+fn reduce_rows<'a>(folded: &'a Option<Vec<(usize, u64)>>, chunk: &'a DataChunk) -> ReduceRows<'a> {
+    match folded {
+        Some(f) => ReduceRows::PerDistinct(f.iter()),
+        None => ReduceRows::Live(chunk.selection.iter(), &chunk.weights),
+    }
+}
+
+/// Fix 107: when every grouping key and every aggregate argument reads ONE
+/// var — the production `(n:UserDataNode {userId: $u})-[:MENTIONS]->(e)
+/// RETURN e.name, coalesce(e.type, 'unknown'), count(*) …` shape: 95k rows
+/// over 37k distinct ends — the rows are folded per DISTINCT id of that
+/// var, each with the number of rows (count-fold weights summed) it stands
+/// for, in the order the ids were first seen: `(first row, multiplicity)`.
+/// Exact when every site folds a multiplicity (`SiteAcc::folds_multiplicity`
+/// — a `collect`, `sum` or `avg` keeps the per-row fold): a group's
+/// first-seen order is its first id's, and its template row is that id's
+/// first row — the general fold's own. `None` (the per-row fold) for keys or
+/// arguments over two vars, a chunk with an OPTIONAL null-fill row, or rows
+/// that barely repeat.
+fn fold_rows_per_distinct(
+    plan: &AggPlan,
+    gkv: &[KeyVal],
+    arg_vals: &[SiteArgVal],
+    distinct: &[Vec<u64>],
+    chunk: &DataChunk,
+) -> Option<Vec<(usize, u64)>> {
+    let mut var: Option<usize> = None;
+    let mut note = |vi: usize| -> bool {
+        match var {
+            None => {
+                var = Some(vi);
+                true
+            }
+            Some(v) => v == vi,
+        }
+    };
+    for k in gkv {
+        match k {
+            KeyVal::Node(vi) | KeyVal::Col(vi, _) => {
+                if !note(*vi) {
+                    return None;
+                }
+            }
+            KeyVal::Const(_) => {}
+        }
+    }
+    for av in arg_vals {
+        match av {
+            SiteArgVal::Gather(vi, _) | SiteArgVal::Present(vi) => {
+                if !note(*vi) {
+                    return None;
+                }
+            }
+            SiteArgVal::Star | SiteArgVal::Const(_) => {}
+        }
+    }
+    let v = var?;
+    if !plan
+        .sites
+        .iter()
+        .all(|s| SiteAcc::for_site(s).folds_multiplicity())
+    {
+        return None;
+    }
+    // The var's sorted distinct ids: the reduce's own set where a column was
+    // read through it, else built here (a bare identity key reads none).
+    let local: Vec<u64>;
+    let ids: &[u64] = if distinct[v].is_empty() {
+        let mut all: Vec<u64> = chunk.selection.iter().map(|&r| chunk.ids[v][r]).collect();
+        all.sort_unstable();
+        all.dedup();
+        local = all;
+        &local
+    } else {
+        &distinct[v]
+    };
+    if chunk.selection.len() < ids.len().saturating_mul(3) / 2 {
+        return None;
+    }
+    let mut mult: Vec<u64> = vec![0; ids.len()];
+    let mut rep: Vec<usize> = vec![0; ids.len()];
+    let mut order: Vec<usize> = Vec::with_capacity(ids.len());
+    for &r in &chunk.selection {
+        let id = chunk.ids[v][r];
+        if id == NULL_ID {
+            return None;
+        }
+        let pos = ids.binary_search(&id).ok()?;
+        let w = if chunk.weights.is_empty() {
+            1
+        } else {
+            chunk.weights[r]
+        };
+        if mult[pos] == 0 {
+            rep[pos] = r;
+            order.push(pos);
+        }
+        mult[pos] = mult[pos].checked_add(w)?;
+    }
+    Some(order.into_iter().map(|p| (rep[p], mult[p])).collect())
 }
 
 /// The DEGREE SHORT-CIRCUIT for the unanchored `MATCH (a:A)-[:R]->(b:B) RETURN
@@ -4489,7 +5073,7 @@ fn run_aggregate(
     // chunk ⇒ zero groups; with >=1 grouping key the aggregating projector emits
     // NO row, and a global aggregate its single zero row, exactly like
     // `run_streaming`.
-    let Some(chunk) = build_chunk(
+    let Some(chunk) = build_chunk_sym(
         graph,
         &plan.a_labels,
         &plan.a_var,
@@ -4497,6 +5081,7 @@ fn run_aggregate(
         &plan.wheres,
         plan.start_anchor.as_ref(),
         params,
+        plan.symmetry.as_ref(),
     )?
     else {
         return Ok(None); // a filter budget / non-boolean decline
@@ -4609,15 +5194,144 @@ fn run_distinct_over_chunk(
 }
 
 /// One morsel's output columns: `(existing-columns, peer-column, rel-column,
-/// used-rels, provenance)` — the partial an `expand` worker returns, concatenated
-/// in slice order to rebuild the serial result.
+/// used-rels, provenance, fold-weights)` — the partial an `expand` worker
+/// returns, concatenated in slice order to rebuild the serial result.
+///
+/// The weight column was added 2026-09-11. It is carried exactly as `prov` is
+/// — a per-row fact copied from the source row to each row it produces — which
+/// is the reason this was a safe change rather than a new mechanism: the
+/// parallel path had been carrying one such column correctly since it was
+/// written, and a second follows the same three lines.
 type ExpandCols = (
     Vec<Vec<u64>>,
     Vec<u64>,
     Option<Vec<u64>>,
     Vec<Vec<u64>>,
     Vec<usize>,
+    Vec<u64>,
 );
+
+/// One frontier walk's shape, shared by every morsel of it.
+struct BfsWalk<'a> {
+    src_vi: usize,
+    dir: Dir,
+    tokens: &'a Option<Vec<u32>>,
+    b_members: Option<&'a crate::MembersView>,
+    max: u64,
+    from_zero: bool,
+}
+
+/// A frontier walk's output for some driving rows: the copied id columns, the
+/// reached nodes, and the provenance and fold weights when the chunk has them.
+type BfsCols = (Vec<Vec<u64>>, Vec<u64>, Vec<usize>, Vec<u64>);
+
+/// The frontier walk from each of `selection`'s driving rows, IN ORDER — the
+/// whole body of [`DataChunk::expand_var_length_bfs`], so a morsel's partial is
+/// exactly the serial output for its rows:
+///   - `seen` is the visited set — a node enters it the first time it is
+///     reached, which fixes both its shortest depth and its single emission;
+///   - `*0..` reaches the source itself at depth 0;
+///   - an UNDIRECTED walk never re-reaches its start through the edge it left
+///     by: the start is seen from the outset and emitted after the walk only
+///     along a real cycle (`interp::shortest_cycle_through`);
+///   - FORWARD adjacency order (canary: reversing it diverges an
+///     order-sensitive DISTINCT reach set), fed zero-copy from the cached CSR
+///     slice; the end-label filter gates EMISSION only — a non-member is still
+///     seen and still queued for a next hop.
+///
+/// `produced`/`over` are the walk's shared row-budget account (as
+/// `expand_row_slice`'s): a slice stops once the total — its frontier
+/// included — passes the budget, the point the serial walk refused at.
+fn bfs_row_slice(
+    graph: &Graph,
+    chunk: &DataChunk,
+    selection: &[usize],
+    walk: &BfsWalk<'_>,
+    produced: &std::sync::atomic::AtomicUsize,
+    over: &std::sync::atomic::AtomicBool,
+    budget: usize,
+) -> BfsCols {
+    use std::sync::atomic::Ordering;
+    let carry_prov = !chunk.prov.is_empty();
+    let carry_w = !chunk.weights.is_empty();
+    let mut out_ids: Vec<Vec<u64>> = (0..chunk.ids.len()).map(|_| Vec::new()).collect();
+    let mut new_col: Vec<u64> = Vec::new();
+    let mut out_prov: Vec<usize> = Vec::new();
+    let mut out_w: Vec<u64> = Vec::new();
+    let mut seen: BTreeSet<u64> = BTreeSet::new();
+    let member = |v: u64| walk.b_members.is_none_or(|m| m.contains(v));
+    let mut counted_len = 0usize;
+    'rows: for &r in selection {
+        if over.load(Ordering::Relaxed) {
+            break;
+        }
+        let src = chunk.ids[walk.src_vi][r];
+        let mut emit = |v: u64, out_ids: &mut Vec<Vec<u64>>, new_col: &mut Vec<u64>| {
+            for (vi, col) in out_ids.iter_mut().enumerate() {
+                col.push(chunk.ids[vi][r]);
+            }
+            new_col.push(v);
+            if carry_prov {
+                out_prov.push(chunk.prov[r]);
+            }
+            if carry_w {
+                out_w.push(chunk.weights[r]);
+            }
+        };
+        seen.clear();
+        if walk.from_zero {
+            seen.insert(src);
+            if member(src) {
+                emit(src, &mut out_ids, &mut new_col);
+            }
+        }
+        let returns = !walk.from_zero
+            && matches!(walk.dir, Dir::Both)
+            && {
+                seen.insert(src);
+                crate::interp::shortest_cycle_through(graph, src, walk.tokens, walk.max).is_some()
+            };
+        let mut frontier: Vec<u64> = vec![src];
+        let mut depth = 0u64;
+        while depth < walk.max && !frontier.is_empty() {
+            depth += 1;
+            let mut next: Vec<u64> = Vec::new();
+            for &u in &frontier {
+                if produced.load(Ordering::Relaxed) + new_col.len() - counted_len + next.len()
+                    > budget
+                {
+                    over.store(true, Ordering::Relaxed);
+                    break 'rows;
+                }
+                graph.adjacent_slim_for_each(u, walk.dir, walk.tokens, |e| {
+                    let v = e.peer;
+                    if !seen.insert(v) {
+                        return; // already reached at its shortest depth
+                    }
+                    if depth < walk.max {
+                        next.push(v); // room for a further hop
+                    }
+                    if member(v) {
+                        emit(v, &mut out_ids, &mut new_col);
+                    }
+                });
+            }
+            frontier = next;
+        }
+        if returns && member(src) {
+            counted!("interp.undirected frontier walk returned to its start along a cycle");
+            emit(src, &mut out_ids, &mut new_col);
+        }
+        // This row's output enters the shared total as one add.
+        let added = new_col.len() - counted_len;
+        counted_len = new_col.len();
+        if added > 0 && produced.fetch_add(added, Ordering::Relaxed) + added > budget {
+            over.store(true, Ordering::Relaxed);
+            break;
+        }
+    }
+    (out_ids, new_col, out_prov, out_w)
+}
 
 /// Expand one MORSEL — a contiguous slice of the driving `selection` — for the
 /// parallel path. Byte-for-byte the same per-row body as [`DataChunk::expand`]'s
@@ -4646,10 +5360,13 @@ fn expand_row_slice(
     dir: Dir,
     tokens: &Option<Vec<u32>>,
     b_members: Option<&crate::MembersView>,
+    closes: Option<&[u64]>,
     track_rels: bool,
     reset_rels: bool,
     carry_prov: bool,
     want_rel_col: bool,
+    weights: &[u64],
+    carry_w: bool,
     produced: &std::sync::atomic::AtomicUsize,
     over: &std::sync::atomic::AtomicBool,
     budget: usize,
@@ -4661,6 +5378,7 @@ fn expand_row_slice(
     let mut rel_col: Option<Vec<u64>> = if want_rel_col { Some(Vec::new()) } else { None };
     let mut out_used: Vec<Vec<u64>> = Vec::new();
     let mut out_prov: Vec<usize> = Vec::new();
+    let mut out_w: Vec<u64> = Vec::new();
     let mut probes = 0u64;
     let mut counted_len = 0usize;
     for &r in selection {
@@ -4684,6 +5402,9 @@ fn expand_row_slice(
                     return;
                 }
             }
+            if closes.is_some_and(|c| c.binary_search(&peer).is_err()) {
+                return;
+            }
             if track_rels && base.contains(&e.rel) {
                 return;
             }
@@ -4702,6 +5423,12 @@ fn expand_row_slice(
             if carry_prov {
                 out_prov.push(prov[r]);
             }
+            // The fold weight, copied per produced row exactly as the serial
+            // loop's `take` does. A weight is what turns a row into a COUNT, so
+            // dropping one here would not fail — it would answer wrongly.
+            if carry_w {
+                out_w.push(weights[r]);
+            }
         });
         // Account this row's output against the SHARED budget. A row's fanout
         // enters the total as one add; the flag trips at the same combined
@@ -4715,7 +5442,7 @@ fn expand_row_slice(
         }
     }
     crate::counters::MEMBERS_PROBES.fetch_add(probes, Ordering::Relaxed);
-    (out_ids, new_col, rel_col, out_used, out_prov)
+    (out_ids, new_col, rel_col, out_used, out_prov, out_w)
 }
 
 /// Run ONE ordered step over a chunk — the single dispatch every hop loop shares:
@@ -4729,9 +5456,91 @@ fn run_hop(
     members: Option<&crate::MembersView>,
     tokens: &Option<Vec<u32>>,
 ) -> Result<DataChunk, RunError> {
+    run_hop_closing(graph, chunk, hop, members, tokens, None)
+}
+
+/// [`run_hop`] for `hops[i]` of a hop loop: an expand whose new var the NEXT
+/// hop closes from, onto one node every live row shares, binds only the peers
+/// that close (`closing_peer_filter`).
+fn run_hop_at(
+    graph: &Graph,
+    chunk: DataChunk,
+    hops: &[Hop],
+    i: usize,
+    members: Option<&crate::MembersView>,
+    hop_tokens: &[Option<Vec<u32>>],
+) -> Result<DataChunk, RunError> {
+    let closes = closing_peer_filter(graph, &chunk, hops, i, hop_tokens);
+    run_hop_closing(graph, chunk, &hops[i], members, &hop_tokens[i], closes.as_deref())
+}
+
+/// THE CLOSE, PUSHED INTO THE EXPAND BEFORE IT.
+///
+/// SNB BI bi18 walks `(tag)<-[:HAS_INTEREST]-(person1)-[:KNOWS]-(mutualFriend)
+/// -[:KNOWS]-(person2)-[:HAS_INTEREST]->(tag)`: the second KNOWS expand built a
+/// row for every friend of every friend — 2.5M at SF3, each with its own
+/// isomorphism set — and the close onto `tag` then dropped all but those whose
+/// `person2` is interested in the tag, one adjacency binary search per row.
+/// When the close's target is the SAME node on every live row, the peers that
+/// can close are exactly the target's neighbours over the close's types in the
+/// reverse direction: computed once, they filter the expand, and a row the
+/// close would drop is never built. Sound as a prefilter only — the close
+/// still runs over the rows that remain, so its multiplicity and relationship
+/// isomorphism are decided exactly where they were, and the surviving rows keep
+/// their order. `None` when the next hop is not such a close.
+fn closing_peer_filter(
+    graph: &Graph,
+    chunk: &DataChunk,
+    hops: &[Hop],
+    i: usize,
+    hop_tokens: &[Option<Vec<u32>>],
+) -> Option<Vec<u64>> {
+    let (hop, next) = (&hops[i], hops.get(i + 1)?);
+    if hop.tgt.is_some() || hop.varlen.is_some() || hop.fold {
+        return None; // only a materialising EXPAND binds peers to filter
+    }
+    let tgt_vi = next.tgt?;
+    if next.fold || next.src != hop.end_vi? {
+        return None; // the close must start from the var this hop binds
+    }
+    let mut live = chunk.selection.iter();
+    let want = *chunk.ids.get(tgt_vi)?.get(*live.next()?)?;
+    if live.any(|&r| chunk.ids[tgt_vi][r] != want) {
+        return None; // a target per row: the per-row close decides
+    }
+    let back = match next.dir {
+        Dir::Out => Dir::In,
+        Dir::In => Dir::Out,
+        Dir::Both => Dir::Both,
+    };
+    let mut peers: Vec<u64> = Vec::new();
+    graph.adjacent_slim_for_each(want, back, &hop_tokens[i + 1], |e| peers.push(e.peer));
+    peers.sort_unstable();
+    peers.dedup();
+    counted!("interp.pipeline expand bound only the peers the next hop closes from");
+    Some(peers)
+}
+
+fn run_hop_closing(
+    graph: &Graph,
+    chunk: DataChunk,
+    hop: &Hop,
+    members: Option<&crate::MembersView>,
+    tokens: &Option<Vec<u32>>,
+    closes: Option<&[u64]>,
+) -> Result<DataChunk, RunError> {
     if let Some(max) = hop.varlen {
         return chunk
-            .expand_var_length_bfs(graph, hop.src, &hop.var, hop.dir, tokens, members, max);
+            .expand_var_length_bfs(
+                graph,
+                hop.src,
+                &hop.var,
+                hop.dir,
+                tokens,
+                members,
+                max,
+                hop.from_zero,
+            );
     }
     match hop.tgt {
         None => chunk.expand(
@@ -4744,6 +5553,7 @@ fn run_hop(
             members,
             hop.track,
             hop.reset,
+            closes,
         ),
         Some(tgt_vi) => chunk.semijoin(
             graph,
@@ -4773,10 +5583,25 @@ fn varlen_distinct_consumed(hops: &[Hop], proj: &Projection) -> bool {
     if !hops_have_varlen(hops) {
         return true;
     }
-    let dv = distinct_vars_of_proj(proj);
-    hops.iter()
-        .filter(|h| h.varlen.is_some())
-        .all(|h| dv.contains(&h.var))
+    // The walk's rows are one per REACHED node where the enumeration's are one
+    // per walk, so the breaker must not count them (`proj_is_set_semantic`);
+    // what it does with the walk's end is then free.
+    //
+    // The sole bounded `*1..max` hop keeps the end-var test as well, because it
+    // may collect a DISTINCT list: the general path walks that shape by the
+    // same frontier exactly when its end is consumed DISTINCT-only
+    // (`frontier_ok`), and the two must agree on a list's order. Mid-path, from
+    // zero or unbounded, the general path enumerates, so no list is admitted.
+    let sole = matches!(hops, [h] if !h.from_zero && h.varlen.is_some_and(|m| m != u64::MAX));
+    if sole {
+        let dv = distinct_vars_of_proj(proj);
+        let ends_distinct = hops
+            .iter()
+            .filter(|h| h.varlen.is_some())
+            .all(|h| dv.contains(&h.var));
+        return ends_distinct && crate::interp::proj_is_set_semantic(proj, true);
+    }
+    crate::interp::proj_is_set_semantic(proj, false)
 }
 
 // ─── COUNT FOLD (operator A of docs/lsqb-completeness-plan.md) ───────────────
@@ -4787,7 +5612,7 @@ fn varlen_distinct_consumed(hops: &[Hop], proj: &Projection) -> bool {
 // a hop whose end var nothing reads need not be expanded: the number of
 // qualifying walks through it (and its whole subtree) can be COUNTED per
 // driving row and multiplied into the row's weight. `reduce_agg_groups` then
-// adds weights instead of 1s (`fold_row_weighted`). Group FIRST-SEEN order is
+// adds weights instead of 1s (`fold_row_mult`). Group FIRST-SEEN order is
 // unchanged because a folded var is never a grouping key and a row whose fold
 // counts zero walks is DROPPED — exactly the rows the general path never
 // produces — so the surviving materialised rows are the general path's rows
@@ -4995,7 +5820,8 @@ fn plan_count_fold(plan: &mut AggPlan) {
         };
         // The filter compares/probes NODE ids only; a rel-kind endpoint keeps
         // the conjunct on the chunk filter (which declines it to the interp).
-        if !matches!(plan.var_kinds[a], VarKind::Node) || !matches!(plan.var_kinds[b], VarKind::Node)
+        if !matches!(plan.var_kinds[a], VarKind::Node)
+            || !matches!(plan.var_kinds[b], VarKind::Node)
         {
             read[a] = true;
             read[b] = true;
@@ -5213,6 +6039,400 @@ fn plan_count_fold(plan: &mut AggPlan) {
         .filter(|(i, _)| !dropped[*i])
         .map(|(_, w)| w)
         .collect();
+    // Fix 90: with the fold marked, look for a symmetry it can break.
+    plan.symmetry = plan_symmetry_breaking(plan, &foldable, &binder);
+}
+
+/// Fix 90 (strategy Q3 of `docs/lsqb-completeness-plan.md`): AUTOMORPHISM
+/// SYMMETRY BREAKING in the count fold — the symmetry the planner proved,
+/// the constraints that keep one order of it, and the multiplier that
+/// restores the count.
+///
+/// LSQB q3's `(p1)-[:KNOWS]-(p2)-[:KNOWS]-(p3)-[:KNOWS]-(p1)` with the same
+/// country sub-pattern on each person is invariant under every permutation
+/// of `{p1, p2, p3}`: each unordered triangle is a result six times over,
+/// once per order. The fold can enumerate ONE order — `id(p1) < id(p2) <
+/// id(p3)`, one `InlinePred::GtBound` on each folded member's binding hop —
+/// and multiply by 3!. At SF1 that is the close hop's 10.1M walks (80.6% of
+/// q3's) cut to a quarter, and q1's KNOWS count halved.
+///
+/// The proof obligation — the failure mode of the idea is a SILENTLY wrong
+/// count, so every clause is a decline unless it holds:
+///
+/// 1. `S` is SYMMETRIC: every transposition `(u v)` of `S` extends to an
+///    automorphism of the WHOLE pattern (labels, every hop's endpoints,
+///    types and direction, and the path partition the relationship-
+///    isomorphism rule is enforced over). Transpositions generate the full
+///    symmetric group, so the result set is invariant under any permutation
+///    of the values `S` takes.
+/// 2. The members of every result are pairwise DISTINCT nodes, so each orbit
+///    under the group has exactly `|S|!` members and exactly one is in
+///    increasing id order. Cypher's relationship isomorphism does NOT give
+///    this by itself: two symmetric vars can bind the SAME node through a
+///    self-loop (adjacent vars) or through parallel edges out of a third
+///    (non-adjacent vars), and such a result has a SMALLER orbit — the
+///    multiplier would overcount it. So the members must be pairwise
+///    ADJACENT in the pattern, through hops whose types carry NO self-loop
+///    in the data. Adjacency is the query's; the self-loop count is the
+///    data's, and it is asked at EXECUTION (`build_chunk_sym`,
+///    `Graph::type_self_loops`), never cached with the plan.
+/// 3. Nothing reads `S`: `count(*)` only, no grouping key, no seek anchor,
+///    and no WHERE or inline predicate at all — the first cut admits only
+///    the predicate-free pattern, since every predicate would have to be
+///    shown invariant under the renaming too and nothing measured needs it.
+/// 4. The constraints are EVALUABLE where they land: every member after the
+///    first (binding order) is a FOLDED var whose binding hop takes the
+///    `GtBound`, and the member before it is in the fold's `bind` when that
+///    level is entered — a folded ancestor, or a materialised var bound
+///    before the fold's root (the position rule). At most one member is
+///    materialised and it is the first (q3: the seed `person1`).
+///
+/// The automorphism search is a label-grouped backtracking over the node
+/// vars with a step budget; a pattern too wide to decide cheaply is declined
+/// rather than planned slowly. Every decline is counted.
+#[derive(Clone, Debug)]
+struct SymmetryPlan {
+    /// The symmetric vars, in binding order.
+    set: Vec<usize>,
+    /// Per member after the first: the hop that binds it and the member
+    /// before it, whose id it must exceed.
+    chain: Vec<(usize, usize)>,
+    /// One joining hop's type list per pair of members (deduplicated; empty =
+    /// untyped, every type). Each must carry zero self-loops at execution.
+    guard_types: Vec<Vec<String>>,
+}
+
+impl SymmetryPlan {
+    /// `|S|!` — the orders the constrained enumeration does not walk. One
+    /// source of truth: the set decides it, so a set and a multiplier can
+    /// never drift apart.
+    fn multiplier(&self) -> u64 {
+        (1..=self.set.len() as u64).product()
+    }
+}
+
+/// One pattern edge, canonical: undirected edges store their endpoints
+/// `a <= b`; directed ones store `a -> b`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct PatEdge {
+    a: usize,
+    b: usize,
+    undirected: bool,
+    types: Vec<String>,
+}
+
+fn pat_edge(a: usize, b: usize, dir: Dir, types: &[String]) -> PatEdge {
+    let mut types = types.to_vec();
+    types.sort();
+    types.dedup();
+    match dir {
+        Dir::Both => PatEdge {
+            a: a.min(b),
+            b: a.max(b),
+            undirected: true,
+            types,
+        },
+        Dir::Out => PatEdge {
+            a,
+            b,
+            undirected: false,
+            types,
+        },
+        Dir::In => PatEdge {
+            a: b,
+            b: a,
+            undirected: false,
+            types,
+        },
+    }
+}
+
+/// The pattern as the automorphism test sees it: a label set per node var
+/// and the edges with their path ids.
+struct PatGraph {
+    labels: Vec<Vec<String>>,
+    edges: Vec<(PatEdge, usize)>,
+    npaths: usize,
+}
+
+fn pat_edge_image(e: &PatEdge, sigma: &[usize]) -> PatEdge {
+    let dir = if e.undirected { Dir::Both } else { Dir::Out };
+    pat_edge(sigma[e.a], sigma[e.b], dir, &e.types)
+}
+
+/// Whether the fully assigned, label-preserving `sigma` is an automorphism:
+/// the edge multiset of every path maps onto the edge multiset of exactly
+/// one path, and the path map is a bijection.
+fn is_pattern_automorphism(g: &PatGraph, sigma: &[usize]) -> bool {
+    let mut by_path: Vec<Vec<PatEdge>> = vec![Vec::new(); g.npaths];
+    for (e, p) in &g.edges {
+        by_path[*p].push(e.clone());
+    }
+    for v in by_path.iter_mut() {
+        v.sort();
+    }
+    let mut used = vec![false; g.npaths];
+    for p in 0..g.npaths {
+        let mut img: Vec<PatEdge> = by_path[p]
+            .iter()
+            .map(|e| pat_edge_image(e, sigma))
+            .collect();
+        img.sort();
+        let Some(q) = (0..g.npaths).find(|&q| !used[q] && by_path[q] == img) else {
+            return false;
+        };
+        used[q] = true;
+    }
+    true
+}
+
+/// The automorphism search's step budget: a pattern that needs more is
+/// declined rather than planned slowly.
+const SYMMETRY_SEARCH_BUDGET: u32 = 4_096;
+/// The widest symmetric set the planner breaks (the multiplier is `n!`).
+const SYMMETRY_MAX_SET: usize = 6;
+
+/// Extend the partial `sigma` (unassigned = `usize::MAX`) over the remaining
+/// vars, label-preserving, pruning on any edge whose endpoints are both
+/// assigned and whose image is no edge of the pattern.
+fn extend_automorphism(
+    g: &PatGraph,
+    sigma: &mut [usize],
+    used: &mut [bool],
+    i: usize,
+    budget: &mut u32,
+) -> bool {
+    let n = sigma.len();
+    if i == n {
+        return is_pattern_automorphism(g, sigma);
+    }
+    if sigma[i] != usize::MAX {
+        return extend_automorphism(g, sigma, used, i + 1, budget);
+    }
+    for c in 0..n {
+        if used[c] || g.labels[c] != g.labels[i] {
+            continue;
+        }
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        sigma[i] = c;
+        used[c] = true;
+        let consistent = g.edges.iter().all(|(e, _)| {
+            if sigma[e.a] == usize::MAX || sigma[e.b] == usize::MAX {
+                return true;
+            }
+            let img = pat_edge_image(e, sigma);
+            g.edges.iter().any(|(f, _)| *f == img)
+        });
+        if consistent && extend_automorphism(g, sigma, used, i + 1, budget) {
+            return true;
+        }
+        sigma[i] = usize::MAX;
+        used[c] = false;
+    }
+    false
+}
+
+/// Whether swapping `u` and `v` while fixing every other member of `set`
+/// extends to an automorphism (the other vars free, label-preserving).
+fn transposition_extends(g: &PatGraph, set: &[usize], u: usize, v: usize) -> bool {
+    let n = g.labels.len();
+    let mut sigma = vec![usize::MAX; n];
+    let mut used = vec![false; n];
+    for &s in set {
+        sigma[s] = s;
+        used[s] = true;
+    }
+    sigma[u] = v;
+    sigma[v] = u;
+    let mut budget = SYMMETRY_SEARCH_BUDGET;
+    extend_automorphism(g, &mut sigma, &mut used, 0, &mut budget)
+}
+
+/// The var the expand hop binding `v` is sourced from.
+fn fold_parent(v: usize, hops: &[Hop], binder: &[Option<usize>]) -> Option<usize> {
+    binder[v].map(|hi| hops[hi].src)
+}
+
+/// The end var of the ROOT hop `v`'s fold runs at (the topmost folded var
+/// on its ancestor chain).
+fn fold_root_end(v: usize, hops: &[Hop], binder: &[Option<usize>], foldable: &[bool]) -> usize {
+    let mut cur = v;
+    loop {
+        match fold_parent(cur, hops, binder) {
+            Some(p) if foldable[p] => cur = p,
+            _ => return cur,
+        }
+    }
+}
+
+/// Whether `anc` is a FOLDED ancestor of `v` (in `bind` when `v`'s level runs).
+fn fold_is_ancestor(
+    anc: usize,
+    v: usize,
+    hops: &[Hop],
+    binder: &[Option<usize>],
+    foldable: &[bool],
+) -> bool {
+    let mut cur = v;
+    loop {
+        match fold_parent(cur, hops, binder) {
+            Some(p) if p == anc => return foldable[p],
+            Some(p) if foldable[p] => cur = p,
+            _ => return false,
+        }
+    }
+}
+
+/// The recogniser (see `SymmetryPlan`): the widest eligible label group
+/// whose every pair is adjacent and whose every transposition is an
+/// automorphism, with its constraint chain under the position rule. Runs
+/// after `plan_count_fold` marked the fold; `foldable`/`binder` are its.
+fn plan_symmetry_breaking(
+    plan: &AggPlan,
+    foldable: &[bool],
+    binder: &[Option<usize>],
+) -> Option<SymmetryPlan> {
+    if !fold_symmetry_breaking_enabled() {
+        return None;
+    }
+    if !plan.group_keys.is_empty() || plan.start_anchor.is_some() || !plan.wheres.is_empty() {
+        return None;
+    }
+    let n = plan.vars.len();
+    if n < 2 || plan.var_kinds.iter().any(|k| !matches!(k, VarKind::Node)) {
+        return None;
+    }
+    if plan
+        .hops
+        .iter()
+        .any(|h| !h.inline.is_empty() || h.varlen.is_some() || h.rel_var.is_some())
+    {
+        return None;
+    }
+    let a_idx = plan.vars.iter().position(|v| *v == plan.a_var)?;
+    let mut labels: Vec<Vec<String>> = vec![Vec::new(); n];
+    labels[a_idx].extend(plan.a_labels.iter().cloned());
+    let mut edges: Vec<(PatEdge, usize)> = Vec::with_capacity(plan.hops.len());
+    let mut pid = 0usize;
+    for (hi, h) in plan.hops.iter().enumerate() {
+        if hi > 0 && h.reset {
+            pid += 1;
+        }
+        let end = h.end_vi.or(h.tgt)?;
+        if end >= n || h.src >= n {
+            return None;
+        }
+        // A close's labels re-verify its TARGET; an expand's bind its end.
+        labels[end].extend(h.labels.iter().cloned());
+        edges.push((pat_edge(h.src, end, h.dir, &h.types), pid));
+    }
+    for l in labels.iter_mut() {
+        l.sort();
+        l.dedup();
+    }
+    let g = PatGraph {
+        labels,
+        edges,
+        npaths: pid + 1,
+    };
+    let eligible = |v: usize| foldable[v] || v == a_idx;
+    let mut best: Option<SymmetryPlan> = None;
+    let mut seen = vec![false; n];
+    for v in 0..n {
+        if seen[v] || !eligible(v) {
+            continue;
+        }
+        let group: Vec<usize> = (v..n)
+            .filter(|&w| eligible(w) && g.labels[w] == g.labels[v])
+            .collect();
+        for &w in &group {
+            seen[w] = true;
+        }
+        if group.len() < 2 {
+            continue;
+        }
+        if group.len() > SYMMETRY_MAX_SET {
+            counted!("interp.pipeline fold symmetry declined: the set is too wide");
+            continue;
+        }
+        // At most one member is materialised, and only as the first: the
+        // constraints land on FOLDED members' binding hops.
+        if group.iter().skip(1).any(|&w| !foldable[w]) {
+            counted!("interp.pipeline fold symmetry declined: a materialised member is not first");
+            continue;
+        }
+        let mut guard_types: Vec<Vec<String>> = Vec::new();
+        let mut ok = true;
+        'pairs: for i in 0..group.len() {
+            for j in i + 1..group.len() {
+                let (u, w) = (group[i], group[j]);
+                let joining = g
+                    .edges
+                    .iter()
+                    .find(|(e, _)| (e.a == u && e.b == w) || (e.a == w && e.b == u));
+                let Some((e, _)) = joining else {
+                    counted!(
+                        "interp.pipeline fold symmetry declined: two members are not adjacent"
+                    );
+                    ok = false;
+                    break 'pairs;
+                };
+                if !guard_types.contains(&e.types) {
+                    guard_types.push(e.types.clone());
+                }
+                if !transposition_extends(&g, &group, u, w) {
+                    counted!(
+                        "interp.pipeline fold symmetry declined: a transposition is not an automorphism"
+                    );
+                    ok = false;
+                    break 'pairs;
+                }
+            }
+        }
+        if !ok {
+            continue;
+        }
+        let mut chain: Vec<(usize, usize)> = Vec::with_capacity(group.len() - 1);
+        for k in 1..group.len() {
+            let (prev, cur) = (group[k - 1], group[k]);
+            let Some(hi) = binder[cur] else {
+                ok = false;
+                break;
+            };
+            let reachable = if foldable[prev] {
+                fold_is_ancestor(prev, cur, &plan.hops, binder, foldable)
+            } else {
+                prev < fold_root_end(cur, &plan.hops, binder, foldable)
+            };
+            if !reachable {
+                counted!("interp.pipeline fold symmetry declined: the position rule");
+                ok = false;
+                break;
+            }
+            chain.push((hi, prev));
+        }
+        if !ok {
+            continue;
+        }
+        let cand = SymmetryPlan {
+            set: group,
+            chain,
+            guard_types,
+        };
+        if best
+            .as_ref()
+            .is_none_or(|b| cand.multiplier() > b.multiplier())
+        {
+            best = Some(cand);
+        }
+    }
+    if best.is_some() {
+        counted!("interp.pipeline fold symmetry planned");
+    }
+    best
 }
 
 /// One hop's inline predicates with their type tokens resolved once (only an
@@ -5237,6 +6457,18 @@ struct FoldPlan<'a> {
     /// Per hop: a fold ROOT — folded, sourced from a MATERIALISED var. Each root
     /// runs its own `fold_tail` at its position; roots' weights multiply.
     root: Vec<bool>,
+    /// Fix 84, per hop: a CLOSE whose probed row belongs to the BOUND node —
+    /// undirected, or directed under the bound-side probe — so the row is
+    /// fixed for the close's whole subtree and can be hoisted once per binding
+    /// (see `FoldState::hoisted`).
+    hoist: Vec<bool>,
+    /// Fix 84, read ONCE on the planning thread: the probes a binding of a
+    /// close's bound node answers through the table before its row is
+    /// hoisted (`fold_hoist_after()`). A parallel fold runs its morsels on
+    /// fresh scoped threads whose thread-locals hold the DEFAULT, so a
+    /// thread-local read inside `fold_rows` ignored `--fold-hoist-after` on
+    /// exactly the folds that matter; every other lever is snapshotted here.
+    hoist_after: usize,
     /// Whether any inline predicate is an edge probe (operator B's counter).
     has_edge_pred: bool,
     /// The memo's id cap: the row budget (a level over it is simply not cached).
@@ -5252,6 +6484,15 @@ struct FoldPlan<'a> {
     /// The running sum the cap is judged against — shared by the parallel
     /// fold's morsel workers, so every worker stops at the same signal.
     reached: std::sync::atomic::AtomicU64,
+    /// Fix 90: the symmetry multiplier — `|S|!` when the plan enumerates one
+    /// order of a proven-symmetric var set (`SymmetryPlan`), else 1. Applied
+    /// to each driving row's weight ONCE, at `multiplier_root`, before the
+    /// probe cap judges it.
+    multiplier: u64,
+    /// The first fold root (lowest hop index) — where the multiplier lands.
+    /// Every root multiplies the same row's weight, so one of them must own
+    /// the factor; `usize::MAX` when nothing folds.
+    multiplier_root: usize,
 }
 
 /// The reserved parameter that carries a probe cap into the count fold —
@@ -5283,6 +6524,178 @@ struct FoldState {
     overflow: bool,
     /// Whether a memo hit served a level (the memo counter).
     memo_used: bool,
+    /// Fix 120's instrument: hop walks, accumulated LOCALLY and flushed once.
+    ///
+    /// This must never be a `counted!` in `hop_sum`. `engram_observe::count`
+    /// costs a thread-local access plus a `RefCell::borrow_mut` on EVERY call
+    /// whether or not a trace is installed, and q3 makes 107,386,468 hop
+    /// walks — an unconditional counter there would cost more than the
+    /// reordering it was added to measure.
+    walks: u64,
+    /// Fix 80: the same walks, PER HOP — the attribution the WCOJ decision
+    /// needs and no post-fix-120 run has ever produced. Indexed by hop;
+    /// accumulated locally for the same reason `walks` is (a `counted!` in
+    /// `hop_sum` would cost more than the mechanism it measures) and flushed
+    /// once per morsel beside it, as `interp.pipeline fold hop walks @hopN`.
+    /// The discriminator for a triangle-close operator is hop N's share of
+    /// the total: the review's kill line is ~40%.
+    walks_by_hop: Vec<u64>,
+    /// Fix 84, per hop: the hoisted row a close probes — the bound node it
+    /// was read for and its adjacency sorted by peer. Rebuilt when the bound
+    /// node changes (once per binding of that var), read by binary search
+    /// for every probe under it. Only hops the plan marked `hoist` use it.
+    hoisted: Vec<Option<HoistedRow>>,
+    /// Fix 84, per hop: the bound node the current run of probes is against
+    /// and how many probes it has answered, so a row is hoisted only once a
+    /// binding has shown it will be probed enough to pay for the read.
+    hoist_seen: Vec<HoistSeen>,
+    /// Fix 84's close-arm counters, tallied here and flushed on the calling
+    /// thread (see `FoldTally`): rows hoisted, probes answered through the
+    /// table under the threshold, hoists deferred by the row's size.
+    hoist_hoisted: u64,
+    hoist_under: u64,
+    hoist_deferred: u64,
+}
+
+/// Fix 84, per hop: the run of probes against ONE binding of the close's
+/// bound node, and when that binding is next considered for a hoist.
+#[derive(Clone, Copy)]
+struct HoistSeen {
+    /// The bound node the run is against; `u64::MAX` before the first probe.
+    node: u64,
+    /// Probes answered for this binding so far.
+    probes: u32,
+    /// The probe count past which the binding is (re)considered: the plan's
+    /// threshold at first; when the row turns out to be more than four times
+    /// the probes made, pushed to a quarter of the row (at least doubled), so
+    /// a hub is SIZED a few times and never copied for a handful of probes.
+    next: u32,
+}
+
+impl HoistSeen {
+    fn fresh(base: usize) -> Self {
+        HoistSeen {
+            node: u64::MAX,
+            probes: 0,
+            next: base.min(u32::MAX as usize) as u32,
+        }
+    }
+}
+
+/// Fix 84: a bound node's adjacency, read once and sorted by peer, so a
+/// close under it costs two `partition_point`s on a local slice instead of a
+/// table probe. The measured q3 discriminator (v187, fix 81's tally): the
+/// close hop is 10,101,202 of 12,533,920 fold walks — 80.6% — every one of
+/// them a probe of the SAME ~36-entry row through `edges_to_peer_slim`'s
+/// snapshot lookup, transaction-pending check and key building. The edge set
+/// is exactly what `edges_to_peer_slim` filters: `adjacent_slim` on the same
+/// node, direction and types, which the walked arm of that probe already
+/// reads — so the hoist is a pure cost change, and the differential proves
+/// it byte for byte.
+#[derive(Clone)]
+struct HoistedRow {
+    node: u64,
+    row: Vec<crate::SlimAdj>,
+}
+
+impl FoldState {
+    /// The walk counters as data, for the caller to flush — see [`FoldTally`].
+    fn tally(&self) -> FoldTally {
+        FoldTally {
+            walks: self.walks,
+            by_hop: self.walks_by_hop.clone(),
+            hoisted: self.hoist_hoisted,
+            under: self.hoist_under,
+            deferred: self.hoist_deferred,
+        }
+    }
+}
+
+/// Fix 81: what one `fold_rows` call walked, carried back to the CALLING
+/// thread as data and flushed there.
+///
+/// The per-morsel flush this replaces recorded NOTHING on a parallel fold. A
+/// trace is thread-local — `engram_observe::with_trace` installs it on the
+/// connection's thread, and `count` is a no-op on every other — while a
+/// parallel fold runs its morsels on the executor's workers. On the pod's
+/// six-worker server the traced q3 therefore carried `fold parallel 1` and no
+/// `fold hop walks` line at all, and the 107,386,468 walks every fold number
+/// quotes came from the pre-fix-119 SERIAL fold, the last time the counter
+/// ran on the thread that held the trace. Fix 80's unit test passed for the
+/// same reason: a four-node fixture never reaches the parallel floor. The
+/// tally crosses the thread boundary as a value; the flush stays where the
+/// trace is.
+struct FoldTally {
+    walks: u64,
+    by_hop: Vec<u64>,
+    /// Fix 84's three close-arm counters, carried the same way: a `counted!`
+    /// on a morsel thread records nowhere, and the threshold's whole point
+    /// is only observable on a parallel fold.
+    hoisted: u64,
+    under: u64,
+    deferred: u64,
+}
+
+/// What one `fold_rows` call returns: the kept `(row, folded weight)` pairs
+/// in row order, whether the memo served, and the walk tally — or the
+/// overflow refusal for the caller to propagate.
+type FoldPart = Result<(Vec<(usize, u64)>, bool, FoldTally), RunError>;
+
+impl FoldTally {
+    fn new(hops: usize) -> Self {
+        Self {
+            walks: 0,
+            by_hop: vec![0; hops],
+            hoisted: 0,
+            under: 0,
+            deferred: 0,
+        }
+    }
+
+    fn add(&mut self, other: &FoldTally) {
+        self.walks += other.walks;
+        for (mine, theirs) in self.by_hop.iter_mut().zip(&other.by_hop) {
+            *mine += *theirs;
+        }
+        self.hoisted += other.hoisted;
+        self.under += other.under;
+        self.deferred += other.deferred;
+    }
+
+    /// Fix 120's instrument and fix 80's per-hop split, flushed once. The
+    /// per-hop label is formatted only under a trace — `counted!` evaluates
+    /// its name BEFORE `count` can decline — so an untraced fold pays nothing
+    /// for strings nobody reads. `@hopN` is the hop's index in the plan, the
+    /// order the plan dump prints, so hop 4's share of q3 reads straight off
+    /// the counters.
+    fn flush(&self) {
+        counted!("interp.pipeline fold hop walks", self.walks);
+        if self.hoisted > 0 {
+            counted!(
+                "interp.pipeline fold close hoisted a bound row",
+                self.hoisted
+            );
+        }
+        if self.under > 0 {
+            counted!(
+                "interp.pipeline fold close probed the table under the hoist threshold",
+                self.under
+            );
+        }
+        if self.deferred > 0 {
+            counted!(
+                "interp.pipeline fold close hoist deferred by the row's size",
+                self.deferred
+            );
+        }
+        if engram_observe::tracing() {
+            for (hi, n) in self.by_hop.iter().enumerate() {
+                if *n > 0 {
+                    counted!(&format!("interp.pipeline fold hop walks @hop{hi}"), *n);
+                }
+            }
+        }
+    }
 }
 
 impl<'a> FoldPlan<'a> {
@@ -5302,6 +6715,7 @@ impl<'a> FoldPlan<'a> {
         tokens: &'a [Option<Vec<u32>>],
         min_vars: usize,
         cap: Option<u64>,
+        multiplier: u64,
     ) -> Self {
         // The binding order's width: every index the hops and their inline
         // predicates mention.
@@ -5316,7 +6730,7 @@ impl<'a> FoldPlan<'a> {
             }
             for p in &h.inline {
                 let o = match p {
-                    InlinePred::NeBound(o) | InlinePred::EqBound(o) => *o,
+                    InlinePred::NeBound(o) | InlinePred::EqBound(o) | InlinePred::GtBound(o) => *o,
                     InlinePred::EdgeToBound { vi, .. } => *vi,
                 };
                 nvars = nvars.max(o + 1);
@@ -5333,10 +6747,8 @@ impl<'a> FoldPlan<'a> {
             }
         }
         let root: Vec<bool> = hops.iter().map(|h| h.fold && !folded_var[h.src]).collect();
-        let members: Vec<Option<&'a crate::MembersView>> = hop_members
-            .iter()
-            .map(|m| m.as_ref())
-            .collect();
+        let members: Vec<Option<&'a crate::MembersView>> =
+            hop_members.iter().map(|m| m.as_ref()).collect();
         let mut has_edge_pred = false;
         let preds: Vec<InlinePreds> = hops
             .iter()
@@ -5356,6 +6768,46 @@ impl<'a> FoldPlan<'a> {
                     .collect()
             })
             .collect();
+        // Fix 120: order each level's children SEMIJOIN-FIRST.
+        //
+        // The push above is in hop-index order, and `level` multiplies the
+        // children in that order with a `w == 0` short-circuit. For LSQB q3
+        // the planner's hop layout put `children[person2] = [KNOWS->person3,
+        // IS_LOCATED_IN->city2]`, so the ~36-way friend expansion and all of
+        // its closes ran BEFORE the two-hop test of whether person2 is even
+        // in the bound country — and the product was then multiplied by zero.
+        // At SF1 only 99,780 of 361,246 KNOWS edges have both endpoints in
+        // one country, so 72.4% of that expansion was pure waste.
+        //
+        // The rank is STRUCTURAL and never an estimate. `cardinality.rs` says
+        // in its own module doc that it models neither WHERE selectivity nor
+        // correlation, and q3's ledger records five cost-model-driven attempts
+        // that all made it worse, one by 1.85x. So: a CLOSE (binds nothing,
+        // can only cut) before an EXPAND, then the smaller subtree, then hop
+        // index as a stable tie-break.
+        if fold_child_order_enabled() {
+            for u in 0..nvars {
+                if children[u].len() < 2 || !children_independent(u, hops, &children, &preds) {
+                    continue;
+                }
+                let before = children[u].clone();
+                let mut ranked: Vec<(u8, usize, usize)> = children[u]
+                    .iter()
+                    .map(|&hi| {
+                        (
+                            u8::from(hops[hi].end_vi.is_some()),
+                            subtree_hops(hi, hops, &children),
+                            hi,
+                        )
+                    })
+                    .collect();
+                ranked.sort_unstable();
+                children[u] = ranked.into_iter().map(|(_, _, hi)| hi).collect();
+                if children[u] != before {
+                    counted!("interp.pipeline fold children ordered semijoin-first");
+                }
+            }
+        }
         // Path membership: path 0 starts at hop 0, every later path at a `reset`.
         let mut path_id = vec![0usize; hops.len()];
         let mut pid = 0usize;
@@ -5370,6 +6822,51 @@ impl<'a> FoldPlan<'a> {
             .map(|u| memo_on && folded_var[u] && memo_ok_for(u, hops, &children, &preds, &path_id))
             .collect();
         let memo_cap = graph.row_budget().unwrap_or(1 << 28);
+        // Fix 84: which closes read a row that is FIXED for their subtree.
+        // A `Both` close already probes from the bound side (`want`, the
+        // hot row); a directed one does under `directed_bound_probe`. In
+        // either case the row belongs to `st.bind[tgt]`, bound above the
+        // close, so one hoisted copy per binding serves every probe below —
+        // LSQB q3's 10.1M triangle closes read person1's ~36-entry row
+        // 10.1M times through `edges_to_peer_slim`'s per-call machinery.
+        let hoist_on = fold_hoisted_close_enabled();
+        let directed_bound = graph.directed_bound_probe();
+        let hoist: Vec<bool> = hops
+            .iter()
+            .map(|h| hoist_on && h.tgt.is_some() && (matches!(h.dir, Dir::Both) || directed_bound))
+            .collect();
+        // Fix 90: the symmetry multiplier lands on the first root.
+        let multiplier_root = root.iter().position(|&r| r).unwrap_or(usize::MAX);
+        // Fix 92: THE PROBE CAP NEEDS A SINGLE ROOT, and is dropped otherwise.
+        //
+        // `reached` is one accumulator and each root charges its own
+        // CUMULATIVE weight into it, but roots' weights MULTIPLY to make the
+        // answer (see `root`). One root's partial is therefore not the count,
+        // and judging the cap against it stops a later root before its first
+        // row: `fold_rows` breaks with `kept` empty, the chunk's selection is
+        // empty, and `constant_projection_over_count` reads that as zero. A
+        // `MATCH … RETURN 1 LIMIT 5` whose true answer is five rows answered
+        // NONE, with no error.
+        //
+        // Found by an adversarial review of fix 90 and reproduced in
+        // `a_multi_root_fold_under_a_limit_answers_every_row`. It PRE-DATES
+        // fix 90 — the same corpus answers 0 rows with symmetry off — but fix
+        // 90 multiplies the first root's partial by |S|!, so the cap is
+        // crossed |S|! times sooner and on exactly the symmetric shapes the
+        // recogniser targets.
+        //
+        // The cap is an optimisation ("any total ≥ skip+limit is as good as
+        // the exact one"), so dropping it costs a full sum on a multi-root
+        // fold and nothing else. Capping correctly would mean judging the
+        // PRODUCT of the roots' partials, which is not available while the
+        // first root is still running — the roots are sequential.
+        let roots = root.iter().filter(|&&r| r).count();
+        let cap = if roots > 1 {
+            counted!("pipeline.count fold probe cap dropped: more than one root");
+            None
+        } else {
+            cap
+        };
         FoldPlan {
             graph,
             hops,
@@ -5379,12 +6876,91 @@ impl<'a> FoldPlan<'a> {
             preds,
             memo_ok,
             root,
+            hoist,
+            hoist_after: fold_hoist_after(),
             has_edge_pred,
             memo_cap,
             cap,
             reached: std::sync::atomic::AtomicU64::new(0),
+            multiplier,
+            multiplier_root,
         }
     }
+}
+
+/// The number of folded hops in `hi`'s subtree, itself included (fix 120).
+/// A close is 1; an expand is 1 plus its end var's whole subtree. Used only
+/// to ORDER siblings, never to estimate a cost — the number of hops is a
+/// property of the plan, not of the data, so it cannot mis-estimate.
+fn subtree_hops(hi: usize, hops: &[Hop], children: &[Vec<usize>]) -> usize {
+    match hops[hi].end_vi {
+        None => 1,
+        Some(u) => {
+            1 + children[u]
+                .iter()
+                .map(|&c| subtree_hops(c, hops, children))
+                .sum::<usize>()
+        }
+    }
+}
+
+/// Every var bound inside `hi`'s subtree (fix 120).
+fn subtree_vars(hi: usize, hops: &[Hop], children: &[Vec<usize>], out: &mut Vec<usize>) {
+    if let Some(u) = hops[hi].end_vi {
+        out.push(u);
+        for &c in &children[u] {
+            subtree_vars(c, hops, children, out);
+        }
+    }
+}
+
+/// Whether `u`'s children may be reordered (fix 120): no child's subtree may
+/// read a var that a SIBLING's subtree binds.
+///
+/// In practice `hop_sum` resets `st.bind[end]` to `NULL_ID` on the way out, so
+/// a sibling's binding is already gone whichever order they run in and such a
+/// predicate reads `NULL_ID` either way. This guard is therefore conservative
+/// rather than load-bearing — and it stays, because "the answer happens not to
+/// depend on it" is the kind of reasoning that a later change to the reset
+/// silently invalidates.
+fn children_independent(
+    u: usize,
+    hops: &[Hop],
+    children: &[Vec<usize>],
+    preds: &[InlinePreds],
+) -> bool {
+    let kids = &children[u];
+    let bound: Vec<Vec<usize>> = kids
+        .iter()
+        .map(|&hi| {
+            let mut v = Vec::new();
+            subtree_vars(hi, hops, children, &mut v);
+            v
+        })
+        .collect();
+    for (a, &hi) in kids.iter().enumerate() {
+        let mut read = Vec::new();
+        let mut stack = vec![hi];
+        while let Some(h) = stack.pop() {
+            for (p, _) in &preds[h] {
+                match p {
+                    InlinePred::NeBound(o) | InlinePred::EqBound(o) | InlinePred::GtBound(o) => {
+                        read.push(*o)
+                    }
+                    InlinePred::EdgeToBound { vi, .. } => read.push(*vi),
+                }
+            }
+            if let Some(e) = hops[h].end_vi {
+                stack.extend(children[e].iter().copied());
+            }
+        }
+        for (b, vars) in bound.iter().enumerate() {
+            if a != b && read.iter().any(|r| vars.contains(r)) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Whether folded level `u` is a pure function of its node id: every close and
@@ -5429,7 +7005,7 @@ fn memo_ok_for(
         }
         for (p, _) in &preds[hi] {
             let o = match p {
-                InlinePred::NeBound(o) | InlinePred::EqBound(o) => *o,
+                InlinePred::NeBound(o) | InlinePred::EqBound(o) | InlinePred::GtBound(o) => *o,
                 InlinePred::EdgeToBound { vi, .. } => *vi,
             };
             if !sub_vars.contains(&o) {
@@ -5523,18 +7099,52 @@ fn fold_tail(
     //     are thread-local — a worker would silently read committed state);
     //   - enough driving rows for the split to beat its own overhead.
     let graph = plan.graph;
+    //
+    // Fix 119: the fold gets its OWN row floor, and it is 2, not
+    // `parallel_min_rows`. That constant is 256 and also gates `expand`'s
+    // parallel path, where it is right — an expand's driving rows are cheap
+    // and 256 of them barely covers a spawn. A fold's driving row is not
+    // cheap: it is an entire nested walk. LSQB q3 seeds on `country`, and
+    // SF1 has 111 of them, so 111 < 256 left q3 running single-threaded on a
+    // six-worker server for its whole measured life while five cores idled.
+    // The floor that matters for a fold is "more than one row to split",
+    // and the executor's own work-stealing cursor handles the rest.
     if graph.parallel_fold_enabled()
         && !graph.in_txn()
-        && chunk.selection.len() >= graph.parallel_min_rows()
+        && chunk.selection.len() >= graph.parallel_fold_min_rows()
     {
         if let Some(exec) = graph.exec() {
             counted!("interp.pipeline fold parallel");
             let workers = exec.width().min(chunk.selection.len()).max(1);
-            let per = chunk.selection.len().div_ceil(workers);
+            // Fix 119: cut FINER than one morsel per worker when no level
+            // memoises. A fold's rows are wildly uneven — SF1's countries run
+            // 1,447 persons down to a handful, and per-country triangle work
+            // grows superlinearly — so `width` contiguous chunks hand one
+            // worker the giant and leave the rest idle. `ScopedExec::for_each`
+            // already pulls morsels off an atomic cursor, so more morsels
+            // than workers costs nothing and lets the skew balance itself.
+            //
+            // Gated on nothing memoising, because `fold_rows` builds a fresh
+            // `FoldState` per morsel: with memo-eligible levels, finer cuts
+            // would rebuild the same memo repeatedly and could cost more than
+            // the balance wins. q3 memoises nothing (every level's subtree
+            // closes onto `person1` or `country`), which is what makes the
+            // finer cut free there and unsafe to make unconditional.
+            let splits = if plan.memo_ok.iter().any(|ok| *ok) {
+                workers
+            } else {
+                counted!("interp.pipeline fold cut finer than its worker count");
+                workers
+                    .saturating_mul(FOLD_MORSELS_PER_WORKER)
+                    .min(chunk.selection.len())
+                    .max(1)
+            };
+            let per = chunk.selection.len().div_ceil(splits);
             let morsels: Vec<&[usize]> = chunk.selection.chunks(per).collect();
-            type Part = Result<(Vec<(usize, u64)>, bool), RunError>;
-            let slots: Vec<std::sync::Mutex<Option<Part>>> =
-                morsels.iter().map(|_| std::sync::Mutex::new(None)).collect();
+            let slots: Vec<std::sync::Mutex<Option<FoldPart>>> = morsels
+                .iter()
+                .map(|_| std::sync::Mutex::new(None))
+                .collect();
             let ids_ref: &[Vec<u64>] = &chunk.ids;
             let used_ref: &[Vec<u64>] = &chunk.used_rels;
             let weights_ref: &[u64] = &weights;
@@ -5544,18 +7154,24 @@ fn fold_tail(
             });
             let mut keep: Vec<usize> = Vec::with_capacity(chunk.selection.len());
             let mut memo_used = false;
+            // Fix 81: the morsels' walk tallies are summed HERE, on the thread
+            // that holds the trace, and flushed once — the sum is the same
+            // total the serial loop reports, hop for hop.
+            let mut tally = FoldTally::new(plan.hops.len());
             for m in slots {
                 let part = m
                     .into_inner()
                     .unwrap_or_else(|e| e.into_inner())
                     .expect("every morsel ran — ScopedExec::for_each returns only when all have");
-                let (kept, used_memo) = part?;
+                let (kept, used_memo, walked) = part?;
                 memo_used |= used_memo;
+                tally.add(&walked);
                 for (r, w) in kept {
                     weights[r] = w;
                     keep.push(r);
                 }
             }
+            tally.flush();
             chunk.selection = keep;
             chunk.weights = weights;
             if memo_used {
@@ -5564,7 +7180,7 @@ fn fold_tail(
             return Ok(chunk);
         }
     }
-    let (kept, memo_used) = fold_rows(
+    let (kept, memo_used, tally) = fold_rows(
         plan,
         hop,
         root,
@@ -5573,6 +7189,7 @@ fn fold_tail(
         &weights,
         &chunk.selection,
     )?;
+    tally.flush();
     let mut keep: Vec<usize> = Vec::with_capacity(kept.len());
     for (r, w) in kept {
         weights[r] = w;
@@ -5599,7 +7216,7 @@ fn fold_rows(
     used_rels: &[Vec<u64>],
     weights: &[u64],
     rows: &[usize],
-) -> Result<(Vec<(usize, u64)>, bool), RunError> {
+) -> FoldPart {
     let nvars = plan.children.len();
     let mut st = FoldState {
         memo: vec![Vec::new(); nvars],
@@ -5607,6 +7224,13 @@ fn fold_rows(
         used: Vec::new(),
         overflow: false,
         memo_used: false,
+        walks: 0,
+        walks_by_hop: vec![0; plan.hops.len()],
+        hoisted: vec![None; plan.hops.len()],
+        hoist_seen: vec![HoistSeen::fresh(plan.hoist_after); plan.hops.len()],
+        hoist_hoisted: 0,
+        hoist_under: 0,
+        hoist_deferred: 0,
     };
     let mut kept: Vec<(usize, u64)> = Vec::with_capacity(rows.len());
     for &r in rows {
@@ -5639,6 +7263,18 @@ fn fold_rows(
         if w == 0 {
             continue; // no walk through the subtree: the general path has no row
         }
+        // Fix 90: the symmetry multiplier restores the orders the fold did
+        // not enumerate — once per driving row, at the first root, and
+        // BEFORE the cap sees the weight (the cap is judged against the
+        // true count).
+        let w = if root == plan.multiplier_root && plan.multiplier > 1 {
+            match w.checked_mul(plan.multiplier) {
+                Some(x) => x,
+                None => return Err(count_fold_overflow()),
+            }
+        } else {
+            w
+        };
         let Some(total) = weights[r]
             .checked_mul(w)
             .filter(|t| i64::try_from(*t).is_ok())
@@ -5651,7 +7287,10 @@ fn fold_rows(
                 .fetch_add(total, std::sync::atomic::Ordering::Relaxed);
         }
     }
-    Ok((kept, st.memo_used))
+    // Fix 120's instrument, and fix 80's per-hop split, returned as a TALLY
+    // rather than flushed here: a morsel may be running on an executor
+    // worker, where a `counted!` records nowhere (fix 81, `FoldTally`).
+    Ok((kept, st.memo_used, st.tally()))
 }
 
 /// THE OPTIONAL FOLD (operator D of `docs/lsqb-completeness-plan.md`) over ONE
@@ -5672,34 +7311,51 @@ fn fold_rows(
 /// as the merge's null-fill row writes it, so `combined_vars` indexing,
 /// `nullable_agg_ok` and `row_ids` are untouched. Rows are never dropped:
 /// a left join keeps every outer row.
-fn fold_optional_leg(
-    outer: DataChunk,
-    outer_len: usize,
+/// Whether an OPTIONAL fold should spread over the executor.
+///
+/// The SAME three conditions `expand` applies before going parallel, and for
+/// the same reasons: the lever must be on, a transaction's uncommitted overlay
+/// is not safe to read from a worker, and below `parallel_min_rows` the morsel
+/// setup costs more than the split saves.
+fn graph_parallel_fold_ok(plan: &FoldPlan<'_>, live: usize) -> bool {
+    let graph = plan.graph;
+    graph.parallel_expand_enabled() && live >= graph.parallel_min_rows() && !graph.in_txn()
+}
+
+/// One morsel of [`fold_optional_leg`]: the leg's weight for each outer row in
+/// `rows`, with its own [`FoldState`] so it can run on an executor worker.
+///
+/// Returns the weights and the outer row indices they belong to, in order, plus
+/// the state's tally — a morsel may run off the calling thread, where
+/// `counted!` records nowhere (fix 81, `FoldTally`).
+fn fold_optional_morsel(
+    outer: &DataChunk,
     plan: &FoldPlan<'_>,
-    combined_vars: &[String],
-    combined_var_kinds: &[VarKind],
-) -> Result<DataChunk, RunError> {
-    let nvars = plan.children.len();
+    roots: &[usize],
+    nvars: usize,
+    rows: &[usize],
+) -> Result<(Vec<u64>, bool, FoldTally), RunError> {
     let mut st = FoldState {
         memo: vec![Vec::new(); nvars],
         bind: vec![NULL_ID; nvars],
         used: Vec::new(),
         overflow: false,
         memo_used: false,
+        walks: 0,
+        walks_by_hop: vec![0; plan.hops.len()],
+        hoisted: vec![None; plan.hops.len()],
+        hoist_seen: vec![HoistSeen::fresh(plan.hoist_after); plan.hops.len()],
+        hoist_hoisted: 0,
+        hoist_under: 0,
+        hoist_deferred: 0,
     };
-    let roots: Vec<usize> = (0..plan.hops.len()).filter(|&hi| plan.root[hi]).collect();
-    let ncols = combined_vars.len();
-    let live = outer.selection.len();
-    let mut out_ids: Vec<Vec<u64>> = (0..ncols).map(|_| Vec::with_capacity(live)).collect();
-    let mut out_w: Vec<u64> = Vec::with_capacity(live);
-    for &r in &outer.selection {
-        // The outer row's bindings; a folded leg var stays `NULL_ID` until the
-        // recursion enters its level.
+    let mut out_w: Vec<u64> = Vec::with_capacity(rows.len());
+    for &r in rows {
         for (vi, col) in outer.ids.iter().enumerate() {
             st.bind[vi] = col[r];
         }
         let mut legs = 1u64;
-        for &hi in &roots {
+        for &hi in roots {
             // Every root of an OPTIONAL leg re-seeds relationship isomorphism:
             // the clause is its own pattern (`left_join_null_extend` forces
             // `reset` on the first hop, and a later path's first hop carries it
@@ -5734,6 +7390,96 @@ fn fold_optional_leg(
             return Err(count_fold_overflow());
         };
         out_w.push(total);
+    }
+    Ok((out_w, st.memo_used, st.tally()))
+}
+
+fn fold_optional_leg(
+    outer: DataChunk,
+    outer_len: usize,
+    plan: &FoldPlan<'_>,
+    combined_vars: &[String],
+    combined_var_kinds: &[VarKind],
+) -> Result<DataChunk, RunError> {
+    let nvars = plan.children.len();
+    let roots: Vec<usize> = (0..plan.hops.len()).filter(|&hi| plan.root[hi]).collect();
+    let ncols = combined_vars.len();
+    let live = outer.selection.len();
+
+    // PARALLEL OVER OUTER ROWS.
+    //
+    // This loop used to run entirely on the calling thread, and at SF10 that is
+    // the whole of LSQB q7: decomposed warm, the label scan costs 0 s, the two
+    // hops 3 s, and the two OPTIONAL legs 17 s of a 20 s query. q7 got 1.68x
+    // from 44 cores (32 s serial, 19 s at width 44) and was the only LSQB query
+    // PostgreSQL beat -- by 7%.
+    //
+    // It is the SAME defect `expand` fixed one call up, whose comment records
+    // it: "the entire benchmark ran on one core of 44 while `query parallelism
+    // ON: width 44` sat in the log above it". The optional fold was left behind.
+    //
+    // Each morsel carries its OWN `FoldState`, so the memo is per morsel. That
+    // is why the split follows the sibling fold's rule rather than always
+    // cutting fine: with memo-eligible levels a finer cut rebuilds the same memo
+    // repeatedly and can cost more than the balance wins.
+    let exec = if graph_parallel_fold_ok(plan, live) {
+        plan.graph.exec()
+    } else {
+        None
+    };
+    let (weights, memo_used, tally) = if let Some(exec) = exec {
+        let workers = exec.width().min(live).max(1);
+        let splits = if plan.memo_ok.iter().any(|ok| *ok) {
+            workers
+        } else {
+            workers
+                .saturating_mul(FOLD_MORSELS_PER_WORKER)
+                .min(live)
+                .max(1)
+        };
+        let per = live.div_ceil(splits);
+        let morsels: Vec<&[usize]> = outer.selection.chunks(per).collect();
+        /// One morsel's answer: its ids, whether it saturated, and its tally.
+        type MorselSlot = std::sync::Mutex<Option<Result<(Vec<u64>, bool, FoldTally), RunError>>>;
+        let slots: Vec<MorselSlot> = morsels
+            .iter()
+            .map(|_| std::sync::Mutex::new(None))
+            .collect();
+        let outer_ref = &outer;
+        let roots_ref = &roots;
+        exec.for_each(morsels.len(), &|i| {
+            let part = fold_optional_morsel(outer_ref, plan, roots_ref, nvars, morsels[i]);
+            *slots[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(part);
+        });
+        // Merged IN MORSEL ORDER, so the output rows are the outer rows in the
+        // order a serial pass would have produced them. An overflow in ANY
+        // morsel fails the whole fold, exactly as the serial loop's early
+        // return did.
+        let mut weights: Vec<u64> = Vec::with_capacity(live);
+        let mut memo_used = false;
+        let mut tally = FoldTally::new(plan.hops.len());
+        for slot in slots {
+            let part = slot
+                .into_inner()
+                .unwrap_or_else(|e| e.into_inner())
+                .expect("every morsel ran — ScopedExec::for_each returns only when all have");
+            let (w, used, walked) = part?;
+            memo_used |= used;
+            tally.add(&walked);
+            weights.extend_from_slice(&w);
+        }
+        counted!("interp.pipeline optional fold parallel");
+        (weights, memo_used, tally)
+    } else {
+        let (w, used, walked) =
+            fold_optional_morsel(&outer, plan, &roots, nvars, &outer.selection)?;
+        (w, used, walked)
+    };
+
+    // The id columns are a pure gather from the outer chunk — no walking, no
+    // state — so they are built here rather than carried through the morsels.
+    let mut out_ids: Vec<Vec<u64>> = (0..ncols).map(|_| Vec::with_capacity(live)).collect();
+    for &r in &outer.selection {
         for (vi, col) in out_ids.iter_mut().enumerate() {
             col.push(if vi < outer_len {
                 outer.ids[vi][r]
@@ -5742,11 +7488,20 @@ fn fold_optional_leg(
             });
         }
     }
-    if st.memo_used {
+    let out_w = weights;
+    let mut st_memo_used = memo_used;
+    let mut leg_tally = tally;
+    let _ = &mut st_memo_used;
+    let _ = &mut leg_tally;
+    if st_memo_used {
         counted!("interp.pipeline count fold memo");
     }
     counted!("interp.pipeline optional fold");
     let n = out_w.len();
+    // Fix 120's instrument and fix 80's per-hop split, flushed once for the
+    // leg — summed across the morsels above, so the total is the one the
+    // serial pass reported, hop for hop.
+    leg_tally.flush();
     Ok(DataChunk {
         vars: combined_vars.to_vec(),
         var_kinds: combined_var_kinds.to_vec(),
@@ -5759,6 +7514,12 @@ fn fold_optional_leg(
         weights: out_w,
     })
 }
+
+/// Morsels per worker when a fold cuts finer than its worker count (fix 119).
+/// Four is enough to absorb SF1's country skew — the largest country holds
+/// 1,447 persons against a median in the low hundreds — without making the
+/// per-morsel `FoldState` setup a visible share of the work.
+const FOLD_MORSELS_PER_WORKER: usize = 4;
 
 /// The weight of folded var `u`'s level at `node`: the product over its folded
 /// child hops of each hop's walk count. Memoised per node when the level is a
@@ -5811,6 +7572,8 @@ fn level(plan: &FoldPlan<'_>, st: &mut FoldState, u: usize, node: u64) -> u64 {
 /// extended by each traversed rel for the level below — `expand`'s `base` /
 /// `out_used`, one recursion level at a time.
 fn hop_sum(plan: &FoldPlan<'_>, st: &mut FoldState, hi: usize, node: u64) -> u64 {
+    st.walks += 1;
+    st.walks_by_hop[hi] += 1;
     let graph = plan.graph;
     let hop = &plan.hops[hi];
     let tokens = &plan.tokens[hi];
@@ -5851,7 +7614,105 @@ fn hop_sum(plan: &FoldPlan<'_>, st: &mut FoldState, hi: usize, node: u64) -> u64
                 graph.edge_count_slim(a, hop.dir, tokens, b)
             }
         };
-        if !hop.track || st.used.is_empty() {
+        // Fix 84: THE HOISTED CLOSE. The row this probe reads belongs to
+        // `want`, which is bound above this hop and fixed for its whole
+        // subtree; `node` is what changes per call. Read `want`'s row ONCE
+        // per binding of `want`, sorted by peer, and answer every probe under
+        // it with two `partition_point`s on the local slice — the same edge
+        // set `edges_to_peer_slim` filters (its walked arm IS
+        // `adjacent_slim_for_each` filtered by peer), the same rel-isomorphism
+        // exclusion, and none of the per-call snapshot lookup,
+        // transaction-pending check or key building.
+        //
+        // LAZILY. A hoist costs O(deg(want)) — the row is copied and sorted
+        // — and pays for itself only when the binding of `want` is probed
+        // many times. Under an ordering that binds `want` afresh for nearly
+        // every probe (a fan-out-1 path under a high-degree bound row) it
+        // would cost a whole row per probe against the table's O(log deg).
+        // So a binding's first `hoist_after` probes go through the table and
+        // only then is its row read; after a read the threshold follows the
+        // row (max(default, deg / 4)), so no binding ever pays a read worth
+        // more than a few times the probes it has already made.
+        //
+        // An UNMINTED type (`Some([])`) never hoists: it has no edges, and
+        // the table path's cache key would have served the UNTYPED table for
+        // it (`adjacent_slim_visit` refuses it now; this is the belt).
+        let hoisted: Option<u64> = if plan.hoist[hi] && !matches!(tokens, Some(v) if v.is_empty()) {
+            let (probe_from, probe_dir) = if matches!(hop.dir, Dir::Both) {
+                (want, Dir::Both)
+            } else {
+                (want, hop.dir.flipped())
+            };
+            let seen = &mut st.hoist_seen[hi];
+            if seen.node != probe_from {
+                *seen = HoistSeen {
+                    node: probe_from,
+                    ..HoistSeen::fresh(plan.hoist_after)
+                };
+            }
+            seen.probes = seen.probes.saturating_add(1);
+            let have = st.hoisted[hi]
+                .as_ref()
+                .is_some_and(|h| h.node == probe_from);
+            if !have && seen.probes > seen.next {
+                // A threshold of 0 is the forcing: hoist on the first probe,
+                // whatever the row. Otherwise SIZE the row first — O(1) from
+                // a resident table — and read it only when it is no more
+                // than four times the probes this binding has already made;
+                // a bigger row is looked at again once the probes catch up,
+                // geometrically, so a hub is sized a few times and never
+                // copied for a handful of probes. No table to size it from
+                // means a probe would walk the row anyway, and one walk is
+                // cheaper than one per probe.
+                let worth = seen.next == 0
+                    || match graph.adjacent_slim_len_hint(probe_from, probe_dir, tokens) {
+                        Some(deg) if deg > 4 * seen.probes as usize => {
+                            let again = (deg / 4)
+                                .max((seen.next as usize).saturating_mul(2))
+                                .min(u32::MAX as usize);
+                            seen.next = again as u32;
+                            st.hoist_deferred += 1;
+                            false
+                        }
+                        _ => true,
+                    };
+                if worth {
+                    let mut row = graph.adjacent_slim(probe_from, probe_dir, tokens);
+                    // Only counts over equal-peer ranges are read from the row,
+                    // so the order among equal peers is unobservable.
+                    row.sort_unstable_by_key(|e| e.peer);
+                    st.hoisted[hi] = Some(HoistedRow {
+                        node: probe_from,
+                        row,
+                    });
+                    st.hoist_hoisted += 1;
+                }
+            }
+            match st.hoisted[hi].as_ref().filter(|h| h.node == probe_from) {
+                Some(h) => {
+                    let row = &h.row;
+                    let lo = row.partition_point(|e| e.peer < node);
+                    let end = row.partition_point(|e| e.peer <= node);
+                    Some(if !hop.track || st.used.is_empty() {
+                        (end - lo) as u64
+                    } else {
+                        row[lo..end]
+                            .iter()
+                            .filter(|e| !st.used.contains(&e.rel))
+                            .count() as u64
+                    })
+                }
+                None => {
+                    st.hoist_under += 1;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(n) = hoisted {
+            n
+        } else if !hop.track || st.used.is_empty() {
             count_edges(node, want)
         } else {
             // A non-empty isomorphism set means the count alone cannot answer:
@@ -5962,7 +7823,10 @@ fn pred_holds(
     match pred {
         InlinePred::NeBound(o) => peer != st.bind[*o],
         InlinePred::EqBound(o) => peer == st.bind[*o],
-        InlinePred::EdgeToBound { vi, dir, negate, .. } => {
+        InlinePred::GtBound(o) => peer > st.bind[*o],
+        InlinePred::EdgeToBound {
+            vi, dir, negate, ..
+        } => {
             // PROBE FROM THE BOUND SIDE when the hop is UNDIRECTED.
             //
             // `edge_count_slim(a, Both, T, b)` and `edge_count_slim(b, Both, T,
@@ -6084,6 +7948,7 @@ mod count_fold_tests {
             reset: false,
             tgt: None,
             varlen: None,
+            from_zero: false,
             end_vi: Some(1),
             fold: true,
             inline: Vec::new(),
@@ -6103,7 +7968,7 @@ mod count_fold_tests {
         let (g, hops, a) = two_walk_fold();
         let members = vec![None];
         let tokens = vec![g.type_tokens_peek(&hops[0].types)];
-        let plan = FoldPlan::new(&g, &hops, &members, &tokens, 0, None);
+        let plan = FoldPlan::new(&g, &hops, &members, &tokens, 0, None, 1);
         assert!(plan.root[0], "a folded hop off the seed is a root");
 
         // A fresh row weighs 1: the fold leaves it at the walk count, 2.
@@ -6143,14 +8008,14 @@ mod count_fold_tests {
         let arg_vals: Vec<SiteArgVal> = vec![SiteArgVal::Star];
         let distinct: Vec<Vec<u64>> = vec![Vec::new()];
         // 1 + i64::MAX overflows the accumulator: refuse.
-        let err = fold_row_weighted(&mut accs, &arg_vals, &distinct, &chunk, 0)
+        let err = fold_row_mult(&mut accs, &arg_vals, &distinct, &chunk, 0, chunk.weights[0])
             .expect_err("a total past i64 must refuse");
         assert!(is_overflow_refusal(&err), "{err:?}");
         // A weight that does not even fit `i64` on its own, likewise.
         let mut over = DataChunk::seed("a", vec![a]);
         over.weights = vec![i64::MAX as u64 + 1];
         let mut accs = vec![SiteAcc::CountStar(0)];
-        let err = fold_row_weighted(&mut accs, &arg_vals, &distinct, &over, 0)
+        let err = fold_row_mult(&mut accs, &arg_vals, &distinct, &over, 0, over.weights[0])
             .expect_err("a weight past i64 must refuse");
         assert!(is_overflow_refusal(&err), "{err:?}");
         // The largest total that fits is still accumulated exactly, and the
@@ -6158,7 +8023,7 @@ mod count_fold_tests {
         // decline — it is a plan the fold never builds, not an overflow.
         let mut accs = vec![SiteAcc::CountStar(0)];
         assert!(
-            fold_row_weighted(&mut accs, &arg_vals, &distinct, &chunk, 0)
+            fold_row_mult(&mut accs, &arg_vals, &distinct, &chunk, 0, chunk.weights[0])
                 .expect("no error")
                 .is_some()
         );
@@ -6188,6 +8053,7 @@ mod count_fold_tests {
             reset: false,
             tgt: None,
             varlen: None,
+            from_zero: false,
             end_vi: Some(end),
             fold: true,
             inline: Vec::new(),
@@ -6228,6 +8094,22 @@ fn build_chunk(
     wheres: &[WherePred],
     anchor: Option<&PropAnchor>,
     params: &BTreeMap<String, Value>,
+) -> Result<Option<DataChunk>, RunError> {
+    build_chunk_sym(graph, a_labels, a_var, hops, wheres, anchor, params, None)
+}
+
+/// `build_chunk` with the count fold's SYMMETRY plan (fix 90) — only the
+/// aggregate path, whose planner runs `plan_count_fold`, has one to pass.
+#[allow(clippy::too_many_arguments)]
+fn build_chunk_sym(
+    graph: &Graph,
+    a_labels: &[String],
+    a_var: &str,
+    hops: &[Hop],
+    wheres: &[WherePred],
+    anchor: Option<&PropAnchor>,
+    params: &BTreeMap<String, Value>,
+    symmetry: Option<&SymmetryPlan>,
 ) -> Result<Option<DataChunk>, RunError> {
     // Fix 48: when the first hop's TYPE has far fewer edges than the seed
     // label has members, the hop table's sources ARE the seed — every
@@ -6296,6 +8178,7 @@ fn build_chunk(
         wheres,
         params,
         Some(a_labels),
+        symmetry,
     )
 }
 
@@ -6394,9 +8277,34 @@ fn anchored_seed_ids(
                 true,
             ))
         }
-        None => Ok((scan(), false)), // over cap / non-servable — fall back to the scan
+        None => {
+            // COUNTED, because this is the most expensive decision in the
+            // anchored-seed path and nothing measured it. A single-value anchor
+            // (`MATCH (m:Message {id: N}) ...`) that cannot be served by an
+            // index falls through to a FULL LABEL SCAN — at SF10 the Message
+            // label is the largest in the corpus. The `is7-replies` shape
+            // averages 0.31 ms and peaks at 2,553 ms while allocating 6,594 MB
+            // in one execution, which is the signature of exactly this branch
+            // being taken occasionally. `stale_declined` stayed at 0 and SF3
+            // ran MORE index catch-ups than SF10, so the existing counters
+            // exonerate index staleness and leave this branch unmeasured.
+            ANCHORED_SEED_FELL_BACK_TO_SCAN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            counted!("interp.pipeline anchored seed fell back to a label scan");
+            Ok((scan(), false))
+        }
     }
 }
+
+/// Anchored seeds that could not be served by an index and fell back to a FULL
+/// LABEL SCAN.
+///
+/// Process-global rather than a thread-local `counted!` so a running server can
+/// surface it: the workload that exhibits it is many clients at once, which is
+/// exactly where a thread-local trace sees nothing. Lives here and not in
+/// `crate::counters` because that module is in `lib.rs`, which this workstream
+/// does not modify.
+pub static ANCHORED_SEED_FELL_BACK_TO_SCAN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// A type's edges must be this many times fewer than the label's members for
 /// its table to seed the chain (fix 48).
@@ -6494,7 +8402,9 @@ fn build_chunk_from_ids(
     wheres: &[WherePred],
     params: &BTreeMap<String, Value>,
 ) -> Result<Option<DataChunk>, RunError> {
-    build_chunk_from_ids_labelled(graph, seed_var, seed_ids, seed_used, hops, wheres, params, None)
+    build_chunk_from_ids_labelled(
+        graph, seed_var, seed_ids, seed_used, hops, wheres, params, None, None,
+    )
 }
 
 /// [`build_chunk_from_ids`] with the seed var's pattern labels, when known:
@@ -6510,6 +8420,7 @@ fn build_chunk_from_ids_labelled(
     wheres: &[WherePred],
     params: &BTreeMap<String, Value>,
     seed_labels: Option<&[String]>,
+    symmetry: Option<&SymmetryPlan>,
 ) -> Result<Option<DataChunk>, RunError> {
     // The pattern labels each var is bound under — the seed's, and each
     // new-var hop's end labels — so a predicate over it can be answered from
@@ -6579,10 +8490,48 @@ fn build_chunk_from_ids_labelled(
     if apply_ready_preds(graph, params, &mut chunk, &mut pending, wheres, &labels_of)?.is_none() {
         return Ok(None); // a budget / non-boolean decline
     }
+    // Fix 90: THE SYMMETRY GATE, at execution. The recogniser's answer
+    // (`symmetry`) is a property of the QUERY; whether the joining types
+    // carry a self-loop is a property of the DATA at this instant, so it is
+    // asked here — committed counts plus this transaction's delta — and
+    // never cached with the plan (`Graph::type_self_loops`). When the gate
+    // passes, the fold runs over a copy of the hops carrying the id-order
+    // constraints, and the multiplier restores the orders it skips; the
+    // expand loop below still walks the ORIGINAL hops by index, which the
+    // copy shares (only `inline` differs).
+    let sym_hops: Option<Vec<Hop>> = symmetry.and_then(|s| {
+        if !fold_symmetry_breaking_enabled() {
+            return None;
+        }
+        let loops: u64 = s.guard_types.iter().map(|t| graph.type_self_loops(t)).sum();
+        if loops > 0 {
+            counted!("interp.pipeline fold symmetry declined: a joining type carries self-loops");
+            return None;
+        }
+        let mut hs = hops.to_vec();
+        for &(hi, other) in &s.chain {
+            hs[hi].inline.push(InlinePred::GtBound(other));
+        }
+        counted!("interp.pipeline fold symmetry broken");
+        Some(hs)
+    });
+    let fold_hops: &[Hop] = sym_hops.as_deref().unwrap_or(hops);
+    let multiplier = match (&sym_hops, symmetry) {
+        (Some(_), Some(s)) => s.multiplier(),
+        _ => 1,
+    };
     // THE COUNT FOLD's lookups, built once when any hop is folded
     // (`plan_count_fold` marked it); `None` = every hop materialises as before.
     let fold_plan = if hops.iter().any(|h| h.fold) {
-        Some(FoldPlan::new(graph, hops, &hop_members, &hop_tokens, 0, count_cap_from(params)))
+        Some(FoldPlan::new(
+            graph,
+            fold_hops,
+            &hop_members,
+            &hop_tokens,
+            0,
+            count_cap_from(params),
+            multiplier,
+        ))
     } else {
         None
     };
@@ -6596,10 +8545,9 @@ fn build_chunk_from_ids_labelled(
             // column(s). A fold that overflows REFUSES the statement — the
             // general path could neither finish nor represent that count.
             Some(fp) if hop.fold => run_hop_folded(chunk, hop, i, fp)?,
-            _ => run_hop(graph, chunk, hop, members_slice, &hop_tokens[i])?,
+            _ => run_hop_at(graph, chunk, hops, i, members_slice, &hop_tokens)?,
         };
-        if apply_ready_preds(graph, params, &mut chunk, &mut pending, wheres, &labels_of)?
-            .is_none()
+        if apply_ready_preds(graph, params, &mut chunk, &mut pending, wheres, &labels_of)?.is_none()
         {
             return Ok(None);
         }
@@ -6614,7 +8562,10 @@ fn build_chunk_from_ids_labelled(
     // the old fallback (apply once at the end) rather than silently dropping it.
     for (wi, _) in std::mem::take(&mut pending) {
         let labels = labels_of.get(&wheres[wi].var).map(Vec::as_slice);
-        if chunk.filter_labelled(graph, params, &wheres[wi], labels)?.is_none() {
+        if chunk
+            .filter_labelled(graph, params, &wheres[wi], labels)?
+            .is_none()
+        {
             return Ok(None);
         }
     }
@@ -6645,7 +8596,10 @@ fn apply_ready_preds(
         if ready {
             let (wi, _) = pending.remove(i);
             let labels = labels_of.get(&wheres[wi].var).map(Vec::as_slice);
-            if chunk.filter_labelled(graph, params, &wheres[wi], labels)?.is_none() {
+            if chunk
+                .filter_labelled(graph, params, &wheres[wi], labels)?
+                .is_none()
+            {
                 return Ok(None);
             }
         } else {
@@ -6766,6 +8720,11 @@ enum NativeKey {
     Bool(bool),
     Int(i64),
     Str(String),
+    /// Fix 107's multi-key path: an entity identity key — `agg_key` of a node
+    /// is `(tag 8, id)`, of a relationship `(tag 9, id)` — injective in the
+    /// id, and a key position never holds both an identity and a value.
+    Node(u64),
+    Rel(u64),
 }
 
 /// Whether every value in a grouping-key column is `NativeKey`-eligible.
@@ -6993,6 +8952,14 @@ fn reduce_agg_groups(
         });
     }
 
+    // Fix 107: the rows folded per distinct id of the ONE var every key and
+    // argument reads, each with its multiplicity — or every live row.
+    let folded: Option<Vec<(usize, u64)>> =
+        fold_rows_per_distinct(plan, &gkv, &arg_vals, &distinct, chunk);
+    if folded.is_some() {
+        counted!("interp.pipeline reduce folded its rows per distinct id");
+    }
+
     // ── FIRST-SEEN group-by (the load-bearing order) ───────────────────────────
     // Iterate the chunk's live rows in PRODUCTION order (scan-order × nested
     // reverse-adjacency — already the selection order). Groups are kept in a Vec
@@ -7010,7 +8977,7 @@ fn reduce_agg_groups(
     if let [KeyVal::Node(gvi)] = gkv.as_slice() {
         let gvi = *gvi;
         let mut index: BTreeMap<u64, usize> = BTreeMap::new();
-        for &r in &chunk.selection {
+        for (r, mult) in reduce_rows(&folded, chunk) {
             let id = chunk.ids[gvi][r];
             let gi = match index.get(&id) {
                 Some(&g) => g,
@@ -7024,9 +8991,7 @@ fn reduce_agg_groups(
                     groups.len() - 1
                 }
             };
-            if fold_row_weighted(&mut groups[gi].1, &arg_vals, &distinct, chunk, r)?
-                .is_none()
-            {
+            if fold_row_mult(&mut groups[gi].1, &arg_vals, &distinct, chunk, r, mult)?.is_none() {
                 return Ok(None);
             }
         }
@@ -7036,16 +9001,14 @@ fn reduce_agg_groups(
     // GLOBAL AGGREGATE: no grouping key — one group over ALL live rows, in
     // first-seen (every row folds into group 0).
     if gkv.is_empty() {
-        for &r in &chunk.selection {
+        for (r, mult) in reduce_rows(&folded, chunk) {
             if groups.is_empty() {
                 groups.push((
                     chunk.row_ids(r),
                     plan.sites.iter().map(SiteAcc::for_site).collect(),
                 ));
             }
-            if fold_row_weighted(&mut groups[0].1, &arg_vals, &distinct, chunk, r)?
-                .is_none()
-            {
+            if fold_row_mult(&mut groups[0].1, &arg_vals, &distinct, chunk, r, mult)?.is_none() {
                 return Ok(None);
             }
         }
@@ -7067,7 +9030,7 @@ fn reduce_agg_groups(
             if col.iter().all(native_key_eligible) {
                 counted!("interp.pipeline aggregate native-key group-by");
                 let mut index: BTreeMap<NativeKey, usize> = BTreeMap::new();
-                for &r in &chunk.selection {
+                for (r, mult) in reduce_rows(&folded, chunk) {
                     // An OPTIONAL null-fill row (fix 30): its key is Null, as
                     // `null.prop` is on the per-tuple path; the sentinel is
                     // not in the distinct set.
@@ -7092,11 +9055,11 @@ fn reduce_agg_groups(
                             groups.len() - 1
                         }
                     };
-                    if fold_row_weighted(&mut groups[gi].1, &arg_vals, &distinct, chunk, r)?
-                .is_none()
-            {
-                return Ok(None);
-            }
+                    if fold_row_mult(&mut groups[gi].1, &arg_vals, &distinct, chunk, r, mult)?
+                        .is_none()
+                    {
+                        return Ok(None);
+                    }
                 }
                 // Same group-key column hand-off the general path builds below, so
                 // the projection reuses the loaded property column.
@@ -7108,12 +9071,76 @@ fn reduce_agg_groups(
         }
     }
 
+    // Fix 107: SEVERAL keys, every one a node identity, a primitive column
+    // value or a primitive constant, key on a `Vec<NativeKey>` — the equality
+    // `agg_key_of` gives each position (an entity by its id alone, a
+    // primitive by its value; a position never compares across kinds) —
+    // without the per-row `Vec<Value>` tuple and canonical serialisation the
+    // general path builds: the two-key MENTIONS aggregate spent a third of
+    // its reduce there. Groups are appended on first sight in production
+    // order, as every path here does.
+    if graph.agg_native_key_enabled() && gkv.len() >= 2 {
+        let eligible = gkv.iter().all(|k| match k {
+            KeyVal::Node(_) => true,
+            KeyVal::Col(_, col) => col.iter().all(native_key_eligible),
+            KeyVal::Const(v) => native_key_eligible(v),
+        });
+        if eligible {
+            counted!("interp.pipeline aggregate native multi-key group-by");
+            let mut index: BTreeMap<Vec<NativeKey>, usize> = BTreeMap::new();
+            for (r, mult) in reduce_rows(&folded, chunk) {
+                let mut nk: Vec<NativeKey> = Vec::with_capacity(gkv.len());
+                for k in &gkv {
+                    nk.push(match k {
+                        KeyVal::Node(vi) if chunk.ids[*vi][r] == NULL_ID => NativeKey::Null,
+                        KeyVal::Node(vi) => match chunk.var_kinds[*vi] {
+                            VarKind::Node => NativeKey::Node(chunk.ids[*vi][r]),
+                            VarKind::Rel => NativeKey::Rel(chunk.ids[*vi][r]),
+                        },
+                        KeyVal::Col(vi, _) if chunk.ids[*vi][r] == NULL_ID => NativeKey::Null,
+                        KeyVal::Col(vi, col) => {
+                            let pos = distinct[*vi]
+                                .binary_search(&chunk.ids[*vi][r])
+                                .expect("a live id is in its var's distinct set");
+                            NativeKey::of(&col[pos])
+                        }
+                        KeyVal::Const(v) => NativeKey::of(v),
+                    });
+                }
+                let gi = match index.get(&nk) {
+                    Some(&g) => g,
+                    None => {
+                        index.insert(nk, groups.len());
+                        groups.push((
+                            chunk.row_ids(r),
+                            plan.sites.iter().map(SiteAcc::for_site).collect(),
+                        ));
+                        budget_check(graph, groups.len())?;
+                        groups.len() - 1
+                    }
+                };
+                if fold_row_mult(&mut groups[gi].1, &arg_vals, &distinct, chunk, r, mult)?.is_none()
+                {
+                    return Ok(None);
+                }
+            }
+            let mut gkc: GroupKeyCols = BTreeMap::new();
+            for gk in &plan.group_keys {
+                if let GroupKind::Col(vi) = gk.kind {
+                    gkc.entry(vi)
+                        .or_insert_with(|| (distinct[vi].clone(), cols[vi].clone()));
+                }
+            }
+            return Ok(Some((groups, gkc)));
+        }
+    }
+
     // GENERAL PATH: at least one value / const key, or multiple keys — the SAME
     // canonical serialization `run_streaming` uses (`agg_key_of`), one NaN nonce
     // threaded across every row.
     let mut index: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
     let mut nonce = 0u64;
-    for &r in &chunk.selection {
+    for (r, mult) in reduce_rows(&folded, chunk) {
         let mut key: Vec<Value> = Vec::with_capacity(gkv.len());
         for k in &gkv {
             key.push(match k {
@@ -7164,9 +9191,7 @@ fn reduce_agg_groups(
                 groups.len() - 1
             }
         };
-        if fold_row_weighted(&mut groups[gi].1, &arg_vals, &distinct, chunk, r)?
-            .is_none()
-        {
+        if fold_row_mult(&mut groups[gi].1, &arg_vals, &distinct, chunk, r, mult)?.is_none() {
             return Ok(None);
         }
     }
@@ -7335,6 +9360,27 @@ fn recognise_optional(sq: &SingleQuery) -> Option<OptionalPlan> {
 
     // Outer read chain + its single-var WHERE (over outer vars only — a nullable
     // var can never be bound here, so referencing one declines via `classify_key`).
+    //
+    // Fix 125 was tried here and REVERTED. It passed `true` for
+    // `allow_start_anchor`, so an outer chain seeded by an inline map —
+    // `MATCH (p:Person {id: K})-[:KNOWS]-(f)` — was accepted instead of
+    // declining. On the platform's `plat-optional-count` that looked like a
+    // large win: the vectorised left join claimed the shape and `store.gets`
+    // fell from ~800 to 7 on the unit corpus.
+    //
+    // It also made this recogniser claim every OTHER inline-seeded OPTIONAL,
+    // and `try_recognisers` runs BEFORE `fold_chain_counts`. So shapes the
+    // COUNT FOLD was serving well — `OPTIONAL MATCH (p)-[:CONTAINS_TRACK]->(t)
+    // RETURN p, count(t)` and its kin — lost the fold and materialised a left
+    // join instead. Seven existing tests failed, every one of them a test that
+    // exists to pin the fold on exactly that shape.
+    //
+    // The decline is therefore not a bug to remove: it is what lets the fold
+    // claim these statements. The real defect on `plat-optional-count` was the
+    // ceiling decline inside the fold's own subquery hop, and fix 121 fixes
+    // that where it lives. Re-raising this needs a way to tell the two cases
+    // apart at plan time, which is a cost model, and q3's ledger records five
+    // cost-model-driven attempts that all made things worse.
     let outer_hc = collect_hops(outer_pattern, None, true, false, false)?;
     let outer_where = recognise_single_var_where(outer_where_opt.as_ref(), &outer_hc.vars)?;
     // A var-length hop in an OPTIONAL left join is out of scope — decline the
@@ -7365,11 +9411,7 @@ fn recognise_optional(sq: &SingleQuery) -> Option<OptionalPlan> {
             return None; // unreachable: the run above admits only optional MATCHes
         };
         let outer_len = bound_vars.len();
-        let prebound = (
-            bound_vars.as_slice(),
-            bound_kinds.as_slice(),
-            &bound_labels,
-        );
+        let prebound = (bound_vars.as_slice(), bound_kinds.as_slice(), &bound_labels);
         let opt_hc = collect_hops(opt_pattern, Some(prebound), false, false, false)?;
         if hops_have_varlen(&opt_hc.hops) {
             return None;
@@ -7525,11 +9567,7 @@ fn recognise_optional(sq: &SingleQuery) -> Option<OptionalPlan> {
 ///
 /// The lever is read HERE, at plan time, exactly as `plan_count_fold` reads it,
 /// so flipping it changes the very next statement.
-fn plan_optional_fold(
-    stages: &mut [OptionalStage],
-    tail: &OptionalTail,
-    var_kinds: &[VarKind],
-) {
+fn plan_optional_fold(stages: &mut [OptionalStage], tail: &OptionalTail, var_kinds: &[VarKind]) {
     if !count_fold_enabled() {
         return;
     }
@@ -7790,7 +9828,15 @@ fn left_join_null_extend(
     // leg that carries one (the fold evaluates no filter inside a leg), and
     // dropping a WHERE would silently overcount, so the runner checks too.
     if !opt_hops.is_empty() && opt_hops.iter().all(|h| h.fold) && opt_where.is_none() {
-        let fp = FoldPlan::new(graph, opt_hops, &opt_members, &opt_tokens, combined_vars.len(), None);
+        let fp = FoldPlan::new(
+            graph,
+            opt_hops,
+            &opt_members,
+            &opt_tokens,
+            combined_vars.len(),
+            None,
+            1,
+        );
         return Ok(Some(fold_optional_leg(
             outer_chunk,
             outer_len,
@@ -7861,6 +9907,7 @@ fn left_join_null_extend(
                     members_slice,
                     hop.track,
                     reset,
+                    None,
                 )?
             }
             Some(tgt_vi) => work.semijoin(
@@ -8678,10 +10725,16 @@ fn try_index_topk(
     chunk: &DataChunk,
     params: &BTreeMap<String, Value>,
 ) -> Result<Option<QueryResult>, RunError> {
-    // The bound and LIMIT must be integer constants/params at run time.
+    // The bound must be an orderable constant/param at run time: an integer,
+    // or a temporal on a typed corpus. It was integers alone until
+    // 2026-09-24, and IC9's `$maxDate` is a DATETIME on the typed store, so
+    // this declined on every IC9 run there and stage 2 gathered ~5M message
+    // records to keep twenty (21 s against PostgreSQL's 0.5).
     let empty_vm = VarMap::new();
     let scope = Scope::over(params, &empty_vm, graph.wall_ms(), graph.zone_provider());
-    let Value::Int(upper) = eval_with(&itk.bound, &scope, None).map_err(RunError::Eval)? else {
+    let bound = eval_with(&itk.bound, &scope, None).map_err(RunError::Eval)?;
+    let Some(upper) = Graph::index_key_of(&bound) else {
+        counted!("interp.pipeline index-ordered topk declined: the bound is not orderable");
         return Ok(None);
     };
     let Some(limit) = crate::interp::eval_count(graph, Some(&itk.limit), params, "LIMIT")? else {
@@ -8706,7 +10759,7 @@ fn try_index_topk(
     let Some(winner_ids) = graph
         .index_ordered_topk_semijoin(
             &itk.order_prop,
-            upper,
+            &upper,
             &edge_tokens,
             itk.op_dir,
             &friends,
@@ -8798,8 +10851,7 @@ fn run_multistage(
 
     // STAGE 2 end-label members + type tokens (computed once, as `build_chunk`
     // does). A hop whose named type was never minted yields no adjacency.
-    let mut hop_members: Vec<Option<crate::MembersView>> =
-        Vec::with_capacity(plan.s2_hops.len());
+    let mut hop_members: Vec<Option<crate::MembersView>> = Vec::with_capacity(plan.s2_hops.len());
     let mut hop_tokens: Vec<Option<Vec<u32>>> = Vec::with_capacity(plan.s2_hops.len());
     for hop in &plan.s2_hops {
         let members = if hop.labels.is_empty() {
@@ -8843,9 +10895,9 @@ fn run_multistage(
     // STAGE 2: expand/semijoin from the carried var(s), in production order —
     // passing each hop's own `reset` (NOT a forced one), byte-identical to the
     // read chain over a fresh seed.
-    for (i, hop) in plan.s2_hops.iter().enumerate() {
+    for (i, _) in plan.s2_hops.iter().enumerate() {
         let members_slice: Option<&crate::MembersView> = hop_members[i].as_ref();
-        chunk = run_hop(graph, chunk, hop, members_slice, &hop_tokens[i])?;
+        chunk = run_hop_at(graph, chunk, &plan.s2_hops, i, members_slice, &hop_tokens)?;
     }
 
     // STAGE-2 WHERE — each per-predicate filter in turn (rel-prop, node-anchor, …).
@@ -8890,9 +10942,9 @@ fn expand_last_stage_batch(
     hop_members: &[Option<crate::MembersView>],
     hop_tokens: &[Option<Vec<u32>>],
 ) -> Result<Option<DataChunk>, RunError> {
-    for (i, hop) in hops.iter().enumerate() {
+    for (i, _) in hops.iter().enumerate() {
         let members_slice: Option<&crate::MembersView> = hop_members[i].as_ref();
-        bc = run_hop(graph, bc, hop, members_slice, &hop_tokens[i])?;
+        bc = run_hop_at(graph, bc, hops, i, members_slice, hop_tokens)?;
     }
     for pred in wheres {
         if bc.filter(graph, params, pred)?.is_none() {
@@ -8993,7 +11045,7 @@ fn date_cmp(
     msg_var: &str,
     graph: &Graph,
     params: &BTreeMap<String, Value>,
-) -> Option<(String, DateOp, i64)> {
+) -> Option<(String, DateOp, Value)> {
     use engram_cypher::ast::BinOp;
     let Expr::Bin(op, l, r) = e else {
         return None;
@@ -9006,16 +11058,16 @@ fn date_cmp(
         }
         None
     };
-    // A CONSTANT integer — evaluated in an EMPTY scope, so any expression that
-    // reads a bound var (e.g. the property side of the comparison) simply fails
-    // to evaluate and is reported as "not a constant" (None), never an error.
-    let eval_int = |x: &Expr| -> Option<i64> {
+    // A CONSTANT — evaluated in an EMPTY scope, so any expression that reads a
+    // bound var (e.g. the property side of the comparison) simply fails to
+    // evaluate and is reported as "not a constant" (None), never an error.
+    // Whether the index can rank it is `date_bound_key`'s to say.
+    let eval_int = |x: &Expr| -> Option<Value> {
         let vm = VarMap::new();
         let scope = Scope::over(params, &vm, graph.wall_ms(), graph.zone_provider());
         match eval_with(x, &scope, None) {
-            Ok(Value::Int(v)) => Some(v),
-            Ok(Value::Date(v)) => Some(v),
-            _ => None,
+            Ok(Value::Null) | Err(_) => None,
+            Ok(v) => Some(v),
         }
     };
     if let (Some(prop), Some(val)) = (prop_of(l), eval_int(r)) {
@@ -9092,8 +11144,8 @@ fn try_ic3_datewindow(
     // other conjuncts (the country membership) are applied later, unchanged.
     let msg_var = &h_msg.var;
     let mut date_prop: Option<String> = None;
-    let mut lo: Option<(i64, bool)> = None;
-    let mut hi: Option<(i64, bool)> = None;
+    let mut lo: Option<(Value, bool)> = None;
+    let mut hi: Option<(Value, bool)> = None;
     let mut other_wheres: Vec<&WherePred> = Vec::new();
     for w in wheres {
         if &w.var == msg_var {
@@ -9131,19 +11183,37 @@ fn try_ic3_datewindow(
     else {
         return Ok(None);
     };
+    // Both bounds must be keys of ONE class the index can rank: a message of
+    // any other class compares null with them, and the WHERE drops it.
+    let (Some(lo_b), Some(hi_b)) = (date_bound_key(&lo_b, &index), date_bound_key(&hi_b, &index))
+    else {
+        counted!("interp.pipeline date window declined a bound it cannot rank");
+        return Ok(None);
+    };
+    if lo_b.class() != hi_b.class() {
+        return Ok(None);
+    }
 
     // (driving…, message): each live driving row × its friend's in-window messages,
     // the date taken from the index — never from the store.
     let ncols = driving.vars.len();
     let mut cols: Vec<Vec<u64>> = vec![Vec::new(); ncols + 1];
+    let admits = creator_index_filter(graph, &index, &h_msg.labels)?;
     for &r in &driving.selection {
         let friend = driving.ids[friend_vi][r];
-        let Some(msgs) = index.get(&friend) else {
+        let Some(msgs) = index.by_creator.get(&friend) else {
             continue;
         };
-        for &(d, _mid, node) in msgs.iter() {
-            let lo_ok = if lo_inc { d >= lo_b } else { d > lo_b };
-            let hi_ok = if hi_inc { d <= hi_b } else { d < hi_b };
+        for (d, _mid, node) in msgs.iter() {
+            if d.class() != lo_b.class() {
+                continue;
+            }
+            let node = *node;
+            if admits.as_ref().is_some_and(|m| !m.contains(node)) {
+                continue;
+            }
+            let lo_ok = if lo_inc { *d >= lo_b } else { *d > lo_b };
+            let hi_ok = if hi_inc { *d <= hi_b } else { *d < hi_b };
             if lo_ok && hi_ok {
                 for (c, col) in cols.iter_mut().enumerate().take(ncols) {
                     col.push(driving.ids[c][r]);
@@ -9632,6 +11702,12 @@ fn rename_var_rel(
         dir: r.dir,
         props: r.props.as_ref().map(|e| substitute_aliases(e, map)),
         length: r.length,
+        // DROPPED, not renamed. `each` is a lifted copy of a WHERE conjunct
+        // that the original WHERE still carries, so losing it costs an
+        // expansion-time filter and never a row. Renaming it here would have
+        // to track the bound local through the same substitution, and a
+        // predicate rewritten wrongly would silently skip candidates.
+        each: None,
     }
 }
 
@@ -9831,6 +11907,8 @@ fn subst_pattern_exprs(p: &Pattern, map: &BTreeMap<String, Expr>) -> Pattern {
                                 dir: r.dir,
                                 props: r.props.as_ref().map(|e| substitute_aliases(e, map)),
                                 length: r.length,
+                                // dropped for the same reason as above
+                                each: None,
                             },
                             subst_node_props(n, map),
                         )
@@ -10075,7 +12153,7 @@ fn try_anchored_hierarchy_prelude(
         return Ok(None);
     }
     let path = &p0.paths[0];
-    if path.shortest || path.hops.len() != 1 {
+    if path.shortest.is_some() || path.hops.len() != 1 {
         return Ok(None);
     }
     let anode = &path.start;
@@ -10156,7 +12234,7 @@ fn try_anchored_hierarchy_prelude(
     counted!("interp.pipeline anchored hierarchy collect served a prelude");
     Ok(Some(QueryResult {
         columns: vec![alias],
-        rows: vec![vec![Value::List(values)]],
+        rows: vec![vec![Value::List((values).into())]],
     }))
 }
 
@@ -10411,7 +12489,7 @@ fn try_split_varlen_then_fixed(cl: &[Clause], i: usize) -> Option<Vec<Clause>> {
         return None;
     }
     let path = &pattern.paths[0];
-    if path.var.is_some() || path.shortest || path.hops.len() < 2 {
+    if path.var.is_some() || path.shortest.is_some() || path.hops.len() < 2 {
         return None;
     }
     let (rel0, node0) = &path.hops[0];
@@ -10485,7 +12563,7 @@ fn try_split_varlen_then_fixed(cl: &[Clause], i: usize) -> Option<Vec<Clause>> {
         pattern: Pattern {
             paths: vec![PathPattern {
                 var: None,
-                shortest: false,
+                shortest: None,
                 start: path.start.clone(),
                 hops: vec![path.hops[0].clone()],
             }],
@@ -10513,7 +12591,7 @@ fn try_split_varlen_then_fixed(cl: &[Clause], i: usize) -> Option<Vec<Clause>> {
         pattern: Pattern {
             paths: vec![PathPattern {
                 var: None,
-                shortest: false,
+                shortest: None,
                 start: NodePattern {
                     var: Some(b.clone()),
                     labels: Vec::new(),
@@ -11059,8 +13137,7 @@ fn run_pipeline(
         chunk = chunk.project_carried(graph, &stage.carried, stage.distinct)?;
 
         // Precompute this stage's end-label members + type tokens once.
-        let mut hop_members: Vec<Option<crate::MembersView>> =
-            Vec::with_capacity(stage.hops.len());
+        let mut hop_members: Vec<Option<crate::MembersView>> = Vec::with_capacity(stage.hops.len());
         let mut hop_tokens: Vec<Option<Vec<u32>>> = Vec::with_capacity(stage.hops.len());
         for hop in &stage.hops {
             let members = if hop.labels.is_empty() {
@@ -11126,9 +13203,9 @@ fn run_pipeline(
             }
         }
 
-        for (i, hop) in stage.hops.iter().enumerate() {
+        for (i, _) in stage.hops.iter().enumerate() {
             let ms: Option<&crate::MembersView> = hop_members[i].as_ref();
-            chunk = run_hop(graph, chunk, hop, ms, &hop_tokens[i])?;
+            chunk = run_hop_at(graph, chunk, &stage.hops, i, ms, &hop_tokens)?;
         }
         for pred in &stage.wheres {
             if chunk.filter(graph, params, pred)?.is_none() {
@@ -11726,7 +13803,7 @@ fn reroot_to_selective_end(graph: &Graph, q: &SingleQuery) -> Option<SingleQuery
         return None;
     }
     let path = &pattern.paths[0];
-    if path.var.is_some() || path.shortest || path.hops.is_empty() {
+    if path.var.is_some() || path.shortest.is_some() || path.hops.is_empty() {
         return None;
     }
     // A variable-length hop's reversal is not modelled here (and the chain
@@ -11773,7 +13850,7 @@ fn reroot_single_path_at(pattern: &Pattern, seed_var: &str) -> Option<Pattern> {
         return None;
     }
     let path = &pattern.paths[0];
-    if path.var.is_some() || path.shortest || path.hops.is_empty() {
+    if path.var.is_some() || path.shortest.is_some() || path.hops.is_empty() {
         return None;
     }
     // The seed var must be the path's TERMINAL node (the last hop's end).
@@ -11812,12 +13889,16 @@ fn reverse_path(path: &PathPattern) -> PathPattern {
             dir: flip_dir(rel.dir),
             props: rel.props.clone(),
             length: rel.length,
+            // CARRIED across the flip: the predicate is about the relationship
+            // itself, and reversing which end drives the walk does not change
+            // which relationships the path is made of.
+            each: rel.each.clone(),
         };
         rev_hops.push((rr, nodes[hi].clone()));
     }
     PathPattern {
         var: None,
-        shortest: false,
+        shortest: None,
         start: nodes[k].clone(),
         hops: rev_hops,
     }
@@ -11916,10 +13997,7 @@ fn stamp_labels(pattern: &Pattern, union: &BTreeMap<String, Vec<String>>) -> Pat
 /// Whether any node of `path` binds `var`.
 fn path_touches(path: &PathPattern, var: &str) -> bool {
     path.start.var.as_deref() == Some(var)
-        || path
-            .hops
-            .iter()
-            .any(|(_, n)| n.var.as_deref() == Some(var))
+        || path.hops.iter().any(|(_, n)| n.var.as_deref() == Some(var))
 }
 
 /// Re-root and re-order a count-only pattern so it can be walked as ONE
@@ -11932,8 +14010,6 @@ fn path_touches(path: &PathPattern, var: &str) -> bool {
 /// scorings of a few dozen multiplications over a memoised fan-out table —
 /// microseconds. LSQB's widest count-only pattern (q3) has five.
 const ORDER_SEARCH_MAX_PATHS: usize = 6;
-
-
 
 /// The memo key for one hop's fan-out: start labels, direction, types, end
 /// labels. `count_hop` iterates the smaller labelled side, so the search must
@@ -12002,14 +14078,7 @@ fn search_ordering(
     let mut order: Vec<usize> = Vec::with_capacity(kept.len());
     let mut taken = vec![false; kept.len()];
     search_step(
-        graph,
-        kept,
-        seed_var,
-        seed_rows,
-        &mut memo,
-        &mut taken,
-        &mut order,
-        &mut best,
+        graph, kept, seed_var, seed_rows, &mut memo, &mut taken, &mut order, &mut best,
     );
     best
 }
@@ -12191,7 +14260,7 @@ fn reorder_pattern(graph: &Graph, pattern: &Pattern) -> Option<Pattern> {
     // silently give up the index seek `start_prop_anchor` seeds it with, turning
     // a point lookup into a label scan.
     for p in &pattern.paths {
-        if p.var.is_some() || p.shortest || p.start.props.is_some() {
+        if p.var.is_some() || p.shortest.is_some() || p.start.props.is_some() {
             return None;
         }
         for (rel, node) in &p.hops {

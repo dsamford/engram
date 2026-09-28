@@ -83,17 +83,33 @@ fn corpus() -> Graph {
         for i in 0..197i64 {
             let mut m = BTreeMap::new();
             m.insert("id".into(), s(&format!("item-{p}-{i}")));
-            m.insert("title".into(), s(&format!("Item {i} of project {p} with a title long enough to matter")));
+            m.insert(
+                "title".into(),
+                s(&format!(
+                    "Item {i} of project {p} with a title long enough to matter"
+                )),
+            );
             m.insert("description".into(), s(&"lorem ipsum ".repeat(20)));
-            m.insert("status".into(), s(["backlog", "todo", "in_progress", "done"][(i % 4) as usize]));
-            m.insert("itemType".into(), s(if i % 10 == 0 { "epic" } else { "task" }));
+            m.insert(
+                "status".into(),
+                s(["backlog", "todo", "in_progress", "done"][(i % 4) as usize]),
+            );
+            m.insert(
+                "itemType".into(),
+                s(if i % 10 == 0 { "epic" } else { "task" }),
+            );
             m.insert("sortOrder".into(), Value::Int((197 - i) * 10));
-            m.insert("updatedAt".into(), s(&format!("2026-08-{:02}T00:00:{:02}Z", 1 + i % 28, i % 60)));
+            m.insert(
+                "updatedAt".into(),
+                s(&format!("2026-08-{:02}T00:00:{:02}Z", 1 + i % 28, i % 60)),
+            );
             let w = g.create_node(&["KMWorkItem".into()], &m).expect("w");
-            g.create_rel(w, "BELONGS_TO_PROJECT", pn, &BTreeMap::new()).expect("btp");
+            g.create_rel(w, "BELONGS_TO_PROJECT", pn, &BTreeMap::new())
+                .expect("btp");
             if i % 5 == 4 {
                 if let Some(parent) = prev {
-                    g.create_rel(parent, "HAS_TASK", w, &BTreeMap::new()).expect("has_task");
+                    g.create_rel(parent, "HAS_TASK", w, &BTreeMap::new())
+                        .expect("has_task");
                 }
             }
             prev = Some(w);
@@ -122,11 +138,22 @@ fn a_the_page_reads_each_survivor_once_and_nothing_else() {
     assert_eq!(count_of(&c, PROBED), 1, "{c:?}");
     assert_eq!(count_of(&c, LEAN), 1, "{c:?}");
     assert_eq!(count_of(&c, PRUNED), 1, "{c:?}");
-    assert_eq!(count_of(&c, FULL), 197, "one hydration per survivor, no probe decode: {c:?}");
-    assert_eq!(count_of(&c, RELS), 0, "the probe walks adjacency, not relationship records: {c:?}");
+    assert_eq!(
+        count_of(&c, FULL),
+        197,
+        "one hydration per survivor, no probe decode: {c:?}"
+    );
+    assert_eq!(
+        count_of(&c, RELS),
+        0,
+        "the probe walks adjacency, not relationship records: {c:?}"
+    );
     // The probe's constant end (`:KMProject {id}`) is one projected read
     // per statement; the per-row EXISTS re-check (197 of them) is gone.
-    assert!(count_of(&c, PROJECTED) <= 1, "no per-row EXISTS re-check: {c:?}");
+    assert!(
+        count_of(&c, PROJECTED) <= 1,
+        "no per-row EXISTS re-check: {c:?}"
+    );
 }
 
 /// The production listing with its two comprehensions: byte-identical to

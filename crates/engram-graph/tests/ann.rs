@@ -47,7 +47,8 @@ fn vector_graph(n: usize, dim: usize) -> Graph {
                 seeded_vec(i as u64, dim)
                     .into_iter()
                     .map(Value::Float)
-                    .collect(),
+                    .collect::<Vec<_>>()
+                    .into(),
             ),
         );
         g.create_node(&["V".to_string()], &props).expect("node");
@@ -161,7 +162,13 @@ fn a_write_between_queries_REBUILDS_and_the_new_row_is_findable() {
     props.insert("i".to_string(), Value::Int(9_999));
     props.insert(
         "e".to_string(),
-        Value::List(q.iter().copied().map(Value::Float).collect()),
+        Value::List(
+            q.iter()
+                .copied()
+                .map(Value::Float)
+                .collect::<Vec<_>>()
+                .into(),
+        ),
     );
     g.create_node(&["V".to_string()], &props)
         .expect("the late arrival");
@@ -236,7 +243,8 @@ fn a_different_query_dimension_rebuilds_for_that_dimension() {
                 seeded_vec(500 + i as u64, 4)
                     .into_iter()
                     .map(Value::Float)
-                    .collect(),
+                    .collect::<Vec<_>>()
+                    .into(),
             ),
         );
         g.create_node(&["V".to_string()], &props).expect("node");
@@ -301,7 +309,13 @@ fn the_exact_arm_caches_its_gather_and_a_write_invalidates() {
     props.insert("i".to_string(), Value::Int(9_999));
     props.insert(
         "e".to_string(),
-        Value::List(q.iter().copied().map(Value::Float).collect()),
+        Value::List(
+            q.iter()
+                .copied()
+                .map(Value::Float)
+                .collect::<Vec<_>>()
+                .into(),
+        ),
     );
     g.create_node(&["V".to_string()], &props).expect("node"); // i = 9_999
     let (after, ta) =
@@ -355,7 +369,12 @@ fn incremental_maintenance_matches_a_full_rebuild_under_mixed_writes() {
     g.set_vector_exact_max(50); // ANN arm
     let q = seeded_vec(555, 8);
     let near = |scale: f64| -> Value {
-        Value::List(q.iter().map(|x| Value::Float(x * scale)).collect()) // cosine(q, q*scale) = 1
+        Value::List(
+            q.iter()
+                .map(|x| Value::Float(x * scale))
+                .collect::<Vec<_>>()
+                .into(),
+        ) // cosine(q, q*scale) = 1
     };
     let (_, plan) = g.vector_query("vi", 10, &q).expect("build");
     assert!(
@@ -473,7 +492,13 @@ fn a_write_to_ANOTHER_index_does_not_touch_this_one() {
     let mut p = BTreeMap::new();
     p.insert(
         "e".to_string(),
-        Value::List(seeded_vec(1, 8).into_iter().map(Value::Float).collect()),
+        Value::List(
+            seeded_vec(1, 8)
+                .into_iter()
+                .map(Value::Float)
+                .collect::<Vec<_>>()
+                .into(),
+        ),
     );
     g.create_node(&["W".to_string()], &p).expect("write W");
     // Querying vi must NOT rebuild and must NOT re-cache — the W write left

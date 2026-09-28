@@ -99,7 +99,7 @@ sequenceDiagram
     Note over L,S: PRECISION LOCKING (opt-in)
     L->>L: ts = bump_ts() — ONE stamp for the write set
     L->>L: append_prehashed for every non-volatile write
-    L->>L: sync() — one fsync
+    L->>L: sync() — one fdatasync, or deferred under group commit
     T->>L: release
     Note over T,S: PUBLISH — push each version into its shard
     Note over T,S: slot.finish() — the visible clock advances
@@ -138,12 +138,38 @@ exactly there.
 The reverse order would let a crash leave a version readable that no log entry
 accounts for — divergence rather than data loss, and worse.
 
+### Where the fsync is paid
+
+Without group commit (`--no-group-commit`) the `sync()` in the diagram is the
+disk sync itself, paid inside the latch. Under group commit — the server's
+default — it only records that a sync is owed, and the sync belongs to one
+**flusher thread**:
+
+- A worker ends its batch holding every reply. If everything appended up to the
+  end of the batch is already durable, and none of its earlier hand-offs is
+  still queued, it replies at once — the test reads a lock-free **durable
+  sequence number**, not the mutex a running fsync holds.
+- Otherwise it hands the held replies to the flusher and takes its next batch.
+  While a hand-off of its is queued, its later replies go through the flusher
+  too, so no reply overtakes an earlier one on its connection.
+- The flusher drains every queued hand-off, pays **one** sync that covers every
+  record appended before it, from every worker, and releases the replies in
+  order.
+
+"Appended up to the end of the batch" includes other workers' records. A write
+is visible on append, before its fsync, so a read in the batch may have observed
+one, and its reply waits for that record to be durable too.
+
+The sync is `fdatasync`, not a full `fsync`: the WAL writes zero-filled space
+ahead of its end, so an append lands in blocks that already exist and a commit's
+sync has no file-size change to journal. See [the commit log](./commit-log.md#the-wal).
+
 ### An fsync failure aborts
 
 `StoreError::Durability` means the write was **unwound**, not that it
-half-happened. In group commit, an fsync failure aborts the process, because the
-held replies are unsent and continuing would acknowledge writes that are not
-durable.
+half-happened. In group commit, an fsync failure aborts the process: the held
+replies are unsent, the writes are already visible to readers on every worker,
+and continuing would acknowledge writes that are not durable.
 
 ## Guard rows
 
@@ -152,17 +178,15 @@ to make two writers touching the same node conflict — but that turned out to b
 too broad.
 
 Two relationship writes to one hub node wrote the **same** guard row and aborted
-each other, conflicting over nothing real. On one shape, a conflict-class
-counter attributed **guard 273 / entity 297** — guard rows were ~48% of all
-re-runs.
+each other, conflicting over nothing real. The more writers share an endpoint,
+the more of their re-runs are that false conflict.
 
 The **guard exemption** recognises the case: two *puts* of the same guard row,
-neither in a read set, do not conflict. Worth **3.7×** on the shared-endpoint
-shape. `--no-guard-exemption` restores the old behaviour as the control.
+neither in a read set, do not conflict. `--no-guard-exemption` restores the old
+behaviour as the control.
 
-Note the shape of that fix: it was gated on a counter *proving* guard rows were
-the cause first. Three theories had already died to instruments elsewhere in the
-same campaign.
+Note the shape of that fix: it was gated on a conflict-class counter *proving*
+guard rows were the cause first, rather than on a theory about them.
 
 ## Id allocation
 
@@ -182,6 +206,13 @@ That is what lets readers catch up in O(delta). The stamp must come from the
 same critical section as the entries; reading the clock separately is the
 stale-stamp hazard [derived structures](./derived-structures.md) describes.
 
+Recording an entry takes the **write** side of that structure's change-log lock
+— every relationship commit takes the adjacency log's, every node-creating
+commit the label log's. The derived-structure refresh reads the same logs, and
+it holds their read side only to **copy** the entries and the fence it needs;
+building the repair set, and folding a label's membership, happen after the lock
+is released. So a commit waits on the refresh for a copy, never for the work.
+
 ## Delete
 
 `delete_node(id, detach)` refuses a node that still has relationships unless
@@ -192,6 +223,25 @@ Deletes write **tombstones**, which compaction drops once no base segment
 shadows the key. The tombstone ratio (0.2, floor 4,096 versions) is a
 compaction trigger of its own, so a delete-heavy workload compacts on the
 tombstones rather than waiting for the segment count.
+
+A `DELETE` demands only the **identity** of what it removes. The clause collects
+ids from the values it is given and the delete path re-reads each record itself,
+so the `DELETE` no longer asks the `MATCH` in front of it to decode every node
+and relationship it binds in full — which, for `MATCH ()-[r:T]->() DELETE r`,
+was every node the unlabelled start seeded. Clauses after the `DELETE` still
+raise their own demands.
+
+The `MATCH` a writing statement runs binds its start candidates in **chunks of
+4,096** (`--match-start-chunk`), carries each chunk through the path's hops, and
+tests the `WHERE` on each row as the last path finishes it — so a row the `WHERE`
+drops is gone before the next chunk is bound. The reason is a statement of the
+form `MATCH (m:Message) WHERE m.id >= $base DETACH DELETE m` whose `WHERE` kept
+nothing: the matcher used to bind every candidate of the label and build a
+partial row for each before the `WHERE` ran, and so held the whole label in
+memory to delete no rows. Chunking changes nothing a caller can observe — the rows, their order, the
+read set and the `WHERE`'s evaluations are the same — and shortest paths keep one
+chunk, because they group by row rather than by start. `0` is the A/B arm: every
+candidate at once, the `WHERE` after collection.
 
 ## Next
 

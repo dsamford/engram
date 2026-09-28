@@ -23,7 +23,10 @@ fn ddl(g: &Graph, src: &str) {
 
 fn params() -> BTreeMap<String, Value> {
     let mut p = BTreeMap::new();
-    p.insert("minAge".to_string(), Value::Str("2026-08-20T00:00:00Z".into()));
+    p.insert(
+        "minAge".to_string(),
+        Value::Str("2026-08-20T00:00:00Z".into()),
+    );
     p.insert("minCount".to_string(), Value::Int(3));
     p
 }
@@ -61,7 +64,7 @@ fn sort_lists(rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
             r.into_iter()
                 .map(|v| match v {
                     Value::List(mut items) => {
-                        items.sort_by_key(|x| format!("{x:?}"));
+                        std::sync::Arc::make_mut(&mut items).sort_by_key(|x| format!("{x:?}"));
                         Value::List(items)
                     }
                     other => other,
@@ -82,28 +85,47 @@ const PROJECTED: &str = "graph.projected node materialisations";
 /// no `type` (a null map value the general path keeps).
 fn corpus() -> Graph {
     let g = Graph::new(Store::new(), Realm(1), Namespace(1));
-    ddl(&g, "CREATE INDEX gwp_status FOR (n:GraphWriteProposal) ON (n.status)");
+    ddl(
+        &g,
+        "CREATE INDEX gwp_status FOR (n:GraphWriteProposal) ON (n.status)",
+    );
     for o in 0..40i64 {
         let mut m = BTreeMap::new();
         m.insert("id".into(), s(&format!("orch-{o}")));
         m.insert("userId".into(), s(&format!("u{}", o % 5)));
         m.insert("conversationId".into(), s(&format!("conv-{o}")));
-        let on = g.create_node(&["MarketOrchestrator".into()], &m).expect("o");
+        let on = g
+            .create_node(&["MarketOrchestrator".into()], &m)
+            .expect("o");
         for t in 0..20i64 {
             let mut tm = BTreeMap::new();
             tm.insert("id".into(), s(&format!("task-{o}-{t}")));
             let tn = g.create_node(&["ResearchTask".into()], &tm).expect("t");
-            g.create_rel(on, "DISPATCHED", tn, &BTreeMap::new()).expect("d");
+            g.create_rel(on, "DISPATCHED", tn, &BTreeMap::new())
+                .expect("d");
             for p in 0..3i64 {
                 let mut pm = BTreeMap::new();
                 pm.insert("id".into(), s(&format!("prop-{o}-{t}-{p}")));
                 if (o + t + p) % 4 != 0 {
                     pm.insert("type".into(), s("research"));
                 }
-                pm.insert("status".into(), s(if (t + p) % 3 == 0 { "pending" } else { "applied" }));
-                pm.insert("createdAt".into(), s(&format!("2026-08-{:02}T00:00:00Z", 1 + (t + p) % 28)));
-                let pn = g.create_node(&["GraphWriteProposal".into()], &pm).expect("p");
-                g.create_rel(tn, "PROPOSED_GRAPH_WRITE", pn, &BTreeMap::new()).expect("pgw");
+                pm.insert(
+                    "status".into(),
+                    s(if (t + p) % 3 == 0 {
+                        "pending"
+                    } else {
+                        "applied"
+                    }),
+                );
+                pm.insert(
+                    "createdAt".into(),
+                    s(&format!("2026-08-{:02}T00:00:00Z", 1 + (t + p) % 28)),
+                );
+                let pn = g
+                    .create_node(&["GraphWriteProposal".into()], &pm)
+                    .expect("p");
+                g.create_rel(tn, "PROPOSED_GRAPH_WRITE", pn, &BTreeMap::new())
+                    .expect("pgw");
             }
         }
     }
@@ -134,7 +156,11 @@ fn a_collect_over_a_map_literal_runs_on_the_pipeline() {
     let (got, c) = traced(&g, ORIG);
     assert_eq!(sort_lists(got), sort_lists(want));
     assert_eq!(count_of(&c, PIPELINE), 1, "{c:?}");
-    assert_eq!(count_of(&c, PROJECTED), 0, "no per-row projected get: {c:?}");
+    assert_eq!(
+        count_of(&c, PROJECTED),
+        0,
+        "no per-row projected get: {c:?}"
+    );
     // The pre-existing order difference is the chain's, not the map's:
     // the property spelling collects in the same order as the map one.
     let prop = ORIG.replace(
@@ -155,7 +181,11 @@ fn a_collect_over_a_map_literal_runs_on_the_pipeline() {
                 .collect(),
             _ => Vec::new(),
         };
-        assert_eq!(a[3], Value::List(from_maps), "same production order as collect(gp.id)");
+        assert_eq!(
+            a[3],
+            Value::List((from_maps).into()),
+            "same production order as collect(gp.id)"
+        );
     }
 }
 
@@ -179,5 +209,9 @@ fn a_list_literal_and_a_two_variable_map() {
     let want = general(&g, two);
     let (got, c) = traced(&g, two);
     assert_eq!(got, want);
-    assert_eq!(count_of(&c, PIPELINE), 0, "a two-variable map declines: {c:?}");
+    assert_eq!(
+        count_of(&c, PIPELINE),
+        0,
+        "a two-variable map declines: {c:?}"
+    );
 }

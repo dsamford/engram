@@ -13,14 +13,19 @@ every connection.
 
 - **Graph traversal.** Multi-hop patterns, variable-length paths, and
   aggregations over neighbourhoods are what the engine is built and measured
-  on. On the analytical LSQB battery at SF1 it leads Neo4j 5.26-community on
-  all nine queries, and on a ten-profile mixed read/write sweep on all twenty
-  levels — see [Measurements](../measurements/index.md), which also states what
-  those numbers do not cover.
-- **Writes.** The storage engine is an append-only MVCC log with adjacency held
-  as a derived structure, so relationship creation, hub writes and delete churn
-  are where the largest margins are.
-- **Standard Cypher.** 3,772 of 3,773 evaluated openCypher TCK scenarios pass,
+  on. Against Neo4j 5.26 Community and PostgreSQL 17, it was the fastest of the
+  three on all nine LSQB pattern-counting queries at both SF3 and SF10, and the
+  only one of the three to answer every query of LSQB, SNB BI, SNB Interactive
+  and FinBench at both sizes measured. It does not lead everywhere: PostgreSQL
+  stays ahead on a set of heavy analytical joins and on FinBench's transfer-path
+  queries. [Three engines at SF3 and SF10](../measurements/three-engines-sf3-sf10.md)
+  has the tables, and states what those numbers do not cover.
+- **Contended writes.** The storage engine is an append-only MVCC log with
+  adjacency held as a derived structure. When every client's writes collide
+  on one record, Engram completed 7,553 updates a second at SF3 with 64
+  clients, against about 650 on Neo4j and on PostgreSQL. On plain inserts
+  PostgreSQL is ahead.
+- **Standard Cypher.** 3,769 of 3,773 evaluated openCypher TCK scenarios pass,
   and the number is ratcheted in CI so it cannot quietly fall. See
   [Cypher support](../using/cypher-support.md).
 - **Graphs larger than memory.** [Paged mode](../architecture/paged-mode.md)
@@ -32,6 +37,18 @@ every connection.
   is a repro, not a story about a bad afternoon.
 - **Vector and full-text search** in-process, with no external index to keep in
   sync. See [Indexes](../architecture/indexes.md).
+- **Graph algorithms in-process.** Twelve families — PageRank, weakly and
+  strongly connected components, degree, BFS and weighted SSSP, triangle count,
+  local clustering, label propagation, Louvain, exact betweenness and closeness
+  — as `engram.algo.*` procedures, each in four modes, plus a stream-only
+  k-shortest-paths procedure, over a projection built from the graph already
+  in the store. Six of them — BFS, WCC, PageRank, SSSP, local clustering and
+  label propagation — have a conformance mode that is validated against LDBC
+  Graphalytics' reference output. A result is held in a bounded cache, is
+  never auto-refreshed and does not survive a restart; a projection past the
+  node, edge or byte ceiling is refused rather than built, and an algorithm
+  past the all-pairs work ceiling is refused rather than run. See
+  [Graph algorithms](../architecture/graph-algorithms.md).
 
 ## What it is not
 
@@ -44,7 +61,8 @@ This section is deliberately longer than the one above.
   is the availability story.
 - **Not backed up.** There is no backup or point-in-time-restore tooling. The
   WAL and the segments are the durable artifacts, and there is no supported
-  procedure around them yet.
+  procedure around them yet beyond copying the directory while the server is
+  stopped.
 - **Not audited.** Authentication attempts, session lifecycle, DDL and
   authorization denials are not recorded anywhere.
 - **Not a Neo4j drop-in**, despite the wire compatibility. The driver

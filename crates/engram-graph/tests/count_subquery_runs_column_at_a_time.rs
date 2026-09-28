@@ -64,17 +64,22 @@ fn corpus() -> Graph {
             if (p + i) % 7 != 0 {
                 m.insert(
                     "status".into(),
-                    s(["backlog", "todo", "in_progress", "done", "cancelled"][((p + i) % 5) as usize]),
+                    s(["backlog", "todo", "in_progress", "done", "cancelled"]
+                        [((p + i) % 5) as usize]),
                 );
             }
             m.insert("kind".into(), s(if p % 2 == 0 { "task" } else { "epic" }));
             m.insert("points".into(), Value::Int((i % 8) + 1));
             let w = g.create_node(&["Item".into()], &m).expect("w");
-            g.create_rel(w, "BELONGS_TO", pn, &BTreeMap::new()).expect("belongs");
+            g.create_rel(w, "BELONGS_TO", pn, &BTreeMap::new())
+                .expect("belongs");
         }
     }
     // The columns the counts read, cached by a whole-label aggregate.
-    let _ = rows(&g, "MATCH (w:Item) RETURN count(w.status) AS a, sum(w.points) AS b, count(w.kind) AS c");
+    let _ = rows(
+        &g,
+        "MATCH (w:Item) RETURN count(w.status) AS a, sum(w.points) AS b, count(w.kind) AS c",
+    );
     let _ = rows(&g, "MATCH (p:Proj) RETURN count(p.kind) AS c");
     g
 }
@@ -98,7 +103,11 @@ fn a_the_dashboards_counts_run_over_cached_columns() {
     assert_eq!(want[0][1], Value::Int(200), "total");
     let (got, c) = traced(&g, DASH);
     assert_eq!(got, want);
-    assert_eq!(count_of(&c, VECTORISED), 20 * 5, "five counts per project row: {c:?}");
+    assert_eq!(
+        count_of(&c, VECTORISED),
+        20 * 5,
+        "five counts per project row: {c:?}"
+    );
     assert!(
         count_of(&c, EXPRESSIONS) < 400,
         "no expression per neighbour (4,000 items × 4 predicates would be 16k): {c:?}"
@@ -136,5 +145,9 @@ fn b_exists_the_outbound_form_and_a_declined_where_agree() {
     assert!(want.iter().all(|r| r[1] == Value::Int(200)));
     let (got, c) = traced(&g, correlated);
     assert_eq!(got, want);
-    assert_eq!(count_of(&c, VECTORISED), 0, "a WHERE reading the outer row keeps the matcher: {c:?}");
+    assert_eq!(
+        count_of(&c, VECTORISED),
+        0,
+        "a WHERE reading the outer row keeps the matcher: {c:?}"
+    );
 }

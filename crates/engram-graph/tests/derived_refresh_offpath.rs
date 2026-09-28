@@ -124,7 +124,12 @@ fn a_reader_building_table_b_is_not_delayed_by_the_refresh_rebuilding_table_a() 
     f.g.set_demote_adjacency_rebuild(false);
     // Build `A`'s table, then make it stale beyond repair.
     let (_, trace) = engram_observe::with_trace(|| out_row(&f.g, f.ids[0], f.a));
-    assert_eq!(count(&trace, "graph.adjacency tables built"), 1, "{:?}", trace.counters());
+    assert_eq!(
+        count(&trace, "graph.adjacency tables built"),
+        1,
+        "{:?}",
+        trace.counters()
+    );
     burst(&f, "A");
 
     let started = Arc::new(AtomicBool::new(false));
@@ -147,15 +152,23 @@ fn a_reader_building_table_b_is_not_delayed_by_the_refresh_rebuilding_table_a() 
     let refresh_still_running = !done.load(Ordering::SeqCst);
     let report = refresh.join().expect("refresh");
 
-    assert_eq!(rows, BIG_PER as usize, "the reader must answer from the direct walk");
+    assert_eq!(
+        rows, BIG_PER as usize,
+        "the reader must answer from the direct walk"
+    );
     // A `sometimes!` event, not a counter: the decline is a declared state.
     assert!(
-        trace.sometimes_hit().contains("graph.adjacency table declined by the entry budget"),
+        trace
+            .sometimes_hit()
+            .contains("graph.adjacency table declined by the entry budget"),
         "the reader must have ATTEMPTED a build of C's table (and been declined): {:?} / {:?}",
         trace.sometimes_hit(),
         trace.counters()
     );
-    assert_eq!(report.adjacency_rebuilt, 1, "the refresh must have REBUILT A's table: {report:?}");
+    assert_eq!(
+        report.adjacency_rebuilt, 1,
+        "the refresh must have REBUILT A's table: {report:?}"
+    );
     assert!(
         refresh_still_running,
         "the reader's build of C completed only after the refresh finished rebuilding A — \
@@ -172,22 +185,56 @@ fn the_refresh_never_rebuilds_an_untyped_table() {
     // gate declines to repair (14,000 changed nodes × 32 ≥ 410,000): a
     // reader would rebuild it; the refresh must not.
     f.g.set_adj_table_max_entries(64 << 20);
-    let (_, trace) = engram_observe::with_trace(|| f.g.adjacent_slim(f.ids[0], Dir::Out, &None).len());
-    assert_eq!(count(&trace, "graph.adjacency tables built"), 1, "{:?}", trace.counters());
+    let (_, trace) =
+        engram_observe::with_trace(|| f.g.adjacent_slim(f.ids[0], Dir::Out, &None).len());
+    assert_eq!(
+        count(&trace, "graph.adjacency tables built"),
+        1,
+        "{:?}",
+        trace.counters()
+    );
     burst(&f, "A");
-    let before = engram_graph::counters::ADJ_TABLES_BUILT.load(Ordering::Relaxed);
     let (report, trace) = engram_observe::with_trace(|| f.g.refresh_stale_derived());
-    assert_eq!(report.adjacency_rebuilt, 0, "an untyped table was rebuilt by the refresh: {report:?}");
+    assert_eq!(
+        report.adjacency_rebuilt, 0,
+        "an untyped table was rebuilt by the refresh: {report:?}"
+    );
     assert_eq!(report.adjacency_repaired, 0, "{report:?}");
-    assert_eq!(report.adjacency_deferred, 1, "the stale untyped table must be DEFERRED: {report:?}");
-    assert_eq!(count(&trace, "graph.adjacency repair declined by cost"), 1, "{:?}", trace.counters());
-    assert_eq!(engram_graph::counters::ADJ_TABLES_BUILT.load(Ordering::Relaxed), before);
-    assert!(!report.any(), "a pass that deferred everything brought nothing current");
+    assert_eq!(
+        report.adjacency_deferred, 1,
+        "the stale untyped table must be DEFERRED: {report:?}"
+    );
+    assert_eq!(
+        count(&trace, "graph.adjacency repair declined by cost"),
+        1,
+        "{:?}",
+        trace.counters()
+    );
+    // The refresh built nothing — judged by THIS closure's trace. The
+    // process-wide `ADJ_TABLES_BUILT` atomic this compared before/after
+    // moves whenever the binary's other tests build a table beside it under
+    // `--test-threads=4` (gate85 read 4 against 3 and went red for it).
+    assert_eq!(
+        count(&trace, "graph.adjacency tables built"),
+        0,
+        "{:?}",
+        trace.counters()
+    );
+    assert!(
+        !report.any(),
+        "a pass that deferred everything brought nothing current"
+    );
     // The reader that wants it pays, exactly as before the refresh existed.
-    let (rows, trace) = engram_observe::with_trace(|| f.g.adjacent_slim(f.ids[0], Dir::Out, &None).len());
+    let (rows, trace) =
+        engram_observe::with_trace(|| f.g.adjacent_slim(f.ids[0], Dir::Out, &None).len());
     // 20 `C`, one `A`, one `D`, and the burst's `A`.
     assert_eq!(rows, (BIG_PER + 3) as usize);
-    assert_eq!(count(&trace, "graph.adjacency tables built"), 1, "{:?}", trace.counters());
+    assert_eq!(
+        count(&trace, "graph.adjacency tables built"),
+        1,
+        "{:?}",
+        trace.counters()
+    );
 }
 
 #[test]
@@ -202,7 +249,11 @@ fn a_pass_rebuilds_at_most_one_table_and_defers_the_rest_to_the_next() {
     burst(&f, "D");
     let first = f.g.refresh_stale_derived();
     assert_eq!(
-        (first.adjacency_rebuilt, first.adjacency_deferred, first.adjacency_repaired),
+        (
+            first.adjacency_rebuilt,
+            first.adjacency_deferred,
+            first.adjacency_repaired
+        ),
         (1, 1, 0),
         "one rebuild per pass, the other deferred: {first:?}"
     );
@@ -217,11 +268,17 @@ fn a_pass_rebuilds_at_most_one_table_and_defers_the_rest_to_the_next() {
     assert!(!third.any(), "nothing left: {third:?}");
     assert_eq!(third, engram_graph::RefreshReport::default());
     // Both tables current and right, with no work left for the reader.
-    let ((a, d), trace) = engram_observe::with_trace(|| (out_row(&f.g, f.ids[0], f.a), out_row(&f.g, f.ids[0], f.d)));
+    let ((a, d), trace) =
+        engram_observe::with_trace(|| (out_row(&f.g, f.ids[0], f.a), out_row(&f.g, f.ids[0], f.d)));
     assert_eq!((a, d), (2, 2));
     assert_eq!(count(&trace, "graph.adjacency tables built"), 0);
     assert_eq!(count(&trace, "graph.adjacency tables repaired"), 0);
-    assert_eq!(count(&trace, "graph.adjacency tables reused"), 2, "{:?}", trace.counters());
+    assert_eq!(
+        count(&trace, "graph.adjacency tables reused"),
+        2,
+        "{:?}",
+        trace.counters()
+    );
 }
 
 /// §5.3's SHIPPED DEFAULT, stated here beside the budget it replaces.

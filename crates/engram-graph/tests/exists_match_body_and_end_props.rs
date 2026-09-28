@@ -82,12 +82,15 @@ fn corpus() -> Graph {
         );
         m.insert("n".to_string(), Value::Int(i));
         if i % 3 != 0 {
-            m.insert("startAt".to_string(), Value::Str(format!("2026-08-{:02}", 1 + i % 28)));
+            m.insert(
+                "startAt".to_string(),
+                Value::Str(format!("2026-08-{:02}", 1 + i % 28)),
+            );
         }
         if i % 11 == 0 {
             m.insert(
                 "affected".to_string(),
-                Value::List(vec![Value::Str("DEU".into()), Value::Str("USA".into())]),
+                Value::List((vec![Value::Str("DEU".into()), Value::Str("USA".into())]).into()),
             );
         }
         if i % 13 == 0 {
@@ -97,7 +100,8 @@ fn corpus() -> Graph {
         // Country edges: every doc with i % 5 == k occurs in country k; every
         // doc with i % 9 == 0 also mentions USA (a second type into the set).
         let c = countries[(i % 5) as usize];
-        g.create_rel(d, "OCCURS_IN", c, &BTreeMap::new()).expect("rel");
+        g.create_rel(d, "OCCURS_IN", c, &BTreeMap::new())
+            .expect("rel");
         if i % 9 == 0 {
             g.create_rel(d, "MENTIONS_COUNTRY", countries[0], &BTreeMap::new())
                 .expect("rel");
@@ -123,9 +127,20 @@ const ANTI_JOIN_FN: &str = "MATCH (n:Doc) WHERE n.kind = 'email' AND NOT exists(
 fn a_single_match_query_body_lifts_to_the_probe_like_the_pattern_spelling() {
     let g = corpus();
     let (on, off) = both(&g, ANTI_JOIN_MATCH);
-    assert_eq!(on, off, "columnar vs general disagree on the MATCH spelling");
-    assert_eq!(rows(&g, ANTI_JOIN_PATTERN), on, "the bare-pattern spelling must agree");
-    assert_eq!(rows(&g, ANTI_JOIN_FN), on, "the exists() spelling must agree");
+    assert_eq!(
+        on, off,
+        "columnar vs general disagree on the MATCH spelling"
+    );
+    assert_eq!(
+        rows(&g, ANTI_JOIN_PATTERN),
+        on,
+        "the bare-pattern spelling must agree"
+    );
+    assert_eq!(
+        rows(&g, ANTI_JOIN_FN),
+        on,
+        "the exists() spelling must agree"
+    );
     for src in [ANTI_JOIN_MATCH, ANTI_JOIN_PATTERN, ANTI_JOIN_FN] {
         assert!(
             counter(&g, src, AGG) > 0,
@@ -147,7 +162,12 @@ fn a_single_match_count_body_is_the_degree() {
     assert_eq!(on, off);
     assert_eq!(rows(&g, bare), on);
     assert!(counter(&g, with_match, AGG) > 0);
-    assert_eq!(on, vec![vec![Value::Int((0..700i64).filter(|i| i % 8 == 0).count() as i64)]]);
+    assert_eq!(
+        on,
+        vec![vec![Value::Int(
+            (0..700i64).filter(|i| i % 8 == 0).count() as i64
+        )]]
+    );
 }
 
 /// A body with a WHERE, or with more than one clause, keeps its treatment —
@@ -171,7 +191,8 @@ fn bodies_that_are_not_one_plain_match_still_agree() {
 const GEO_COUNT: &str = "MATCH (g:Doc) WHERE exists((g)-[:OCCURS_IN|MENTIONS_COUNTRY]->(:Country {iso3: $a})) RETURN count(g) AS n";
 const GEO_OR: &str = "MATCH (g:Doc) WHERE g.startAt IS NOT NULL AND ($a IN coalesce(g.affected, []) OR g.region = $a OR exists((g)-[:OCCURS_IN|MENTIONS_COUNTRY]->(:Country {iso3: $a}))) AND ($b IN coalesce(g.affected, []) OR g.region = $b OR exists((g)-[:OCCURS_IN|MENTIONS_COUNTRY]->(:Country {iso3: $b}))) RETURN count(g) AS n";
 const GEO_STAGE: &str = "MATCH (g:Doc) WHERE g.startAt IS NOT NULL AND exists((g)-[:OCCURS_IN]->(:Country {iso3: $a})) WITH g, g.n AS n WHERE n >= 10 WITH collect({n: n, s: g.startAt}) AS events WITH [e IN events WHERE e.n < 400 | e.n] AS small, [e IN events | e.n] AS all RETURN size(small) AS a, size(all) AS b";
-const GEO_LITERAL: &str = "MATCH (g:Doc) WHERE exists((g)-[:OCCURS_IN]->(:Country {iso3: 'SRB'})) RETURN count(g) AS n";
+const GEO_LITERAL: &str =
+    "MATCH (g:Doc) WHERE exists((g)-[:OCCURS_IN]->(:Country {iso3: 'SRB'})) RETURN count(g) AS n";
 const GEO_TWO_KEYS: &str = "MATCH (g:Doc) WHERE exists((g)-[:OCCURS_IN]->(:Country {iso3: $a, missing: 1})) RETURN count(g) AS n";
 
 #[test]
@@ -205,7 +226,11 @@ fn maps_the_probe_cannot_resolve_once_decline_and_agree() {
     ] {
         let (on, off) = both(&g, src);
         assert_eq!(on, off, "columnar vs general disagree on `{src}`");
-        assert_eq!(counter(&g, src, END_MAP), 0, "`{src}` must not resolve a far-end map");
+        assert_eq!(
+            counter(&g, src, END_MAP),
+            0,
+            "`{src}` must not resolve a far-end map"
+        );
     }
 }
 
@@ -242,7 +267,12 @@ fn a_declared_key_on_a_wide_far_end_seeks_its_candidates() {
     assert_eq!(on, off);
     assert!(counter(&g, src, "interp.columnar probe sought its far end") > 0);
     assert!(counter(&g, src, END_MAP) > 0);
-    assert_eq!(on, vec![vec![Value::Int((0..700i64).filter(|i| i % 600 == 7).count() as i64)]]);
+    assert_eq!(
+        on,
+        vec![vec![Value::Int(
+            (0..700i64).filter(|i| i % 600 == 7).count() as i64
+        )]]
+    );
 }
 
 /// The far-end set is a CANDIDATE filter on the neighbour, never a node read:
@@ -260,6 +290,8 @@ fn the_probe_tests_membership_of_the_neighbour_in_the_resolved_set() {
     assert_eq!(on, off);
     assert_eq!(
         on,
-        vec![vec![Value::Int((0..700i64).filter(|i| i % 9 == 0).count() as i64)]]
+        vec![vec![Value::Int(
+            (0..700i64).filter(|i| i % 9 == 0).count() as i64
+        )]]
     );
 }

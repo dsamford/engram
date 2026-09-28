@@ -458,6 +458,33 @@ impl SealedSegment {
         }
     }
 
+    /// [`SealedSegment::get_at`] for a run of point reads, BORROWED: `f`
+    /// sees the visible value's bytes; a paged segment answers from
+    /// `cursor`'s block when the key falls in it (see
+    /// [`PagedSegment::visit_at_with_cursor`]), a resident segment ignores
+    /// the cursor. `Some(true)`: a value (handed to `f`); `Some(false)`: a
+    /// tombstone; `None`: nothing visible here.
+    pub(crate) fn visit_at_with_cursor(
+        &self,
+        key: &LogicalKey,
+        ts: u64,
+        cursor: &mut Option<(usize, crate::paged::Block)>,
+        f: impl FnOnce(&[u8]),
+    ) -> Option<bool> {
+        match self {
+            SealedSegment::Resident(s) => s.get_at(key, ts).map(|v| match v.value.as_ref() {
+                Some(bytes) => {
+                    f(bytes);
+                    true
+                }
+                None => false,
+            }),
+            SealedSegment::Paged(p) => p
+                .visit_at_with_cursor(key, ts, cursor, f)
+                .unwrap_or_else(|e| paged_fatal(p.seq(), e)),
+        }
+    }
+
     /// The newest version at or below `ts`, PROJECTED (see [`Segment::get_projected_at`]).
     pub(crate) fn get_projected_at(
         &self,
@@ -486,19 +513,6 @@ impl SealedSegment {
         self.range_for_each_in(lo, hi, false, f)
     }
 
-    /// [`SealedSegment::range_for_each`] under the block cache's SCAN policy —
-    /// identical keys and versions; a paged backing neither promotes nor
-    /// displaces cached blocks for a walk that touches each block once. A
-    /// resident backing has no cache and is unchanged.
-    pub(crate) fn range_for_each_scan(
-        &self,
-        lo: &[u8],
-        hi: Option<&[u8]>,
-        f: impl FnMut(&LogicalKey, &[Version]),
-    ) {
-        self.range_for_each_in(lo, hi, true, f)
-    }
-
     /// [`SealedSegment::range_for_each`] with an EARLY STOP: `f` answers
     /// whether to continue, and the call answers whether the walk ran to
     /// completion (`false` = the visitor stopped it). A paged backing fetches
@@ -506,10 +520,18 @@ impl SealedSegment {
     /// over a wide span must pay for its budget, not for the span (the
     /// production mirror's labels interleave in id space, so a 15-node
     /// label's span was the entire node partition, walked per property read).
+    ///
+    /// `scan` selects the block cache's scan policy, exactly as
+    /// [`SealedSegment::range_for_each_scan`] does — so a caller that wants BOTH
+    /// an early stop and the scan policy no longer has to give one up. Before
+    /// this, `merge_span`'s single-segment fast path chose the non-stopping
+    /// walk to keep the policy and then read every remaining block after its
+    /// visitor had stopped.
     pub(crate) fn range_for_each_until(
         &self,
         lo: &[u8],
         hi: Option<&[u8]>,
+        scan: bool,
         mut f: impl FnMut(&LogicalKey, &[Version]) -> bool,
     ) -> bool {
         match self {
@@ -522,7 +544,7 @@ impl SealedSegment {
                 true
             }
             SealedSegment::Paged(p) => p
-                .range_for_each_until(lo, hi, |k, v| f(k, v))
+                .range_for_each_until(lo, hi, scan, |k, v| f(k, v))
                 .unwrap_or_else(|e| paged_fatal(p.seq(), e)),
         }
     }

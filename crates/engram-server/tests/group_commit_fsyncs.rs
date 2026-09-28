@@ -202,7 +202,9 @@ fn the_id_reservation_is_what_removed_the_allocator_fsyncs() {
             write(&mut c, i);
         }
         let cost = fsyncs() - before;
-        eprintln!("[group commit OFF, id_reservation {reservation}] {N} statements cost {cost} fsync(s)");
+        eprintln!(
+            "[group commit OFF, id_reservation {reservation}] {N} statements cost {cost} fsync(s)"
+        );
         let _ = std::fs::remove_dir_all(&dir);
         cost
     };
@@ -285,10 +287,14 @@ fn the_maintenance_tick_and_refresh_ask_cost_no_fsync() {
     let before = fsyncs();
     std::thread::sleep(Duration::from_millis(300));
     let idle = fsyncs() - before;
-    let runs = engram_server::counters::MAINTENANCE_REFRESH_RUNS.load(Ordering::Relaxed) - runs_before;
+    let runs =
+        engram_server::counters::MAINTENANCE_REFRESH_RUNS.load(Ordering::Relaxed) - runs_before;
     eprintln!("[idle, 1 ms tick] {runs} maintenance pass(es), {idle} fsync(s)");
     assert!(runs >= 10, "the maintenance thread barely ticked: {runs}");
-    assert_eq!(idle, 0, "an idle server's maintenance ticks performed {idle} fsync(s)");
+    assert_eq!(
+        idle, 0,
+        "an idle server's maintenance ticks performed {idle} fsync(s)"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -334,7 +340,10 @@ fn concurrent_clients_share_fsyncs() {
          {:.1} statements per fsync",
         statements as f64 / cost.max(1) as f64
     );
-    assert!(cost > 0, "{statements} durable statements cost NO fsync at all");
+    assert!(
+        cost > 0,
+        "{statements} durable statements cost NO fsync at all"
+    );
     assert!(
         cost < statements,
         "{statements} concurrent statements cost {cost} fsyncs — nothing was batched. \
@@ -412,7 +421,10 @@ fn six_workers_share_one_fsync_across_workers() {
          fsync(s) — {:.1} statements per fsync",
         statements as f64 / cost.max(1) as f64
     );
-    assert!(cost > 0, "{statements} durable statements cost NO fsync at all");
+    assert!(
+        cost > 0,
+        "{statements} durable statements cost NO fsync at all"
+    );
     // Strictly fewer than one per statement is the floor for "any sharing";
     // the bar is set at half, because a cross-worker protocol that only
     // shares occasionally is one whose convoy has merely moved.

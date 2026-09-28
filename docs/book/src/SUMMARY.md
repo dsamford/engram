@@ -38,6 +38,7 @@
 - [The commit log](./architecture/commit-log.md)
 - [Indexes](./architecture/indexes.md)
 - [Concurrency and the worker model](./architecture/concurrency.md)
+- [Graph algorithms](./architecture/graph-algorithms.md)
 - [Seams not yet on the serving path](./architecture/seams.md)
 
 # Reference
@@ -48,6 +49,8 @@
 - [Compiled-in constants](./reference/constants.md)
 - [Environment variables](./reference/environment.md)
 - [Cypher procedures](./reference/procedures.md)
+- [Regular expressions](./reference/regex.md)
+- [Trigram index](./reference/trigram-index.md)
 - [Errors](./reference/errors.md)
 - [Bolt and PackStream](./reference/bolt.md)
 - [Counters and observability](./reference/observability.md)
@@ -63,35 +66,10 @@
 - [Architecture decision records](./development/adr.md)
   - [ADR-001 — On-disk formats](./development/adr-001-on-disk-formats.md)
 
-# Design history
-
-- [About these documents](./history/index.md)
-- [Engine redesign](./history/engine-redesign.md)
-- [Execution engine evaluation](./history/execution-engine-evaluation.md)
-- [Query planning](./history/query-planning.md)
-- [Tail remediation plan](./history/remediation-plan.md)
-- [Concurrency direction](./history/concurrency-direction.md)
-- [Derived structures](./history/derived-structures.md)
-- [The derived-refresh write tax](./history/derived-refresh-write-tax.md)
-- [Write path, phase 0](./history/write-path-phase0.md)
-- [Write concurrency ceiling](./history/write-concurrency-ceiling.md)
-- [RC1 — guard-row exemption](./history/rc1-guard-exemption.md)
-- [RC2 — the sealed prefix](./history/rc2-sealed-prefix.md)
-- [Scale and integrity plan](./history/scale-and-integrity-plan.md)
-- [LSQB completeness](./history/lsqb-completeness.md)
-- [Relationship-create parity](./history/rel-create-parity.md)
-- [openCypher conformance strategy](./history/conformance-strategy.md)
-- [The SNB proving ground](./history/snb-benchmark.md)
-- [Leave nothing on the floor](./history/leave-nothing-on-the-floor.md)
-
 # Measurements
 
 - [How Engram is measured](./measurements/index.md)
-- [Neo4j head to head](./measurements/neo4j-head-to-head.md)
-- [LDBC SNB stress](./measurements/ldbc-snb-stress.md)
-- [Official SF1, paged](./measurements/official-sf1-paged.md)
-- [The port benchmark](./measurements/port-benchmark.md)
-- [Decoded-value parity](./measurements/decoded-values.md)
+- [Three engines at SF3 and SF10](./measurements/three-engines-sf3-sf10.md)
 
 ---
 

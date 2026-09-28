@@ -75,10 +75,13 @@ fn corpus() -> Graph {
         if i % 4 == 0 {
             m.insert(
                 "tags".to_string(),
-                Value::List(vec![
-                    Value::Str("x".into()),
-                    Value::Str(if i % 8 == 0 { "y" } else { "z" }.into()),
-                ]),
+                Value::List(
+                    (vec![
+                        Value::Str("x".into()),
+                        Value::Str(if i % 8 == 0 { "y" } else { "z" }.into()),
+                    ])
+                    .into(),
+                ),
             );
         }
         let d = g.create_node(&["Doc".into()], &m).expect("doc");
@@ -95,7 +98,8 @@ fn corpus() -> Graph {
 const COUNT: &str = "MATCH (d:Doc) WHERE d.kind = 'email' AND d.flag = true AND d.note IS NULL RETURN count(d) AS n";
 // No seekable equality here: an equality on `kind` would seek the range
 // index and never walk a column at all (the right plan, and not this test's).
-const PROJECT: &str = "MATCH (d:Doc) WHERE d.n % 7 = 0 RETURN d.n AS n, d.note AS note ORDER BY n LIMIT 5";
+const PROJECT: &str =
+    "MATCH (d:Doc) WHERE d.n % 7 = 0 RETURN d.n AS n, d.note AS note ORDER BY n LIMIT 5";
 const STAGE: &str = "MATCH (d:Doc) WHERE d.flag = true WITH d.n AS n ORDER BY n DESC LIMIT 3 RETURN collect(n) AS top";
 // A hop with a probe over the label: the columnar aggregate lifts the probe
 // and walks the label's columns (a `(d)-[:TAGGED]->(t)` chain would run the
@@ -120,17 +124,24 @@ fn a_second_read_over_the_label_is_served_from_the_cache_and_agrees() {
         // Read back by a walk, or — for a plain count — counted over the
         // columns as vectors without a walk at all.
         assert!(
-            count(&t2, SERVED) > 0 && (count(&t2, READ_FROM_CACHE) > 0 || count(&t2, VECTORISED) > 0),
+            count(&t2, SERVED) > 0
+                && (count(&t2, READ_FROM_CACHE) > 0 || count(&t2, VECTORISED) > 0),
             "`{src}`: the second read must read them back (served {}, read {}, vectorised {})",
             count(&t2, SERVED),
             count(&t2, READ_FROM_CACHE),
             count(&t2, VECTORISED)
         );
-        assert_eq!(count(&t2, KEPT), 0, "`{src}`: nothing new to keep on the second walk");
+        assert_eq!(
+            count(&t2, KEPT),
+            0,
+            "`{src}`: nothing new to keep on the second walk"
+        );
     }
     // Fixture sanity: emails (i % 7 != 0), even (flag), not a multiple of 3 (no note).
     let g = corpus();
-    let expect = (0..1200i64).filter(|i| i % 7 != 0 && i % 2 == 0 && i % 3 != 0).count() as i64;
+    let expect = (0..1200i64)
+        .filter(|i| i % 7 != 0 && i % 2 == 0 && i % 3 != 0)
+        .count() as i64;
     assert_eq!(rows(&g, COUNT), vec![vec![Value::Int(expect)]]);
 }
 
@@ -165,11 +176,23 @@ fn a_cached_count_is_evaluated_over_the_columns_as_vectors() {
     let (got, t) = traced(&g, src);
     assert_eq!(got, expect);
     assert!(count(&t, SERVED) > 0, "served from the cache…");
-    assert_eq!(count(&t, "interp.columnar aggregate counted over cached columns"), 0, "…but walked");
+    assert_eq!(
+        count(&t, "interp.columnar aggregate counted over cached columns"),
+        0,
+        "…but walked"
+    );
 }
 
-/// A commit retires every column: the next read rebuilds and reflects the
-/// write — never the value it read before it.
+/// A commit retires the column it INVALIDATES: the next read rebuilds and
+/// reflects the write — never the value it read before it.
+///
+/// Fix 124 narrowed this from "every column" to "the columns whose (label,
+/// property) epochs moved". The write below sets `flag`, so `flag`'s column
+/// must be retired and rebuilt; a column over another property of the same
+/// label is not invalidated by it and may still be served. This test used to
+/// assert `SERVED == 0` — the old all-or-nothing regime — and that assertion
+/// is the one thing fix 124 deliberately changes. What must NOT change is the
+/// answer, and that is asserted below exactly as before.
 #[test]
 fn a_commit_retires_the_columns_and_the_next_read_reflects_the_write() {
     let g = corpus();
@@ -179,10 +202,14 @@ fn a_commit_retires_the_columns_and_the_next_read_reflects_the_write() {
     // Flip one counted email's flag off: the count must drop by exactly one.
     rows(&g, "MATCH (d:Doc {n: 2}) SET d.flag = false RETURN d.n");
     let (after, t) = traced(&g, COUNT);
-    assert!(count(&t, RETIRED) > 0, "the stale column must be retired, not served");
-    assert_eq!(count(&t, SERVED), 0);
+    assert!(
+        count(&t, RETIRED) > 0,
+        "the stale column must be retired, not served"
+    );
     assert!(count(&t, KEPT) > 0, "the rebuilt column is kept again");
-    let Value::Int(b) = before[0][0] else { panic!() };
+    let Value::Int(b) = before[0][0] else {
+        panic!()
+    };
     assert_eq!(after, vec![vec![Value::Int(b - 1)]]);
     // And the rebuilt column serves the read after that.
     let (again, t) = traced(&g, COUNT);
@@ -209,7 +236,11 @@ fn the_budget_bounds_what_is_kept_and_never_the_answer() {
     assert_eq!(count(&t, SERVED), 0);
     let (r, t) = traced(&g, COUNT);
     assert_eq!(r, expect);
-    assert_eq!(count(&t, SERVED), 0, "nothing was kept, so nothing is served");
+    assert_eq!(
+        count(&t, SERVED),
+        0,
+        "nothing was kept, so nothing is served"
+    );
     // Back to the default: kept and served again.
     g.set_prop_column_budget(engram_graph::PROP_COLUMN_BUDGET_BYTES);
     let (_, t) = traced(&g, COUNT);
@@ -226,7 +257,10 @@ fn a_batched_aggregate_walks_whole_once_then_batches_against_the_cache() {
     let g = corpus();
     g.set_columnar_agg_batch_size(256); // 1,200 members → five batches
     let (first, t1) = traced(&g, COUNT);
-    assert!(count(&t1, WALKED_WHOLE) > 0, "the first read walks whole to keep");
+    assert!(
+        count(&t1, WALKED_WHOLE) > 0,
+        "the first read walks whole to keep"
+    );
     assert!(count(&t1, KEPT) > 0);
     assert_eq!(count(&t1, "interp.columnar aggregate batched"), 0);
     let (second, t2) = traced(&g, COUNT);
@@ -254,8 +288,16 @@ fn the_memory_report_counts_the_columns() {
     assert_eq!(g.memory_report().prop_columns, 0);
     rows(&g, COUNT);
     let r = g.memory_report();
-    assert!(r.prop_columns >= 3, "kind, flag and note: {}", r.prop_columns);
+    assert!(
+        r.prop_columns >= 3,
+        "kind, flag and note: {}",
+        r.prop_columns
+    );
     assert!(r.prop_column_bytes > 0);
     g.set_prop_column_budget(0);
-    assert_eq!(g.memory_report().prop_columns, 0, "a zero budget empties the cache");
+    assert_eq!(
+        g.memory_report().prop_columns,
+        0,
+        "a zero budget empties the cache"
+    );
 }

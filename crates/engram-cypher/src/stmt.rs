@@ -52,16 +52,51 @@ pub struct RelPattern {
     pub props: Option<Expr>,
     /// Variable-length, if any. `Some(VarLength{None,None})` is bare `*`.
     pub length: Option<VarLength>,
+    /// A per-relationship predicate LIFTED from the enclosing `WHERE`, as
+    /// `(bound name, predicate)` — never written in source, and never parsed.
+    ///
+    /// `WHERE all(e IN r WHERE e.timestamp > $t)` over a variable-length `r`
+    /// is true of a path only if it is true of EVERY relationship on it, so a
+    /// candidate edge that fails it cannot appear in any surviving path and
+    /// the walk need not continue through it. Recording the predicate on the
+    /// pattern is what lets the expansion see it: the matcher is handed a
+    /// `RelPattern`, never the clause's `WHERE`.
+    ///
+    /// The lift COPIES: the original `WHERE` stays exactly as written and is
+    /// still evaluated on the finished rows. So this can only ever remove work
+    /// that provably yields nothing — an engine that ignores the field returns
+    /// the same rows as one that honours it, which is what makes it safe to
+    /// apply in one matcher and not another.
+    pub each: Option<(String, Expr)>,
+}
+
+/// Which shortest paths a `shortestPath(…)` / `allShortestPaths(…)` wrapper
+/// asks for.
+///
+/// An enum and not a second boolean beside `shortest`, because two booleans
+/// admit a state — "all, but not shortest" — that has no meaning, and every
+/// site that reads them would have to know which combinations are real. The
+/// selector is one question with two answers, so it is one field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shortest {
+    /// `shortestPath(…)` — ONE path of minimum length, as Neo4j returns.
+    One,
+    /// `allShortestPaths(…)` — EVERY path of minimum length.
+    ///
+    /// Not the same question, and the difference is not a `LIMIT`: a graph
+    /// with three equally short routes returns three rows here and one for
+    /// [`Shortest::One`], so a caller cannot recover this from that.
+    All,
 }
 
 /// One path: a node, then rel-node hops; possibly named, possibly wrapped in
-/// `shortestPath(…)`.
+/// `shortestPath(…)` or `allShortestPaths(…)`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PathPattern {
     /// `p = …`
     pub var: Option<String>,
-    /// Wrapped in `shortestPath(…)`.
-    pub shortest: bool,
+    /// The shortest-path wrapper, if any.
+    pub shortest: Option<Shortest>,
     /// The first node.
     pub start: NodePattern,
     /// The hops.
@@ -344,6 +379,22 @@ pub enum SchemaCmd {
         /// The properties.
         props: Vec<String>,
     },
+    /// `CREATE TRIGRAM INDEX <name> FOR (n:Label) ON (n.prop)`.
+    ///
+    /// One label and one property, unlike the fulltext form's lists. A trigram
+    /// index is a per-property inverted structure; spanning several would make
+    /// the write hook read the whole node on every write to any of them, which
+    /// is the cost the fulltext index pays and this one does not need to.
+    CreateTrigramIndex {
+        /// The index's name.
+        name: String,
+        /// Whether `IF NOT EXISTS` was given.
+        if_not_exists: bool,
+        /// The label.
+        label: String,
+        /// The property.
+        prop: String,
+    },
     /// `CREATE [RANGE] INDEX [name] FOR (n:Label) ON (n.p…)` — or the
     /// relationship form `FOR ()-[r:TYPE]-() ON (r.p…)`.
     CreateRangeIndex {
@@ -471,9 +522,10 @@ impl Clause {
     /// procedure is treated as a writer, including all of `apoc.*`.
     pub fn may_write(&self) -> bool {
         match self {
-            Clause::Match { .. } | Clause::Unwind { .. } | Clause::With { .. } | Clause::Return { .. } => {
-                false
-            }
+            Clause::Match { .. }
+            | Clause::Unwind { .. }
+            | Clause::With { .. }
+            | Clause::Return { .. } => false,
             Clause::Create { .. }
             | Clause::Merge { .. }
             | Clause::Set { .. }
@@ -486,14 +538,22 @@ impl Clause {
     }
 }
 
-/// The procedures known not to mutate the graph, by (lower-cased,
-/// dot-joined) name. Deliberately a short allow-list rather than a deny-list:
-/// a procedure missing from it merely runs inside a transaction.
+/// Whether a procedure leaves the graph unchanged, by (lower-cased,
+/// dot-joined) name.
+///
+/// This used to be a hand-kept allow-list of names and two PREFIXES, which is
+/// a classification by spelling: anything under `db.index.` counted as
+/// read-only whether it existed or not, so a future
+/// `db.index.fulltext.createNodeIndex` would have been admitted to a read
+/// transaction by its ancestors' name. It also listed `db.info`, which has no
+/// implementation at all — it parsed, passed the check, and then refused at
+/// run time.
+///
+/// The catalogue answers instead, from the same declaration the interpreter
+/// dispatches on, so a procedure cannot be classified one way and implemented
+/// another. **An unknown name is not read-only** — the same fail-closed
+/// direction the allow-list had, now for the whole surface rather than for
+/// whatever the list happened to omit.
 fn procedure_is_read_only(name: &str) -> bool {
-    name.starts_with("db.index.")
-        || name.starts_with("db.schema.")
-        || matches!(
-            name,
-            "db.labels" | "db.relationshiptypes" | "db.propertykeys" | "db.info" | "dbms.components"
-        )
+    engram_proc::is_read_only(name)
 }

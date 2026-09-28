@@ -1,0 +1,1497 @@
+{
+  "catalogue_version": 1,
+  "family": "snb_bi",
+  "what_this_is": "The LDBC SNB Business Intelligence read battery - 20 templates, 28 scored variants - transcribed per dialect. A SEPARATE catalogue file from catalogue/statements.json, deliberately: catalogue::digest() is FNV-1a over a whole file and report.rs refuses to compare two runs whose digests differ, so adding a family to the lsqb file would orphan every measurement taken before the edit. New family, new file, its own digest.",
+  "why_this_family_is_worth_more_than_the_others": "It is the only workload here with an EXTERNAL correctness oracle. LDBC publishes a third-party SF10 answer set, https://datasets.ldbcouncil.org/bi-pre-audit/output-sf10-validation-umbra.tar.zst (333,971 B), produced by Umbra - another organisation, another implementation language. Every count recorded in this repository today is two of engram's own arms agreeing with each other over one converter's output, which cannot catch a defect the converter and both arms share. This can.",
+  "cross_validation": {
+    "oracle": "https://datasets.ldbcouncil.org/bi-pre-audit/output-sf10-validation-umbra.tar.zst",
+    "tool": "ldbc_snb_bi/scripts/cross-validate.py",
+    "what_it_requires": "The comparison is ROW-ALIGNED, not set-based. cross-validate.py walks the two result files in parallel, one line per (query, variant, parameter set), and each line is `<query>|<variant>|<parameters-json>|<results-json>`. It compares the two results with recursive_diff at abs_tol=1e-5, so floats need only agree to 1e-5 but STRUCTURE must agree exactly - column names are keys in the JSON objects, and a row count or an ordering that differs is a difference. It exits non-zero if ANY line differs OR if any line was skipped, and a skipped line is what you get when the two files disagree about which variants ran at all. So producing a comparable file means: the same variant set, in the same order, driven by the SAME parameter rows in the same order, with LDBC's column names and its type conversions (common/result_mapping.py, and queries.py's convert_value_to_string: ID/INT -> int, FLOAT -> float, DATETIME -> '%Y-%m-%dT%H:%M:%S.mmm+00:00', DATE -> '%Y-%m-%d', BOOL -> bool).",
+    "what_is_not_established": "Whether engram's answers are comparable to the Umbra file at all before the write batches are applied. The Umbra output is expected to be the pristine initial snapshot, but that is an expectation, not a verified fact; docs/bench/ldbc-coverage-plan.md 2.2 makes BI1/BI2/BI12 against it the two-week decision gate precisely because a systematic divergence there would be evidence that the power batch's writes are applied first."
+  },
+  "provenance": {
+    "source_repo": "github.com/ldbc/ldbc_snb_bi at 47dd38b40844ecdb0e42e5a610c369535304786d, fetched 2026-09-11",
+    "cypher": "neo4j/queries/bi-<n>.cypher, verbatim including LDBC's own leading comment and :params example block. The comment carries the example parameter values and is kept because it is the only in-file record of what a plausible binding looks like.",
+    "sql": "umbra/queries/bi-<n>.sql, verbatim. Umbra's SQL is close to PostgreSQL but NOT identical - see sql_notes.",
+    "projection.columns": "common/result_mapping.py, verbatim (name and type per column, in order). This file is the authority on the result contract; docs/bench/ldbc-coverage-plan.md listed it as unread, and reading it is what produced the column types here.",
+    "parameters": "paramgen/paramgen-queries/pg-<variant>.sql, from the `AS 'name:TYPE'` aliases that become the CSV header of parameters-sf<SF>/bi-<variant>.csv. The parameter CSVs themselves are NOT in the repo; they ship in snb-bi/ldbc-snb-bi-parameters-sf1-to-sf30000.zip (786,466 B).",
+    "variant_curation": "the percentile_disc(...) and WHERE clauses of the same pg-<variant>.sql files.",
+    "precomputation": "umbra/dml/precomp/bi-<n>.sql and neo4j/queries/bi-<n>-create-graph.cypher."
+  },
+  "status_values": {
+    "verified": "this text has been executed against the engine it names and its answer checked against another engine's",
+    "unverified": "transcribed, never executed. A run that uses it is a first run, not a comparison.",
+    "unsupported": "this dialect cannot express the shape; `reason` says why. Declared, never dropped."
+  },
+  "every_entry_here_is_unverified": "SUPERSEDED IN PART, 2026-09-23: every entry is unverified EXCEPT a dialect whose `status` says `verified` -- bi15, bi19 and bi20, `cypher_engram` and `sql` -- and each of those carries a `verification` saying what ran, on which parameters, and what both engines answered. The rest stands as written: Nothing in this file has been run. It is a transcription of LDBC's text and of the contract around it. The one thing it is NOT is evidence about engram.",
+  "dialects": {
+    "cypher": {
+      "engines": [
+        "engram",
+        "neo4j"
+      ],
+      "transport": "bolt",
+      "note": "one text for both engines is the whole point of the shared key: a Bolt comparison must not become a comparison of two Cyphers. BI15, BI19 and BI20 break that premise and are declared `unsupported` here, with the Neo4j reference text kept under `cypher_neo4j`."
+    },
+    "sql": {
+      "engines": [
+        "postgres"
+      ],
+      "transport": "pgwire",
+      "note": "the text is Umbra's. It has not been run against PostgreSQL."
+    },
+    "cypher_ladybug": {
+      "engines": [
+        "ladybug",
+        "kuzu"
+      ],
+      "transport": "embedded-python",
+      "rel_alternation": true,
+      "note": "no LadybugDB/Kuzu implementation of BI is published by LDBC, so these entries are the `cypher` text unchanged plus a mechanically-detected list of constructs a first run must clear. They are transcriptions of a Neo4j dialect, not a ported battery, and treating them as the latter is the mistake this note exists to prevent."
+    },
+    "cypher_neo4j": {
+      "engines": [
+        "neo4j"
+      ],
+      "transport": "bolt",
+      "note": "present ONLY for BI15/BI19/BI20, where Neo4j-via-GDS and engram-via-procedure are different bytes. Recorded so the gap is visible; there is no `cypher_engram` key because no engram text has been written. Be candid about what this costs: for those three queries `sql` carries the second-witness independence alone, and they are also the three most likely to time out in PostgreSQL."
+    }
+  },
+  "parameters_note": "BI queries are PARAMETERISED and the parameters are curated, so a literal baked into the text is a different benchmark. Each variant below declares its parameter names and LDBC types. Placeholder syntax is LDBC's own and differs per dialect - Cypher uses `$name` (bind it), Umbra's SQL uses psql's `:name` interpolation (substitute or rewrite to a positional bind; a `:name` sent unchanged over pgwire is not a parameter). Neither is the `${name}` form the lsqb family's renderer uses, so a driver for this family BINDS and does not render.",
+  "parameter_cycling_note": "The parameter files are SHORTER than a batch needs and LDBC's drivers wrap around them with itertools.cycle, continuing the iterator ACROSS batches: bi-14a/14b hold 50 rows, bi-4/9/11/13 hold 40, bi-3 holds 55 at SF10, against 30 instances per variant per batch. Two consequences worth stating next to the rule: parameters demonstrably repeat, so a result cache not invalidated by the write batch is rewarded for the wrong reason; and restarting the iterator per batch produces a different, non-comparable workload.",
+  "variants_note": "20 templates, 28 scored variants. A variant is NOT a different statement: LDBC's driver reads queries/bi-<n>.cypher for every variant of template n and changes only which parameter file feeds it (see neo4j/benchmark.py, query_variants). The variants are recorded as a list rather than flattened into 28 entries because flattening would duplicate 28 copies of 20 texts and let two of them drift apart, and collapsing to 20 would lose the fact that a/b are curated from OPPOSITE ends of a frequency distribution and are meant to have different costs. Scored variant order, as the driver runs it: 1, 2a, 2b, 3, 4, 5, 6, 7, 8a, 8b, 9, 10a, 10b, 11, 12, 13, 14a, 14b, 15a, 15b, 16a, 16b, 17, 18, 19a, 19b, 20a, 20b.",
+  "projection_note": "The projection contract - columns, types, ORDER BY, LIMIT - is what decides whether two dialects answered the same question. BI answers are RANKED and TRUNCATED, so a tie broken differently is a different answer even when both sides computed every value correctly, and a count-only check cannot see it. Each query therefore carries `projection.tie_break`: whether the ORDER BY is a total order over the projected columns, and where it is not, what breaks the tie. Two traps recorded there rather than rediscovered: BI8 and BI16 sort on a SUM that is not a projected column, and BI14 picks its per-city winner by an INNER pre-order, so `max()` per city is not equivalent.",
+  "scores_note": "This is the READ battery only. power@SF and throughput@SF are NOT computable from it and a number that looks like power@SF but is not is worse than no number: power@SF = 3600 / geomean_29(t_w, t_1, t_2a, ..., t_20b) x SF takes the WRITE time as its 29th term, and throughput@SF = (24h - t_load) x n_batches / t_batches x SF subtracts the load time from a day. Also note the per-variant time the power score uses is the SUM over the 30 instances, not a mean or a median - one pathological parameter moves the score, which is the entire reason parameter curation exists.",
+  "corpus_note": "BI has its own corpus: bi-pre-audit/bi-sf<SF>-composite-projected-fk.tar.zst, laid out as initial_snapshot/{static,dynamic}/<Entity>/part-*.csv[.gz]. Two facts that decide whether a run can be compared to the external oracle at all: its DateTime is RFC-3339 `+00:00` where Interactive v1's is `+0000`, so a date parser that silently leaves an unparsed value as a string makes every windowed query (BI1, BI2, BI8, BI9, BI12, BI13, BI15, BI16, BI17) answer empty rather than fail; and the parameters and the oracle's result rows both carry LDBC ids, while engram keeps gid and `id` dense and carries the LDBC id as a second indexed property `ldbcId` (docs/bench/ldbc-coverage-plan.md 2.2). Any comparison against the oracle must project `ldbcId` where the contract says ID.\n\nCORRECTION 2026-09-21, measured: the second id property is `sourceId`, NOT `ldbcId`. On the SF3 corpus `p.ldbcId` is NULL for all 24,328 Persons and `p.sourceId` is present for all of them — so the instruction above, followed literally, projects a null column and a comparison against the oracle silently matches nothing. Worked example: the Person engram calls id 17049 carries sourceId 15393162799074.",
+  "sql_notes": "The SQL is Umbra's and is not verified against PostgreSQL. Known differences to resolve before it can be: BI4 and BI6 read PRECOMPUTED tables (Top100PopularForumsQ04, PopularityScoreQ06) that the Cypher computes inline, so the two dialects do NOT do the same work for those two - see `precomputation`; the schema is composite-merged-fk with a materialised Message view (Post and Comment folded into one table with RootPostId / ParentMessageId), which docs/bench/pg-snb-schema.sql does not currently declare; and maintain-views.sql uses FORCEORDER(), an Umbra optimizer hint PostgreSQL does not have.",
+  "precomputation": {
+    "what_this_is": "Work LDBC does BEFORE timing, per engine, which is therefore not charged to the query. Recorded because a dialect that computes it inline and one that reads it from a table are not doing the same work, and the timing is what looks wrong, not the answer.",
+    "sql": {
+      "bi4": "umbra/dml/precomp/bi-4.sql builds Top100PopularForumsQ04(id, creationDate, maxNumberOfMembers) - the max over per-country member counts per Forum. The Cypher computes this inline.",
+      "bi6": "umbra/dml/precomp/bi-6.sql builds PopularityScoreQ06(person2id, popularityScore) - likes received per Person. The Cypher computes this inline, which is what its own comment calls 'a redundant computation due to the lack of composable graph queries'.",
+      "bi19": "umbra/dml/precomp/bi-19.sql builds PathQ19(src, dst, w), w = greatest(round(40 - sqrt(interactions)), 1), inserted in both directions.",
+      "bi20": "umbra/dml/precomp/bi-20.sql builds PathQ20(src, dst, w), w = min(abs(classYear difference)) + 1 over shared universities."
+    },
+    "cypher_neo4j": {
+      "bi19": "neo4j/queries/bi-19-create-graph.cypher projects a GDS graph named 'bi19' with the same weight formula; bi-19-drop-graph.cypher removes it. bi-19-without-precomputation.cypher exists as the un-precomputed alternative.",
+      "bi20": "neo4j/queries/bi-20-create-graph.cypher projects 'bi20' with the classYear weight; bi-20-drop-graph.cypher removes it. bi-20-without-precomputation.cypher likewise.",
+      "bi15": "no separate file - BI15's own text drops and re-projects its 'bi15' graph inside the timed statement, which is why its cost is not comparable to BI19's or BI20's."
+    },
+    "cypher_engram": {
+      "bi19": "PATH_Q19 weighted relationship, w = greatest(round(40 - sqrt(interactions)), 1); 5,000 edges on SF0.1 in 69 s.",
+      "bi20": "PATH_Q20 weighted relationship, w = min(abs(classYear difference)) + 1; 2,958 edges on SF0.1 in 0.26 s, 866,117 pairs at SF3.",
+      "bi15": "NONE, deliberately: bi15 builds and drops its own PATH_Q15 inside the timed statement, which is what makes its cost incomparable with bi19's and bi20's. Measured: the algorithm DOES see relationships created earlier in the same statement, so the whole thing is one statement rather than a precomputation plus a query."
+    }
+  },
+  "snb_bi": {
+    "queries": {
+      "bi1": {
+        "title": "Posting summary",
+        "variants": [
+          {
+            "variant": "1",
+            "parameter_file": "parameters-sf<SF>/bi-1.csv",
+            "parameters": [
+              {
+                "name": "datetime",
+                "type": "DATETIME"
+              }
+            ]
+          }
+        ],
+        "projection": {
+          "columns": [
+            {
+              "name": "year",
+              "type": "INT32"
+            },
+            {
+              "name": "isComment",
+              "type": "BOOL"
+            },
+            {
+              "name": "lengthCategory",
+              "type": "INT32"
+            },
+            {
+              "name": "messageCount",
+              "type": "INT32"
+            },
+            {
+              "name": "averageMessageLength",
+              "type": "FLOAT32"
+            },
+            {
+              "name": "sumMessageLength",
+              "type": "INT32"
+            },
+            {
+              "name": "percentageOfMessages",
+              "type": "FLOAT32"
+            }
+          ],
+          "order_by": [
+            "year DESC",
+            "isComment ASC",
+            "lengthCategory ASC"
+          ],
+          "limit": null,
+          "tie_break": "Total. (year, isComment, lengthCategory) is the GROUP BY key and there is no LIMIT, so every group is returned and no tie can be truncated."
+        },
+        "cypher": {
+          "status": "unverified",
+          "text": "// Q1. Posting summary\n/*\n:params { datetime: datetime('2011-12-01T00:00:00.000') }\n*/\nMATCH (message:Message)\nWHERE message.creationDate < $datetime\nWITH count(message) AS totalMessageCountInt // this should be a subquery once Cypher supports it\nWITH toFloat(totalMessageCountInt) AS totalMessageCount\nMATCH (message:Message)\nWHERE message.creationDate < $datetime\n  AND message.content IS NOT NULL\nWITH\n  totalMessageCount,\n  message,\n  message.creationDate.year AS year\nWITH\n  totalMessageCount,\n  year,\n  message:Comment AS isComment,\n  CASE\n    WHEN message.length <  40 THEN 0\n    WHEN message.length <  80 THEN 1\n    WHEN message.length < 160 THEN 2\n    ELSE                           3\n  END AS lengthCategory,\n  count(message) AS messageCount,\n  sum(message.length) / toFloat(count(message)) AS averageMessageLength,\n  sum(message.length) AS sumMessageLength\nRETURN\n  year,\n  isComment,\n  lengthCategory,\n  messageCount,\n  averageMessageLength,\n  sumMessageLength,\n  messageCount / totalMessageCount AS percentageOfMessages\nORDER BY\n  year DESC,\n  isComment ASC,\n  lengthCategory ASC\n"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "/* Q1. Posting summary\n\\set datetime '\\'2011-12-01T00:00:00.000+00:00\\''::timestamp\n */\nWITH\n  message_count AS (\n    SELECT 0.0 + count(*) AS cnt\n      FROM Message\n     WHERE creationDate < :datetime\n)\n, message_prep AS (\n    SELECT extract(year from creationDate) AS messageYear\n         , ParentMessageId IS NOT NULL AS isComment\n         , CASE\n             WHEN length <  40 THEN 0 -- short\n             WHEN length <  80 THEN 1 -- one liner\n             WHEN length < 160 THEN 2 -- tweet\n             ELSE                   3 -- long\n           END AS lengthCategory\n         , length\n      FROM Message\n     WHERE creationDate < :datetime\n       AND content IS NOT NULL\n)\nSELECT messageYear, isComment, lengthCategory\n     , count(*) AS messageCount\n     , avg(length::bigint) AS averageMessageLength\n     , sum(length::bigint) AS sumMessageLength\n     , count(*) / mc.cnt AS percentageOfMessages\n  FROM message_prep\n     , message_count mc\n GROUP BY messageYear, isComment, lengthCategory, mc.cnt\n ORDER BY messageYear DESC, isComment ASC, lengthCategory ASC\n;\n"
+        },
+        "cypher_ladybug": {
+          "status": "unverified",
+          "text": "// Q1. Posting summary\n/*\n:params { datetime: datetime('2011-12-01T00:00:00.000') }\n*/\nMATCH (message:Message)\nWHERE message.creationDate < $datetime\nWITH count(message) AS totalMessageCountInt // this should be a subquery once Cypher supports it\nWITH toFloat(totalMessageCountInt) AS totalMessageCount\nMATCH (message:Message)\nWHERE message.creationDate < $datetime\n  AND message.content IS NOT NULL\nWITH\n  totalMessageCount,\n  message,\n  message.creationDate.year AS year\nWITH\n  totalMessageCount,\n  year,\n  message:Comment AS isComment,\n  CASE\n    WHEN message.length <  40 THEN 0\n    WHEN message.length <  80 THEN 1\n    WHEN message.length < 160 THEN 2\n    ELSE                           3\n  END AS lengthCategory,\n  count(message) AS messageCount,\n  sum(message.length) / toFloat(count(message)) AS averageMessageLength,\n  sum(message.length) AS sumMessageLength\nRETURN\n  year,\n  isComment,\n  lengthCategory,\n  messageCount,\n  averageMessageLength,\n  sumMessageLength,\n  messageCount / totalMessageCount AS percentageOfMessages\nORDER BY\n  year DESC,\n  isComment ASC,\n  lengthCategory ASC\n",
+          "note": "the `cypher` text unchanged. It is NOT ESTABLISHED that LadybugDB/Kuzu parses it; `constructs_to_check` is what a first run has to clear, detected mechanically over this text rather than by trying it.",
+          "constructs_to_check": [
+            "`:Message` - an abstract label carried by both Post and Comment. LadybugDB/Kuzu stores one table per label and has no multi-label node, so this needs the `Post:Comment` rewrite the lsqb family already applies.",
+            "component access on a temporal value (`.year` / `.month`)",
+            "`toFloat()`",
+            "`IS NOT NULL` on a property"
+          ]
+        }
+      },
+      "bi2": {
+        "title": "Tag evolution",
+        "variants": [
+          {
+            "variant": "2a",
+            "parameter_file": "parameters-sf<SF>/bi-2a.csv",
+            "parameters": [
+              {
+                "name": "date",
+                "type": "DATETIME"
+              },
+              {
+                "name": "tagClass",
+                "type": "STRING"
+              }
+            ],
+            "curation": "percentile_disc(0.92) of tagClassNumMessages - a busy TagClass."
+          },
+          {
+            "variant": "2b",
+            "parameter_file": "parameters-sf<SF>/bi-2b.csv",
+            "parameters": [
+              {
+                "name": "date",
+                "type": "DATETIME"
+              },
+              {
+                "name": "tagClass",
+                "type": "STRING"
+              }
+            ],
+            "curation": "percentile_disc(0.62) of tagClassNumMessages."
+          }
+        ],
+        "projection": {
+          "columns": [
+            {
+              "name": "tag.name",
+              "type": "STRING"
+            },
+            {
+              "name": "countWindow1",
+              "type": "INT32"
+            },
+            {
+              "name": "countWindow2",
+              "type": "INT32"
+            },
+            {
+              "name": "diff",
+              "type": "INT32"
+            }
+          ],
+          "order_by": [
+            "diff DESC",
+            "tag.name ASC"
+          ],
+          "limit": 100,
+          "tie_break": "Total: tag.name is unique among Tags."
+        },
+        "cypher": {
+          "status": "unverified",
+          "text": "// Q2. Tag evolution\n/*\n:params { date: datetime('2012-06-01'), tagClass: 'MusicalArtist' }\n*/\nMATCH (tag:Tag)-[:HAS_TYPE]->(:TagClass {name: $tagClass})\n// window 1\nOPTIONAL MATCH (message1:Message)-[:HAS_TAG]->(tag)\n  WHERE $date <= message1.creationDate\n    AND message1.creationDate < $date + duration({days: 100})\nWITH tag, count(message1) AS countWindow1\n// window 2\nOPTIONAL MATCH (message2:Message)-[:HAS_TAG]->(tag)\n  WHERE $date + duration({days: 100}) <= message2.creationDate\n    AND message2.creationDate < $date + duration({days: 200})\nWITH\n  tag,\n  countWindow1,\n  count(message2) AS countWindow2\nRETURN\n  tag.name,\n  countWindow1,\n  countWindow2,\n  abs(countWindow1 - countWindow2) AS diff\nORDER BY\n  diff DESC,\n  tag.name ASC\nLIMIT 100\n"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "/* Q2. Tag evolution\n\\set date '\\'2012-06-01\\''::timestamp\n\\set tagClass '\\'MusicalArtist\\''\n */\nWITH\nMyTag AS (\nSELECT Tag.id AS id, Tag.name AS name\n  FROM TagClass\n  JOIN Tag\n    ON Tag.TypeTagClassId = TagClass.id\n WHERE TagClass.name = :tagClass\n),\ndetail AS (\nSELECT t.id as TagId\n     , count(CASE WHEN Message.creationDate <  :date + INTERVAL '100 days' THEN Message.MessageId ELSE NULL END) AS countMonth1\n     , count(CASE WHEN Message.creationDate >= :date + INTERVAL '100 days' THEN Message.MessageId ELSE NULL END) AS countMonth2\n  FROM MyTag t\n  JOIN Message_hasTag_Tag\n         ON Message_hasTag_tag.TagId = t.id\n  JOIN Message\n    ON Message.MessageId = Message_hasTag_tag.MessageId\n   AND Message.creationDate >= :date\n   AND Message.creationDate <  :date + INTERVAL '200 days'\n GROUP BY t.id\n)\nSELECT t.name AS \"tag.name\"\n     , coalesce(countMonth1, 0)\n     , coalesce(countMonth2, 0)\n     , abs(coalesce(countMonth1, 0)-coalesce(countMonth2, 0)) AS diff\n  FROM MyTag t LEFT JOIN detail ON t.id = detail.TagId\n ORDER BY diff desc, t.name\n LIMIT 100\n;\n"
+        },
+        "cypher_ladybug": {
+          "status": "unverified",
+          "text": "// Q2. Tag evolution\n/*\n:params { date: datetime('2012-06-01'), tagClass: 'MusicalArtist' }\n*/\nMATCH (tag:Tag)-[:HAS_TYPE]->(:TagClass {name: $tagClass})\n// window 1\nOPTIONAL MATCH (message1:Message)-[:HAS_TAG]->(tag)\n  WHERE $date <= message1.creationDate\n    AND message1.creationDate < $date + duration({days: 100})\nWITH tag, count(message1) AS countWindow1\n// window 2\nOPTIONAL MATCH (message2:Message)-[:HAS_TAG]->(tag)\n  WHERE $date + duration({days: 100}) <= message2.creationDate\n    AND message2.creationDate < $date + duration({days: 200})\nWITH\n  tag,\n  countWindow1,\n  count(message2) AS countWindow2\nRETURN\n  tag.name,\n  countWindow1,\n  countWindow2,\n  abs(countWindow1 - countWindow2) AS diff\nORDER BY\n  diff DESC,\n  tag.name ASC\nLIMIT 100\n",
+          "note": "the `cypher` text unchanged. It is NOT ESTABLISHED that LadybugDB/Kuzu parses it; `constructs_to_check` is what a first run has to clear, detected mechanically over this text rather than by trying it.",
+          "constructs_to_check": [
+            "`:Message` - an abstract label carried by both Post and Comment. LadybugDB/Kuzu stores one table per label and has no multi-label node, so this needs the `Post:Comment` rewrite the lsqb family already applies.",
+            "`duration({...})` temporal arithmetic",
+            "`OPTIONAL MATCH`"
+          ]
+        }
+      },
+      "bi3": {
+        "title": "Popular topics in a country",
+        "variants": [
+          {
+            "variant": "3",
+            "parameter_file": "parameters-sf<SF>/bi-3.csv",
+            "parameters": [
+              {
+                "name": "tagClass",
+                "type": "STRING"
+              },
+              {
+                "name": "country",
+                "type": "STRING"
+              }
+            ]
+          }
+        ],
+        "projection": {
+          "columns": [
+            {
+              "name": "forum.id",
+              "type": "ID"
+            },
+            {
+              "name": "forum.title",
+              "type": "STRING"
+            },
+            {
+              "name": "forum.creationDate",
+              "type": "DATETIME"
+            },
+            {
+              "name": "person.id",
+              "type": "ID"
+            },
+            {
+              "name": "messageCount",
+              "type": "INT32"
+            }
+          ],
+          "order_by": [
+            "messageCount DESC",
+            "forum.id ASC"
+          ],
+          "limit": 20,
+          "tie_break": "Total: forum.id identifies the group."
+        },
+        "cypher": {
+          "status": "unverified",
+          "text": "// Q3. Popular topics in a country\n/*\n:params { tagClass: 'MusicalArtist', country: 'Burma' }\n*/\nMATCH\n  (:Country {name: $country})<-[:IS_PART_OF]-(:City)<-[:IS_LOCATED_IN]-\n  (person:Person)<-[:HAS_MODERATOR]-(forum:Forum)-[:CONTAINER_OF]->\n  (post:Post)<-[:REPLY_OF*0..]-(message:Message)-[:HAS_TAG]->(:Tag)-[:HAS_TYPE]->(:TagClass {name: $tagClass})\nRETURN\n  forum.id,\n  forum.title,\n  forum.creationDate,\n  person.id,\n  count(DISTINCT message) AS messageCount\nORDER BY\n  messageCount DESC,\n  forum.id ASC\nLIMIT 20\n"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "/* Q3. Popular topics in a country\n\\set tagClass '\\'MusicalArtist\\''\n\\set country '\\'Burma\\''\n */\nSELECT Forum.id                AS \"forum.id\"\n     , Forum.title             AS \"forum.title\"\n     , Forum.creationDate      AS \"forum.creationDate\"\n     , Forum.ModeratorPersonId AS \"person.id\"\n     , count(Message.MessageId) AS messageCount\nFROM Message\nJOIN Forum\n  ON Forum.id = Message.ContainerForumId\nJOIN Person AS ModeratorPerson\n  ON ModeratorPerson.id = Forum.ModeratorPersonId\nJOIN City\n  ON City.id = ModeratorPerson.LocationCityId\nJOIN Country\n  ON Country.id = City.PartOfCountryId\n AND Country.name = :country\nWHERE EXISTS (\n  SELECT 1\n    FROM TagClass\n    JOIN Tag\n      ON Tag.TypeTagClassId = TagClass.id\n    JOIN Message_hasTag_Tag\n      ON Message_hasTag_Tag.TagId = Tag.id\n   WHERE Message.MessageId = Message_hasTag_Tag.MessageId AND TagClass.name = :tagClass)\nGROUP BY Forum.id, Forum.title, Forum.creationDate, Forum.ModeratorPersonId\nORDER BY messageCount DESC, Forum.id\nLIMIT 20\n;\n"
+        },
+        "cypher_ladybug": {
+          "status": "unverified",
+          "text": "// Q3. Popular topics in a country\n/*\n:params { tagClass: 'MusicalArtist', country: 'Burma' }\n*/\nMATCH\n  (:Country {name: $country})<-[:IS_PART_OF]-(:City)<-[:IS_LOCATED_IN]-\n  (person:Person)<-[:HAS_MODERATOR]-(forum:Forum)-[:CONTAINER_OF]->\n  (post:Post)<-[:REPLY_OF*0..]-(message:Message)-[:HAS_TAG]->(:Tag)-[:HAS_TYPE]->(:TagClass {name: $tagClass})\nRETURN\n  forum.id,\n  forum.title,\n  forum.creationDate,\n  person.id,\n  count(DISTINCT message) AS messageCount\nORDER BY\n  messageCount DESC,\n  forum.id ASC\nLIMIT 20\n",
+          "note": "the `cypher` text unchanged. It is NOT ESTABLISHED that LadybugDB/Kuzu parses it; `constructs_to_check` is what a first run has to clear, detected mechanically over this text rather than by trying it.",
+          "constructs_to_check": [
+            "`:Message` - an abstract label carried by both Post and Comment. LadybugDB/Kuzu stores one table per label and has no multi-label node, so this needs the `Post:Comment` rewrite the lsqb family already applies.",
+            "variable-length `*0..` traversal with an unbounded upper end"
+          ]
+        }
+      },
+      "bi4": {
+        "title": "Top message creators in a country",
+        "variants": [
+          {
+            "variant": "4",
+            "parameter_file": "parameters-sf<SF>/bi-4.csv",
+            "parameters": [
+              {
+                "name": "date",
+                "type": "DATETIME"
+              }
+            ]
+          }
+        ],
+        "projection": {
+          "columns": [
+            {
+              "name": "person.id",
+              "type": "ID"
+            },
+            {
+              "name": "person.firstName",
+              "type": "STRING"
+            },
+            {
+              "name": "person.lastName",
+              "type": "STRING"
+            },
+            {
+              "name": "person.creationDate",
+              "type": "DATETIME"
+            },
+            {
+              "name": "messageCount",
+              "type": "INT32"
+            }
+          ],
+          "order_by": [
+            "messageCount DESC",
+            "person.id ASC"
+          ],
+          "limit": 100,
+          "tie_break": "Total: person.id is unique."
+        },
+        "cypher": {
+          "status": "unverified",
+          "text": "// Q4. Top message creators in a country\n/*\n:params { date: datetime('2010-01-29') }\n*/\nMATCH (country:Country)<-[:IS_PART_OF]-(:City)<-[:IS_LOCATED_IN]-(person:Person)<-[:HAS_MEMBER]-(forum:Forum)\nWHERE forum.creationDate > $date\nWITH country, forum, count(person) AS numberOfMembers\nORDER BY numberOfMembers DESC, forum.id ASC, country.id\nWITH DISTINCT forum AS topForum\nLIMIT 100\n\nWITH collect(topForum) AS topForums\n\nCALL {\n  WITH topForums\n  UNWIND topForums AS topForum1\n  MATCH (topForum1)-[:CONTAINER_OF]->(post:Post)<-[:REPLY_OF*0..]-(message:Message)-[:HAS_CREATOR]->(person:Person)<-[:HAS_MEMBER]-(topForum2:Forum)\n  WITH person, message, topForum2\n  WHERE topForum2 IN topForums\n  RETURN person, count(DISTINCT message) AS messageCount\nUNION ALL\n  // Ensure that people who are members of top forums but have 0 messages are also returned.\n  // To this end, we return each person with a 0 messageCount\n  WITH topForums\n  UNWIND topForums AS topForum1\n  MATCH (person:Person)<-[:HAS_MEMBER]-(topForum1:Forum)\n  RETURN person, 0 AS messageCount\n}\nRETURN\n  person.id AS personId,\n  person.firstName AS personFirstName,\n  person.lastName AS personLastName,\n  person.creationDate AS personCreationDate,\n  sum(messageCount) AS messageCount\nORDER BY\n  messageCount DESC,\n  person.id ASC\nLIMIT 100\n"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "/* Q4. Top message creators by country\n\\set date '\\'2012-09-01\\''::timestamp\n */\nWITH Top100_Popular_Forums AS (\n  SELECT id, creationDate, maxNumberOfMembers\n  FROM Top100PopularForumsQ04\n  WHERE creationDate > :date\n  ORDER BY maxNumberOfMembers DESC, id\n  LIMIT 100\n)\nSELECT au.id AS \"person.id\"\n     , au.firstName AS \"person.firstName\"\n     , au.lastName AS \"person.lastName\"\n     , au.creationDate\n     -- a single person might be member of more than 1 of the top100 forums, so their messages should be DISTINCT counted\n     , count(Message.MessageId) AS messageCount\n  FROM\n       Person au\n       LEFT JOIN Message\n              ON au.id = Message.CreatorPersonId\n             AND Message.ContainerForumId IN (SELECT id FROM Top100_Popular_Forums)\n  WHERE EXISTS (SELECT 1\n                FROM Top100_Popular_Forums\n                INNER JOIN Forum_hasMember_Person\n                        ON Forum_hasMember_Person.ForumId = Top100_Popular_Forums.id\n                WHERE Forum_hasMember_Person.PersonId = au.id\n               )\nGROUP BY au.id, au.firstName, au.lastName, au.creationDate\nORDER BY messageCount DESC, au.id\nLIMIT 100\n;\n"
+        },
+        "cypher_ladybug": {
+          "status": "unverified",
+          "text": "// Q4. Top message creators in a country\n/*\n:params { date: datetime('2010-01-29') }\n*/\nMATCH (country:Country)<-[:IS_PART_OF]-(:City)<-[:IS_LOCATED_IN]-(person:Person)<-[:HAS_MEMBER]-(forum:Forum)\nWHERE forum.creationDate > $date\nWITH country, forum, count(person) AS numberOfMembers\nORDER BY numberOfMembers DESC, forum.id ASC, country.id\nWITH DISTINCT forum AS topForum\nLIMIT 100\n\nWITH collect(topForum) AS topForums\n\nCALL {\n  WITH topForums\n  UNWIND topForums AS topForum1\n  MATCH (topForum1)-[:CONTAINER_OF]->(post:Post)<-[:REPLY_OF*0..]-(message:Message)-[:HAS_CREATOR]->(person:Person)<-[:HAS_MEMBER]-(topForum2:Forum)\n  WITH person, message, topForum2\n  WHERE topForum2 IN topForums\n  RETURN person, count(DISTINCT message) AS messageCount\nUNION ALL\n  // Ensure that people who are members of top forums but have 0 messages are also returned.\n  // To this end, we return each person with a 0 messageCount\n  WITH topForums\n  UNWIND topForums AS topForum1\n  MATCH (person:Person)<-[:HAS_MEMBER]-(topForum1:Forum)\n  RETURN person, 0 AS messageCount\n}\nRETURN\n  person.id AS personId,\n  person.firstName AS personFirstName,\n  person.lastName AS personLastName,\n  person.creationDate AS personCreationDate,\n  sum(messageCount) AS messageCount\nORDER BY\n  messageCount DESC,\n  person.id ASC\nLIMIT 100\n",
+          "note": "the `cypher` text unchanged. It is NOT ESTABLISHED that LadybugDB/Kuzu parses it; `constructs_to_check` is what a first run has to clear, detected mechanically over this text rather than by trying it.",
+          "constructs_to_check": [
+            "`:Message` - an abstract label carried by both Post and Comment. LadybugDB/Kuzu stores one table per label and has no multi-label node, so this needs the `Post:Comment` rewrite the lsqb family already applies.",
+            "variable-length `*0..` traversal with an unbounded upper end",
+            "a `CALL { }` subquery"
+          ]
+        }
+      },
+      "bi5": {
+        "title": "Most active posters of a given topic",
+        "variants": [
+          {
+            "variant": "5",
+            "parameter_file": "parameters-sf<SF>/bi-5.csv",
+            "parameters": [
+              {
+                "name": "tag",
+                "type": "STRING"
+              }
+            ]
+          }
+        ],
+        "projection": {
+          "columns": [
+            {
+              "name": "person.id",
+              "type": "ID"
+            },
+            {
+              "name": "replyCount",
+              "type": "INT32"
+            },
+            {
+              "name": "likeCount",
+              "type": "INT32"
+            },
+            {
+              "name": "messageCount",
+              "type": "INT32"
+            },
+            {
+              "name": "score",
+              "type": "INT32"
+            }
+          ],
+          "order_by": [
+            "score DESC",
+            "person.id ASC"
+          ],
+          "limit": 100,
+          "tie_break": "Total: person.id is unique."
+        },
+        "cypher": {
+          "status": "unverified",
+          "text": "// Q5. Most active Posters of a given Topic\n/*\n:params { tag: 'Abbas_I_of_Persia' }\n*/\nMATCH (tag:Tag {name: $tag})<-[:HAS_TAG]-(message:Message)-[:HAS_CREATOR]->(person:Person)\nOPTIONAL MATCH (message)<-[likes:LIKES]-(:Person)\nWITH person, message, count(likes) AS likeCount\nOPTIONAL MATCH (message)<-[:REPLY_OF]-(reply:Comment)\nWITH person, message, likeCount, count(reply) AS replyCount\nWITH person, count(message) AS messageCount, sum(likeCount) AS likeCount, sum(replyCount) AS replyCount\nRETURN\n  person.id,\n  replyCount,\n  likeCount,\n  messageCount,\n  1*messageCount + 2*replyCount + 10*likeCount AS score\nORDER BY\n  score DESC,\n  person.id ASC\nLIMIT 100\n"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "/* Q5. Most active posters in a given topic\n\\set tag '\\'Abbas_I_of_Persia\\''\n */\nWITH detail AS (\nSELECT Message.CreatorPersonId AS CreatorPersonId\n     , sum(coalesce(Cs.c, 0))  AS replyCount\n     , sum(coalesce(Plm.c, 0)) AS likeCount\n     , count(Message.MessageId) AS messageCount\n  FROM Tag\n  JOIN Message_hasTag_Tag\n    ON Message_hasTag_Tag.TagId = Tag.id\n  JOIN Message\n    ON Message.MessageId = Message_hasTag_Tag.MessageId\n  LEFT JOIN (SELECT ParentMessageId, count(*) FROM Message c WHERE ParentMessageId IS NOT NULL GROUP BY ParentMessageId) Cs(id, c) ON Cs.id = Message.MessageId\n  LEFT JOIN (SELECT MessageId, count(*) FROM Person_likes_Message GROUP BY MessageId) Plm(id, c) ON Plm.id = Message.MessageId\n WHERE Tag.name = :tag\n GROUP BY Message.CreatorPersonId\n)\nSELECT CreatorPersonId AS \"person.id\"\n     , replyCount\n     , likeCount\n     , messageCount\n     , 1*messageCount + 2*replyCount + 10*likeCount AS score\n  FROM detail\n ORDER BY score DESC, CreatorPersonId\n LIMIT 100\n;\n"
+        },
+        "cypher_ladybug": {
+          "status": "unverified",
+          "text": "// Q5. Most active Posters of a given Topic\n/*\n:params { tag: 'Abbas_I_of_Persia' }\n*/\nMATCH (tag:Tag {name: $tag})<-[:HAS_TAG]-(message:Message)-[:HAS_CREATOR]->(person:Person)\nOPTIONAL MATCH (message)<-[likes:LIKES]-(:Person)\nWITH person, message, count(likes) AS likeCount\nOPTIONAL MATCH (message)<-[:REPLY_OF]-(reply:Comment)\nWITH person, message, likeCount, count(reply) AS replyCount\nWITH person, count(message) AS messageCount, sum(likeCount) AS likeCount, sum(replyCount) AS replyCount\nRETURN\n  person.id,\n  replyCount,\n  likeCount,\n  messageCount,\n  1*messageCount + 2*replyCount + 10*likeCount AS score\nORDER BY\n  score DESC,\n  person.id ASC\nLIMIT 100\n",
+          "note": "the `cypher` text unchanged. It is NOT ESTABLISHED that LadybugDB/Kuzu parses it; `constructs_to_check` is what a first run has to clear, detected mechanically over this text rather than by trying it.",
+          "constructs_to_check": [
+            "`:Message` - an abstract label carried by both Post and Comment. LadybugDB/Kuzu stores one table per label and has no multi-label node, so this needs the `Post:Comment` rewrite the lsqb family already applies.",
+            "`OPTIONAL MATCH`"
+          ]
+        }
+      },
+      "bi6": {
+        "title": "Most authoritative users on a given topic",
+        "variants": [
+          {
+            "variant": "6",
+            "parameter_file": "parameters-sf<SF>/bi-6.csv",
+            "parameters": [
+              {
+                "name": "tag",
+                "type": "STRING"
+              }
+            ]
+          }
+        ],
+        "projection": {
+          "columns": [
+            {
+              "name": "person1.id",
+              "type": "ID"
+            },
+            {
+              "name": "authorityScore",
+              "type": "INT32"
+            }
+          ],
+          "order_by": [
+            "authorityScore DESC",
+            "person1.id ASC"
+          ],
+          "limit": 100,
+          "tie_break": "Total: person1.id is unique."
+        },
+        "cypher": {
+          "status": "unverified",
+          "text": "// Q6. Most authoritative users on a given topic\n/*\n:params { tag: 'Arnold_Schwarzenegger' }\n*/\nMATCH (tag:Tag {name: $tag})<-[:HAS_TAG]-(message1:Message)-[:HAS_CREATOR]->(person1:Person)\nOPTIONAL MATCH (message1)<-[:LIKES]-(person2:Person)\nOPTIONAL MATCH (person2)<-[:HAS_CREATOR]-(message2:Message)<-[like:LIKES]-(person3:Person)\nRETURN\n  person1.id,\n  // Using 'DISTINCT like' here ensures that each person2's popularity score is only added once for each person1\n  count(DISTINCT like) AS authorityScore\nORDER BY\n  authorityScore DESC,\n  person1.id ASC\nLIMIT 100\n\n// We need to use a redundant computation due to the lack of composable graph queries in the currently supported Cypher version.\n// This might change in the future with new Cypher versions and GQL.\n"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "/* Q6. Most authoritative users on a given topic\n\\set tag '\\'Arnold_Schwarzenegger\\''\n */\nWITH poster_w_liker AS (\n        SELECT DISTINCT\n            message1.CreatorPersonId AS person1id,\n            like2.PersonId AS person2id\n        FROM Tag\n        JOIN Message_hasTag_Tag\n          ON Message_hasTag_Tag.TagId = Tag.id\n        JOIN Message message1\n          ON message1.MessageId = Message_hasTag_Tag.MessageId\n        LEFT JOIN Person_likes_Message like2\n               ON like2.MessageId = message1.MessageId\n           -- we don't need the Person itself as its ID is in the like\n         WHERE Tag.name = :tag\n    )\nSELECT pl.person1id AS \"person1.id\",\n       sum(coalesce(ps.popularityScore, 0)) AS authorityScore\nFROM poster_w_liker pl\nLEFT JOIN PopularityScoreQ06 ps\n         ON ps.person2id = pl.person2id\nGROUP BY pl.person1id\nORDER BY authorityScore DESC, pl.person1id ASC\nLIMIT 100\n;\n"
+        },
+        "cypher_ladybug": {
+          "status": "unverified",
+          "text": "// Q6. Most authoritative users on a given topic\n/*\n:params { tag: 'Arnold_Schwarzenegger' }\n*/\nMATCH (tag:Tag {name: $tag})<-[:HAS_TAG]-(message1:Message)-[:HAS_CREATOR]->(person1:Person)\nOPTIONAL MATCH (message1)<-[:LIKES]-(person2:Person)\nOPTIONAL MATCH (person2)<-[:HAS_CREATOR]-(message2:Message)<-[like:LIKES]-(person3:Person)\nRETURN\n  person1.id,\n  // Using 'DISTINCT like' here ensures that each person2's popularity score is only added once for each person1\n  count(DISTINCT like) AS authorityScore\nORDER BY\n  authorityScore DESC,\n  person1.id ASC\nLIMIT 100\n\n// We need to use a redundant computation due to the lack of composable graph queries in the currently supported Cypher version.\n// This might change in the future with new Cypher versions and GQL.\n",
+          "note": "the `cypher` text unchanged. It is NOT ESTABLISHED that LadybugDB/Kuzu parses it; `constructs_to_check` is what a first run has to clear, detected mechanically over this text rather than by trying it.",
+          "constructs_to_check": [
+            "`:Message` - an abstract label carried by both Post and Comment. LadybugDB/Kuzu stores one table per label and has no multi-label node, so this needs the `Post:Comment` rewrite the lsqb family already applies.",
+            "`OPTIONAL MATCH`"
+          ]
+        }
+      },
+      "bi7": {
+        "title": "Related topics",
+        "variants": [
+          {
+            "variant": "7",
+            "parameter_file": "parameters-sf<SF>/bi-7.csv",
+            "parameters": [
+              {
+                "name": "tag",
+                "type": "STRING"
+              }
+            ]
+          }
+        ],
+        "projection": {
+          "columns": [
+            {
+              "name": "relatedTag.name",
+              "type": "STRING"
+            },
+            {
+              "name": "count",
+              "type": "INT32"
+            }
+          ],
+          "order_by": [
+            "count DESC",
+            "relatedTag.name ASC"
+          ],
+          "limit": 100,
+          "tie_break": "Total: relatedTag.name is unique among Tags."
+        },
+        "cypher": {
+          "status": "unverified",
+          "text": "// Q7. Related Topics\n/*\n:params { tag: 'Enrique_Iglesias' }\n*/\nMATCH\n  (tag:Tag {name: $tag})<-[:HAS_TAG]-(message:Message),\n  (message)<-[:REPLY_OF]-(comment:Comment)-[:HAS_TAG]->(relatedTag:Tag)\nWHERE NOT (comment)-[:HAS_TAG]->(tag)\nRETURN\n  relatedTag.name,\n  count(DISTINCT comment) AS count\nORDER BY\n  count DESC,\n  relatedTag.name ASC\nLIMIT 100\n"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "/* Q7. Related topics\n\\set tag '\\'Enrique_Iglesias\\''\n */\nWITH MyMessage AS (\n  SELECT m.MessageId\n  FROM Message_hasTag_Tag m, Tag\n  WHERE Tag.name = :tag and m.TagId = Tag.Id\n)\nSELECT RelatedTag.name AS \"relatedTag.name\"\n     , count(*) AS count\n  FROM MyMessage ParentMessage_HasTag_Tag\n  -- as an optimization, we don't need message here as its ID is in ParentMessage_HasTag_Tag\n  -- so proceed to the comment directly\n  INNER JOIN Message Comment\n          ON ParentMessage_HasTag_Tag.MessageId = Comment.ParentMessageId\n  -- comment's tag\n  LEFT  JOIN Message_hasTag_Tag ct\n          ON Comment.MessageId = ct.MessageId\n  INNER JOIN Tag RelatedTag\n          ON RelatedTag.id = ct.TagId\n WHERE TRUE\n  -- comment doesn't have the given tag\n   AND Comment.MessageId NOT IN (SELECT MessageId FROM MyMessage)\n   AND Comment.ParentMessageId IS NOT NULL\n GROUP BY RelatedTag.Name\n ORDER BY count DESC, RelatedTag.name\n LIMIT 100\n;\n"
+        },
+        "cypher_ladybug": {
+          "status": "unverified",
+          "text": "// Q7. Related Topics\n/*\n:params { tag: 'Enrique_Iglesias' }\n*/\nMATCH\n  (tag:Tag {name: $tag})<-[:HAS_TAG]-(message:Message),\n  (message)<-[:REPLY_OF]-(comment:Comment)-[:HAS_TAG]->(relatedTag:Tag)\nWHERE NOT (comment)-[:HAS_TAG]->(tag)\nRETURN\n  relatedTag.name,\n  count(DISTINCT comment) AS count\nORDER BY\n  count DESC,\n  relatedTag.name ASC\nLIMIT 100\n",
+          "note": "the `cypher` text unchanged. It is NOT ESTABLISHED that LadybugDB/Kuzu parses it; `constructs_to_check` is what a first run has to clear, detected mechanically over this text rather than by trying it.",
+          "constructs_to_check": [
+            "`:Message` - an abstract label carried by both Post and Comment. LadybugDB/Kuzu stores one table per label and has no multi-label node, so this needs the `Post:Comment` rewrite the lsqb family already applies."
+          ]
+        }
+      },
+      "bi8": {
+        "title": "Central person for a tag",
+        "variants": [
+          {
+            "variant": "8a",
+            "parameter_file": "parameters-sf<SF>/bi-8a.csv",
+            "parameters": [
+              {
+                "name": "tag",
+                "type": "STRING"
+              },
+              {
+                "name": "startDate",
+                "type": "DATETIME"
+              },
+              {
+                "name": "endDate",
+                "type": "DATETIME"
+              }
+            ],
+            "curation": "percentile_disc(0.98) of the tag/window message frequency - a busy Tag."
+          },
+          {
+            "variant": "8b",
+            "parameter_file": "parameters-sf<SF>/bi-8b.csv",
+            "parameters": [
+              {
+                "name": "tag",
+                "type": "STRING"
+              },
+              {
+                "name": "startDate",
+                "type": "DATETIME"
+              },
+              {
+                "name": "endDate",
+                "type": "DATETIME"
+              }
+            ],
+            "curation": "percentile_disc(0.31) of the same distribution."
+          }
+        ],
+        "projection": {
+          "columns": [
+            {
+              "name": "person.id",
+              "type": "ID"
+            },
+            {
+              "name": "score",
+              "type": "INT32"
+            },
+            {
+              "name": "friendsScore",
+              "type": "INT32"
+            }
+          ],
+          "order_by": [
+            "score + friendsScore DESC",
+            "person.id ASC"
+          ],
+          "limit": 100,
+          "tie_break": "Total: person.id is unique. The sort key is the SUM `score + friendsScore`, which is NOT one of the projected columns - an implementation that sorts on `score` alone returns a different top 100 while every column type still matches."
+        },
+        "cypher": {
+          "status": "unverified",
+          "text": "// Q8. Central Person for a Tag\n/*\n:params { tag: 'Che_Guevara', startDate: datetime('2011-07-20'), endDate: datetime('2011-07-25') }\n*/\nMATCH (tag:Tag {name: $tag})\n// score\nOPTIONAL MATCH (tag)<-[interest:HAS_INTEREST]-(person:Person)\nWITH tag, collect(person) AS interestedPersons\nOPTIONAL MATCH (tag)<-[:HAS_TAG]-(message:Message)-[:HAS_CREATOR]->(person:Person)\n         WHERE $startDate < message.creationDate\n           AND message.creationDate < $endDate\nWITH tag, interestedPersons, interestedPersons + collect(person) AS persons\nUNWIND persons AS person\nWITH DISTINCT tag, person\nWITH\n  tag,\n  person,\n  100 * size([(tag)<-[interest:HAS_INTEREST]-(person) | interest]) + size([(tag)<-[:HAS_TAG]-(message:Message)-[:HAS_CREATOR]->(person) WHERE $startDate < message.creationDate AND message.creationDate < $endDate | message])\n  AS score\nOPTIONAL MATCH (person)-[:KNOWS]-(friend)\n// We need to use a redundant computation due to the lack of composable graph queries in the currently supported Cypher version.\n// This might change in the future with new Cypher versions and GQL.\nWITH\n  person,\n  score,\n  100 * size([(tag)<-[interest:HAS_INTEREST]-(friend) | interest]) + size([(tag)<-[:HAS_TAG]-(message:Message)-[:HAS_CREATOR]->(friend) WHERE $startDate < message.creationDate AND message.creationDate < $endDate | message])\n  AS friendScore\nRETURN\n  person.id,\n  score,\n  sum(friendScore) AS friendsScore\nORDER BY\n  score + friendsScore DESC,\n  person.id ASC\nLIMIT 100\n"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "/* Q8. Central person for a tag\n\\set tag '\\'Che_Guevara\\''\n\\set startDate '\\'2011-07-20\\''::timestamp\n\\set endDate '\\'2011-07-25\\''::timestamp\n */\nWITH Person_interested_in_Tag AS (\n    SELECT Person.id AS PersonId\n      FROM Person\n      JOIN Person_hasInterest_Tag\n        ON Person_hasInterest_Tag.PersonId = Person.id\n      JOIN Tag\n        ON Tag.id = Person_hasInterest_Tag.TagId\n       AND Tag.name = :tag\n)\n   , Person_Message_score AS (\n    SELECT Person.id AS PersonId\n         , count(*) AS message_score\n      FROM Tag\n      JOIN Message_hasTag_Tag\n        ON Message_hasTag_Tag.TagId = Tag.id\n      JOIN Message\n        ON Message_hasTag_Tag.MessageId = Message.MessageId\n       AND :startDate < Message.creationDate\n      JOIN Person\n        ON Person.id = Message.CreatorPersonId\n     WHERE Tag.name = :tag\n       AND Message.creationDate < :endDate\n     GROUP BY Person.id\n)\n   , Person_score AS (\n    SELECT coalesce(Person_interested_in_Tag.PersonId, pms.PersonId) AS PersonId\n         , CASE WHEN Person_interested_in_Tag.PersonId IS NULL then 0 ELSE 100 END -- scored from interest in the given tag\n         + coalesce(pms.message_score, 0) AS score\n      FROM Person_interested_in_Tag\n           FULL JOIN Person_Message_score pms\n                  ON Person_interested_in_Tag.PersonId = pms.PersonId\n)\nSELECT p.PersonId AS \"person.id\"\n     , p.score AS score\n     , coalesce(sum(f.score), 0) AS friendsScore\n  FROM Person_score p\n  LEFT JOIN Person_knows_Person\n    ON Person_knows_Person.Person1Id = p.PersonId\n  LEFT JOIN Person_score f -- the friend\n    ON f.PersonId = Person_knows_Person.Person2Id\n GROUP BY p.PersonId, p.score\n ORDER BY p.score + coalesce(sum(f.score), 0) DESC, p.PersonId\n LIMIT 100\n;\n"
+        },
+        "cypher_ladybug": {
+          "status": "unverified",
+          "text": "// Q8. Central Person for a Tag\n/*\n:params { tag: 'Che_Guevara', startDate: datetime('2011-07-20'), endDate: datetime('2011-07-25') }\n*/\nMATCH (tag:Tag {name: $tag})\n// score\nOPTIONAL MATCH (tag)<-[interest:HAS_INTEREST]-(person:Person)\nWITH tag, collect(person) AS interestedPersons\nOPTIONAL MATCH (tag)<-[:HAS_TAG]-(message:Message)-[:HAS_CREATOR]->(person:Person)\n         WHERE $startDate < message.creationDate\n           AND message.creationDate < $endDate\nWITH tag, interestedPersons, interestedPersons + collect(person) AS persons\nUNWIND persons AS person\nWITH DISTINCT tag, person\nWITH\n  tag,\n  person,\n  100 * size([(tag)<-[interest:HAS_INTEREST]-(person) | interest]) + size([(tag)<-[:HAS_TAG]-(message:Message)-[:HAS_CREATOR]->(person) WHERE $startDate < message.creationDate AND message.creationDate < $endDate | message])\n  AS score\nOPTIONAL MATCH (person)-[:KNOWS]-(friend)\n// We need to use a redundant computation due to the lack of composable graph queries in the currently supported Cypher version.\n// This might change in the future with new Cypher versions and GQL.\nWITH\n  person,\n  score,\n  100 * size([(tag)<-[interest:HAS_INTEREST]-(friend) | interest]) + size([(tag)<-[:HAS_TAG]-(message:Message)-[:HAS_CREATOR]->(friend) WHERE $startDate < message.creationDate AND message.creationDate < $endDate | message])\n  AS friendScore\nRETURN\n  person.id,\n  score,\n  sum(friendScore) AS friendsScore\nORDER BY\n  score + friendsScore DESC,\n  person.id ASC\nLIMIT 100\n",
+          "note": "the `cypher` text unchanged. It is NOT ESTABLISHED that LadybugDB/Kuzu parses it; `constructs_to_check` is what a first run has to clear, detected mechanically over this text rather than by trying it.",
+          "constructs_to_check": [
+            "`:Message` - an abstract label carried by both Post and Comment. LadybugDB/Kuzu stores one table per label and has no multi-label node, so this needs the `Post:Comment` rewrite the lsqb family already applies.",
+            "a pattern comprehension inside `size(...)`",
+            "`OPTIONAL MATCH`"
+          ]
+        }
+      },
+      "bi9": {
+        "title": "Top thread initiators",
+        "variants": [
+          {
+            "variant": "9",
+            "parameter_file": "parameters-sf<SF>/bi-9.csv",
+            "parameters": [
+              {
+                "name": "startDate",
+                "type": "DATETIME"
+              },
+              {
+                "name": "endDate",
+                "type": "DATETIME"
+              }
+            ]
+          }
+        ],
+        "projection": {
+          "columns": [
+            {
+              "name": "person.id",
+              "type": "ID"
+            },
+            {
+              "name": "person.firstName",
+              "type": "STRING"
+            },
+            {
+              "name": "person.lastName",
+              "type": "STRING"
+            },
+            {
+              "name": "threadCount",
+              "type": "INT32"
+            },
+            {
+              "name": "messageCount",
+              "type": "INT32"
+            }
+          ],
+          "order_by": [
+            "messageCount DESC",
+            "person.id ASC"
+          ],
+          "limit": 100,
+          "tie_break": "Total: person.id is unique."
+        },
+        "cypher": {
+          "status": "unverified",
+          "text": "// Q9. Top thread initiators\n/*\n:params { startDate: datetime('2011-10-01'), endDate: datetime('2011-10-15') }\n*/\nMATCH (person:Person)<-[:HAS_CREATOR]-(post:Post)<-[:REPLY_OF*0..]-(reply:Message)\nWHERE  post.creationDate >= $startDate\n  AND  post.creationDate <= $endDate\n  AND reply.creationDate >= $startDate\n  AND reply.creationDate <= $endDate\nRETURN\n  person.id,\n  person.firstName,\n  person.lastName,\n  count(DISTINCT post) AS threadCount,\n  count(DISTINCT reply) AS messageCount\nORDER BY\n  messageCount DESC,\n  person.id ASC\nLIMIT 100\n"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "/* Q9. Top thread initiators\n\\set startDate '\\'2011-10-01\\''::timestamp\n\\set endDate '\\'2011-10-15\\''::timestamp\n */\nWITH\nMPP AS (SELECT RootPostId, count(*) as MessageCount FROM Message WHERE Message.creationDate BETWEEN :startDate AND :endDate GROUP BY RootPostId)\nSELECT Person.id AS \"person.id\"\n     , Person.firstName AS \"person.firstName\"\n     , Person.lastName AS \"person.lastName\"\n     , count(Post.id) AS threadCount\n     , sum(MPP.MessageCount) AS messageCount\n  FROM Person\n  JOIN Post_View Post\n    ON Person.id = Post.CreatorPersonId\n  JOIN MPP\n    ON Post.id = MPP.RootPostId\n WHERE Post.creationDate BETWEEN :startDate AND :endDate\n GROUP BY Person.id, Person.firstName, Person.lastName\n ORDER BY messageCount DESC, Person.id\n LIMIT 100\n;\n"
+        },
+        "cypher_ladybug": {
+          "status": "unverified",
+          "text": "// Q9. Top thread initiators\n/*\n:params { startDate: datetime('2011-10-01'), endDate: datetime('2011-10-15') }\n*/\nMATCH (person:Person)<-[:HAS_CREATOR]-(post:Post)<-[:REPLY_OF*0..]-(reply:Message)\nWHERE  post.creationDate >= $startDate\n  AND  post.creationDate <= $endDate\n  AND reply.creationDate >= $startDate\n  AND reply.creationDate <= $endDate\nRETURN\n  person.id,\n  person.firstName,\n  person.lastName,\n  count(DISTINCT post) AS threadCount,\n  count(DISTINCT reply) AS messageCount\nORDER BY\n  messageCount DESC,\n  person.id ASC\nLIMIT 100\n",
+          "note": "the `cypher` text unchanged. It is NOT ESTABLISHED that LadybugDB/Kuzu parses it; `constructs_to_check` is what a first run has to clear, detected mechanically over this text rather than by trying it.",
+          "constructs_to_check": [
+            "`:Message` - an abstract label carried by both Post and Comment. LadybugDB/Kuzu stores one table per label and has no multi-label node, so this needs the `Post:Comment` rewrite the lsqb family already applies.",
+            "variable-length `*0..` traversal with an unbounded upper end"
+          ]
+        }
+      },
+      "bi10": {
+        "title": "Experts in social circle",
+        "variants": [
+          {
+            "variant": "10a",
+            "parameter_file": "parameters-sf<SF>/bi-10a.csv",
+            "parameters": [
+              {
+                "name": "personId",
+                "type": "ID"
+              },
+              {
+                "name": "country",
+                "type": "STRING"
+              },
+              {
+                "name": "tagClass",
+                "type": "STRING"
+              },
+              {
+                "name": "minPathDistance",
+                "type": "INT"
+              },
+              {
+                "name": "maxPathDistance",
+                "type": "INT"
+              }
+            ],
+            "curation": "percentile_disc(0.55) on the person, country and tagClass frequencies."
+          },
+          {
+            "variant": "10b",
+            "parameter_file": "parameters-sf<SF>/bi-10b.csv",
+            "parameters": [
+              {
+                "name": "personId",
+                "type": "ID"
+              },
+              {
+                "name": "country",
+                "type": "STRING"
+              },
+              {
+                "name": "tagClass",
+                "type": "STRING"
+              },
+              {
+                "name": "minPathDistance",
+                "type": "INT"
+              },
+              {
+                "name": "maxPathDistance",
+                "type": "INT"
+              }
+            ],
+            "curation": "percentile_disc(0.35) on the person frequency, `frequency = 1` on the country leg and percentile_disc(0.25) on the tagClass - a rarer neighbourhood."
+          }
+        ],
+        "projection": {
+          "columns": [
+            {
+              "name": "expertCandidatePerson.id",
+              "type": "ID"
+            },
+            {
+              "name": "tag.name",
+              "type": "STRING"
+            },
+            {
+              "name": "messageCount",
+              "type": "INT32"
+            }
+          ],
+          "order_by": [
+            "messageCount DESC",
+            "tag.name ASC",
+            "expertCandidatePerson.id ASC"
+          ],
+          "limit": 100,
+          "tie_break": "Total: (expertCandidatePerson.id, tag.name) is the grouping key."
+        },
+        "cypher": {
+          "status": "unverified",
+          "text": "// Q10. Experts in social circle\n// Requires the Neo4j APOC library\n/*\n:params {\n    personId: 30786325588624,\n    country: 'China',\n    tagClass: 'MusicalArtist',\n    minPathDistance: 3,\n    maxPathDistance: 4\n}\n*/\nMATCH (startPerson:Person {id: $personId})\nCALL apoc.path.subgraphNodes(startPerson, {\n\trelationshipFilter: \"KNOWS\",\n    minLevel: 1,\n    maxLevel: $minPathDistance-1\n})\nYIELD node\nWITH startPerson, collect(DISTINCT node) AS nodesCloserThanMinPathDistance\nCALL apoc.path.subgraphNodes(startPerson, {\n\trelationshipFilter: \"KNOWS\",\n    minLevel: 1,\n    maxLevel: $maxPathDistance\n})\nYIELD node\nWITH nodesCloserThanMinPathDistance, collect(DISTINCT node) AS nodesCloserThanMaxPathDistance\n// compute the difference of sets: nodesCloserThanMaxPathDistance - nodesCloserThanMinPathDistance\nWITH [n IN nodesCloserThanMaxPathDistance WHERE NOT n IN nodesCloserThanMinPathDistance] AS expertCandidatePersons\nUNWIND expertCandidatePersons AS expertCandidatePerson\nMATCH\n  (expertCandidatePerson)-[:IS_LOCATED_IN]->(:City)-[:IS_PART_OF]->(:Country {name: $country}),\n  (expertCandidatePerson)<-[:HAS_CREATOR]-(message:Message)-[:HAS_TAG]->(:Tag)-[:HAS_TYPE]->\n  (:TagClass {name: $tagClass})\nMATCH\n  (message)-[:HAS_TAG]->(tag:Tag)\nRETURN\n  expertCandidatePerson.id,\n  tag.name,\n  count(DISTINCT message) AS messageCount\nORDER BY\n  messageCount DESC,\n  tag.name ASC,\n  expertCandidatePerson.id ASC\nLIMIT 100\n"
+        },
+        "cypher_engram": {
+          "status": "unverified",
+          "text": "MATCH (startPerson:Person {id: $personId})\nCALL engram.algo.bfs.stream({\n  nodeLabels: ['Person'], relationshipTypes: ['KNOWS'],\n  orientation: 'UNDIRECTED', sourceNode: id(startPerson)\n})\nYIELD nodeId, depth\nWITH nodeId WHERE depth >= $minPathDistance AND depth <= $maxPathDistance\nMATCH (expertCandidatePerson:Person) WHERE id(expertCandidatePerson) = nodeId\nMATCH\n  (expertCandidatePerson)-[:IS_LOCATED_IN]->(:City)-[:IS_PART_OF]->(:Country {name: $country}),\n  (expertCandidatePerson)<-[:HAS_CREATOR]-(message:Message)-[:HAS_TAG]->(:Tag)-[:HAS_TYPE]->\n  (:TagClass {name: $tagClass})\nMATCH\n  (message)-[:HAS_TAG]->(tag:Tag)\nRETURN\n  expertCandidatePerson.id,\n  tag.name,\n  count(DISTINCT message) AS messageCount\nORDER BY\n  messageCount DESC,\n  tag.name ASC,\n  expertCandidatePerson.id ASC\nLIMIT 100\n",
+          "notes": "The reference text's two `apoc.path.subgraphNodes` calls take the set of persons within `maxPathDistance` KNOWS hops and subtract those within `minPathDistance - 1`. That difference is exactly the persons whose SHORTEST KNOWS distance lies in [minPathDistance, maxPathDistance], which is what a BFS depth is, so `engram.algo.bfs.stream` answers it in one traversal. UNDIRECTED because apoc's `relationshipFilter: \"KNOWS\"` with no arrow follows both directions. The start person has depth 0 and is excluded by any minPathDistance >= 1, as `minLevel: 1` excludes it in the reference. Everything after the candidate set is the reference text unchanged."
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "/* Q10. Experts in social circle\n\\set personId 30786325588624\n\\set country '\\'China\\''\n\\set tagClass '\\'MusicalArtist\\''\n\\set minPathDistance 3 -- fixed value\n\\set maxPathDistance 4 -- fixed value\n */\nWITH friends AS\n  (SELECT Person2Id\n     FROM Person_knows_Person\n    WHERE Person1Id = :personId\n  )\n  , friends_of_friends AS\n  (SELECT knowsB.Person2Id AS Person2Id\n     FROM friends\n     JOIN Person_knows_Person knowsB\n       ON friends.Person2Id = knowsB.Person1Id\n  )\n  , friends_and_friends_of_friends AS\n  (SELECT Person2Id\n     FROM friends\n    UNION -- using plain UNION to eliminate duplicates\n   SELECT Person2Id\n     FROM friends_of_friends\n  )\n  , friends_between_3_and_4_hops AS (\n    -- people reachable through 1..4 hops\n    (SELECT DISTINCT knowsD.Person2Id AS Person2Id\n      FROM friends_and_friends_of_friends ffoaf\n      JOIN Person_knows_Person knowsC\n        ON knowsC.Person1Id = ffoaf.Person2Id\n      JOIN Person_knows_Person knowsD\n        ON knowsD.Person1Id = knowsC.Person2Id\n    )\n    -- removing people reachable through 1..2 hops, yielding the ones reachable through 3..4 hops\n    EXCEPT\n    (SELECT Person2Id\n      FROM friends_and_friends_of_friends\n    )\n  )\n  , friend_list AS (\n    SELECT f.person2Id AS friendId\n      FROM friends_between_3_and_4_hops f\n      JOIN Person tf -- the friend's person record\n        ON tf.id = f.person2Id\n      JOIN City\n        ON City.id = tf.LocationCityId\n      JOIN Country\n        ON Country.id = City.PartOfCountryId\n       AND Country.name = :country\n  )\n  , messages_of_tagclass_by_friends AS (\n    SELECT DISTINCT f.friendId\n         , Message.MessageId AS messageid\n      FROM friend_list f\n      JOIN Message\n        ON Message.CreatorPersonId = f.friendId\n      JOIN Message_hasTag_Tag\n        ON Message_hasTag_Tag.MessageId = Message.MessageId\n      JOIN Tag\n        ON Tag.id = Message_hasTag_Tag.TagId\n      JOIN TagClass\n        ON TagClass.id = Tag.TypeTagClassId\n      WHERE TagClass.name = :tagClass\n  )\nSELECT m.friendId AS \"person.id\"\n     , Tag.name AS \"tag.name\"\n     , count(*) AS messageCount\n  FROM messages_of_tagclass_by_friends m\n  JOIN Message_hasTag_Tag\n    ON Message_hasTag_Tag.MessageId = m.MessageId\n  JOIN Tag\n    ON Tag.id = Message_hasTag_Tag.TagId\n GROUP BY m.friendId, Tag.name\n ORDER BY messageCount DESC, Tag.name, m.friendId\n LIMIT 100\n;\n"
+        },
+        "cypher_ladybug": {
+          "status": "unsupported",
+          "reason": "The reference text calls `apoc.path.subgraphNodes`, a Neo4j APOC procedure. LadybugDB/Kuzu ships no APOC, and the min/max path-distance node-set difference would need a different formulation that has not been written."
+        },
+        "cypher_portable": {
+          "status": "rewrite",
+          "why": "The published `cypher` text calls `apoc.path.subgraphNodes`, and LDBC's own header says so: 'Requires the Neo4j APOC library'. That is a Neo4j LIBRARY dependency, not a Cypher feature, so it is not an engram gap and closing it by implementing an APOC-compatible procedure would be measuring the wrong thing. The same query is expressed without APOC in this catalogue's own `sql` dialect, which is what says it is expressible.",
+          "rewrite_of": "cypher",
+          "equivalence": "`apoc.path.subgraphNodes(start, {relationshipFilter: 'KNOWS', minLevel: 1, maxLevel: L})` yields the DISTINCT nodes reachable from `start` over 1..L KNOWS hops; an undirected `-[:KNOWS*1..L]-` walk with `collect(DISTINCT ...)` is the same set. The two levels are `$minPathDistance - 1` = 2 and `$maxPathDistance` = 4 at the published parameters, written out here because a variable-length bound cannot be a parameter. Everything after the set difference is the published text, unchanged.",
+          "not_the_published_text": "Any measurement taken with this must say it used the rewrite. It answers the same question; it is not what LDBC printed.",
+          "text": "MATCH (startPerson:Person {id: $personId})-[:KNOWS*1..2]-(near:Person)\nWITH startPerson, collect(DISTINCT near) AS nodesCloserThanMinPathDistance\nMATCH (startPerson)-[:KNOWS*1..4]-(far:Person)\nWITH nodesCloserThanMinPathDistance, collect(DISTINCT far) AS nodesCloserThanMaxPathDistance\nWITH [n IN nodesCloserThanMaxPathDistance WHERE NOT n IN nodesCloserThanMinPathDistance] AS expertCandidatePersons\nUNWIND expertCandidatePersons AS expertCandidatePerson\nMATCH\n  (expertCandidatePerson)-[:IS_LOCATED_IN]->(:City)-[:IS_PART_OF]->(:Country {name: $country}),\n  (expertCandidatePerson)<-[:HAS_CREATOR]-(message:Message)-[:HAS_TAG]->(:Tag)-[:HAS_TYPE]->\n  (:TagClass {name: $tagClass})\nMATCH\n  (message)-[:HAS_TAG]->(tag:Tag)\nRETURN\n  expertCandidatePerson.id,\n  tag.name,\n  count(DISTINCT message) AS messageCount\nORDER BY\n  messageCount DESC,\n  tag.name ASC,\n  expertCandidatePerson.id ASC\nLIMIT 100\n"
+        }
+      },
+      "bi11": {
+        "title": "Friend triangles",
+        "variants": [
+          {
+            "variant": "11",
+            "parameter_file": "parameters-sf<SF>/bi-11.csv",
+            "parameters": [
+              {
+                "name": "country",
+                "type": "STRING"
+              },
+              {
+                "name": "startDate",
+                "type": "DATETIME"
+              },
+              {
+                "name": "endDate",
+                "type": "DATETIME"
+              }
+            ]
+          }
+        ],
+        "projection": {
+          "columns": [
+            {
+              "name": "count",
+              "type": "INT64"
+            }
+          ],
+          "order_by": [],
+          "limit": null,
+          "tie_break": "Single row (a count); no ordering."
+        },
+        "cypher": {
+          "status": "unverified",
+          "text": "// Q11. Friend triangles\n/*\n:params {\n  country: 'India',\n  startDate: datetime('2012-09-29'),\n  endDate: datetime('2013-01-01')\n}\n*/\nMATCH (a:Person)-[:IS_LOCATED_IN]->(:City)-[:IS_PART_OF]->(country:Country {name: $country}),\n      (a)-[k1:KNOWS]-(b:Person)\nWHERE a.id < b.id\n  AND $startDate <= k1.creationDate AND k1.creationDate <= $endDate\nWITH DISTINCT country, a, b\nMATCH (b)-[:IS_LOCATED_IN]->(:City)-[:IS_PART_OF]->(country)\nWITH DISTINCT country, a, b\nMATCH (b)-[k2:KNOWS]-(c:Person),\n      (c)-[:IS_LOCATED_IN]->(:City)-[:IS_PART_OF]->(country)\nWHERE b.id < c.id\n  AND $startDate <= k2.creationDate AND k2.creationDate <= $endDate\nWITH DISTINCT a, b, c\nMATCH (c)-[k3:KNOWS]-(a)\nWHERE $startDate <= k3.creationDate AND k3.creationDate <= $endDate\nWITH DISTINCT a, b, c\nRETURN count(*) AS count\n"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "/* Q11. Friend triangles\n\\set country '\\'China\\''\n\\set startDate '\\'2010-06-01\\''::timestamp\n\\set endDate '\\'2010-07-01\\''::timestamp\n */\nWITH Persons_of_country_w_friends AS (\n    SELECT Person.id AS PersonId\n         , Person_knows_Person.Person2Id AS FriendId\n         , Person_knows_Person.creationDate AS creationDate\n      FROM Person\n      JOIN City\n        ON City.id = Person.LocationCityId\n      JOIN Country\n        ON Country.id = City.PartOfCountryId\n       AND Country.name = :country\n      JOIN Person_knows_Person\n        ON Person_knows_Person.Person1Id = Person.id\n)\nSELECT count(*)\n  FROM Persons_of_country_w_friends p1\n  JOIN Persons_of_country_w_friends p2\n    ON p1.FriendId = p2.PersonId\n  JOIN Persons_of_country_w_friends p3\n    ON p2.FriendId = p3.PersonId\n   AND p3.FriendId = p1.PersonId\n WHERE true\n    -- filter: unique triangles only\n   AND p1.PersonId < p2.PersonId\n   AND p2.PersonId < p3.PersonId\n    -- filter: only edges created after :startDate and before :endDate\n   AND :startDate <= p1.creationDate AND p1.creationDate <= :endDate\n   AND :startDate <= p2.creationDate AND p2.creationDate <= :endDate\n   AND :startDate <= p3.creationDate AND p3.creationDate <= :endDate\n;\n"
+        },
+        "cypher_ladybug": {
+          "status": "unverified",
+          "text": "// Q11. Friend triangles\n/*\n:params {\n  country: 'India',\n  startDate: datetime('2012-09-29'),\n  endDate: datetime('2013-01-01')\n}\n*/\nMATCH (a:Person)-[:IS_LOCATED_IN]->(:City)-[:IS_PART_OF]->(country:Country {name: $country}),\n      (a)-[k1:KNOWS]-(b:Person)\nWHERE a.id < b.id\n  AND $startDate <= k1.creationDate AND k1.creationDate <= $endDate\nWITH DISTINCT country, a, b\nMATCH (b)-[:IS_LOCATED_IN]->(:City)-[:IS_PART_OF]->(country)\nWITH DISTINCT country, a, b\nMATCH (b)-[k2:KNOWS]-(c:Person),\n      (c)-[:IS_LOCATED_IN]->(:City)-[:IS_PART_OF]->(country)\nWHERE b.id < c.id\n  AND $startDate <= k2.creationDate AND k2.creationDate <= $endDate\nWITH DISTINCT a, b, c\nMATCH (c)-[k3:KNOWS]-(a)\nWHERE $startDate <= k3.creationDate AND k3.creationDate <= $endDate\nWITH DISTINCT a, b, c\nRETURN count(*) AS count\n",
+          "note": "the `cypher` text unchanged. It is NOT ESTABLISHED that LadybugDB/Kuzu parses it; `constructs_to_check` is what a first run has to clear, detected mechanically over this text rather than by trying it.",
+          "constructs_to_check": []
+        }
+      },
+      "bi12": {
+        "title": "How many persons have a given number of messages",
+        "variants": [
+          {
+            "variant": "12",
+            "parameter_file": "parameters-sf<SF>/bi-12.csv",
+            "parameters": [
+              {
+                "name": "startDate",
+                "type": "DATETIME"
+              },
+              {
+                "name": "lengthThreshold",
+                "type": "INT"
+              },
+              {
+                "name": "languages",
+                "type": "STRING[]"
+              }
+            ]
+          }
+        ],
+        "projection": {
+          "columns": [
+            {
+              "name": "messageCount",
+              "type": "INT32"
+            },
+            {
+              "name": "personCount",
+              "type": "INT32"
+            }
+          ],
+          "order_by": [
+            "personCount DESC",
+            "messageCount DESC"
+          ],
+          "limit": null,
+          "tie_break": "Total: messageCount is the grouping key."
+        },
+        "cypher": {
+          "status": "unverified",
+          "text": "// Q12. How many persons have a given number of posts\n/*\n:params {\n  startDate: datetime('2010-07-22'),\n  lengthThreshold: 20,\n  languages: ['ar', 'hu']\n}\n*/\nMATCH (person:Person)\nOPTIONAL MATCH (person)<-[:HAS_CREATOR]-(message:Message)-[:REPLY_OF*0..]->(post:Post)\nWHERE message.content IS NOT NULL\n  AND message.length < $lengthThreshold\n  AND message.creationDate > $startDate\n  AND post.language IN $languages\nWITH\n  person,\n  count(message) AS messageCount\nRETURN\n  messageCount,\n  count(person) AS personCount\nORDER BY\n  personCount DESC,\n  messageCount DESC\n"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "/* Q12. How many persons have a given number of messages\n\\set startDate '\\'2010-07-22\\''::timestamp\n\\set lengthThreshold '20'\n\\set languages '\\'{\"ar\", \"hu\"}\\''::varchar[]\n */\nWITH person_w_posts AS (\n    SELECT Person.id, count(Message.MessageId) as messageCount\n      FROM Person\n      LEFT JOIN Message\n        ON Person.id = Message.CreatorPersonId\n       AND Message.content IS NOT NULL\n       AND Message.length < :lengthThreshold\n       AND Message.creationDate > :startDate\n       AND Message.RootPostLanguage IN :languages\n     GROUP BY Person.id\n)\n, message_count_distribution AS (\n    SELECT pp.messageCount, count(*) as personCount\n      FROM person_w_posts pp\n     GROUP BY pp.messageCount\n     ORDER BY personCount DESC, messageCount DESC\n)\nSELECT *\n  FROM message_count_distribution\nORDER BY personCount DESC, messageCount DESC\n;\n"
+        },
+        "cypher_ladybug": {
+          "status": "unverified",
+          "text": "// Q12. How many persons have a given number of posts\n/*\n:params {\n  startDate: datetime('2010-07-22'),\n  lengthThreshold: 20,\n  languages: ['ar', 'hu']\n}\n*/\nMATCH (person:Person)\nOPTIONAL MATCH (person)<-[:HAS_CREATOR]-(message:Message)-[:REPLY_OF*0..]->(post:Post)\nWHERE message.content IS NOT NULL\n  AND message.length < $lengthThreshold\n  AND message.creationDate > $startDate\n  AND post.language IN $languages\nWITH\n  person,\n  count(message) AS messageCount\nRETURN\n  messageCount,\n  count(person) AS personCount\nORDER BY\n  personCount DESC,\n  messageCount DESC\n",
+          "note": "the `cypher` text unchanged. It is NOT ESTABLISHED that LadybugDB/Kuzu parses it; `constructs_to_check` is what a first run has to clear, detected mechanically over this text rather than by trying it.",
+          "constructs_to_check": [
+            "`:Message` - an abstract label carried by both Post and Comment. LadybugDB/Kuzu stores one table per label and has no multi-label node, so this needs the `Post:Comment` rewrite the lsqb family already applies.",
+            "variable-length `*0..` traversal with an unbounded upper end",
+            "`IS NOT NULL` on a property",
+            "`OPTIONAL MATCH`"
+          ]
+        }
+      },
+      "bi13": {
+        "title": "Zombies in a country",
+        "variants": [
+          {
+            "variant": "13",
+            "parameter_file": "parameters-sf<SF>/bi-13.csv",
+            "parameters": [
+              {
+                "name": "country",
+                "type": "STRING"
+              },
+              {
+                "name": "endDate",
+                "type": "DATETIME"
+              }
+            ]
+          }
+        ],
+        "projection": {
+          "columns": [
+            {
+              "name": "zombie.id",
+              "type": "ID"
+            },
+            {
+              "name": "zombieLikeCount",
+              "type": "INT32"
+            },
+            {
+              "name": "totalLikeCount",
+              "type": "INT32"
+            },
+            {
+              "name": "zombieScore",
+              "type": "FLOAT32"
+            }
+          ],
+          "order_by": [
+            "zombieScore DESC",
+            "zombie.id ASC"
+          ],
+          "limit": 100,
+          "tie_break": "Total: zombie.id is unique."
+        },
+        "cypher": {
+          "status": "unverified",
+          "text": "// Q13. Zombies in a country\n/*\n:params { country: 'France', endDate: datetime('2013-01-01') }\n*/\nMATCH (country:Country {name: $country})<-[:IS_PART_OF]-(:City)<-[:IS_LOCATED_IN]-(zombie:Person)\nWHERE zombie.creationDate < $endDate\nWITH country, zombie\nOPTIONAL MATCH (zombie)<-[:HAS_CREATOR]-(message:Message)\nWHERE message.creationDate < $endDate\nWITH\n  country,\n  zombie,\n  count(message) AS messageCount\nWITH\n  country,\n  zombie,\n  12 * ($endDate.year  - zombie.creationDate.year )\n     + ($endDate.month - zombie.creationDate.month)\n     + 1 AS months,\n  messageCount\nWHERE messageCount / months < 1\nWITH\n  country,\n  collect(zombie) AS zombies\nUNWIND zombies AS zombie\nOPTIONAL MATCH\n  (zombie)<-[:HAS_CREATOR]-(message:Message)<-[:LIKES]-(likerZombie:Person)\nWHERE likerZombie IN zombies\nWITH\n  zombie,\n  count(likerZombie) AS zombieLikeCount\nOPTIONAL MATCH\n  (zombie)<-[:HAS_CREATOR]-(message:Message)<-[:LIKES]-(likerPerson:Person)\nWHERE likerPerson.creationDate < $endDate\nWITH\n  zombie,\n  zombieLikeCount,\n  count(likerPerson) AS totalLikeCount\nRETURN\n  zombie.id,\n  zombieLikeCount,\n  totalLikeCount,\n  CASE totalLikeCount\n    WHEN 0 THEN 0.0\n    ELSE zombieLikeCount / toFloat(totalLikeCount)\n  END AS zombieScore\nORDER BY\n  zombieScore DESC,\n  zombie.id ASC\nLIMIT 100\n"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "/* Q13. Zombies in a country\n\\set country '\\'France\\''\n\\set endDate '\\'2013-01-01\\''::timestamp\n */\nWITH Zombies AS (\n    SELECT Person.id AS zombieid\n      FROM Country\n      JOIN City\n        ON City.PartOfCountryId = Country.id\n      JOIN Person\n        ON Person.LocationCityId = City.id\n      LEFT JOIN Message\n         ON Person.id = Message.CreatorPersonId\n        AND Message.creationDate BETWEEN Person.creationDate AND :endDate -- the lower bound is an optmization to prune messages\n     WHERE Country.name = :country\n       AND Person.creationDate < :endDate\n     GROUP BY Person.id, Person.creationDate\n        -- average of [0, 1) messages per month is equivalent with having less messages than the month span between person creationDate and parameter :endDate\n    HAVING count(Message.MessageId) < 12*extract(YEAR FROM :endDate) + extract(MONTH FROM :endDate)\n                            - (12*extract(YEAR FROM Person.creationDate) + extract(MONTH FROM Person.creationDate))\n                            + 1\n)\nSELECT Z.zombieid AS \"zombie.id\"\n     , coalesce(t.zombieLikeCount, 0) AS zombieLikeCount\n     , coalesce(t.totalLikeCount, 0) AS totalLikeCount\n     , CASE WHEN t.totalLikeCount > 0 THEN t.zombieLikeCount::float/t.totalLikeCount ELSE 0 END AS zombieScore\n  FROM Zombies Z LEFT JOIN (\n    SELECT Z.zombieid, count(*) as totalLikeCount, sum(case when exists (SELECT 1 FROM Zombies ZL WHERE ZL.zombieid = p.id) then 1 else 0 end) AS zombieLikeCount\n    FROM Person p, Person_likes_Message plm, Message m, Zombies Z\n    WHERE Z.zombieid = m.CreatorPersonId AND p.creationDate < :endDate\n        AND p.id = plm.PersonId AND m.MessageId = plm.MessageId\n    GROUP BY Z.zombieid\n  ) t ON (Z.zombieid = t.zombieid)\n ORDER BY zombieScore DESC, Z.zombieid\n LIMIT 100\n;\n"
+        },
+        "cypher_ladybug": {
+          "status": "unverified",
+          "text": "// Q13. Zombies in a country\n/*\n:params { country: 'France', endDate: datetime('2013-01-01') }\n*/\nMATCH (country:Country {name: $country})<-[:IS_PART_OF]-(:City)<-[:IS_LOCATED_IN]-(zombie:Person)\nWHERE zombie.creationDate < $endDate\nWITH country, zombie\nOPTIONAL MATCH (zombie)<-[:HAS_CREATOR]-(message:Message)\nWHERE message.creationDate < $endDate\nWITH\n  country,\n  zombie,\n  count(message) AS messageCount\nWITH\n  country,\n  zombie,\n  12 * ($endDate.year  - zombie.creationDate.year )\n     + ($endDate.month - zombie.creationDate.month)\n     + 1 AS months,\n  messageCount\nWHERE messageCount / months < 1\nWITH\n  country,\n  collect(zombie) AS zombies\nUNWIND zombies AS zombie\nOPTIONAL MATCH\n  (zombie)<-[:HAS_CREATOR]-(message:Message)<-[:LIKES]-(likerZombie:Person)\nWHERE likerZombie IN zombies\nWITH\n  zombie,\n  count(likerZombie) AS zombieLikeCount\nOPTIONAL MATCH\n  (zombie)<-[:HAS_CREATOR]-(message:Message)<-[:LIKES]-(likerPerson:Person)\nWHERE likerPerson.creationDate < $endDate\nWITH\n  zombie,\n  zombieLikeCount,\n  count(likerPerson) AS totalLikeCount\nRETURN\n  zombie.id,\n  zombieLikeCount,\n  totalLikeCount,\n  CASE totalLikeCount\n    WHEN 0 THEN 0.0\n    ELSE zombieLikeCount / toFloat(totalLikeCount)\n  END AS zombieScore\nORDER BY\n  zombieScore DESC,\n  zombie.id ASC\nLIMIT 100\n",
+          "note": "the `cypher` text unchanged. It is NOT ESTABLISHED that LadybugDB/Kuzu parses it; `constructs_to_check` is what a first run has to clear, detected mechanically over this text rather than by trying it.",
+          "constructs_to_check": [
+            "`:Message` - an abstract label carried by both Post and Comment. LadybugDB/Kuzu stores one table per label and has no multi-label node, so this needs the `Post:Comment` rewrite the lsqb family already applies.",
+            "component access on a temporal value (`.year` / `.month`)",
+            "`toFloat()`",
+            "`OPTIONAL MATCH`"
+          ]
+        }
+      },
+      "bi14": {
+        "title": "International dialogue",
+        "variants": [
+          {
+            "variant": "14a",
+            "parameter_file": "parameters-sf<SF>/bi-14a.csv",
+            "parameters": [
+              {
+                "name": "country1",
+                "type": "STRING"
+              },
+              {
+                "name": "country2",
+                "type": "STRING"
+              }
+            ],
+            "curation": "percentile_disc(0.98) of countryPairsNumFriends - a heavily connected country pair."
+          },
+          {
+            "variant": "14b",
+            "parameter_file": "parameters-sf<SF>/bi-14b.csv",
+            "parameters": [
+              {
+                "name": "country1",
+                "type": "STRING"
+              },
+              {
+                "name": "country2",
+                "type": "STRING"
+              }
+            ],
+            "curation": "percentile_disc(0.03) of countryPairsNumFriends - a sparsely connected pair."
+          }
+        ],
+        "projection": {
+          "columns": [
+            {
+              "name": "person1.id",
+              "type": "ID"
+            },
+            {
+              "name": "person2.id",
+              "type": "ID"
+            },
+            {
+              "name": "city1.name",
+              "type": "STRING"
+            },
+            {
+              "name": "score",
+              "type": "INT32"
+            }
+          ],
+          "order_by": [
+            "score DESC",
+            "person1.id ASC",
+            "person2.id ASC"
+          ],
+          "limit": 100,
+          "tie_break": "Total, but only because of the INNER pre-order. The per-city winner is `collect({score, person1Id, person2Id})[0]` taken under `ORDER BY city1.name ASC, score DESC, person1.id ASC, person2.id ASC`, so a tie inside a city is broken by (person1.id, person2.id). An implementation that takes an arbitrary max per city agrees on the score and disagrees on the pair."
+        },
+        "cypher": {
+          "status": "unverified",
+          "text": "// Q14. International dialog\n/*\n:params { country1: 'Chile', country2: 'Argentina' }\n*/\nMATCH\n  (country1:Country {name: $country1})<-[:IS_PART_OF]-(city1:City)<-[:IS_LOCATED_IN]-(person1:Person),\n  (country2:Country {name: $country2})<-[:IS_PART_OF]-(city2:City)<-[:IS_LOCATED_IN]-(person2:Person),\n  (person1)-[:KNOWS]-(person2)\nWITH person1, person2, city1, 0 AS score\n// case 1\nOPTIONAL MATCH (person1)<-[:HAS_CREATOR]-(c:Comment)-[:REPLY_OF]->(:Message)-[:HAS_CREATOR]->(person2)\nWITH DISTINCT person1, person2, city1, score + (CASE WHEN c IS NULL THEN 0 ELSE  4 END) AS score\n// case 2\nOPTIONAL MATCH (person1)<-[:HAS_CREATOR]-(m:Message)<-[:REPLY_OF]-(:Comment)-[:HAS_CREATOR]->(person2)\nWITH DISTINCT person1, person2, city1, score + (CASE WHEN m IS NULL THEN 0 ELSE  1 END) AS score\n// case 3\nOPTIONAL MATCH (person1)-[:LIKES]->(m:Message)-[:HAS_CREATOR]->(person2)\nWITH DISTINCT person1, person2, city1, score + (CASE WHEN m IS NULL THEN 0 ELSE 10 END) AS score\n// case 4\nOPTIONAL MATCH (person1)<-[:HAS_CREATOR]-(m:Message)<-[:LIKES]-(person2)\nWITH DISTINCT person1, person2, city1, score + (CASE WHEN m IS NULL THEN 0 ELSE  1 END) AS score\n// preorder\nORDER BY\n  city1.name ASC,\n  score DESC,\n  person1.id ASC,\n  person2.id ASC\nWITH city1, collect({score: score, person1Id: person1.id, person2Id: person2.id})[0] AS top\nRETURN\n  top.person1Id,\n  top.person2Id,\n  city1.name,\n  top.score\nORDER BY\n  top.score DESC,\n  top.person1Id ASC,\n  top.person2Id ASC\nLIMIT 100\n"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "/* Q14. International dialog\n\\set country1 '\\'Chile\\''\n\\set country2 '\\'Argentina\\''\n */\nWITH PersonPairCandidates AS (\n    SELECT Person1.id AS Person1Id\n         , Person2.id AS Person2Id\n         , City1.id AS cityId\n         , City1.name AS cityName\n      FROM Country Country1\n      JOIN City City1\n        ON City1.PartOfCountryId = Country1.id\n      JOIN Person Person1\n        ON Person1.LocationCityId = City1.id\n      JOIN Person_knows_Person\n        ON Person_knows_Person.Person1Id = Person1.id\n      JOIN Person Person2\n        ON Person2.id = Person_knows_Person.Person2Id\n      JOIN City City2\n        ON Person2.LocationCityId = City2.id\n      JOIN Country Country2\n        ON Country2.id = City2.PartOfCountryId\n     WHERE Country1.name = :country1\n       AND Country2.name = :country2\n)\n,  PPC(Person1Id, Person2Id, Flipped) AS (\n   SELECT Person1Id AS Person1Id, Person2Id AS Person2Id, false AS Flipped FROM PersonPairCandidates\n   UNION ALL\n   SELECT Person2Id AS Person1Id, Person1Id AS Person2Id, true As Flipped FROM PersonPairCandidates\n)\n,  pair_scores AS (\n    SELECT CASE WHEN Flipped THEN Person2Id ELSE Person1Id END AS Person1Id,\n           CASE WHEN Flipped THEN Person1Id ELSE Person2Id END AS Person2Id,\n        (\n        CASE WHEN EXISTS (SELECT 1 FROM Message m, Message r WHERE m.MessageId = r.ParentMessageId AND Person1Id = r.CreatorPersonId AND Person2Id = m.CreatorPersonId AND EXISTS (SELECT 1 FROM PPC x WHERE x.Person1Id = r.CreatorPersonId)) THEN (CASE WHEN Flipped THEN 1 ELSE 4 END) ELSE 0 END +\n        CASE WHEN EXISTS (SELECT 1 FROM Message m, Person_likes_Message l WHERE Person2Id = m.CreatorPersonId AND m.MessageId = l.MessageId AND l.PersonId = Person1Id AND EXISTS (SELECT 1 FROM PPC x WHERE x.Person1Id = l.PersonId)) THEN (CASE WHEN Flipped THEN 1 ELSE 10 END) ELSE 0 END\n        ) as score\n      FROM PPC\n)\n,  pair_scoresX AS (\n    SELECT Person1Id, Person2Id, sum(score) as score\n      FROM pair_scores\n      GROUP BY Person1Id, Person2Id\n)\n,  score_ranks AS (\n    SELECT DISTINCT ON (cityId)\n         PersonPairCandidates.Person1Id, PersonPairCandidates.Person2Id, cityId, cityName\n         , s.score AS score\n      FROM PersonPairCandidates\n      LEFT JOIN pair_scoresX s\n             ON s.Person1Id = PersonPairCandidates.Person1Id\n            AND s.person2Id = PersonPairCandidates.Person2Id\n      ORDER BY cityId, s.score DESC, PersonPairCandidates.Person1Id, PersonPairCandidates.Person2Id\n)\nSELECT score_ranks.Person1Id AS \"person1.id\"\n     , score_ranks.Person2Id AS \"person2.id\"\n     , score_ranks.cityName AS \"city1.name\"\n     , score_ranks.score\n  FROM score_ranks\n ORDER BY score_ranks.score DESC, score_ranks.Person1Id, score_ranks.Person2Id\n LIMIT 100\n;\n"
+        },
+        "cypher_ladybug": {
+          "status": "unverified",
+          "text": "// Q14. International dialog\n/*\n:params { country1: 'Chile', country2: 'Argentina' }\n*/\nMATCH\n  (country1:Country {name: $country1})<-[:IS_PART_OF]-(city1:City)<-[:IS_LOCATED_IN]-(person1:Person),\n  (country2:Country {name: $country2})<-[:IS_PART_OF]-(city2:City)<-[:IS_LOCATED_IN]-(person2:Person),\n  (person1)-[:KNOWS]-(person2)\nWITH person1, person2, city1, 0 AS score\n// case 1\nOPTIONAL MATCH (person1)<-[:HAS_CREATOR]-(c:Comment)-[:REPLY_OF]->(:Message)-[:HAS_CREATOR]->(person2)\nWITH DISTINCT person1, person2, city1, score + (CASE WHEN c IS NULL THEN 0 ELSE  4 END) AS score\n// case 2\nOPTIONAL MATCH (person1)<-[:HAS_CREATOR]-(m:Message)<-[:REPLY_OF]-(:Comment)-[:HAS_CREATOR]->(person2)\nWITH DISTINCT person1, person2, city1, score + (CASE WHEN m IS NULL THEN 0 ELSE  1 END) AS score\n// case 3\nOPTIONAL MATCH (person1)-[:LIKES]->(m:Message)-[:HAS_CREATOR]->(person2)\nWITH DISTINCT person1, person2, city1, score + (CASE WHEN m IS NULL THEN 0 ELSE 10 END) AS score\n// case 4\nOPTIONAL MATCH (person1)<-[:HAS_CREATOR]-(m:Message)<-[:LIKES]-(person2)\nWITH DISTINCT person1, person2, city1, score + (CASE WHEN m IS NULL THEN 0 ELSE  1 END) AS score\n// preorder\nORDER BY\n  city1.name ASC,\n  score DESC,\n  person1.id ASC,\n  person2.id ASC\nWITH city1, collect({score: score, person1Id: person1.id, person2Id: person2.id})[0] AS top\nRETURN\n  top.person1Id,\n  top.person2Id,\n  city1.name,\n  top.score\nORDER BY\n  top.score DESC,\n  top.person1Id ASC,\n  top.person2Id ASC\nLIMIT 100\n",
+          "note": "the `cypher` text unchanged. It is NOT ESTABLISHED that LadybugDB/Kuzu parses it; `constructs_to_check` is what a first run has to clear, detected mechanically over this text rather than by trying it.",
+          "constructs_to_check": [
+            "`:Message` - an abstract label carried by both Post and Comment. LadybugDB/Kuzu stores one table per label and has no multi-label node, so this needs the `Post:Comment` rewrite the lsqb family already applies.",
+            "`collect()` over a map literal, indexed with `[0]`",
+            "`OPTIONAL MATCH`"
+          ]
+        }
+      },
+      "bi15": {
+        "title": "Weighted interaction paths",
+        "variants": [
+          {
+            "variant": "15a",
+            "parameter_file": "parameters-sf<SF>/bi-15a.csv",
+            "parameters": [
+              {
+                "name": "person1Id",
+                "type": "ID"
+              },
+              {
+                "name": "person2Id",
+                "type": "ID"
+              },
+              {
+                "name": "startDate",
+                "type": "DATETIME"
+              },
+              {
+                "name": "endDate",
+                "type": "DATETIME"
+              }
+            ],
+            "curation": "percentile_disc(0.95), with a further join in pg-15a.sql (pg-15a_core.sql) that constrains the pair through a middle candidate on a KNOWS path - transcribed from the parameter query, not verified against the generated rows."
+          },
+          {
+            "variant": "15b",
+            "parameter_file": "parameters-sf<SF>/bi-15b.csv",
+            "parameters": [
+              {
+                "name": "person1Id",
+                "type": "ID"
+              },
+              {
+                "name": "person2Id",
+                "type": "ID"
+              },
+              {
+                "name": "startDate",
+                "type": "DATETIME"
+              },
+              {
+                "name": "endDate",
+                "type": "DATETIME"
+              }
+            ],
+            "curation": "percentile_disc(0.10)."
+          }
+        ],
+        "projection": {
+          "columns": [
+            {
+              "name": "weight",
+              "type": "FLOAT32"
+            }
+          ],
+          "order_by": [],
+          "limit": null,
+          "tie_break": "Single row: `max(totalCost)`, and -1.0 when no path exists. An empty result is a DIFFERENT answer from the reference, which returns the row."
+        },
+        "cypher": {
+          "status": "unsupported",
+          "reason": "No single Cypher text serves both engines. Neo4j needs GDS - `gds.graph.project.cypher` then `gds.shortestPath.dijkstra.stream` over the projection - and engram would need its own weighted shortest-path procedure over a materialised weight property. The engram text is NOT ESTABLISHED. `cypher_neo4j` below carries the reference text so the gap is declared rather than dropped. docs/bench/ldbc-coverage-plan.md 2.2 names this the family's weakest point: for BI15/BI19/BI20, `sql` carries the second-witness independence alone."
+        },
+        "cypher_neo4j": {
+          "status": "unverified",
+          "text": "// Q15. Weighted interaction paths\n// Requires the Neo4j Graph Data Science library\n/*\n:params {\n    person1Id: 14,\n    person2Id: 16,\n    startDate: datetime('2010-11-01'),\n    endDate: datetime('2010-12-01')\n}\n*/\nCALL gds.graph.drop('bi15', false)\nYIELD graphName\n\n// ----------------------------------------------------------------------------------------------------\nWITH count(*) AS dummy\n// ----------------------------------------------------------------------------------------------------\n\nCALL gds.graph.project.cypher(\n  'bi15',\n  'MATCH (p:Person) RETURN id(p) AS id',\n  'MATCH (pA:Person)-[knows:KNOWS]-(pB:Person)\n      OPTIONAL MATCH (pA)<-[:HAS_CREATOR]-(m1:Message)-[r:REPLY_OF]-(m2:Message)-[:HAS_CREATOR]->(pB)\n      OPTIONAL MATCH (m1)-[:REPLY_OF*0..]->(:Post)<-[:CONTAINER_OF]-(forum:Forum)\n              WHERE forum.creationDate >= datetime({epochmillis: ' + $startDate.epochMillis + '})\n                AND forum.creationDate <= datetime({epochmillis: ' + $endDate.epochMillis   + '})\n      WITH pA, pB,\n          sum(CASE forum IS NOT NULL\n              WHEN true THEN\n                  CASE (m1:Post OR m2:Post) WHEN true THEN 1.0\n                  ELSE 0.5 END\n              ELSE 0.0 END\n          ) AS w\n      RETURN\n        id(pA) AS source,\n        id(pB) AS target,\n        1/(w+1) AS weight\n  '\n)\nYIELD graphName\n\n// ----------------------------------------------------------------------------------------------------\nWITH count(*) AS dummy\n// ----------------------------------------------------------------------------------------------------\n\nCALL {\n  MATCH (person1:Person {id: $person1Id}), (person2:Person {id: $person2Id})\n  CALL gds.shortestPath.dijkstra.stream('bi15', {\n    sourceNode: person1,\n    targetNode: person2,\n    relationshipWeightProperty: 'weight'\n  })\n  YIELD index, sourceNode, targetNode, totalCost, nodeIds, costs, path\n  RETURN totalCost\n  UNION ALL\n  RETURN -1.0 AS totalCost\n}\nRETURN max(totalCost) AS totalCost\n"
+        },
+        "sql": {
+          "status": "verified",
+          "text": "/* Q15. Trusted connection paths through forums created in a given timeframe\n\\set person1Id 21990232564808\n\\set person2Id 26388279076936\n\\set startDate '\\'2010-11-01\\''::timestamp\n\\set endDate '\\'2010-12-01\\''::timestamp\n */\nwith recursive\nsrcs(f) as (select :person1Id),\ndsts(t) as (select :person2Id),\nmyForums(id) as (\n    select id from Forum f where f.creationDate between :startDate and :endDate\n),\nmm as (\n    select least(msg.CreatorPersonId, reply.CreatorPersonId) as src, greatest(msg.CreatorPersonId, reply.CreatorPersonId) as dst, sum(case when msg.ParentMessageId is null then 10 else 5 end) as w\n    from Person_knows_Person pp, Message msg, Message reply\n    where true\n          and pp.person1id = msg.CreatorPersonId \n          and pp.person2id = reply.CreatorPersonId\n          and reply.ParentMessageId = msg.MessageId\n          and exists (select * from myForums f where f.id = msg.containerforumid)\n          and exists (select * from myForums f where f.id = reply.containerforumid)\n    group by src, dst\n),\npath(src, dst, w) as (\n    select pp.person1id, pp.person2id, 10::double precision / (coalesce(w, 0) + 10)\n    from Person_knows_Person pp left join mm on least(pp.person1id, pp.person2id) = mm.src and greatest(pp.person1id, pp.person2id) = mm.dst\n),\n-- bidirectional bfs for nonexistant paths\npexists(src, dir) as (\n    (\n        select f, true from srcs\n        union all\n        select t, false from dsts\n    )\n    union\n    (\n        with\n        ss(src, dir) as (select src, dir from pexists),\n        ns(src, dir) as (select p.dst, ss.dir from ss, path p where ss.src = p.src),\n        bb(src, dir) as (select src, dir from ns union all select src, dir from ss),\n        found as (\n            select 1\n            from bb b1, bb b2\n            where b1.dir and (not b2.dir) and b1.src = b2.src\n        )\n        select src, dir\n        from ns\n        where not exists (select 1 from found)\n        union all\n        select -1, true\n        where exists (select 1 from found)\n    )\n),\npathfound(c) as (\n    select 1\n    from pexists\n    where src = -1 and dir\n),\nshorts(dir, gsrc, dst, w, dead, iter) as (\n    (\n        select false, f, f, 0::double precision, false, 0 from srcs where exists (select 1 from pathfound)\n        union all\n        select true, t, t, 0::double precision, false, 0 from dsts where exists (select 1 from pathfound)\n    )\n    union all\n    (\n        with\n        ss as (select * from shorts),\n        toExplore as (select * from ss where dead = false order by w limit 1000),\n        -- assumes graph is undirected\n        newPoints(dir, gsrc, dst, w, dead) as (\n            select e.dir, e.gsrc as gsrc, p.dst as dst, e.w + p.w as w, false as dead\n            from path p join toExplore e on (e.dst = p.src)\n            union all\n            select dir, gsrc, dst, w, dead or exists (select * from toExplore e where e.dir = o.dir and e.gsrc = o.gsrc and e.dst = o.dst) from ss o\n        ),\n        fullTable as (\n            select distinct on(dir, gsrc, dst) dir, gsrc, dst, w, dead\n            from newPoints\n            order by dir, gsrc, dst, w, dead desc\n        ),\n        found as (\n            select min(l.w + r.w) as w\n            from fullTable l, fullTable r\n            where l.dir = false and r.dir = true and l.dst = r.dst\n        )\n        select dir,\n               gsrc,\n               dst,\n               w,\n               dead or (coalesce(t.w > (select f.w/2 from found f), false)),\n               e.iter + 1 as iter\n        from fullTable t, (select iter from toExplore limit 1) e\n    )\n),\nss(dir, gsrc, dst, w, iter) as (\n    select dir, gsrc, dst, w, iter from shorts where iter = (select max(iter) from shorts)\n),\nresults(f, t, w) as (\n    select l.gsrc, r.gsrc, min(l.w + r.w)\n    from ss l, ss r\n    where l.dir = false and r.dir = true and l.dst = r.dst\n    group by l.gsrc, r.gsrc\n)\nselect coalesce(min(w), -1) from results;\n",
+          "verification": "2026-09-23, SF3, measurements/baselines/bi-p95-v2.json: engram (cypher_engram, rev22) and PostgreSQL 17 (sql, ldbc_bi_sf3) both answered totalCost 0.1756782945736434 for bi15a and bi15b -- identical to the last digit."
+        },
+        "cypher_ladybug": {
+          "status": "unsupported",
+          "reason": "Calls `gds.graph.project.cypher` and `gds.shortestPath.dijkstra.stream` - Neo4j GDS over a projected weighted graph. No equivalent text has been written."
+        },
+        "cypher_engram": {
+          "status": "verified",
+          "text": "MATCH (m1:Comment)\nMATCH (m1)-[:REPLY_OF]->(m2:Message)\nMATCH (m1)-[:HAS_CREATOR]->(c1:Person), (m2)-[:HAS_CREATOR]->(c2:Person)\nWHERE c1 <> c2 AND (c1)-[:KNOWS]-(c2)\nOPTIONAL MATCH (m1)-[:REPLY_OF*0..]->(post:Post)<-[:CONTAINER_OF]-(forum:Forum)\n  WHERE forum.creationDate >= $startDate AND forum.creationDate <= $endDate\nWITH CASE WHEN id(c1) < id(c2) THEN id(c1) ELSE id(c2) END AS a,\n     CASE WHEN id(c1) < id(c2) THEN id(c2) ELSE id(c1) END AS b,\n     CASE WHEN forum IS NULL THEN 0.0 WHEN post = m2 THEN 1.0 ELSE 0.5 END AS x\nWITH a, b, sum(x) AS w\nWITH collect({source: a, target: b, weight: 1.0 / (w + 1.0)}) AS interacting\nMATCH (pA:Person)-[:KNOWS]-(pB:Person)\nWHERE id(pA) < id(pB)\nWITH interacting, collect({source: id(pA), target: id(pB), weight: 1.0}) AS knows\nCALL engram.algo.project({\n  name: 'q15', nodeLabels: ['Person'], edges: knows + interacting, orientation: 'UNDIRECTED'\n})\nYIELD projection\nMATCH (person1:Person {id: $person1Id}), (person2:Person {id: $person2Id})\nCALL engram.algo.kshortestpaths.stream({\n  projection: projection,\n  sourceNode: id(person1), targetNode: id(person2), k: 1\n})\nYIELD totalCost\nWITH collect(totalCost) AS costs\nUNWIND (CASE WHEN size(costs) = 0 THEN [-1.0] ELSE costs END) AS c\nRETURN max(c) AS totalCost",
+          "notes": "The weights are computed EDGE-CENTRICALLY, as LDBC's PostgreSQL reference computes them: one pass over the replies, each a REPLY_OF edge from a Comment (only comments reply in SNB), between two people who KNOW each other, summed per unordered pair of creators. The replied-to message is a Post exactly when it is the root the forum walk ends at (`post = m2`) — the SQL's `ParentMessageId IS NULL` — so no message is label-tested, which would bind it from its record (docs/bench/engram-gap-closure.md §39). Every KNOWS pair enters the projection at weight 1.0 and each interacting pair AGAIN at 1 / (w + 1): a pair that interacts is two parallel edges, and k = 1 takes the cheaper — 1 / (w + 1) is never above 1.0 — which is the one weight the reference's pair-centric form gives it. That equivalence is pinned by `bi15s_edge_centric_weights_answer_as_the_pair_centric_ones` (engram-graph) against the pair-centric text; it holds for k = 1 only. The projection is built INSIDE the timed statement, as LDBC's own bi15 builds it, and WRITES NOTHING (`engram.algo.project`, statement-scoped); the vertices are every Person, so a disconnected pair answers -1.0, the reference's contract. Its cost includes the projection build and is not comparable with bi19's or bi20's.",
+          "verification": "2026-09-23, SF3, measurements/baselines/bi-p95-v2.json: engram (cypher_engram, rev22) and PostgreSQL 17 (sql, ldbc_bi_sf3) both answered totalCost 0.1756782945736434 for bi15a and bi15b -- identical to the last digit."
+        }
+      },
+      "bi16": {
+        "title": "Fake news detection",
+        "variants": [
+          {
+            "variant": "16a",
+            "parameter_file": "parameters-sf<SF>/bi-16a.csv",
+            "parameters": [
+              {
+                "name": "tagA",
+                "type": "STRING"
+              },
+              {
+                "name": "dateA",
+                "type": "DATETIME"
+              },
+              {
+                "name": "tagB",
+                "type": "STRING"
+              },
+              {
+                "name": "dateB",
+                "type": "DATETIME"
+              },
+              {
+                "name": "maxKnowsLimit",
+                "type": "INT"
+              }
+            ],
+            "curation": "percentile_disc(0.995) on the second tag. Separately, the example parameters in the query file carry LDBC's own comment that they return a 'false positive' because maxKnowsLimit is set too high; whether the curated 16a rows share that property is NOT ESTABLISHED - the parameter CSVs were not read."
+          },
+          {
+            "variant": "16b",
+            "parameter_file": "parameters-sf<SF>/bi-16b.csv",
+            "parameters": [
+              {
+                "name": "tagA",
+                "type": "STRING"
+              },
+              {
+                "name": "dateA",
+                "type": "DATETIME"
+              },
+              {
+                "name": "tagB",
+                "type": "STRING"
+              },
+              {
+                "name": "dateB",
+                "type": "DATETIME"
+              },
+              {
+                "name": "maxKnowsLimit",
+                "type": "INT"
+              }
+            ],
+            "curation": "percentile_disc(0.45) and percentile_disc(0.37) on the two tags."
+          }
+        ],
+        "projection": {
+          "columns": [
+            {
+              "name": "person.id",
+              "type": "ID"
+            },
+            {
+              "name": "messageCountA",
+              "type": "INT32"
+            },
+            {
+              "name": "messageCountB",
+              "type": "INT32"
+            }
+          ],
+          "order_by": [
+            "messageCountA + messageCountB DESC",
+            "person1.id ASC"
+          ],
+          "limit": 20,
+          "tie_break": "Total: person1.id is unique. The sort key `messageCountA + messageCountB` is again not a projected column."
+        },
+        "cypher": {
+          "status": "unverified",
+          "text": "// Q16. Fake news detection\n// These parameters return a 'false positive' as the maxKnowsLimit is set too high.\n/*\n:params {\n  tagA: 'Meryl_Streep',\n  dateA: datetime('2012-09-16'),\n  tagB: 'Hank_Williams',\n  dateB: datetime('2012-05-08'),\n  maxKnowsLimit: 4\n}\n*/\nUNWIND [\n    {letter: 'A', tag: $tagA, date: $dateA},\n    {letter: 'B', tag: $tagB, date: $dateB}\n  ] AS param\nWITH param.letter AS paramLetter, param.tag AS paramTagX, param.date AS paramDateX\nCALL {\n  WITH paramTagX, paramDateX\n  MATCH (person1:Person)<-[:HAS_CREATOR]-(message1:Message)-[:HAS_TAG]->(tag:Tag {name: paramTagX})\n  WHERE date(message1.creationDate) = date(paramDateX)\n  // filter out Persons with more than $maxKnowsLimit friends who created the same kind of Message\n  OPTIONAL MATCH (person1)-[:KNOWS]-(person2:Person)<-[:HAS_CREATOR]-(message2:Message)-[:HAS_TAG]->(tag)\n  WHERE date(message2.creationDate) = date(paramDateX)\n  WITH person1, count(DISTINCT message1) AS cm, count(DISTINCT person2) AS cp2\n  WHERE cp2 <= $maxKnowsLimit\n  // return count\n  RETURN person1, cm\n}\nWITH person1, collect({letter: paramLetter, messageCount: cm}) AS results\nWHERE size(results) = 2\nRETURN\n  person1.id,\n  [r IN results WHERE r.letter = 'A' | r.messageCount][0] AS messageCountA,\n  [r IN results WHERE r.letter = 'B' | r.messageCount][0] AS messageCountB\nORDER BY messageCountA + messageCountB DESC, person1.id ASC\nLIMIT 20\n"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "/* Q16. Fake news detection\n\\set tagA '\\'Augustine_of_Hippo\\''\n\\set dateA '\\'2011-10-10\\''::timestamp\n\\set tagB '\\'Manuel_Noriega\\''\n\\set dateB '\\'2012-06-02\\''::timestamp\n\\set maxKnowsLimit '5'\n */\nWITH\n  subgraphA AS (\n    SELECT DISTINCT Person.id AS PersonId, Message.MessageId AS MessageId\n    FROM Person\n    JOIN Message\n      ON Message.CreatorPersonId = Person.id\n     AND Message.creationDate::date = :dateA\n    JOIN Message_hasTag_Tag\n      ON Message_hasTag_Tag.MessageId = Message.MessageId\n    JOIN Tag\n      ON Tag.id = Message_hasTag_Tag.TagId\n     AND Tag.name = :tagA\n  ),\n  personA AS (\n    SELECT\n        subgraphA1.PersonId,\n        count(DISTINCT subgraphA1.MessageId) AS cm,\n        count(DISTINCT Person_knows_Person.Person2Id) AS cp2\n    FROM subgraphA subgraphA1\n    LEFT JOIN Person_knows_Person\n    ON Person_knows_Person.Person1Id = subgraphA1.PersonId\n    AND Person_knows_Person.Person2Id IN (SELECT PersonId FROM subgraphA)\n    GROUP BY subgraphA1.PersonId\n    HAVING count(DISTINCT Person_knows_Person.Person2Id) <= :maxKnowsLimit\n    ORDER BY subgraphA1.PersonId ASC\n  ),\n  subgraphB AS (\n    SELECT DISTINCT Person.id AS PersonId, Message.MessageId AS MessageId\n    FROM Person\n    JOIN Message\n      ON Message.CreatorPersonId = Person.id\n     AND Message.creationDate::date = :dateB\n    JOIN Message_hasTag_Tag\n      ON Message_hasTag_Tag.MessageId = Message.MessageId\n    JOIN Tag\n      ON Tag.id = Message_hasTag_Tag.TagId\n     AND Tag.name = :tagB\n  ),\n  personB AS (\n    SELECT\n        subgraphB1.PersonId,\n        count(DISTINCT subgraphB1.MessageId) AS cm,\n        count(DISTINCT Person_knows_Person.Person2Id) AS cp2\n    FROM subgraphB subgraphB1\n    LEFT JOIN Person_knows_Person\n    ON Person_knows_Person.Person1Id = subgraphB1.PersonId\n    AND Person_knows_Person.Person2Id IN (SELECT PersonId FROM subgraphB)\n    GROUP BY subgraphB1.PersonId\n    HAVING count(DISTINCT Person_knows_Person.Person2Id) <= :maxKnowsLimit\n    ORDER BY subgraphB1.PersonId ASC\n  )\nSELECT\n    personA.PersonId AS PersonId,\n    personA.cm AS messageCountA,\n    personB.cm AS messageCountB\nFROM personA\nJOIN personB\n  ON personB.PersonId = personA.PersonId\nORDER BY personA.cm + personB.cm DESC, PersonId ASC\nLIMIT 20\n;\n"
+        },
+        "cypher_ladybug": {
+          "status": "unverified",
+          "text": "// Q16. Fake news detection\n// These parameters return a 'false positive' as the maxKnowsLimit is set too high.\n/*\n:params {\n  tagA: 'Meryl_Streep',\n  dateA: datetime('2012-09-16'),\n  tagB: 'Hank_Williams',\n  dateB: datetime('2012-05-08'),\n  maxKnowsLimit: 4\n}\n*/\nUNWIND [\n    {letter: 'A', tag: $tagA, date: $dateA},\n    {letter: 'B', tag: $tagB, date: $dateB}\n  ] AS param\nWITH param.letter AS paramLetter, param.tag AS paramTagX, param.date AS paramDateX\nCALL {\n  WITH paramTagX, paramDateX\n  MATCH (person1:Person)<-[:HAS_CREATOR]-(message1:Message)-[:HAS_TAG]->(tag:Tag {name: paramTagX})\n  WHERE date(message1.creationDate) = date(paramDateX)\n  // filter out Persons with more than $maxKnowsLimit friends who created the same kind of Message\n  OPTIONAL MATCH (person1)-[:KNOWS]-(person2:Person)<-[:HAS_CREATOR]-(message2:Message)-[:HAS_TAG]->(tag)\n  WHERE date(message2.creationDate) = date(paramDateX)\n  WITH person1, count(DISTINCT message1) AS cm, count(DISTINCT person2) AS cp2\n  WHERE cp2 <= $maxKnowsLimit\n  // return count\n  RETURN person1, cm\n}\nWITH person1, collect({letter: paramLetter, messageCount: cm}) AS results\nWHERE size(results) = 2\nRETURN\n  person1.id,\n  [r IN results WHERE r.letter = 'A' | r.messageCount][0] AS messageCountA,\n  [r IN results WHERE r.letter = 'B' | r.messageCount][0] AS messageCountB\nORDER BY messageCountA + messageCountB DESC, person1.id ASC\nLIMIT 20\n",
+          "note": "the `cypher` text unchanged. It is NOT ESTABLISHED that LadybugDB/Kuzu parses it; `constructs_to_check` is what a first run has to clear, detected mechanically over this text rather than by trying it.",
+          "constructs_to_check": [
+            "`:Message` - an abstract label carried by both Post and Comment. LadybugDB/Kuzu stores one table per label and has no multi-label node, so this needs the `Post:Comment` rewrite the lsqb family already applies.",
+            "a `CALL { }` subquery",
+            "the `date()` temporal constructor",
+            "`collect()` over a map literal, indexed with `[0]`",
+            "`UNWIND` over an inline list of maps",
+            "`OPTIONAL MATCH`"
+          ]
+        }
+      },
+      "bi17": {
+        "title": "Information propagation analysis",
+        "variants": [
+          {
+            "variant": "17",
+            "parameter_file": "parameters-sf<SF>/bi-17.csv",
+            "parameters": [
+              {
+                "name": "tag",
+                "type": "STRING"
+              },
+              {
+                "name": "delta",
+                "type": "INT"
+              }
+            ]
+          }
+        ],
+        "projection": {
+          "columns": [
+            {
+              "name": "person1.id",
+              "type": "ID"
+            },
+            {
+              "name": "messageCount",
+              "type": "INT32"
+            }
+          ],
+          "order_by": [
+            "messageCount DESC",
+            "person1.id ASC"
+          ],
+          "limit": 10,
+          "tie_break": "Total: person1.id is unique. LIMIT 10 is the tightest in the family, so a tie broken differently is most visible here."
+        },
+        "cypher": {
+          "status": "unverified",
+          "text": "// Q17. Information propagation analysis\n/*\n:params { tag: 'Slavoj_Žižek', delta: 4 }\n*/\nMATCH\n  (tag:Tag {name: $tag}),\n  (person1:Person)<-[:HAS_CREATOR]-(message1:Message)-[:REPLY_OF*0..]->(post1:Post)<-[:CONTAINER_OF]-(forum1:Forum),\n  (message1)-[:HAS_TAG]->(tag),\n// Having two HAS_MEMBER edges in the same MATCH clause ensures that person2 and person3 are different\n// as Cypher's edge-isomorphic matching does not allow for such a match in a single MATCH clause.\n  (forum1)<-[:HAS_MEMBER]->(person2:Person)<-[:HAS_CREATOR]-(comment:Comment)-[:HAS_TAG]->(tag),\n  (forum1)<-[:HAS_MEMBER]->(person3:Person)<-[:HAS_CREATOR]-(message2:Message),\n  (comment)-[:REPLY_OF]->(message2)-[:REPLY_OF*0..]->(post2:Post)<-[:CONTAINER_OF]-(forum2:Forum)\n// The query allows message2 = post2. If this is the case, their HAS_TAG edges to tag overlap,\n// and Cypher's edge-isomorphic matching does not allow for such a match in a single MATCH clause.\n// To work around this, we add them in separate MATCH clauses.\nMATCH (comment)-[:HAS_TAG]->(tag)\nMATCH (message2)-[:HAS_TAG]->(tag)\nWHERE forum1 <> forum2\n  AND message2.creationDate > message1.creationDate + duration({hours: $delta})\n  AND NOT (forum2)-[:HAS_MEMBER]->(person1)\nRETURN person1.id, count(DISTINCT message2) AS messageCount\nORDER BY messageCount DESC, person1.id ASC\nLIMIT 10\n"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "/* Q17. Information propagation analysis\n\\set tag '\\'Slavoj_Žižek\\''\n\\set delta '4'\n */\nWITH MyMessage as (\n    SELECT *\n    FROM Message\n-- (tag)<-[:HAS_TAG]-(message)\n    WHERE MessageId in (SELECT MessageId FROM Message_hasTag_Tag WHERE TagId IN (SELECT id FROM Tag WHERE Tag.name = :tag))\n)\n-- (message1)-[:HAS_CREATOR]->(person1)\nSELECT Message1.CreatorPersonId AS \"person1.id\", count(DISTINCT Message2.MessageId) AS messageCount\nFROM MyMessage Message1\n-- (message2 <date filtering>})\nJOIN MyMessage Message2\n ON (Message1.creationDate + ':delta hour'::interval) < Message2.creationDate\nJOIN MyMessage Comment\n ON Comment.ParentMessageId = Message2.MessageId\n-- (forum1)-[:Has_MEMBER]->(person2)\nJOIN Forum_hasMember_Person Forum_hasMember_Person2\n  ON Forum_hasMember_Person2.ForumId = Message1.ContainerForumId -- forum1\n AND Forum_hasMember_Person2.PersonId = Comment.CreatorPersonId -- person2\n-- (forum1)-[:Has_MEMBER]->(person3)\nJOIN Forum_hasMember_Person Forum_hasMember_Person3\n  ON Forum_hasMember_Person3.ForumId = Message1.ContainerForumId -- forum1\n AND Forum_hasMember_Person3.PersonId = Message2.CreatorPersonId -- person3\nWHERE Message1.ContainerForumId <> Message2.ContainerForumId\n  -- person2 <> person3\n  AND Forum_hasMember_Person2.PersonId <> Forum_hasMember_Person3.PersonId\n  -- NOT (forum2)-[:HAS_MEMBER]->(person1)\n  AND NOT EXISTS (SELECT 1\n                  FROM Forum_hasMember_Person Forum_hasMember_Person1\n                  WHERE Forum_hasMember_Person1.ForumId = Message2.ContainerForumId -- forum2\n                    AND Forum_hasMember_Person1.PersonId = Message1.CreatorPersonId -- person1\n                 )\nGROUP BY Message1.CreatorPersonId\nORDER BY messageCount DESC, Message1.CreatorPersonId ASC\nLIMIT 10\n;\n"
+        },
+        "cypher_ladybug": {
+          "status": "unverified",
+          "text": "// Q17. Information propagation analysis\n/*\n:params { tag: 'Slavoj_Žižek', delta: 4 }\n*/\nMATCH\n  (tag:Tag {name: $tag}),\n  (person1:Person)<-[:HAS_CREATOR]-(message1:Message)-[:REPLY_OF*0..]->(post1:Post)<-[:CONTAINER_OF]-(forum1:Forum),\n  (message1)-[:HAS_TAG]->(tag),\n// Having two HAS_MEMBER edges in the same MATCH clause ensures that person2 and person3 are different\n// as Cypher's edge-isomorphic matching does not allow for such a match in a single MATCH clause.\n  (forum1)<-[:HAS_MEMBER]->(person2:Person)<-[:HAS_CREATOR]-(comment:Comment)-[:HAS_TAG]->(tag),\n  (forum1)<-[:HAS_MEMBER]->(person3:Person)<-[:HAS_CREATOR]-(message2:Message),\n  (comment)-[:REPLY_OF]->(message2)-[:REPLY_OF*0..]->(post2:Post)<-[:CONTAINER_OF]-(forum2:Forum)\n// The query allows message2 = post2. If this is the case, their HAS_TAG edges to tag overlap,\n// and Cypher's edge-isomorphic matching does not allow for such a match in a single MATCH clause.\n// To work around this, we add them in separate MATCH clauses.\nMATCH (comment)-[:HAS_TAG]->(tag)\nMATCH (message2)-[:HAS_TAG]->(tag)\nWHERE forum1 <> forum2\n  AND message2.creationDate > message1.creationDate + duration({hours: $delta})\n  AND NOT (forum2)-[:HAS_MEMBER]->(person1)\nRETURN person1.id, count(DISTINCT message2) AS messageCount\nORDER BY messageCount DESC, person1.id ASC\nLIMIT 10\n",
+          "note": "the `cypher` text unchanged. It is NOT ESTABLISHED that LadybugDB/Kuzu parses it; `constructs_to_check` is what a first run has to clear, detected mechanically over this text rather than by trying it.",
+          "constructs_to_check": [
+            "`:Message` - an abstract label carried by both Post and Comment. LadybugDB/Kuzu stores one table per label and has no multi-label node, so this needs the `Post:Comment` rewrite the lsqb family already applies.",
+            "variable-length `*0..` traversal with an unbounded upper end",
+            "`duration({...})` temporal arithmetic"
+          ]
+        }
+      },
+      "bi18": {
+        "title": "Friend recommendation",
+        "variants": [
+          {
+            "variant": "18",
+            "parameter_file": "parameters-sf<SF>/bi-18.csv",
+            "parameters": [
+              {
+                "name": "tag",
+                "type": "STRING"
+              }
+            ]
+          }
+        ],
+        "projection": {
+          "columns": [
+            {
+              "name": "person1.id",
+              "type": "ID"
+            },
+            {
+              "name": "person2.id",
+              "type": "ID"
+            },
+            {
+              "name": "mutualFriendCount",
+              "type": "INT32"
+            }
+          ],
+          "order_by": [
+            "mutualFriendCount DESC",
+            "person1.id ASC",
+            "person2.id ASC"
+          ],
+          "limit": 20,
+          "tie_break": "Total: (person1.id, person2.id) is unique. KNOWS is symmetric and the reference does not deduplicate the direction, so each qualifying unordered pair appears TWICE - a run that emits it once returns 20 different rows under the LIMIT."
+        },
+        "cypher": {
+          "status": "unverified",
+          "text": "// Q18. Friend recommendation\n/*\n:params { tag: 'Frank_Sinatra' }\n*/\nMATCH (tag:Tag {name: $tag})<-[:HAS_INTEREST]-(person1:Person)-[:KNOWS]-(mutualFriend:Person)-[:KNOWS]-(person2:Person)-[:HAS_INTEREST]->(tag)\nWHERE person1 <> person2\n  AND NOT (person1)-[:KNOWS]-(person2)\nRETURN person1.id AS person1Id, person2.id AS person2Id, count(DISTINCT mutualFriend) AS mutualFriendCount\nORDER BY mutualFriendCount DESC, person1Id ASC, person2Id ASC\nLIMIT 20\n"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "/* Q18. Friend recommendation\n\\set tag '\\'Frank_Sinatra\\''\n */\nWITH\nPersonWithInterest AS (\nSELECT pt.PersonId as PersonId\nFROM Person_hasInterest_Tag pt, Tag t\nWHERE t.name = :tag and pt.TagId = t.id\n),\nFriendsOfInterested AS (\nSELECT k.Person1Id AS InterestedId, k.Person2Id AS FriendId\nFROM PersonWithInterest p, Person_knows_Person k\nWHERE p.PersonId = k.Person1Id\n)\nSELECT k1.InterestedId AS \"person1.id\", k2.InterestedId AS \"person2.id\", count(k1.FriendId) AS mutualFriendCount\nFROM FriendsOfInterested k1\nJOIN FriendsOfInterested k2\n  ON k1.FriendId = k2.FriendId -- pattern: mutualFriend\n -- negative edge\nWHERE k1.InterestedId != k2.InterestedId\n  AND NOT EXISTS (SELECT 1\n         FROM Person_knows_Person k3\n        WHERE k3.Person1Id = k2.InterestedId -- pattern: person2\n          AND k3.Person2Id = k1.InterestedId -- pattern: person1\n      )\nGROUP BY k1.InterestedId, k2.InterestedId\nORDER BY mutualFriendCount DESC, k1.InterestedId ASC, k2.InterestedId ASC\nLIMIT 20\n;\n"
+        },
+        "cypher_ladybug": {
+          "status": "unverified",
+          "text": "// Q18. Friend recommendation\n/*\n:params { tag: 'Frank_Sinatra' }\n*/\nMATCH (tag:Tag {name: $tag})<-[:HAS_INTEREST]-(person1:Person)-[:KNOWS]-(mutualFriend:Person)-[:KNOWS]-(person2:Person)-[:HAS_INTEREST]->(tag)\nWHERE person1 <> person2\n  AND NOT (person1)-[:KNOWS]-(person2)\nRETURN person1.id AS person1Id, person2.id AS person2Id, count(DISTINCT mutualFriend) AS mutualFriendCount\nORDER BY mutualFriendCount DESC, person1Id ASC, person2Id ASC\nLIMIT 20\n",
+          "note": "the `cypher` text unchanged. It is NOT ESTABLISHED that LadybugDB/Kuzu parses it; `constructs_to_check` is what a first run has to clear, detected mechanically over this text rather than by trying it.",
+          "constructs_to_check": []
+        }
+      },
+      "bi19": {
+        "title": "Interaction path between cities",
+        "variants": [
+          {
+            "variant": "19a",
+            "parameter_file": "parameters-sf<SF>/bi-19a.csv",
+            "parameters": [
+              {
+                "name": "city1Id",
+                "type": "ID"
+              },
+              {
+                "name": "city2Id",
+                "type": "ID"
+              }
+            ],
+            "curation": "percentile_disc(0.55) of cityPairsNumFriends restricted to `country1Id <> country2Id` - the two cities are in DIFFERENT countries."
+          },
+          {
+            "variant": "19b",
+            "parameter_file": "parameters-sf<SF>/bi-19b.csv",
+            "parameters": [
+              {
+                "name": "city1Id",
+                "type": "ID"
+              },
+              {
+                "name": "city2Id",
+                "type": "ID"
+              }
+            ],
+            "curation": "percentile_disc(0.25) of cityPairsNumFriends restricted to `country1Id = country2Id` - same country."
+          }
+        ],
+        "projection": {
+          "columns": [
+            {
+              "name": "person1.id",
+              "type": "ID"
+            },
+            {
+              "name": "person2.id",
+              "type": "ID"
+            },
+            {
+              "name": "totalWeight",
+              "type": "FLOAT32"
+            }
+          ],
+          "order_by": [
+            "person1.id ASC",
+            "person2.id ASC"
+          ],
+          "limit": null,
+          "tie_break": "Total: (person1.id, person2.id). The result is filtered to the rows whose totalWeight equals the minimum, so the row COUNT is data-dependent and there is no LIMIT."
+        },
+        "cypher": {
+          "status": "unsupported",
+          "reason": "As BI15. Neo4j-via-GDS and engram-via-procedure are not the same bytes, so the shared `cypher` dialect's premise does not hold. `cypher_neo4j` carries the reference text; it also depends on a `bi19` weight graph built by a separate precomputation, recorded under `precomputation`."
+        },
+        "cypher_neo4j": {
+          "status": "unverified",
+          "text": "// Q19. Interaction path between cities\n// Requires the Neo4j Graph Data Science library\n/*\n:params { city1Id: 669, city2Id: 648 }\n*/\nMATCH\n  (person1:Person)-[:IS_LOCATED_IN]->(city1:City {id: $city1Id}),\n  (person2:Person)-[:IS_LOCATED_IN]->(city2:City {id: $city2Id})\nCALL gds.shortestPath.dijkstra.stream('bi19', {\n  sourceNode: person1,\n  targetNode: person2,\n  relationshipWeightProperty: 'weight'\n})\nYIELD totalCost\nWITH person1.id AS person1Id, person2.id AS person2Id, totalCost AS totalWeight\nORDER BY totalWeight ASC, person1.id ASC, person2.id ASC\nWITH collect({person1Id: person1Id, person2Id: person2Id, totalWeight: totalWeight}) AS results\nUNWIND results AS result\nWITH result.person1Id AS person1Id, result.person2Id AS person2Id, result.totalWeight AS totalWeight\nWHERE totalWeight = results[0].totalWeight\nRETURN person1Id, person2Id, totalWeight\nORDER BY person1Id, person2Id\n"
+        },
+        "sql": {
+          "status": "verified",
+          "text": "/* Q19. Interaction path between cities\n\\set city1Id 608\n\\set city2Id 1148\n */\nwith recursive\nsrcs(f) as (select id from Person where locationcityid = :city1Id),\ndsts(t) as (select id from Person where locationcityid = :city2Id),\nshorts(dir, gsrc, dst, w, dead, iter) as (\n    (\n        select false, f, f, 0::double precision, false, 0 from srcs\n        union all\n        select true, t, t, 0::double precision, false, 0 from dsts\n    )\n    union all\n    (\n        with\n        ss as (select * from shorts),\n        toExplore as (select * from ss where dead = false order by w limit 1000),\n        -- assumes graph is undirected\n        newPoints(dir, gsrc, dst, w, dead) as (\n            select e.dir, e.gsrc as gsrc, p.dst as dst, e.w + p.w as w, false as dead\n            from PathQ19 p join toExplore e on (e.dst = p.src)\n            union all\n            select dir, gsrc, dst, w, dead or exists (select * from toExplore e where e.dir = o.dir and e.gsrc = o.gsrc and e.dst = o.dst) from ss o\n        ),\n        fullTable as (\n            select distinct on(dir, gsrc, dst) dir, gsrc, dst, w, dead\n            from newPoints\n            order by dir, gsrc, dst, w, dead desc\n        ),\n        found as (\n            select min(l.w + r.w) as w\n            from fullTable l, fullTable r\n            where l.dir = false and r.dir = true and l.dst = r.dst\n        )\n        select dir,\n               gsrc,\n               dst,\n               w,\n               dead or (coalesce(t.w > (select f.w/2 from found f), false)),\n               e.iter + 1 as iter\n        from fullTable t, (select iter from toExplore limit 1) e\n    )\n),\nss(dir, gsrc, dst, w, iter) as (\n    select dir, gsrc, dst, w, iter from shorts where iter = (select max(iter) from shorts)\n),\nresults(f, t, w) as (\n    select l.gsrc, r.gsrc, min(l.w + r.w)\n    from ss l, ss r\n    where l.dir = false and r.dir = true and l.dst = r.dst\n    group by l.gsrc, r.gsrc\n)\nselect * from results where w = (select min(w) from results) order by f, t;\n",
+          "verification": "2026-09-23, SF3, bi-p95-v2.json (cities 1049/1057, LDBC 1160/1168): both engines answered the same TWO tied rows, (2199023269684, 4398046525935, 68) and (2199023270081, 4398046525935, 68) in LDBC ids -- engram's ids translated through sourceId. Re-checked on the PATH_Q19 rebuilt to LDBC's definition (440,400 interacting pairs, as PostgreSQL's PathQ19): unchanged."
+        },
+        "cypher_ladybug": {
+          "status": "unsupported",
+          "reason": "As BI15: a weighted single-pair shortest path over a precomputed weight graph, spelled as Neo4j GDS."
+        },
+        "cypher_engram": {
+          "status": "verified",
+          "precomputation": "MATCH (p1:Person)-[:KNOWS]-(p2:Person)\nWHERE id(p1) < id(p2)\nMATCH (p1)<-[:HAS_CREATOR]-(m1:Message)-[:REPLY_OF]-(m2:Message)-[:HAS_CREATOR]->(p2)\nWITH p1, p2, count(m2) AS interactions\nWITH p1, p2, CASE WHEN 40 - sqrt(interactions) > 1\n             THEN round(40 - sqrt(interactions)) ELSE 1.0 END AS w\nCREATE (p1)-[:PATH_Q19 {w: w}]->(p2)",
+          "text": "MATCH\n  (person1:Person)-[:IS_LOCATED_IN]->(city1:City {id: $city1Id}),\n  (person2:Person)-[:IS_LOCATED_IN]->(city2:City {id: $city2Id})\nCALL engram.algo.kshortestpaths.stream({\n  nodeLabels: ['Person'], relationshipTypes: ['PATH_Q19'],\n  orientation: 'UNDIRECTED', relationshipWeightProperty: 'w',\n  sourceNode: id(person1), targetNode: id(person2), k: 1\n})\nYIELD totalCost\nWITH person1.id AS person1Id, person2.id AS person2Id, totalCost AS totalWeight\nORDER BY totalWeight ASC, person1Id ASC, person2Id ASC\nWITH collect({person1Id: person1Id, person2Id: person2Id, totalWeight: totalWeight}) AS results\nUNWIND results AS result\nWITH result.person1Id AS person1Id, result.person2Id AS person2Id,\n     result.totalWeight AS totalWeight, results\nWHERE totalWeight = results[0].totalWeight\nRETURN person1Id, person2Id, totalWeight\nORDER BY person1Id, person2Id",
+          "notes": "PARKED, not wired. Like `cypher_neo4j`, this is a reference text rather than an executable dialect: the shared `cypher` key stays `unsupported` because no single text serves both engines. MECHANISM PROVEN on 2026-09-21 against a copy of the SF0.1 corpus — the precomputation materialises the same weighted edge set LDBC's `PathQ19`/`PathQ20` tables hold, and `engram.algo.kshortestpaths.stream` with k=1 reads `w` through `relationshipWeightProperty`, returning a totalCost equal to the edge weight. NO ENGINE CHANGE WAS NEEDED: engram deliberately has no graph catalogue, and it does not need one here, because a materialised relationship type IS the projection. To RUN these the lane needs a dialect key it can select for engram, and the precomputation has to run untimed first — which is what LDBC does for its own arms.",
+          "precomputation_correction": "CORRECTED 2026-09-23 against LDBC's own umbra/dml/precomp/bi-19.sql (vendored under docs/bench/ldbc-official/bi-umbra): PathQ19 holds ONLY the KNOWS pairs that interacted -- an inner join with the reply pairs. This text used an OPTIONAL MATCH, so every non-interacting pair also carried an edge at w = 40 (124,561 extra edges at SF3). bi19's answer matched PostgreSQL's exactly with them in place, which proves nothing about parameters whose cheapest route runs through one.",
+          "status_note": "The `notes` below predate the lane: this text IS wired (`harness snb-bi --dialect cypher_engram`) and runs at SF3 and SF10, against a store holding the precomputed relationship type, built untimed as LDBC's arms build theirs.",
+          "verification": "2026-09-23, SF3, bi-p95-v2.json (cities 1049/1057, LDBC 1160/1168): both engines answered the same TWO tied rows, (2199023269684, 4398046525935, 68) and (2199023270081, 4398046525935, 68) in LDBC ids -- engram's ids translated through sourceId. Re-checked on the PATH_Q19 rebuilt to LDBC's definition (440,400 interacting pairs, as PostgreSQL's PathQ19): unchanged."
+        }
+      },
+      "bi20": {
+        "title": "Recruitment",
+        "variants": [
+          {
+            "variant": "20a",
+            "parameter_file": "parameters-sf<SF>/bi-20a.csv",
+            "parameters": [
+              {
+                "name": "company",
+                "type": "STRING"
+              },
+              {
+                "name": "person2Id",
+                "type": "ID"
+              }
+            ],
+            "curation": "LDBC's own comment: 'variant (a): guaranteed that no path exists'."
+          },
+          {
+            "variant": "20b",
+            "parameter_file": "parameters-sf<SF>/bi-20b.csv",
+            "parameters": [
+              {
+                "name": "company",
+                "type": "STRING"
+              },
+              {
+                "name": "person2Id",
+                "type": "ID"
+              }
+            ],
+            "curation": "LDBC's own comment: 'variant (b): guaranteed that a path exists'."
+          }
+        ],
+        "projection": {
+          "columns": [
+            {
+              "name": "person1.id",
+              "type": "ID"
+            },
+            {
+              "name": "totalWeight",
+              "type": "INT64"
+            }
+          ],
+          "order_by": [
+            "person1.id ASC"
+          ],
+          "limit": 20,
+          "tie_break": "Total: person1.id, filtered to the minimum totalWeight, then LIMIT 20."
+        },
+        "cypher": {
+          "status": "unsupported",
+          "reason": "As BI15. `cypher_neo4j` carries the reference text and depends on the `bi20` weight graph built by a separate precomputation, recorded under `precomputation`."
+        },
+        "cypher_neo4j": {
+          "status": "unverified",
+          "text": "// Q20. Recruitment\n// Requires the Neo4j Graph Data Science library\n/*\n:params { company: 'Falcon_Air', person2Id: 66 }\n*/\nMATCH\n  (company:Company {name: $company})<-[:WORK_AT]-(person1:Person),\n  (person2:Person {id: $person2Id})\nCALL gds.shortestPath.dijkstra.stream('bi20', {\n  sourceNode: person1,\n  targetNode: person2,\n  relationshipWeightProperty: 'weight'\n})\nYIELD totalCost\nWHERE person1.id <> $person2Id\nWITH person1.id AS person1Id, totalCost AS totalWeight\nORDER BY totalWeight ASC\nWITH collect({person1Id: person1Id, totalWeight: totalWeight}) AS results\nUNWIND results AS result\nWITH result.person1Id AS person1Id, result.totalWeight AS totalWeight\nWHERE totalWeight = results[0].totalWeight\nRETURN person1Id, totalWeight\nORDER BY person1Id ASC\nLIMIT 20\n"
+        },
+        "sql": {
+          "status": "verified",
+          "text": "/* Q20. Recruitment\n\\set person2Id 32985348834889\n\\set company 'Express_Air'\n */\nwith recursive\nsrcs(f) as (select :person2Id),\ndsts(t) as (\n    select personid\n    from Person_workat_company pwc, Company c\n    where pwc.companyid = c.id and c.name=:company\n),\n-- Try to find any path with a faster two way BFS\nanyPath(pos) as (\n    select f from srcs\n    union\n    (\n        with\n        ss as (select pos from anyPath)\n        select dst\n        from ss, PathQ20\n        where pos = src and not exists (select 1 from ss, dsts where ss.pos = dsts.t)\n    )\n),\npathExists as (\n    select 1 where exists (select 1 from anyPath ss, dsts where ss.pos = dsts.t)\n),\nshorts(dir, gsrc, dst, w, dead, iter) as (\n    (\n        select false, f, f, 0, false, 0 from srcs where exists (select 1 from pathExists)\n        union all\n        select true, t, t, 0, false, 0 from dsts where exists (select 1 from pathExists)\n    )\n    union all\n    (\n        with\n        ss as (select * from shorts),\n        toExplore as (select * from ss where dead = false order by w limit 1000),\n        -- assumes graph is undirected\n        newPoints(dir, gsrc, dst, w, dead) as (\n            select e.dir, e.gsrc as gsrc, p.dst as dst, e.w + p.w as w, false as dead\n            from PathQ20 p join toExplore e on (e.dst = p.src)\n            union all\n            select dir, gsrc, dst, w, dead or exists (select * from toExplore e where e.dir = o.dir and e.gsrc = o.gsrc and e.dst = o.dst) from ss o\n        ),\n        fullTable as (\n            select distinct on(dir, gsrc, dst) dir, gsrc, dst, w, dead\n            from newPoints\n            order by dir, gsrc, dst, w, dead desc\n        ),\n        found as (\n            select min(l.w + r.w) as w\n            from fullTable l, fullTable r\n            where l.dir = false and r.dir = true and l.dst = r.dst\n        )\n        select dir,\n               gsrc,\n               dst,\n               w,\n               dead or (coalesce(t.w > (select f.w/2 from found f), false)),\n               e.iter + 1 as iter\n        from fullTable t, (select iter from toExplore limit 1) e\n    )\n),\nss(dir, gsrc, dst, w, iter) as (\n    select dir, gsrc, dst, w, iter from shorts where iter = (select max(iter) from shorts)\n),\nresults(f, t, w) as (\n    select l.gsrc, r.gsrc, min(l.w + r.w)\n    from ss l, ss r\n    where l.dir = false and r.dir = true and l.dst = r.dst\n    group by l.gsrc, r.gsrc\n)\nselect t, w from results where w = (select min(w) from results) order by t limit 20;\n",
+          "verification": "2026-09-23, SF3: four (company, person2) probes chosen in PostgreSQL over its PathQ20 -- Air_India_Cargo/6597069779470, Deccan_360/22140, East_Star_Airlines/2199023271926, Jet_Airways/22140 -- answered identically by engram on PATH_Q20 rebuilt to LDBC's definition (32,023 pairs, as PostgreSQL's): (6597069790648, 1), (19791209303899, 2), {(19791209306653, 3), (21990232577868, 3)}, (4398046513174, 1). The first comparison, on the old precomputation, DISAGREED -- engram found a route PostgreSQL correctly did not -- and is what exposed it. Each engine orders person1Id in its own id space, which can change which tied rows survive LIMIT 20, never which rows qualify."
+        },
+        "cypher_ladybug": {
+          "status": "unsupported",
+          "reason": "As BI15: a weighted single-pair shortest path over a precomputed weight graph, spelled as Neo4j GDS."
+        },
+        "cypher_engram": {
+          "status": "verified",
+          "precomputation": "MATCH (p1:Person)-[:KNOWS]-(p2:Person)\nWHERE id(p1) < id(p2)\nMATCH (p1)-[s1:STUDY_AT]->(u:University)<-[s2:STUDY_AT]-(p2)\nWITH p1, p2, min(abs(s1.classYear - s2.classYear)) + 1 AS w\nCREATE (p1)-[:PATH_Q20 {w: w}]->(p2)",
+          "text": "MATCH\n  (company:Company {name: $company})<-[:WORK_AT]-(person1:Person),\n  (person2:Person {id: $person2Id})\nCALL engram.algo.kshortestpaths.stream({\n  nodeLabels: ['Person'], relationshipTypes: ['PATH_Q20'],\n  orientation: 'UNDIRECTED', relationshipWeightProperty: 'w',\n  sourceNode: id(person1), targetNode: id(person2), k: 1\n})\nYIELD totalCost\nWHERE person1.id <> $person2Id\nWITH person1.id AS person1Id, totalCost AS totalWeight\nORDER BY totalWeight ASC\nWITH collect({person1Id: person1Id, totalWeight: totalWeight}) AS results\nUNWIND results AS result\nWITH result.person1Id AS person1Id, result.totalWeight AS totalWeight, results\nWHERE totalWeight = results[0].totalWeight\nRETURN person1Id, totalWeight\nORDER BY person1Id ASC\nLIMIT 20",
+          "notes": "PARKED, not wired. Like `cypher_neo4j`, this is a reference text rather than an executable dialect: the shared `cypher` key stays `unsupported` because no single text serves both engines. MECHANISM PROVEN on 2026-09-21 against a copy of the SF0.1 corpus — the precomputation materialises the same weighted edge set LDBC's `PathQ19`/`PathQ20` tables hold, and `engram.algo.kshortestpaths.stream` with k=1 reads `w` through `relationshipWeightProperty`, returning a totalCost equal to the edge weight. NO ENGINE CHANGE WAS NEEDED: engram deliberately has no graph catalogue, and it does not need one here, because a materialised relationship type IS the projection. To RUN these the lane needs a dialect key it can select for engram, and the precomputation has to run untimed first — which is what LDBC does for its own arms.",
+          "precomputation_correction": "CORRECTED 2026-09-23 against LDBC's own umbra/dml/precomp/bi-20.sql: PathQ20 holds the pairs that KNOW each other AND studied at the same university. This text omitted KNOWS and linked every co-alumni pair -- 866,117 at SF3 where the definition gives 32,023 -- so engram answered bi20 with a weight-1 route between two people who studied together and do not know each other, where PostgreSQL's (correct) answer was empty. Found by the first value-level comparison with the SQL witness.",
+          "status_note": "The `notes` below predate the lane: this text IS wired (`harness snb-bi --dialect cypher_engram`) and runs at SF3 and SF10, against a store holding the precomputed relationship type, built untimed as LDBC's arms build theirs.",
+          "verification": "2026-09-23, SF3: four (company, person2) probes chosen in PostgreSQL over its PathQ20 -- Air_India_Cargo/6597069779470, Deccan_360/22140, East_Star_Airlines/2199023271926, Jet_Airways/22140 -- answered identically by engram on PATH_Q20 rebuilt to LDBC's definition (32,023 pairs, as PostgreSQL's): (6597069790648, 1), (19791209303899, 2), {(19791209306653, 3), (21990232577868, 3)}, (4398046513174, 1). The first comparison, on the old precomputation, DISAGREED -- engram found a route PostgreSQL correctly did not -- and is what exposed it. Each engine orders person1Id in its own id space, which can change which tied rows survive LIMIT 20, never which rows qualify."
+        }
+      }
+    },
+    "parameter_type_correction": "Parameter types were corrected 2026-09-21: twenty parameters across ten queries declared DATE where LDBC's own `:params` block supplies datetime(...) and the query compares directly against message.creationDate, which is a DATETIME. Bound as a DATE they matched ZERO rows against a typed-temporal corpus -- an empty result indistinguishable from a working query, which is the same failure class as bi12's languages and bi16's dates. The declared type now follows LDBC's example block."
+  },
+  "id_space_note": "THE ENGINES DO NOT SHARE AN ID SPACE, and that blocks a cross-engine parameter file. engram's `id` is DENSE (0, 1, 2, ...); the PostgreSQL arm loaded from raw Datagen CSV with no dense remap, so its ids are LDBC's own (§1.4). A parameter file derived against engram therefore carries ids that are meaningless — or worse, silently valid and WRONG — on the other arms: binding personId 17049 into Postgres selects whatever entity happens to hold that LDBC id, not the person engram measured. Until a derivation emits `sourceId` for ID-typed parameters AND engram's own text matches on it, the three arms cannot be given the same parameter file, and no cross-engine BI row may be built. This is a prerequisite for the comparator re-run that the coverage plan's Phase 0c did not account for."
+}

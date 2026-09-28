@@ -37,7 +37,11 @@ fn rows(g: &Graph, src: &str, p: &BTreeMap<String, Value>) -> Vec<Vec<Value>> {
         .rows
 }
 
-fn traced(g: &Graph, src: &str, p: &BTreeMap<String, Value>) -> (Vec<Vec<Value>>, BTreeMap<String, u64>) {
+fn traced(
+    g: &Graph,
+    src: &str,
+    p: &BTreeMap<String, Value>,
+) -> (Vec<Vec<Value>>, BTreeMap<String, u64>) {
     let (r, trace) = engram_observe::with_trace(|| rows(g, src, p));
     (r, trace.counters().clone())
 }
@@ -64,8 +68,14 @@ const GETS: &str = "store.gets";
 /// past the seek floor too); one email in eight is quarantined.
 fn corpus() -> Graph {
     let g = Graph::new(Store::new(), Realm(1), Namespace(1));
-    ddl(&g, "CREATE INDEX udn_user FOR (n:UserDataNode) ON (n.userId)");
-    ddl(&g, "CREATE INDEX udn_type FOR (n:UserDataNode) ON (n.nodeType)");
+    ddl(
+        &g,
+        "CREATE INDEX udn_user FOR (n:UserDataNode) ON (n.userId)",
+    );
+    ddl(
+        &g,
+        "CREATE INDEX udn_type FOR (n:UserDataNode) ON (n.nodeType)",
+    );
     let body: String = "b".repeat(2048);
     let mut ents = Vec::new();
     for k in 0..600i64 {
@@ -73,7 +83,11 @@ fn corpus() -> Graph {
         m.insert("name".to_string(), Value::Str(format!("Entity {k:03}")));
         m.insert(
             "type".to_string(),
-            Value::Str(if k % 3 == 0 { "org".into() } else { "person".into() }),
+            Value::Str(if k % 3 == 0 {
+                "org".into()
+            } else {
+                "person".into()
+            }),
         );
         ents.push(g.create_node(&["Entity".into()], &m).expect("entity"));
     }
@@ -92,7 +106,8 @@ fn corpus() -> Graph {
         if i % 3 == 0 {
             for k in 0..2 {
                 let e = ents[((i / 3 + k * 7) % 600) as usize];
-                g.create_rel(n, "MENTIONS", e, &BTreeMap::new()).expect("mentions");
+                g.create_rel(n, "MENTIONS", e, &BTreeMap::new())
+                    .expect("mentions");
             }
         }
     }
@@ -114,7 +129,11 @@ fn a_sought_end_drives_the_hop_aggregate() {
     let (got, c) = traced(&g, ORIG, &p);
     assert_eq!(got, want);
     assert_eq!(count_of(&c, HOP_SCAN), 1, "the hop scan ran: {c:?}");
-    assert_eq!(count_of(&c, SEEDED), 1, "seeded from the sought user: {c:?}");
+    assert_eq!(
+        count_of(&c, SEEDED),
+        1,
+        "seeded from the sought user: {c:?}"
+    );
     assert_eq!(count_of(&c, FULL), 0, "no node decoded in full: {c:?}");
     // The user's 500 emails and the entities they reach — never the 6,000.
     assert!(
@@ -159,7 +178,11 @@ fn an_unknown_user_answers_empty_without_the_walk() {
     let (got, c) = traced(&g, ORIG, &p);
     assert!(got.is_empty(), "{got:?}");
     assert_eq!(count_of(&c, SEEDED), 1, "{c:?}");
-    assert_eq!(count_of(&c, GETS), 0, "nothing read for an empty seek: {c:?}");
+    assert_eq!(
+        count_of(&c, GETS),
+        0,
+        "nothing read for an empty seek: {c:?}"
+    );
 }
 
 /// The whole-type forms never seed: no equality on a declared key (the
@@ -182,7 +205,11 @@ fn the_whole_type_forms_never_seed() {
         let want = general(&g, src, &p);
         let (got, c) = traced(&g, src, &p);
         assert_eq!(got, want, "`{src}`");
-        assert_eq!(count_of(&c, SEEDED), 0, "`{src}` keeps the type walk: {c:?}");
+        assert_eq!(
+            count_of(&c, SEEDED),
+            0,
+            "`{src}` keeps the type walk: {c:?}"
+        );
     }
 }
 
@@ -208,7 +235,10 @@ fn a_sought_far_end_is_the_pipelines() {
         let (got, c) = traced(&g, src, &p);
         assert_eq!(got, want, "`{src}`");
         assert_eq!(count_of(&c, SEEDED), 0, "`{src}`: {c:?}");
-        assert!(count_of(&c, "interp.pipeline aggregate runs") > 0, "`{src}`: {c:?}");
+        assert!(
+            count_of(&c, "interp.pipeline aggregate runs") > 0,
+            "`{src}`: {c:?}"
+        );
         assert_eq!(count_of(&c, FULL), 0, "`{src}`: {c:?}");
     }
 }

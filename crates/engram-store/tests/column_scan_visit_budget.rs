@@ -56,7 +56,10 @@ fn member_record(i: u32) -> Vec<u8> {
 /// blocks once paged.
 fn filler_record(i: u32) -> Vec<u8> {
     let mut r = Record::new();
-    r.set(PropertyId(7), string(&format!("filler-{i}-{}", "x".repeat(48))));
+    r.set(
+        PropertyId(7),
+        string(&format!("filler-{i}-{}", "x".repeat(48))),
+    );
     r.encode()
 }
 
@@ -84,15 +87,10 @@ fn interleaved() -> Store {
 
 fn scan(s: &Store, budget: usize) -> (Option<u64>, Vec<Vec<u8>>) {
     let mut got = Vec::new();
-    let visited = s.scan_column_range_with(
-        &prefix(),
-        &[],
-        None,
-        1,
-        u64::MAX,
-        budget,
-        &mut |b, _| got.push(b.to_vec()),
-    );
+    let visited =
+        s.scan_column_range_with(&prefix(), &[], None, 1, u64::MAX, budget, &mut |b, _| {
+            got.push(b.to_vec())
+        });
     (visited, got)
 }
 
@@ -103,7 +101,10 @@ fn a_span_wider_than_the_budget_declines_before_handing_anything_over() {
     // is far below the 40,002 rows the span holds: decline — and nothing is
     // handed over, because the decision is made on the walk, not after it.
     let (visited, got) = scan(&s, 8);
-    assert_eq!(visited, None, "a span of 40k rows must decline a budget of 8");
+    assert_eq!(
+        visited, None,
+        "a span of 40k rows must decline a budget of 8"
+    );
     assert!(got.is_empty(), "declined before any entry was handed over");
     assert_eq!(
         s.scan_column_presence_at(&prefix(), &[], None, 1, u64::MAX, 8),
@@ -143,7 +144,10 @@ fn a_span_that_would_hold_more_bytes_than_the_budget_declines() {
     // the second member.
     s.set_column_scan_byte_budget(64 * 1024);
     let ((visited, got), trace) = engram_observe::with_trace(|| scan(&s, 1_000_000));
-    assert_eq!(visited, None, "a span holding megabytes must decline a 64 KB byte budget");
+    assert_eq!(
+        visited, None,
+        "a span holding megabytes must decline a 64 KB byte budget"
+    );
     assert!(got.is_empty(), "declined before any entry was handed over");
     assert!(
         trace
@@ -174,18 +178,24 @@ fn an_unbounded_read_ignores_the_byte_budget_and_completes() {
     assert_eq!(bodies, vec![body(0), body(FILLERS + 1)]);
     // And the budgeted entry point with an explicit unbounded row budget is
     // the same read: it completes too.
-    assert_eq!(scan(&s, usize::MAX).0, Some(2), "usize::MAX rows means unbounded, bytes included");
+    assert_eq!(
+        scan(&s, usize::MAX).0,
+        Some(2),
+        "usize::MAX rows means unbounded, bytes included"
+    );
     // A budgeted read with the same 1 KB still declines on bytes.
-    assert_eq!(scan(&s, usize::MAX - 1).0, None, "a finite row budget carries the byte budget");
+    assert_eq!(
+        scan(&s, usize::MAX - 1).0,
+        None,
+        "a finite row budget carries the byte budget"
+    );
 }
 
 #[test]
 fn on_a_paged_store_the_decline_stops_fetching_blocks() {
     let s = interleaved();
-    let dir = std::env::temp_dir().join(format!(
-        "engram_column_visit_budget_{}",
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("engram_column_visit_budget_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("mkdir");
     // A cache too small to retain the walk: every block a walk crosses is a
     // pread, so preads count blocks fetched.

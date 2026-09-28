@@ -13,7 +13,7 @@ flowchart TD
     D --> E["build the GraphResolver closure"]
     E --> F["store.seal() — drain a loaded tail"]
     F --> G["spill + report (paged only)"]
-    G --> H["spawn maintenance thread"]
+    G --> H["spawn maintenance threads<br/>(refresh, then storage)"]
     H --> I["spawn counters thread"]
     I --> J["warm: upgrade markers,<br/>adopt sidecar, build derived"]
     J --> K["spawn N worker threads"]
@@ -106,8 +106,8 @@ write and costs nothing. With eight, the fsync's few milliseconds are long
 enough that all eight send their next request, so the next batch shares one
 fsync eight ways.
 
-Before group commit existed, write throughput was **flat at 375 → 380 ops/s
-from one to eight clients**.
+Before group commit existed, every write paid an fsync of its own, so adding
+clients did not add write throughput.
 
 ## Threads
 
@@ -117,10 +117,20 @@ from one to eight clients**.
 | reader | 1 per connection | socket → engine, with the credit loop |
 | writer | 1 per connection | engine → socket |
 | engine worker | `--workers` | owns its sessions in a map; batches, runs, fsyncs, replies |
-| maintenance | 1 | compaction, spilling, log truncation, derived refresh |
+| storage maintenance | 1 | compaction, spilling, log truncation |
+| derived refresh | 1 | the derived-structure refresh, on its own thread and its own ask channel (`--no-split-maintenance` puts it back on the storage thread) |
 | counters | 1 | the two stderr lines, every 30 s, on change only |
 
 **Two OS threads per connection** is why `--max-connections` exists at all.
+
+**Two maintenance threads**, so that a derived refresh never queues behind a
+compaction or a spill (see [the overview](./overview.md#threads) for why that
+matters in paged mode). The refresh thread is spawned first, with
+its own `Sender`/`Receiver` pair, and the storage thread follows; a worker's
+post-batch refresh ask is routed to the refresh channel whenever
+`split_maintenance` is set, which it is by default. On the
+`--no-split-maintenance` arm the refresh returns to the tail of the storage
+loop, where it cannot start until that loop's spill or compaction returns.
 
 A connection pins to `id % workers`, which means a worker's sessions are its
 own: no cross-worker session map, no lock around it.
@@ -131,14 +141,16 @@ Before releasing replies, the worker checks three thresholds:
 
 | check | trigger |
 |---|---|
-| seal | `tail_versions >= --seal-after` |
-| compaction | `segment_count >= --compact-after`, or the tombstone ratio |
-| derived refresh | `--refresh-after-writes` commit stamps since the last |
+| seal | `tail_versions >= --seal-after`, checked after the fsync so the segment holds only durable versions |
+| compaction | asked **only when that seal happened** — past `--compact-after` segments, past the tombstone ratio (which also requires a minimum version count — `tombstone_min_versions`, a `ServerConfig` field with no flag — so a store holding four rows, three of them tombstones, does not compact on every seal), or, in paged mode, on **every** seal, because a spill is cheap and is what keeps RSS bounded |
+| derived refresh | `--refresh-after-writes` commit stamps since the last ask |
 
-Compaction and refresh are *asks* — a message to the maintenance thread — so a
-worker never does that work on a statement's critical path. Sealing is done
-inline by whichever worker's batch crosses the threshold, because it must
-happen under the log latch anyway.
+The compaction check is nested inside the seal rather than beside it: the code
+is `if tail_versions() >= seal_after && seal().is_some()`, so a batch that does
+not seal never asks. Compaction and refresh are *asks* — a message to a
+maintenance thread — so a worker never does that work on a statement's critical
+path. Sealing is done inline by whichever worker's batch crosses the threshold,
+because it must happen under the log latch anyway.
 
 ## Session state
 
@@ -152,10 +164,11 @@ A session is a `BoltServer` plus its reply channel and its inflight counter. The
 Worth listing, because they are the things that would otherwise show up as
 latency:
 
-- **Compaction** — maintenance thread.
-- **Spilling** — maintenance thread.
-- **Derived refresh** — maintenance thread, which is the entire point.
-- **Log truncation** — maintenance thread.
+- **Compaction** — the storage maintenance thread.
+- **Spilling** — the storage maintenance thread.
+- **Derived refresh** — its own thread, which is the entire point. See
+  [Concurrency](./concurrency.md).
+- **Log truncation** — the storage maintenance thread.
 
 What a client *does* wait on: its statement, and one fsync shared with whatever
 else was in the batch.

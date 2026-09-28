@@ -61,7 +61,10 @@ const FULL: &str = "graph.nodes materialised in full";
 /// `userId` index; a third of each user's emails carry an EmailAsk.
 fn corpus() -> Graph {
     let g = Graph::new(Store::new(), Realm(1), Namespace(1));
-    ddl(&g, "CREATE INDEX udn_user FOR (n:UserDataNode) ON (n.userId)");
+    ddl(
+        &g,
+        "CREATE INDEX udn_user FOR (n:UserDataNode) ON (n.userId)",
+    );
     let body: String = "b".repeat(3072);
     for i in 0..4000i64 {
         let mut m = BTreeMap::new();
@@ -69,18 +72,38 @@ fn corpus() -> Graph {
         m.insert("userId".to_string(), Value::Str(format!("u{}", i % 8)));
         m.insert("classified".to_string(), Value::Bool(i % 5 != 0));
         if i % 4 == 0 {
-            m.insert("abuseStatus".to_string(), Value::Str(if i % 8 == 0 { "clean".into() } else { "quarantined".into() }));
+            m.insert(
+                "abuseStatus".to_string(),
+                Value::Str(if i % 8 == 0 {
+                    "clean".into()
+                } else {
+                    "quarantined".into()
+                }),
+            );
         }
         m.insert("nodeId".to_string(), Value::Str(format!("mail-{i:05}")));
-        m.insert("createdAt".to_string(), Value::Str(format!("2026-{:02}-{:02}T{:02}:{:02}:00Z", 1 + (i % 12), 1 + (i % 28), i % 24, i % 60)));
+        m.insert(
+            "createdAt".to_string(),
+            Value::Str(format!(
+                "2026-{:02}-{:02}T{:02}:{:02}:00Z",
+                1 + (i % 12),
+                1 + (i % 28),
+                i % 24,
+                i % 60
+            )),
+        );
         m.insert("rawData".to_string(), Value::Str(body.clone()));
         let n = g.create_node(&["UserDataNode".into()], &m).expect("email");
         if i % 3 == 0 {
             let mut a = BTreeMap::new();
             a.insert("resolved".to_string(), Value::Bool(i % 6 == 0));
-            a.insert("deadline".to_string(), Value::Str(format!("2026-10-{:02}", 1 + (i % 28))));
+            a.insert(
+                "deadline".to_string(),
+                Value::Str(format!("2026-10-{:02}", 1 + (i % 28))),
+            );
             let ask = g.create_node(&["EmailAsk".into()], &a).expect("ask");
-            g.create_rel(n, "HAS_ASK", ask, &BTreeMap::new()).expect("has ask");
+            g.create_rel(n, "HAS_ASK", ask, &BTreeMap::new())
+                .expect("has ask");
         }
     }
     g
@@ -107,7 +130,10 @@ fn a_lean_seed_population_is_bound_from_the_label_column() {
         assert_eq!(want.len(), 50, "fixture: `{src}`");
         let (got, c) = traced(&g, src);
         assert_eq!(got, want, "`{src}`");
-        assert!(count_of(&c, BOUND) > 0, "`{src}` binds its seeds from the column: {c:?}");
+        assert!(
+            count_of(&c, BOUND) > 0,
+            "`{src}` binds its seeds from the column: {c:?}"
+        );
         assert!(
             count_of(&c, PROJECTED) < 64 && count_of(&c, FULL) < 64,
             "`{src}` reads no record per seed: {c:?}"

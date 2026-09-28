@@ -39,7 +39,7 @@ use crate::sst::{self, BlockHandle, SegmentFooter, SstError};
 use crate::{LogicalKey, Version};
 
 /// A decoded data block: its entries in key order, shared out of the cache.
-type Block = Arc<Vec<(LogicalKey, Vec<Version>)>>;
+pub(crate) type Block = Arc<Vec<(LogicalKey, Vec<Version>)>>;
 
 /// Opening a `paged` segment failed — the OS read, or the format/verification.
 #[derive(Debug)]
@@ -172,6 +172,7 @@ impl BlockCache {
             }
             None => {
                 counted!("paged.block cache miss");
+                crate::PAGED_BLOCK_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 None
             }
         }
@@ -305,6 +306,7 @@ impl BlockCache {
             } else {
                 shard.map.remove(&v);
                 counted!("paged.block evicted");
+                crate::PAGED_BLOCK_EVICTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
         // Total over budget → evict from main with a CLOCK second chance.
@@ -328,6 +330,7 @@ impl BlockCache {
                 if let Some(s) = shard.map.remove(&v) {
                     shard.main_bytes -= s.size;
                     counted!("paged.block evicted");
+                crate::PAGED_BLOCK_EVICTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -394,6 +397,10 @@ pub struct PagedSegment {
     versions: u64,
     file: Arc<File>,
     index: Vec<BlockHandle>,
+    /// The greatest key this segment holds (v4+). `None` for an older file,
+    /// which cannot say — then a lookup above the range faults its last block
+    /// in and scans it, as every reader did before v4.
+    max_key: Option<LogicalKey>,
     cache: Arc<BlockCache>,
 }
 
@@ -417,7 +424,8 @@ impl PagedSegment {
         // pread exactly the index region and parse it.
         let mut index_buf = vec![0u8; footer.index_len as usize];
         pread_exact(&file, footer.index_offset, &mut index_buf).map_err(OpenError::Io)?;
-        let index = sst::read_index(&index_buf).map_err(OpenError::Format)?;
+        let (index, max_key) = sst::read_index_and_max(&index_buf, footer.format_version)
+            .map_err(OpenError::Format)?;
         Ok(PagedSegment {
             seq: footer.seq,
             max_commit_ts: footer.max_commit_ts,
@@ -425,6 +433,7 @@ impl PagedSegment {
             versions: footer.versions,
             file: Arc::new(file),
             index,
+            max_key,
             cache,
         })
     }
@@ -469,6 +478,19 @@ impl PagedSegment {
         if self.index.is_empty() || key < self.index[0].first_key.as_slice() {
             return None;
         }
+        // ABOVE THE SEGMENT IS ALSO OUTSIDE IT.
+        //
+        // Pruning ran from below only, so a key past this file's last key
+        // still selected the final block, faulted it in from disk, verified
+        // its BLAKE3 and searched it — to find nothing. Every point lookup for
+        // a key beyond a segment's range paid that, and a store keeps many
+        // segments, of which at most one can hold the key.
+        if let Some(max) = &self.max_key {
+            if key > max.as_slice() {
+                counted!("paged.segment pruned above its max key");
+                return None;
+            }
+        }
         // partition_point → count of handles with first_key <= key; the last
         // such is that minus one. Blocks are contiguous key ranges, so exactly
         // one block can hold the key.
@@ -508,6 +530,7 @@ impl PagedSegment {
             })?;
         let mut frame = vec![0u8; frame_len];
         counted!("paged.pread");
+        crate::PAGED_PREADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         pread_exact(&self.file, h.offset, &mut frame).map_err(|_| SstError::Truncated {
             what: "data block pread",
         })?;
@@ -541,6 +564,53 @@ impl PagedSegment {
         Ok(versions.iter().rev().find(|v| v.commit_ts <= ts).cloned())
     }
 
+    /// [`PagedSegment::get_at`] for a RUN of point reads, BORROWED: `f` sees
+    /// the newest visible value's bytes in the block itself (no `Version`
+    /// clone — `get_at` copies the record out), and `cursor` keeps the last
+    /// block fetched so a key covered by that same block is answered without
+    /// a cache touch (a shard lock, a map probe and an `Arc` clone per read).
+    /// A gather over a sorted id set reads a block's rows in a row, so a
+    /// 37,270-id gather (the MENTIONS aggregate's ends on the mirror, ~7 µs
+    /// a get) touches each block once. `Some(true)`: a value, handed to `f`;
+    /// `Some(false)`: a tombstone (this segment's answer is "deleted" — no
+    /// older segment is consulted, as `get_at` has it); `None`: no visible
+    /// version here.
+    pub(crate) fn visit_at_with_cursor(
+        &self,
+        key: &LogicalKey,
+        ts: u64,
+        cursor: &mut Option<(usize, Block)>,
+        f: impl FnOnce(&[u8]),
+    ) -> Result<Option<bool>, SstError> {
+        let Some(bi) = self.covering_block(key) else {
+            return Ok(None);
+        };
+        let block = match cursor {
+            Some((at, b)) if *at == bi => {
+                counted!("paged.block reused by the gather cursor");
+                Arc::clone(b)
+            }
+            _ => {
+                let b = self.block(bi)?;
+                *cursor = Some((bi, Arc::clone(&b)));
+                b
+            }
+        };
+        let Ok(row) = block.binary_search_by(|(k, _)| k.as_slice().cmp(key)) else {
+            return Ok(None); // the covering block is the only candidate
+        };
+        match block[row].1.iter().rev().find(|v| v.commit_ts <= ts) {
+            None => Ok(None),
+            Some(v) => match v.value.as_ref() {
+                Some(bytes) => {
+                    f(bytes);
+                    Ok(Some(true))
+                }
+                None => Ok(Some(false)),
+            },
+        }
+    }
+
     /// The projected form a resident `get_projected_at` would return: `None` if
     /// this segment holds no visible version, `Some(None)` for a tombstone,
     /// `Some(Some(Record))` for a value. A paged segment is row form, so a
@@ -552,12 +622,10 @@ impl PagedSegment {
         ts: u64,
         _props: &[u32],
     ) -> Result<Option<Option<crate::segment::Projected>>, SstError> {
-        Ok(self
-            .get_at(key, ts)?
-            .map(|v| {
-                v.value
-                    .map(|b| crate::segment::Projected::Record(b.to_vec()))
-            }))
+        Ok(self.get_at(key, ts)?.map(|v| {
+            v.value
+                .map(|b| crate::segment::Projected::Record(b.to_vec()))
+        }))
     }
 
     /// Call `f(key, versions)` for every key in `[lo, hi)`, in key order —
@@ -603,9 +671,10 @@ impl PagedSegment {
         &self,
         lo: &[u8],
         hi: Option<&[u8]>,
+        scan: bool,
         f: impl FnMut(&LogicalKey, &[Version]) -> bool,
     ) -> Result<bool, SstError> {
-        self.range_for_each_until_in(lo, hi, false, f)
+        self.range_for_each_until_in(lo, hi, scan, f)
     }
 
     fn range_for_each_until_in(
@@ -615,9 +684,30 @@ impl PagedSegment {
         scan: bool,
         mut f: impl FnMut(&LogicalKey, &[Version]) -> bool,
     ) -> Result<bool, SstError> {
-        // First block that can hold a key >= lo: the block covering lo, or block
-        // 0 when lo sorts before every block.
-        let start = self.covering_block(lo).unwrap_or(0);
+        // First block that can hold a key >= lo: block 0 when lo sorts before
+        // every block, else the block covering lo — and NONE when lo is above
+        // the segment's max key.
+        //
+        // `covering_block` answers `None` for both ends, which is right for a
+        // point lookup ("not here") and wrong for a range if read as one
+        // answer. This read every `None` as "before the first block" and
+        // started at block 0; for a span above the segment no block's first
+        // key reaches `hi` either, so the walk crossed the WHOLE segment and
+        // kept nothing. On the SF3 store that was a 56 MB segment per
+        // adjacency scan — 24.7M block visits in bi11's first leg.
+        if self.index.is_empty() {
+            return Ok(true);
+        }
+        let start = if lo < self.index[0].first_key.as_slice() {
+            0
+        } else {
+            match self.covering_block(lo) {
+                Some(bi) => bi,
+                // The only `None` left: lo is past this segment's max key, so
+                // nothing here is >= lo.
+                None => return Ok(true),
+            }
+        };
         for bi in start..self.index.len() {
             // Blocks are sorted by first key; once a block starts at/after hi,
             // no later block can contribute.
@@ -815,7 +905,10 @@ mod tests {
         assert_eq!(rows, keys.len(), "the scan must visit every row");
         let c = trace.counters();
         assert!(
-            c.get("paged.block scan bypassed the cache").copied().unwrap_or(0) > 0,
+            c.get("paged.block scan bypassed the cache")
+                .copied()
+                .unwrap_or(0)
+                > 0,
             "vacuous: the cache was not smaller than the segment: {c:?}"
         );
         let (_, trace) = engram_observe::with_trace(|| {
@@ -843,14 +936,18 @@ mod tests {
         let paged = PagedSegment::open(&path, cache).expect("open");
         let (first, trace) = engram_observe::with_trace(|| {
             let mut rows = 0usize;
-            paged.range_for_each_scan(&[], None, |_, _| rows += 1).expect("scan");
+            paged
+                .range_for_each_scan(&[], None, |_, _| rows += 1)
+                .expect("scan");
             rows
         });
         let preads = trace.counters().get("paged.pread").copied().unwrap_or(0);
         assert!(preads > 1, "vacuous: a one-block segment");
         let (second, trace) = engram_observe::with_trace(|| {
             let mut rows = 0usize;
-            paged.range_for_each_scan(&[], None, |_, _| rows += 1).expect("scan");
+            paged
+                .range_for_each_scan(&[], None, |_, _| rows += 1)
+                .expect("scan");
             rows
         });
         assert_eq!(first, second);
@@ -860,7 +957,10 @@ mod tests {
             0,
             "the second scan re-faulted blocks the cache had room for: {c:?}"
         );
-        assert_eq!(c.get("paged.block cache scan hit").copied().unwrap_or(0), preads);
+        assert_eq!(
+            c.get("paged.block cache scan hit").copied().unwrap_or(0),
+            preads
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -980,7 +1080,9 @@ mod cache_tests {
         });
         let c = trace.counters();
         assert_eq!(
-            c.get("paged.block scan bypassed the cache").copied().unwrap_or(0),
+            c.get("paged.block scan bypassed the cache")
+                .copied()
+                .unwrap_or(0),
             60,
             "every scan block must be read through, not admitted: {c:?}"
         );
@@ -993,12 +1095,18 @@ mod cache_tests {
             }
         });
         assert_eq!(
-            trace.counters().get("paged.block cache miss").copied().unwrap_or(0),
+            trace
+                .counters()
+                .get("paged.block cache miss")
+                .copied()
+                .unwrap_or(0),
             0,
             "a working-set read missed after the scan"
         );
         assert_eq!(
-            (0..60u64).filter(|&o| cache.get_scan(2, 1000 + o).is_some()).count(),
+            (0..60u64)
+                .filter(|&o| cache.get_scan(2, 1000 + o).is_some())
+                .count(),
             0,
             "a scan block was admitted into a full cache"
         );
@@ -1015,15 +1123,23 @@ mod cache_tests {
             assert!(cache.get_scan(3, off).is_none());
             cache.insert_scan(3, off, block(0), 50);
         }
-        let resident = (0..60u64).filter(|&o| cache.get_scan(3, o).is_some()).count();
-        assert_eq!(resident, 60, "a scan into free room must retain every block");
+        let resident = (0..60u64)
+            .filter(|&o| cache.get_scan(3, o).is_some())
+            .count();
+        assert_eq!(
+            resident, 60,
+            "a scan into free room must retain every block"
+        );
         // And the plain path agrees: a one-touch block is not dropped while
         // there is room for it.
         for off in 0..60u64 {
             cache.insert(4, off, block(0), 50);
         }
         let resident = (0..60u64).filter(|&o| cache.get(4, o).is_some()).count();
-        assert_eq!(resident, 60, "the plain admission dropped blocks with room to spare");
+        assert_eq!(
+            resident, 60,
+            "the plain admission dropped blocks with room to spare"
+        );
     }
 
     /// A scan touch is NOT a re-reference: a probation block a scan crosses is
@@ -1042,7 +1158,13 @@ mod cache_tests {
         for off in 10..40u64 {
             cache.insert(1, off, block(0), SZ);
         }
-        assert!(cache.get(1, 1).is_some(), "the reader-touched block must be promoted");
-        assert!(cache.get(1, 2).is_none(), "the scan-touched block must NOT be promoted");
+        assert!(
+            cache.get(1, 1).is_some(),
+            "the reader-touched block must be promoted"
+        );
+        assert!(
+            cache.get(1, 2).is_none(),
+            "the scan-touched block must NOT be promoted"
+        );
     }
 }

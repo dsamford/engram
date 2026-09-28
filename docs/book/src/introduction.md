@@ -8,21 +8,23 @@ A property-graph database in Rust, speaking openCypher over the Bolt protocol.
 
 Engram is a single-process graph engine with its own Cypher parser and planner,
 MVCC storage over a write-ahead log, paged segments that read block-by-block so
-a graph can exceed RAM, vector indexes, and a Bolt v5 listener that stock Neo4j
+a graph can exceed RAM, vector indexes, graph algorithms as `engram.algo.*`
+procedures, and a Bolt listener (protocol 5.0–5.8 and 6.0) that stock Neo4j
 drivers connect to.
 
 |  |  |
 |---|---|
-| **Measured standing** | ahead of Neo4j 5.26-community on **all 19 workloads** measured at LDBC SNB SF1 — LSQB 9/9 and the stress suite's 20 levels, same-window pairs |
-| **openCypher conformance** | 3,772 of 3,773 evaluated TCK scenarios (99.97%), CI-ratcheted |
+| **Measured standing** | against Neo4j 5.26 Community and PostgreSQL 17 on LSQB, SNB BI and SNB Interactive at SF3 and SF10 and FinBench at SF1 and SF10: the only one of the three to answer every query, faster than Neo4j on **103 of the 119** queries both answered and faster than PostgreSQL on **90 of 126**. PostgreSQL stays ahead on a set of heavy analytical joins and on FinBench's transfer-path queries |
+| **openCypher conformance** | 3,769 of 3,773 evaluated TCK scenarios (99.9%), CI-ratcheted |
 | **`unsafe` code** | none — the workspace denies it outright |
-| **Third-party crates** | 39, every one permissively licensed, no copyleft |
+| **Third-party crates** | 44, every one permissively licensed, no copyleft |
 | **Reproducibility** | two processes, one seed, one identical trace digest — enforced as a gate |
 
 The performance line is the one most worth checking rather than believing:
-[Measurements](./measurements/index.md) carries the per-query tables, the
-methodology, the commands to reproduce them, and — at equal prominence — what
-they do not say.
+[Three engines at SF3 and SF10](./measurements/three-engines-sf3-sf10.md)
+carries the per-query tables, the rig and the protocol, and — at equal
+prominence — what they do not say. These are not official LDBC results; that
+page says what that means.
 
 ## Where to start
 
@@ -55,14 +57,14 @@ The book runs from newcomer to expert in order, and each part stands alone:
 | [Architecture](./architecture/overview.md) | how it works inside, with diagrams |
 | [Reference](./reference/cli.md) | every flag, field, constant, variable, procedure and error |
 | [Development](./development/building.md) | building, the gates, testing, simulation, benchmarking |
-| [Design history](./history/index.md) | the engineering record — dated, superseded in places, kept because the reasoning is the value |
-| [Measurements](./measurements/index.md) | performance claims, each with its corpus, host shape and command |
+| [Measurements](./measurements/index.md) | how performance is measured, and the current comparison with its rig, data sizes and protocol |
 
 ## A note on how this project states things
 
 Engram's documentation tries to state absences as loudly as features, because a
-list of features implies the rest exist. Where a number appears, it is
-reproducible from a file under [Measurements](./measurements/index.md). Where a
+list of features implies the rest exist. Where a performance number appears, it
+comes from the current comparison under [Measurements](./measurements/index.md),
+which names the rig, the data size and the protocol it was taken under. Where a
 rule is described, it is usually enforced by a gate rather than by convention —
 the project's own phrasing is that *a rule nothing checks is a preference*.
 

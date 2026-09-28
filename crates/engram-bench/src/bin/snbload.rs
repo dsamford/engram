@@ -139,8 +139,28 @@ fn lit(s: &str) -> String {
 fn renderable(v: &Value) -> bool {
     matches!(
         v,
-        Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Str(_) | Value::Null
+        Value::Int(_)
+            | Value::Float(_)
+            | Value::Bool(_)
+            | Value::Str(_)
+            | Value::Null
+            | Value::Date(_)
+            | Value::DateTime { .. }
     )
+}
+
+/// `days` since the epoch → `yyyy-MM-dd` (Howard Hinnant's `civil_from_days`).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 /// Render one property value as a Cypher literal.
@@ -158,6 +178,36 @@ fn render(v: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         Value::Str(s) => lit(s),
         Value::Null => "null".into(),
+        // A temporal is spelled as the CONSTRUCTOR, not as the integer it
+        // could be flattened to. `datagen2jsonl` used to emit epoch millis
+        // here and the store held integers, so `message.creationDate <
+        // datetime(...)` compared Int against DateTime — false rather than an
+        // error — and three SNB BI queries returned zero rows that read as
+        // clean executions. Spelling the type is what makes `.year`, `date()`
+        // and duration arithmetic mean anything.
+        Value::Date(days) => {
+            let (y, m, d) = civil_from_days(*days);
+            format!("date('{y:04}-{m:02}-{d:02}')")
+        }
+        Value::DateTime {
+            epoch_seconds,
+            nanos,
+            ..
+        } => {
+            // Rendered in UTC. `epoch_seconds` is ALREADY the UTC instant --
+            // `untag_temporal` subtracts the offset when it parses -- so the
+            // offset is not applied again here. The corpus is generated with
+            // `+0000` throughout, and collapsing to one zone keeps two runs
+            // byte-identical, which the determinism gate compares.
+            let (days, rem) = (
+                epoch_seconds.div_euclid(86_400),
+                epoch_seconds.rem_euclid(86_400),
+            );
+            let (y, mo, d) = civil_from_days(days);
+            let (h, mi, sec) = (rem / 3600, rem / 60 % 60, rem % 60);
+            let milli = nanos / 1_000_000;
+            format!("datetime('{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{sec:02}.{milli:03}Z')")
+        }
         // Unreachable after `check_props`; a panic here means the two
         // disagree, and a loud stop still beats a node with a silently
         // missing property.
@@ -200,6 +250,31 @@ fn props_literal(p: &BTreeMap<String, Value>, gid: &str) -> String {
         parts.push(format!("{k}: {}", render(v)));
     }
     parts.join(", ")
+}
+
+/// One relationship's property map, rendered as a Cypher map literal.
+///
+/// FinBench is why this exists. Five of its edge types carry properties AND
+/// permit multiplicity N between the same ordered pair, so an edge's identity
+/// is its properties rather than its endpoints; a loader that reads only
+/// `s`/`d`/`t` loads such a corpus clean and measures a smaller, simpler graph
+/// than the one it was given.
+///
+/// Unlike `props_literal` this returns the BRACES too, because a relationship
+/// map is inlined as one element of the UNWIND list rather than spliced into a
+/// node pattern.
+///
+/// Keys render in the map's own sorted order so two runs of one corpus emit
+/// byte-identical statements, which the determinism gate compares.
+fn rel_props_literal(p: &BTreeMap<String, Value>) -> String {
+    let mut parts = Vec::with_capacity(p.len());
+    for (k, v) in p {
+        if !bare_identifier(k) {
+            panic!("snbload: relationship property key {k:?} is not a bare identifier");
+        }
+        parts.push(format!("{k}: {}", render(v)));
+    }
+    format!("{{{}}}", parts.join(", "))
 }
 
 /// A refusal raised BEFORE any statement was sent. Every corpus-triggered
@@ -551,6 +626,64 @@ enum Pairs {
     Gids(Vec<(String, String)>),
 }
 
+/// One group's pairs, and — only for a corpus that carries them — the
+/// rendered property map of each pair, positionally parallel to it.
+///
+/// EMPTY IS THE SNB CASE AND IT MUST STAY BYTE-IDENTICAL. Every SNB figure in
+/// `measurements/` was taken against the two-element `[s, d]` statement; a
+/// loader that began emitting a three-element one for every corpus would make
+/// the entire back catalogue incomparable and say nothing. So the property
+/// form is reached only when `rels.jsonl` actually carried a `"p"`.
+struct Group {
+    pairs: Pairs,
+    /// Rendered `{k: v}` literals, parallel to `pairs`, or empty.
+    props: Vec<String>,
+}
+
+impl Group {
+    fn new(pairs: Pairs) -> Self {
+        Group {
+            pairs,
+            props: Vec::new(),
+        }
+    }
+    fn len(&self) -> usize {
+        self.pairs.len()
+    }
+    fn has_props(&self) -> bool {
+        !self.props.is_empty()
+    }
+    /// Every element rendered, three-element when this group carries
+    /// properties and two-element when it does not.
+    fn elements(&self) -> Vec<String> {
+        let base = self.pairs.elements();
+        if !self.has_props() {
+            return base;
+        }
+        assert_eq!(
+            base.len(),
+            self.props.len(),
+            "snbload: {} pair(s) against {} property map(s) -- a group that              lost the correspondence would attach properties to the wrong              edges, silently",
+            base.len(),
+            self.props.len()
+        );
+        base.iter()
+            .zip(self.props.iter())
+            // `base` renders as `[s, d]`; splice the map in before the close.
+            .map(|(e, p)| format!("{}, {}]", e.trim_end_matches(']'), p))
+            .collect()
+    }
+    fn lists(&self) -> Vec<String> {
+        if !self.has_props() {
+            return self.pairs.lists();
+        }
+        self.elements()
+            .chunks(BATCH)
+            .map(|c| c.join(", "))
+            .collect()
+    }
+}
+
 impl Pairs {
     fn len(&self) -> usize {
         match self {
@@ -880,7 +1013,7 @@ fn main() {
 
     // ── Relationships, grouped by TYPE and by the label pair they join ─────
     let t1 = Instant::now();
-    let mut groups: BTreeMap<GroupKey, Pairs> = BTreeMap::new();
+    let mut groups: BTreeMap<GroupKey, Group> = BTreeMap::new();
     let mut rels = 0u64;
     let mut skipped = 0u64;
     engram_bench::read_jsonl(&dir.join("rels.jsonl"), |v| {
@@ -888,6 +1021,23 @@ fn main() {
         let s = engram_bench::get_str(&m, "s");
         let d = engram_bench::get_str(&m, "d");
         let t = engram_bench::get_str(&m, "t");
+        // `"p"` is the additive relationship-property field. Absent on every
+        // SNB corpus, and read as None rather than as an empty map: an empty
+        // map would render `{}` and change the emitted statement.
+        let rp = match m.get("p") {
+            Some(Value::Map(pm)) if !pm.is_empty() => {
+                // Through the SAME untagging node properties take. The JSONL
+                // contract tags typed values, and a relationship property that
+                // skipped this would render its tag wrapper as the value.
+                let mut u = 0usize;
+                let decoded: BTreeMap<String, Value> = pm
+                    .iter()
+                    .map(|(k, x)| (k.clone(), engram_bench::untag_prop(x, &mut u)))
+                    .collect();
+                Some(rel_props_literal(&decoded))
+            }
+            _ => None,
+        };
         // An endpoint whose node was not in nodes.jsonl is counted, never
         // silently dropped: a corpus that loses edges loads fine and answers
         // every traversal short.
@@ -897,12 +1047,15 @@ fn main() {
                     skipped += 1;
                     return;
                 };
-                match groups
+                let g = groups
                     .entry((t, sl.to_string(), dl.to_string()))
-                    .or_insert_with(|| Pairs::Ids(Vec::new()))
-                {
+                    .or_insert_with(|| Group::new(Pairs::Ids(Vec::new())));
+                match &mut g.pairs {
                     Pairs::Ids(v) => v.push((si, di)),
                     Pairs::Gids(_) => unreachable!("id mode holds id pairs"),
+                }
+                if let Some(rp) = rp {
+                    g.props.push(rp);
                 }
             }
             None => {
@@ -910,12 +1063,15 @@ fn main() {
                     skipped += 1;
                     return;
                 };
-                match groups
+                let g = groups
                     .entry((t, sl.clone(), dl.clone()))
-                    .or_insert_with(|| Pairs::Gids(Vec::new()))
-                {
+                    .or_insert_with(|| Group::new(Pairs::Gids(Vec::new())));
+                match &mut g.pairs {
                     Pairs::Gids(v) => v.push((s, d)),
                     Pairs::Ids(_) => unreachable!("gid mode holds gid pairs"),
+                }
+                if let Some(rp) = rp {
+                    g.props.push(rp);
                 }
             }
         }
@@ -971,14 +1127,20 @@ fn main() {
             for list in pairs.lists() {
                 // One statement per pair keeps the plan trivial on both engines;
                 // batching is by UNWIND over an inlined list of id pairs.
-                conn.run(
-                    &format!(
-                        "UNWIND [{list}] AS pair \
-                         MATCH (a:{sl} {{{prop}: pair[0]}}), (b:{dl} {{{prop}: pair[1]}}) \
-                         CREATE (a)-[:{t}]->(b)"
-                    ),
-                    "rel create",
-                );
+                // Two statements, and WHICH ONE is emitted is a property of
+                // the corpus, never of a flag: a corpus carrying no `"p"` gets
+                // the exact statement every recorded SNB measurement was taken
+                // against, so the back catalogue stays comparable.
+                let stmt = if pairs.has_props() {
+                    format!(
+                        "UNWIND [{list}] AS pair                          MATCH (a:{sl} {{{prop}: pair[0]}}), (b:{dl} {{{prop}: pair[1]}})                          CREATE (a)-[r:{t}]->(b) SET r = pair[2]"
+                    )
+                } else {
+                    format!(
+                        "UNWIND [{list}] AS pair                          MATCH (a:{sl} {{{prop}: pair[0]}}), (b:{dl} {{{prop}: pair[1]}})                          CREATE (a)-[:{t}]->(b)"
+                    )
+                };
+                conn.run(&stmt, "rel create");
                 statements += 1;
             }
         }
@@ -1029,7 +1191,11 @@ fn main() {
 
     eprintln!(
         "[snbload] DONE: {nodes} nodes, {rels} rels into {} in {:.1}s ({} statement(s))",
-        if dump.is_some() { "the plan dump" } else { &addr },
+        if dump.is_some() {
+            "the plan dump"
+        } else {
+            &addr
+        },
         t0.elapsed().as_secs_f64(),
         conn.acked
     );
@@ -1253,7 +1419,7 @@ mod tests {
         assert_eq!(check_props(&ok), Ok(()));
         // A list is not something the renderer inlines.
         let mut bad = ok.clone();
-        bad.insert("emails".to_string(), Value::List(vec![]));
+        bad.insert("emails".to_string(), Value::List((vec![]).into()));
         assert!(check_props(&bad).unwrap_err().contains("emails"));
         // A key that is not a bare identifier.
         let mut bad = ok.clone();

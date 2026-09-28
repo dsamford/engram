@@ -178,7 +178,9 @@ See [The commit log](./commit-log.md).
   diff plus a failing test, never an accident.
 - The commit-log hash rule is pinned by a golden test whose literal was updated
   exactly once and which carries the previous value.
-- 45 tests across `engram-key`, with every non-structural property canaried.
+- Three test files across `engram-key` — dispatch, encoding and value — with
+  every non-structural property canaried. None of them lives in `src`, so the
+  suite reaches the crate only through its public surface.
 
 One canary was **retired by making its property structural**: the list-skip
 arithmetic moved to `u64`, where a `u32` count cannot wrap on any target.

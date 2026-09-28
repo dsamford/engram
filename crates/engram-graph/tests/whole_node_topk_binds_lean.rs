@@ -83,7 +83,8 @@ fn corpus() -> Graph {
     let mut m = BTreeMap::new();
     m.insert("pid".to_string(), Value::Str("u1".to_string()));
     let u1 = g.create_node(&["Person".into()], &m).expect("person");
-    g.create_rel(u1, "MEMBER", projects[0], &BTreeMap::new()).expect("m");
+    g.create_rel(u1, "MEMBER", projects[0], &BTreeMap::new())
+        .expect("m");
     for i in 0..N {
         let mut m = BTreeMap::new();
         m.insert("n".to_string(), Value::Int(i));
@@ -136,20 +137,35 @@ fn the_listing_hydrates_only_its_page_and_answers_the_rules() {
     assert_eq!(got.iter().map(|r| n_of(r)).collect::<Vec<_>>(), want);
     // Every row carries the WHOLE record (the body) and its project.
     for (r, &i) in got.iter().zip(&want) {
-        let Value::Map(m) = &r[0] else { panic!("{:?}", r[0]) };
-        assert_eq!(m.get("body").map(|v| matches!(v, Value::Str(s) if s.len() == 2_000)), Some(true));
+        let Value::Map(m) = &r[0] else {
+            panic!("{:?}", r[0])
+        };
+        assert_eq!(
+            m.get("body")
+                .map(|v| matches!(v, Value::Str(s) if s.len() == 2_000)),
+            Some(true)
+        );
         assert_eq!(r[1], Value::Int(project(i)));
     }
     assert!(count_of(&c, LEAN) >= 1, "{c:?}");
     assert!(count_of(&c, HYDRATED) >= 10, "{c:?}");
-    assert!(count_of(&c, KEY_DIRECT) >= 100, "the key is read from the lean row: {c:?}");
+    assert!(
+        count_of(&c, KEY_DIRECT) >= 100,
+        "the key is read from the lean row: {c:?}"
+    );
     // Only the page is decoded in full — never the label.
     assert!(
         count_of(&c, FULL) <= 15 + 8,
         "{} full materialisations for a page of 15: {c:?}",
         count_of(&c, FULL)
     );
-    assert_eq!(general(&g, LISTING).iter().map(|r| n_of(r)).collect::<Vec<_>>(), want);
+    assert_eq!(
+        general(&g, LISTING)
+            .iter()
+            .map(|r| n_of(r))
+            .collect::<Vec<_>>(),
+        want
+    );
 }
 
 /// The bare form (`RETURN w … ORDER BY w.updated`) binds lean too; the
@@ -166,7 +182,9 @@ fn a_bare_whole_node_output_binds_lean_as_well() {
     let (got, c) = traced(&g, src);
     assert_eq!(got.iter().map(|r| n_of(r)).collect::<Vec<_>>(), want);
     for r in &got {
-        let Value::Node { props, .. } = &r[0] else { panic!("{:?}", r[0]) };
+        let Value::Node { props, .. } = &r[0] else {
+            panic!("{:?}", r[0])
+        };
         assert!(props.contains_key("body"), "hydrated in full: {props:?}");
     }
     // The columnar projection recogniser may claim this hop-less spelling
@@ -176,7 +194,10 @@ fn a_bare_whole_node_output_binds_lean_as_well() {
         "{c:?}"
     );
     assert!(count_of(&c, FULL) <= 3 + 8, "{c:?}");
-    assert_eq!(general(&g, src).iter().map(|r| n_of(r)).collect::<Vec<_>>(), want);
+    assert_eq!(
+        general(&g, src).iter().map(|r| n_of(r)).collect::<Vec<_>>(),
+        want
+    );
 }
 
 /// CONTROLS: a whole-node read BEFORE the breaker (`size(keys(w))` in the

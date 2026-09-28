@@ -118,10 +118,26 @@ before feeding a batch's bytes to the protocol machine. Everything below reads
 time from what it was handed, and everything that needs *ordering* rather than
 wall time uses the commit clock instead, which is a counter the store owns.
 
-`engram-server` is also the only crate in the workspace carrying
-`#![allow(clippy::disallowed_methods, clippy::disallowed_types)]`. That is not
-an exemption so much as a boundary: the adapter is where the real world is
-allowed to exist, and it is one file deep.
+`engram-server/src/lib.rs` is also the only **serving-path** source in the
+workspace carrying `#![allow(clippy::disallowed_methods,
+clippy::disallowed_types)]`. That is not an exemption so much as a boundary: the
+adapter is where the real world is allowed to exist, and it is one file deep.
+
+The benchmark binaries carry the same waiver, and so do about a hundred of the
+integration tests: they need real threads and a real clock, which the simulation
+`Runtime` deliberately does not provide and which is the point of them. So a
+grep for the waiver returns dozens of hits and the rule can look unenforced.
+None of those hits is on the path a client's bytes take, which is the claim that
+matters.
+
+Two engine functions on that path do carry a narrower, item-level
+`#[allow(clippy::disallowed_methods)]`, each with its reason at the site. The
+memory-admission queue's poll sleeps the waiting statement's own thread for
+10 ms at a time, bounded by the queue's deadline: the server runs each
+statement on a real worker thread with no cooperative runtime to yield to, and
+a simulated run never reaches a memory ceiling. And the algorithm phase report
+behind `ENGRAM_ALGO_TIMING=1` reads a clock to print elapsed times to stderr,
+never as an input to an answer. Neither spawns a thread.
 
 ## D2 — the engine never spawns
 
@@ -140,9 +156,12 @@ So the server is **not** single-threaded, and describing it that way is wrong:
 - `--workers N` runs N engine threads over one shared store, with connections
   pinned to a worker by `id % workers`.
 - Each connection additionally has a reader and a writer thread.
-- A maintenance thread and a counters thread run alongside.
-- Inside a statement, **morsel-parallel** `expand` and count-fold operators can
-  split work across a thread pool.
+- Two maintenance threads (storage, and the derived refresh) and a counters
+  thread run alongside.
+- Inside a statement, **morsel-parallel** operators can split work across a
+  thread pool: the columnar `expand` and count fold, the general matcher's
+  input rows, a first-stage `MATCH`'s seed set and a stage's continuation, an
+  aggregation grouped by its seed, and the graph-algorithm kernels.
 
 What survives, and is the actual rule, is narrower and sharper: **the engine
 crates never spawn a thread.** `std::thread::spawn` is denied workspace-wide,
@@ -169,13 +188,26 @@ is the part worth understanding:
 |---|---|
 | **absent** (default, and always in the simulation lane) | operators take their serial paths; one lever check on the hot path |
 | `SerialExec` | width 1, inline — the *parallel machinery* run **deterministically** |
-| the server's thread-scope pool | real OS threads, behind `ENGRAM_QUERY_PARALLELISM` |
+| the server's thread-scope pool | real OS threads, behind `ENGRAM_QUERY_PARALLELISM` — drawn from a process-wide budget, so a statement that finds it empty runs serially rather than waiting; within a grant the calling thread works too, and helpers start only as the run proves long enough to need them |
 
 Because the engine asks for parallelism rather than owning it, the morsel
 machinery — split, slot collection, ordered merge — can be exercised
 single-threaded through the *same code path*. Partials are concatenated in
 morsel order, so a parallel run is byte-identical to a serial one, proven per
 operator by an A/B differential with a fired-counter canary.
+
+The budget is what keeps the seam honest under load. The pool used to spawn
+`width` threads per statement with nothing coordinating between statements, so C
+concurrent clients produced up to `C × width` workers against a fixed CPU quota;
+`ENGRAM_PARALLEL_SLOTS` now caps the whole process, defaulting to the configured
+width, and a statement takes what is free with a non-blocking CAS rather than
+queueing for it. What it takes is a ceiling rather than a spawn count: the
+calling thread claims morsels itself, one helper waits out a short ramp before
+joining, and further helpers start only while unclaimed morsels outnumber the
+helpers started but not yet working, so a short step pays for at most one
+thread it did not use. Taking zero means running serially, and that is a schedule
+change rather than a result change — the trait promises that `for_each` invokes
+`f` for every index, not that any particular number of threads does it.
 
 That is what a database owning its own thread pool cannot do.
 
@@ -206,7 +238,7 @@ Before a subsystem may fire an event, it registers it. Four kinds:
 
 ```sh
 cargo xtask d3
-# [PASS] d3  367 file(s), 12 Subsystem impl(s) checked, 2 test fixture(s) excluded,
+# [PASS] d3  486 file(s), 12 Subsystem impl(s) checked, 2 test fixture(s) excluded,
 #            canary detected 3 of 3
 ```
 
@@ -266,7 +298,7 @@ Each decision follows the same three-step shape:
 3. **Prove the check still bites** — a canary that must fire, and a negative
    canary proving it has not started matching everything.
 
-You will meet step 2 constantly. `[PASS] c-deps 39 package(s), 39 inspected`
+You will meet step 2 constantly. `[PASS] c-deps 44 package(s), 44 inspected`
 carries that second number because a gate which walked zero files prints "no
 findings" in exactly the same words as one that walked all of them — and this
 repository has shipped an audit that skipped the very thing it appeared to

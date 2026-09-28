@@ -93,17 +93,23 @@ crate, and the workload drives the actual store, log and codec.
 ### Crash points
 
 Named places the harness can kill the process, declared by the subsystem that
-owns them:
+owns them. The four the sweep arms:
 
 | crash point | between |
 |---|---|
-| `store.before_log_append` | preparing a write and logging it |
 | `store.between_log_and_publish` | the log append and the tail push |
 | `graph.between_node_and_membership` | a node record and its membership rows |
+| `adjacency.between_out_and_in` | an edge's outgoing direction and its incoming one |
+| `objstore.between_seal_and_put` | sealing a segment and putting it to the tier |
 
-That second one is the WAL rule made testable: **log, then publish**. Killing
-exactly there and asserting what recovery does is what turns an ordering
-argument into a test.
+The first is the WAL rule made testable: **log, then publish**. Killing exactly
+there and asserting what recovery does is what turns an ordering argument into a
+test.
+
+Seventeen crash points are declared across the workspace, so most of them are
+not armed by this sweep. That gap is visible rather than hidden, which is the
+whole reason for declaring a crash point instead of discovering it: a point
+nothing arms can be counted.
 
 ### Invariants
 

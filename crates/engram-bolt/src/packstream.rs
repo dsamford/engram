@@ -144,7 +144,9 @@ impl Pack {
     pub fn into_value(self) -> Result<Value, PackError> {
         match self {
             Pack::Value(v) => Ok(v),
-            Pack::Bytes(b) => Ok(Value::List(b.into_iter().map(|x| Value::Int(i64::from(x))).collect())),
+            Pack::Bytes(b) => Ok(Value::List(
+                b.into_iter().map(|x| Value::Int(i64::from(x))).collect::<Vec<_>>().into(),
+            )),
             Pack::Struct { tag, .. } => Err(PackError::BadStructure {
                 tag,
                 detail: "expected a plain value".into(),
@@ -169,7 +171,7 @@ pub fn encode_value(v: &Value, out: &mut Vec<u8>) -> Result<(), PackError> {
         Value::Str(s) => encode_string(s, out),
         Value::List(items) => {
             encode_size(items.len(), 0x90, 0xD4, out);
-            for item in items {
+            for item in (items).iter() {
                 encode_value(item, out)?;
             }
         }
@@ -179,17 +181,11 @@ pub fn encode_value(v: &Value, out: &mut Vec<u8>) -> Result<(), PackError> {
         // no current caller round-trips a path through Bolt.
         Value::Path(items) => {
             encode_size(items.len(), 0x90, 0xD4, out);
-            for item in items {
+            for item in (items).iter() {
                 encode_value(item, out)?;
             }
         }
-        Value::Map(entries) => {
-            encode_size(entries.len(), 0xA0, 0xD8, out);
-            for (k, val) in entries {
-                encode_string(k, out);
-                encode_value(val, out)?;
-            }
-        }
+        Value::Map(entries) => encode_map(entries, out)?,
         Value::Node { id, labels, props } => {
             let iid = i64::try_from(*id)
                 .map_err(|_| PackError::Unrepresentable("node id past i64".into()))?;
@@ -199,7 +195,11 @@ pub fn encode_value(v: &Value, out: &mut Vec<u8>) -> Result<(), PackError> {
             for l in labels {
                 encode_string(l, out);
             }
-            encode_value(&Value::Map(props.clone()), out)?;
+            // Fix 88: the properties are encoded IN PLACE. Wrapping them in a
+            // `Value::Map(props.clone())` deep-copied every property string of
+            // every node and relationship on the wire — 1,144 fat projects per
+            // project listing, each cloned to be written once and dropped.
+            encode_map(props, out)?;
             encode_string(&format!("n:{id}"), out);
         }
         Value::Date(days) => {
@@ -272,7 +272,7 @@ pub fn encode_value(v: &Value, out: &mut Vec<u8>) -> Result<(), PackError> {
             encode_int(as_i(*src, "src id")?, out);
             encode_int(as_i(*dst, "dst id")?, out);
             encode_string(rel_type, out);
-            encode_value(&Value::Map(props.clone()), out)?;
+            encode_map(props, out)?;
             encode_string(&format!("r:{id}"), out);
             encode_string(&format!("n:{src}"), out);
             encode_string(&format!("n:{dst}"), out);
@@ -339,6 +339,17 @@ fn encode_bytes(b: &[u8], out: &mut Vec<u8>) {
         }
     }
     out.extend_from_slice(b);
+}
+
+/// A map's entries, keys as strings, values recursively — the properties of
+/// a node or relationship encode through here without a copy (fix 88).
+fn encode_map(entries: &BTreeMap<String, Value>, out: &mut Vec<u8>) -> Result<(), PackError> {
+    encode_size(entries.len(), 0xA0, 0xD8, out);
+    for (k, val) in entries {
+        encode_string(k, out);
+        encode_value(val, out)?;
+    }
+    Ok(())
 }
 
 fn encode_string(s: &str, out: &mut Vec<u8>) {
@@ -563,7 +574,7 @@ impl<'a> Decoder<'a> {
                 // scalar path.
                 items.push(decode_value(d.decode()?)?);
             }
-            Ok(Pack::Value(Value::List(items)))
+            Ok(Pack::Value(Value::List((items).into())))
         })
     }
 
@@ -608,7 +619,7 @@ pub fn decode_value(pack: Pack) -> Result<Value, PackError> {
                     return Err(PackError::BadStructure {
                         tag: SIG_VECTOR,
                         detail: "type_marker".into(),
-                    })
+                    });
                 }
             };
             let Pack::Bytes(data) = data else {
@@ -628,7 +639,7 @@ pub fn decode_value(pack: Pack) -> Result<Value, PackError> {
                     return Err(PackError::BadStructure {
                         tag: SIG_VECTOR,
                         detail: format!("unknown element type marker {other:#04X}"),
-                    })
+                    });
                 }
             };
             if data.len() % width != 0 {
@@ -650,7 +661,7 @@ pub fn decode_value(pack: Pack) -> Result<Value, PackError> {
                     0xC6 => Value::Float(f64::from(f32::from_be_bytes([c[0], c[1], c[2], c[3]]))),
                     _ => Value::Float(f64::from_be_bytes(c.try_into().expect("8"))),
                 })
-                .collect();
+                .collect::<Vec<_>>().into();
             Ok(Value::List(elements))
         }
         Pack::Struct {
@@ -677,7 +688,7 @@ pub fn decode_value(pack: Pack) -> Result<Value, PackError> {
                 });
             };
             let mut labels = Vec::with_capacity(ls.len());
-            for l in ls {
+            for l in (ls).iter().cloned() {
                 match l {
                     Value::Str(s) => labels.push(s),
                     _ => {

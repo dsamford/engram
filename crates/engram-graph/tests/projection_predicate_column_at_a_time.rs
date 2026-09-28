@@ -26,10 +26,18 @@ const EXPR: &str = "cypher.expressions evaluated";
 fn params() -> BTreeMap<String, Value> {
     let mut p = BTreeMap::new();
     p.insert("t".to_string(), Value::Str("Business and Finance".into()));
-    p.insert("cutoff".to_string(), Value::Str("2026-08-31T00:00:00.000Z".into()));
+    p.insert(
+        "cutoff".to_string(),
+        Value::Str("2026-08-31T00:00:00.000Z".into()),
+    );
     p.insert(
         "existingIds".to_string(),
-        Value::List((4600..4610).map(|i| Value::Str(format!("s-{i:05}"))).collect()),
+        Value::List(
+            (4600..4610)
+                .map(|i| Value::Str(format!("s-{i:05}")))
+                .collect::<Vec<_>>()
+                .into(),
+        ),
     );
     p
 }
@@ -38,7 +46,9 @@ type Rows = Result<Vec<Vec<Value>>, String>;
 
 fn rows(g: &Graph, src: &str) -> Rows {
     let q = parse_statement(src).unwrap_or_else(|e| panic!("parse `{src}`: {e}"));
-    run_query(g, &q, params()).map(|r| r.rows).map_err(|e| e.to_string())
+    run_query(g, &q, params())
+        .map(|r| r.rows)
+        .map_err(|e| e.to_string())
 }
 
 fn traced(g: &Graph, src: &str) -> (Rows, BTreeMap<String, u64>) {
@@ -69,19 +79,38 @@ fn corpus() -> Graph {
         m.insert("storyId".to_string(), Value::Str(format!("s-{i:05}")));
         m.insert(
             "primaryTopic".to_string(),
-            Value::Str(if i % 50 == 0 { "Sports".into() } else { "Business and Finance".into() }),
+            Value::Str(if i % 50 == 0 {
+                "Sports".into()
+            } else {
+                "Business and Finance".into()
+            }),
         );
         m.insert(
             "status".to_string(),
-            Value::Str(if i % 10 == 3 { "stale".into() } else { "active".into() }),
+            Value::Str(if i % 10 == 3 {
+                "stale".into()
+            } else {
+                "active".into()
+            }),
         );
         let recent = i >= n - n / 12 || i % 97 == 0;
         m.insert(
             "lastUpdatedAt".to_string(),
             Value::Str(if recent {
-                format!("2026-09-0{}T{:02}:{:02}:00.000Z", 1 + (i % 4), i % 24, i % 60)
+                format!(
+                    "2026-09-0{}T{:02}:{:02}:00.000Z",
+                    1 + (i % 4),
+                    i % 24,
+                    i % 60
+                )
             } else {
-                format!("2026-0{}-{:02}T{:02}:{:02}:00.000Z", 1 + (i % 8), 1 + (i % 28), i % 24, i % 60)
+                format!(
+                    "2026-0{}-{:02}T{:02}:{:02}:00.000Z",
+                    1 + (i % 8),
+                    1 + (i % 28),
+                    i % 24,
+                    i % 60
+                )
             }),
         );
         m.insert("title".to_string(), Value::Str(format!("Story {i}")));
@@ -94,8 +123,7 @@ fn corpus() -> Graph {
     g
 }
 
-const PRED: &str =
-    "s.primaryTopic = $t AND s.status <> 'stale' AND s.lastUpdatedAt > $cutoff";
+const PRED: &str = "s.primaryTopic = $t AND s.status <> 'stale' AND s.lastUpdatedAt > $cutoff";
 
 /// The answer equals the general path's and the second run was vectorised.
 fn check(g: &Graph, src: &str) -> BTreeMap<String, u64> {
@@ -107,11 +135,34 @@ fn check(g: &Graph, src: &str) -> BTreeMap<String, u64> {
     c
 }
 
+/// A CAPPED scan's answer (fix 82): the general path's row count, every
+/// row one the unlimited statement answers, and the same rows again on the
+/// second (vectorised) run. WHICH k of the matches a bare LIMIT keeps is
+/// the scan's choice — it takes them from the newest chunk first, where the
+/// general path's walk takes the first in id order.
+fn check_capped(g: &Graph, src: &str, unlimited: &str) -> BTreeMap<String, u64> {
+    let want_n = general(g, src)
+        .unwrap_or_else(|e| panic!("general `{src}`: {e}"))
+        .len();
+    let all = general(g, unlimited).unwrap_or_else(|e| panic!("general `{unlimited}`: {e}"));
+    let first = rows(g, src).unwrap_or_else(|e| panic!("first `{src}`: {e}"));
+    assert_eq!(first.len(), want_n, "first run `{src}`: {first:?}");
+    for r in &first {
+        assert!(
+            all.contains(r),
+            "`{src}` answered a row the unlimited statement does not: {r:?}"
+        );
+    }
+    let (got, c) = traced(g, src);
+    assert_eq!(got.unwrap(), first, "second run `{src}`");
+    c
+}
+
 #[test]
 fn a_bare_limit_stops_at_its_kth_survivor_without_a_scope_per_member() {
     let g = corpus();
     let src = format!("MATCH (s:NewsStory) WHERE {PRED} RETURN s.storyId AS storyId LIMIT 5");
-    let c = check(&g, &src);
+    let c = check_capped(&g, &src, &src.replace(" LIMIT 5", ""));
     assert!(count_of(&c, VECTOR) > 0, "{c:?}");
     assert!(count_of(&c, STOPPED) > 0, "{c:?}");
     // The five rows' items and the statement's constants — not a member.
@@ -121,8 +172,9 @@ fn a_bare_limit_stops_at_its_kth_survivor_without_a_scope_per_member() {
 #[test]
 fn skip_and_limit_together_cap_the_survivors() {
     let g = corpus();
-    let src = format!("MATCH (s:NewsStory) WHERE {PRED} RETURN s.storyId AS storyId SKIP 3 LIMIT 4");
-    let c = check(&g, &src);
+    let src =
+        format!("MATCH (s:NewsStory) WHERE {PRED} RETURN s.storyId AS storyId SKIP 3 LIMIT 4");
+    let c = check_capped(&g, &src, &src.replace(" SKIP 3 LIMIT 4", ""));
     assert!(count_of(&c, VECTOR) > 0, "{c:?}");
 }
 
@@ -143,7 +195,7 @@ fn a_constant_string_list_is_hashed_and_the_answer_is_unchanged() {
     let src = format!(
         "MATCH (s:NewsStory) WHERE {PRED} AND NOT s.storyId IN $existingIds RETURN s.storyId AS storyId, s.title AS title LIMIT 5"
     );
-    let c = check(&g, &src);
+    let c = check_capped(&g, &src, &src.replace(" LIMIT 5", ""));
     assert!(count_of(&c, VECTOR) > 0, "{c:?}");
     // A null needle against the list, and a needle that is in it.
     let src2 = "MATCH (s:NewsStory) WHERE s.summary IN $existingIds OR s.storyId IN $existingIds RETURN s.storyId AS storyId ORDER BY storyId";
@@ -157,7 +209,7 @@ fn presence_conjuncts_read_the_presence_columns() {
     let src = format!(
         "MATCH (s:NewsStory) WHERE {PRED} AND s.archivedAt IS NULL AND s.summary IS NOT NULL RETURN s.storyId AS storyId LIMIT 7"
     );
-    let c = check(&g, &src);
+    let c = check_capped(&g, &src, &src.replace(" LIMIT 7", ""));
     assert!(count_of(&c, VECTOR) > 0, "{c:?}");
 }
 
@@ -165,8 +217,10 @@ fn presence_conjuncts_read_the_presence_columns() {
 fn a_single_phase_projection_binds_only_the_survivors_from_its_walk() {
     let g = corpus();
     // The items read nothing beyond the predicate: one walk binds both.
-    let src = format!("MATCH (s:NewsStory) WHERE {PRED} RETURN s.primaryTopic AS t, s.status AS st LIMIT 5");
-    let c = check(&g, &src);
+    let src = format!(
+        "MATCH (s:NewsStory) WHERE {PRED} RETURN s.primaryTopic AS t, s.status AS st LIMIT 5"
+    );
+    let c = check_capped(&g, &src, &src.replace(" LIMIT 5", ""));
     assert!(count_of(&c, VECTOR) > 0, "{c:?}");
     assert!(count_of(&c, EXPR) < 200, "{c:?}");
 }
@@ -184,14 +238,18 @@ fn distinct_and_a_predicate_less_scan_are_unchanged() {
 
 /// CONTROL: a predicate the vectoriser declines (non-constant arithmetic)
 /// keeps the per-member walk — the columnar projection still runs it, with
-/// its early exit — and answers as the general path does.
+/// its early exit (from the newest chunk, fix 82) — and answers matches
+/// the general path answers.
 #[test]
 fn a_predicate_the_vectoriser_declines_keeps_the_walk() {
     let g = corpus();
     let src = "MATCH (s:NewsStory) WHERE s.primaryTopic = $t AND s.score + 0.5 > 1.2 RETURN s.storyId AS storyId LIMIT 5";
-    let c = check(&g, src);
+    let c = check_capped(&g, src, &src.replace(" LIMIT 5", ""));
     assert_eq!(count_of(&c, VECTOR), 0, "{c:?}");
-    assert!(count_of(&c, "interp.columnar projection scans") > 0, "{c:?}");
+    assert!(
+        count_of(&c, "interp.columnar projection scans") > 0,
+        "{c:?}"
+    );
     assert!(count_of(&c, STOPPED) > 0, "{c:?}");
 }
 

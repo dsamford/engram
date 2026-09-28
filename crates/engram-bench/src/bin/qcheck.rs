@@ -33,7 +33,7 @@ fn main() {
         eprintln!("[qcheck] loaded {} nodes, {} rels", stats.nodes, stats.rels);
     }
     let (mut ok, mut perr, mut rerr) = (0u32, 0u32, 0u32);
-    for entry in arr {
+    for entry in (arr).iter().cloned() {
         let Value::Map(m) = entry else { continue };
         let id = match m.get("id") {
             Some(Value::Str(s)) => s.clone(),

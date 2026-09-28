@@ -180,7 +180,9 @@ surprises you.
 
 ## Next
 
-- [How Engram is different](./how-its-different.md) — the three decisions that
-  explain the rest of the codebase.
+- [How Engram is different](./how-its-different.md) — how the storage and
+  execution choices compare to Neo4j, Kuzu/LadybugDB, DuckDB and SQLite.
+- [The three decisions](../architecture/three-decisions.md) — the choices that
+  explain the rest of the codebase, and the gate that enforces each.
 - [Cypher support](../using/cypher-support.md) — the query language in detail.
 - [Architecture overview](../architecture/overview.md) — the map of the engine.

@@ -1,5 +1,5 @@
 //! `lsqb <bolt-addr> [--json <out>] [--queries q1,q3] [--timeout-secs N]
-//! [--expect <counts.json>]` — the LSQB cyclic-join lane.
+//! [--probe-timeout-secs N] [--expect <counts.json>]` — the LSQB cyclic-join lane.
 //!
 //! LSQB (the LDBC Labelled Subgraph Query Benchmark) is nine subgraph-COUNTING
 //! queries over the SNB schema — cyclic joins, triangles, anti-joins — each
@@ -13,10 +13,12 @@
 //! queries use — `Message` as a supertype label on both `Post` and `Comment`,
 //! `Country`/`City` as secondary labels beside `Place`, and every relationship
 //! type (`CONTAINER_OF`, `HAS_MEMBER`, `REPLY_OF`, …) — so all nine queries
-//! map 1:1 and the adapted text below is the official text, line-joined. The
-//! per-query `divergence` field exists so that any future schema drift is
-//! declared rather than silently absorbed; a query the schema cannot express
-//! would be emitted with status `unmappable` and the reason, never dropped.
+//! map 1:1. The adapted text is NOT restated here: it is read from the shared
+//! statement catalogue (`catalogue/statements.json`), which every driver in
+//! this crate renders from, so one copy exists and two engines cannot end up
+//! asked slightly different questions. A query the schema cannot express is
+//! declared `unsupported` in the catalogue, with its reason, and emitted here
+//! with status `unmappable` — never dropped.
 //! Counts are properties of the corpus (snbgen synthetic, not LDBC Datagen):
 //! comparable across engines loading the SAME corpus, not against published
 //! LSQB numbers.
@@ -51,9 +53,10 @@
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::collections::BTreeMap;
-use std::sync::mpsc;
+use std::sync::{OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
+use engram_bench::catalogue::{Catalogue, Dialect, Status as CatalogueStatus};
 use engram_bolt::client::Client;
 use engram_cypher::Value;
 use engram_cypher::json::{from_json, to_json};
@@ -68,116 +71,121 @@ struct QuerySpec {
     /// official join shape (`unmappable` then says why).
     adapted: Option<&'static str>,
     /// Where the adapted text departs from the official query, the departure,
-    /// stated; `None` means the text is the official text.
+    /// stated; `None` means the text is the official text. The catalogue has
+    /// no key for a free-text departure — it declares an inexpressible shape
+    /// as `unsupported` plus a reason, which arrives here as `unmappable` —
+    /// so this is `None` for every catalogue-supplied entry. The field and its
+    /// report key stay because every committed report carries the key and
+    /// `report.rs` still emits it.
     divergence: Option<&'static str>,
     /// Required when `adapted` is `None`: why the query cannot be mapped.
     unmappable: Option<&'static str>,
 }
 
-/// All nine official LSQB queries. Text is the official cypher/q{n}.cypher
-/// from ldbc/lsqb, line-joined; the snbgen schema needs no label or type
-/// renames (see the module docs).
-const QUERIES: &[QuerySpec] = &[
-    QuerySpec {
-        name: "q1",
-        adapted: Some(
-            "MATCH (:Country)<-[:IS_PART_OF]-(:City)<-[:IS_LOCATED_IN]-(:Person)\
-             <-[:HAS_MEMBER]-(:Forum)-[:CONTAINER_OF]->(:Post)<-[:REPLY_OF]-(:Comment)\
-             -[:HAS_TAG]->(:Tag)-[:HAS_TYPE]->(:TagClass) RETURN count(*) AS count",
-        ),
-        divergence: None,
-        unmappable: None,
-    },
-    QuerySpec {
-        name: "q2",
-        adapted: Some(
-            "MATCH (person1:Person)-[:KNOWS]-(person2:Person), \
-             (person1)<-[:HAS_CREATOR]-(comment:Comment)-[:REPLY_OF]->(post:Post)\
-             -[:HAS_CREATOR]->(person2) RETURN count(*) AS count",
-        ),
-        divergence: None,
-        unmappable: None,
-    },
-    QuerySpec {
-        name: "q3",
-        adapted: Some(
-            "MATCH (country:Country) \
-             MATCH (person1:Person)-[:IS_LOCATED_IN]->(city1:City)-[:IS_PART_OF]->(country) \
-             MATCH (person2:Person)-[:IS_LOCATED_IN]->(city2:City)-[:IS_PART_OF]->(country) \
-             MATCH (person3:Person)-[:IS_LOCATED_IN]->(city3:City)-[:IS_PART_OF]->(country) \
-             MATCH (person1)-[:KNOWS]-(person2)-[:KNOWS]-(person3)-[:KNOWS]-(person1) \
-             RETURN count(*) AS count",
-        ),
-        divergence: None,
-        unmappable: None,
-    },
-    QuerySpec {
-        name: "q4",
-        adapted: Some(
-            "MATCH (:Tag)<-[:HAS_TAG]-(message:Message)-[:HAS_CREATOR]->(creator:Person), \
-             (message)<-[:LIKES]-(liker:Person), \
-             (message)<-[:REPLY_OF]-(comment:Comment) RETURN count(*) AS count",
-        ),
-        divergence: None,
-        unmappable: None,
-    },
-    QuerySpec {
-        name: "q5",
-        adapted: Some(
-            "MATCH (tag1:Tag)<-[:HAS_TAG]-(message:Message)<-[:REPLY_OF]-(comment:Comment)\
-             -[:HAS_TAG]->(tag2:Tag) WHERE tag1 <> tag2 RETURN count(*) AS count",
-        ),
-        divergence: None,
-        unmappable: None,
-    },
-    QuerySpec {
-        name: "q6",
-        adapted: Some(
-            "MATCH (person1:Person)-[:KNOWS]-(person2:Person)-[:KNOWS]-(person3:Person)\
-             -[:HAS_INTEREST]->(tag:Tag) WHERE person1 <> person3 RETURN count(*) AS count",
-        ),
-        divergence: None,
-        unmappable: None,
-    },
-    QuerySpec {
-        name: "q7",
-        adapted: Some(
-            "MATCH (:Tag)<-[:HAS_TAG]-(message:Message)-[:HAS_CREATOR]->(creator:Person) \
-             OPTIONAL MATCH (message)<-[:LIKES]-(liker:Person) \
-             OPTIONAL MATCH (message)<-[:REPLY_OF]-(comment:Comment) \
-             RETURN count(*) AS count",
-        ),
-        divergence: None,
-        unmappable: None,
-    },
-    QuerySpec {
-        name: "q8",
-        adapted: Some(
-            "MATCH (tag1:Tag)<-[:HAS_TAG]-(message:Message)<-[:REPLY_OF]-(comment:Comment)\
-             -[:HAS_TAG]->(tag2:Tag) \
-             WHERE NOT (comment)-[:HAS_TAG]->(tag1) AND tag1 <> tag2 \
-             RETURN count(*) AS count",
-        ),
-        divergence: None,
-        unmappable: None,
-    },
-    QuerySpec {
-        name: "q9",
-        adapted: Some(
-            "MATCH (person1:Person)-[:KNOWS]-(person2:Person)-[:KNOWS]-(person3:Person)\
-             -[:HAS_INTEREST]->(tag:Tag) \
-             WHERE NOT (person1)-[:KNOWS]-(person3) AND person1 <> person3 \
-             RETURN count(*) AS count",
-        ),
-        divergence: None,
-        unmappable: None,
-    },
-];
+/// Everything this lane sends, resolved once from the catalogue.
+struct Lane {
+    /// The nine queries, in catalogue order.
+    queries: Vec<QuerySpec>,
+    /// The all-node census statement.
+    census_nodes: &'static str,
+    /// The `:Person` census statement.
+    census_persons: &'static str,
+}
 
-/// The census statements: an empty corpus answers 0 to every lane query and
-/// would pass vacuously, so a run against one fails before measuring.
-const CENSUS_NODES: &str = "MATCH (n) RETURN count(n) AS c";
-const CENSUS_PERSONS: &str = "MATCH (p:Person) RETURN count(p) AS c";
+/// Promote one catalogue string to `'static`.
+///
+/// Leaked deliberately, and bounded: eleven strings, once, at startup, for the
+/// life of the process — the same trade `stress` makes for its shape table.
+/// The alternative is an owned `String` per `QuerySpec`, which would change
+/// the lifetime of the text `QueryOutcome` borrows and ripple through a file
+/// three people are editing, to save eleven allocations that are never freed
+/// because the process ends first.
+fn leaked(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
+
+/// The nine official LSQB queries and the two census statements, READ FROM the
+/// shared catalogue (`catalogue/statements.json`) rather than restated here.
+///
+/// They were restated here until the convergence cutover, and that second copy
+/// is the failure this indirection removes. Two copies of a query give two
+/// engines two chances to be asked slightly different questions, and the
+/// divergence that matters is the one that does NOT change the count — a
+/// missing `LIMIT`, a join written the expensive way round — because then
+/// nothing fails and only the timing is wrong.
+///
+/// The text is byte-identical to what this binary sent before the cutover.
+/// `tests/a_lsqb_statement_lives_once_and_matches_the_baseline.rs` holds the
+/// recorded bytes and fails if they ever move: every LSQB number this project
+/// has published was measured with these, and to a plan cache a statement that
+/// differs by one space is a different statement.
+///
+/// # Panics
+/// If the compiled-in catalogue is malformed or has no LSQB block. That is a
+/// build defect rather than a runtime condition — the catalogue is
+/// `include_str!`'d, so there is no run to attempt and nothing a flag could
+/// fix.
+fn lane() -> &'static Lane {
+    static LANE: OnceLock<Lane> = OnceLock::new();
+    LANE.get_or_init(|| {
+        let cat = Catalogue::load()
+            .unwrap_or_else(|e| panic!("the compiled-in statement catalogue does not parse: {e}"));
+        let names = cat
+            .lsqb_names()
+            .unwrap_or_else(|e| panic!("the catalogue declares no LSQB queries: {e}"));
+        let queries = names
+            .iter()
+            .map(|name| {
+                let entry = cat
+                    .lsqb(name, Dialect::Cypher)
+                    .unwrap_or_else(|e| panic!("catalogue: {e}"));
+                // `unsupported` is the catalogue's word for this lane's
+                // `unmappable`: the reason travels with it, and the query is
+                // reported rather than dropped — a battery quietly missing a
+                // query scores an engine on eight of nine and says nine.
+                let (adapted, unmappable) = match entry.status {
+                    CatalogueStatus::Unsupported(reason) => (None, Some(leaked(reason))),
+                    _ => (Some(leaked(entry.text)), None),
+                };
+                QuerySpec {
+                    name: leaked(name.clone()),
+                    adapted,
+                    divergence: None,
+                    unmappable,
+                }
+            })
+            .collect();
+        let (nodes, persons) = cat
+            .lsqb_census(Dialect::Cypher)
+            .unwrap_or_else(|e| panic!("the catalogue declares no LSQB census: {e}"));
+        Lane {
+            queries,
+            census_nodes: leaked(nodes),
+            census_persons: leaked(persons),
+        }
+    })
+}
+
+/// All nine official LSQB queries, in table order. Text is the official
+/// `cypher/q{n}.cypher` from ldbc/lsqb, line-joined; the snbgen schema needs
+/// no label or type renames (see the module docs).
+fn queries() -> &'static [QuerySpec] {
+    &lane().queries
+}
+
+/// The all-node census statement: an empty corpus answers 0 to every lane
+/// query and would pass vacuously, so a run against one fails before
+/// measuring.
+fn census_nodes() -> &'static str {
+    lane().census_nodes
+}
+
+/// The `:Person` half of the census. Two statements rather than one because a
+/// corpus with nodes but no persons is a corpus loaded from the wrong export,
+/// and the whole battery would then answer 0 legitimately.
+fn census_persons() -> &'static str {
+    lane().census_persons
+}
 
 /// Derive the existence probe from an adapted query: the same pattern (WHERE
 /// clauses included — an anti-join query's zero is only provable with the NOT
@@ -334,7 +342,9 @@ fn judge(count: i64, probe: &Probe, expected: Option<i64>) -> (Status, Option<St
         ),
         Probe::Failed(e) => (
             Status::Ok,
-            Some(format!("count is non-zero; note: existence probe failed ({e})")),
+            Some(format!(
+                "count is non-zero; note: existence probe failed ({e})"
+            )),
         ),
         Probe::Exists => (Status::Ok, None),
     }
@@ -393,6 +403,9 @@ fn outcome_value(o: &QueryOutcome) -> Value {
 struct RunMeta {
     addr: String,
     timeout_secs: u64,
+    /// The probe's own budget. Recorded because a probe label reading
+    /// "cut off at 300s" is only interpretable next to the budget that cut it.
+    probe_timeout_secs: u64,
     census_nodes: Option<i64>,
     census_persons: Option<i64>,
     census_error: Option<String>,
@@ -409,6 +422,10 @@ fn render_json(meta: &RunMeta, outcomes: &[QueryOutcome], pass: bool) -> String 
     m.insert(
         "timeout_secs".to_string(),
         Value::Int(meta.timeout_secs as i64),
+    );
+    m.insert(
+        "probe_timeout_secs".to_string(),
+        Value::Int(meta.probe_timeout_secs as i64),
     );
     m.insert("census_nodes".to_string(), opt_int(meta.census_nodes));
     m.insert("census_persons".to_string(), opt_int(meta.census_persons));
@@ -448,7 +465,13 @@ fn render_json(meta: &RunMeta, outcomes: &[QueryOutcome], pass: bool) -> String 
     m.insert("pass".to_string(), Value::Bool(pass));
     m.insert(
         "queries".to_string(),
-        Value::List(outcomes.iter().map(outcome_value).collect()),
+        Value::List(
+            outcomes
+                .iter()
+                .map(outcome_value)
+                .collect::<Vec<_>>()
+                .into(),
+        ),
     );
     to_json(&Value::Map(m))
 }
@@ -468,12 +491,12 @@ fn parse_queries_arg(arg: &str) -> Result<Vec<&'static str>, String> {
         return Err("--queries selected nothing".to_string());
     }
     for w in &wanted {
-        if !QUERIES.iter().any(|q| q.name == *w) {
-            let known: Vec<&str> = QUERIES.iter().map(|q| q.name).collect();
+        if !queries().iter().any(|q| q.name == *w) {
+            let known: Vec<&str> = queries().iter().map(|q| q.name).collect();
             return Err(format!("unknown query {w:?}; known: {}", known.join(",")));
         }
     }
-    Ok(QUERIES
+    Ok(queries()
         .iter()
         .map(|q| q.name)
         .filter(|n| wanted.contains(n))
@@ -492,14 +515,16 @@ fn parse_expect(src: &str) -> Result<BTreeMap<String, i64>, String> {
     };
     let mut out = BTreeMap::new();
     if let Some(Value::List(entries)) = m.get("queries") {
-        for e in entries {
+        for e in entries.iter() {
             let Value::Map(em) = e else {
                 return Err("--expect: entries under \"queries\" must be objects".to_string());
             };
             let Some(Value::Str(name)) = em.get("query") else {
-                return Err("--expect: an entry under \"queries\" has no \"query\" name".to_string());
+                return Err(
+                    "--expect: an entry under \"queries\" has no \"query\" name".to_string()
+                );
             };
-            if !QUERIES.iter().any(|q| q.name == name.as_str()) {
+            if !queries().iter().any(|q| q.name == name.as_str()) {
                 return Err(format!("--expect names unknown query {name:?}"));
             }
             match em.get("count") {
@@ -508,13 +533,15 @@ fn parse_expect(src: &str) -> Result<BTreeMap<String, i64>, String> {
                 }
                 Some(Value::Null) | None => {} // unmeasured upstream — no expectation
                 Some(other) => {
-                    return Err(format!("--expect: {name} has a non-integer count {other:?}"));
+                    return Err(format!(
+                        "--expect: {name} has a non-integer count {other:?}"
+                    ));
                 }
             }
         }
     } else {
         for (k, val) in &m {
-            if !QUERIES.iter().any(|q| q.name == k.as_str()) {
+            if !queries().iter().any(|q| q.name == k.as_str()) {
                 return Err(format!("--expect names unknown query {k:?}"));
             }
             match val {
@@ -540,6 +567,7 @@ fn run_one(
     addr: &str,
     spec: &QuerySpec,
     timeout: Duration,
+    probe_timeout: Duration,
     expected: Option<i64>,
 ) -> QueryOutcome {
     let Some(adapted) = spec.adapted else {
@@ -567,17 +595,52 @@ fn run_one(
     // server ran, and one that takes 180 s (q3, v69–v71) or 69 s (q1 at SF3)
     // behind a 0.6 s count is the kind of number that hid for three days
     // when only the count's millis were reported.
-    let (probe, probe_label) = match run_wire(addr, &probe_stmt, timeout) {
+    //
+    // THE PROBE GETS ITS OWN BUDGET, and at SF10 that stopped being optional.
+    //
+    // `RETURN 1 LIMIT 1` is meant to be the CHEAP half of this pair. It is not,
+    // for any pattern the planner cannot push a limit into: `early_cap` lives
+    // only inside `try_columnar_projection`, which `recognise_projection` gates
+    // on exactly `[Match, Return]` over ONE variable, so a multi-hop pattern
+    // enumerates in full and `rows.truncate(limit)` keeps one row afterwards.
+    // The count FOLDS; the probe MATERIALISES. Measured on the SF10 run of
+    // 2026-09-11:
+    //
+    //     q2   count 789.3 ms     probe 1716361 ms   -- 2175x the query
+    //     q4   count 3307.0 ms    probe 1313454 ms
+    //     q1   count 540748.0 ms  probe 1099562 ms
+    //     ...against q5 157 ms, q8 164 ms, q9 58 ms, which are single linear
+    //     paths and stream a first row immediately.
+    //
+    // 85 minutes of probes behind 9.4 minutes of queries: ~90% of the battery's
+    // wall clock spent proving that patterns with billions of matches have at
+    // least one.
+    //
+    // Capping it is safe, and `judge` is why rather than my say-so. A probe is
+    // load-bearing in exactly ONE case — a count of 0, where `Probe::Failed`
+    // yields `UnverifiedZero`, a FAILURE. That path is untouched: an unproven
+    // absence still refuses. For a NON-ZERO count `judge` already answers
+    // `Status::Ok` for `Probe::Failed`, so a cut-off probe lands exactly where
+    // a failed one always did, and says in its label that it was cut off.
+    //
+    // The default is the statement timeout, so an unflagged run behaves today
+    // EXACTLY as it did before this existed. A shrinking default would turn a
+    // slow-but-conclusive zero-probe into a failing run somewhere nobody was
+    // looking; a lane that wants the cap asks for it.
+    let (probe, probe_label) = match run_wire(addr, &probe_stmt, probe_timeout) {
         Wire::Rows(rows, ms) if rows.is_empty() => (Probe::Absent, format!("absent {ms:.0}ms")),
         Wire::Rows(_, ms) => (Probe::Exists, format!("exists {ms:.0}ms")),
         Wire::Failed(e) => {
             let label = format!("failed: {e}");
             (Probe::Failed(e), label)
         }
-        Wire::TimedOut => (
-            Probe::Failed("probe timed out".to_string()),
-            "failed: timeout".to_string(),
-        ),
+        Wire::TimedOut => {
+            let secs = probe_timeout.as_secs();
+            (
+                Probe::Failed(format!("probe exceeded its {secs}s budget")),
+                format!("failed: cut off at {secs}s"),
+            )
+        }
     };
 
     match run_wire(addr, adapted, timeout) {
@@ -646,7 +709,8 @@ fn census(addr: &str, stmt: &str, timeout: Duration) -> Result<i64, String> {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: lsqb <bolt-addr> [--json <out>] [--queries q1,q3] [--timeout-secs N] [--expect <counts.json>]"
+        "usage: lsqb <bolt-addr> [--json <out>] [--queries q1,q3] [--timeout-secs N]
+       [--probe-timeout-secs N] [--expect <counts.json>]"
     );
     eprintln!("  runs the nine LSQB cyclic-join queries against a loaded SNB-schema corpus.");
     eprintln!("  --expect: a flat {{\"q1\": 123, ...}} map, or this tool's own --json report.");
@@ -659,6 +723,9 @@ fn main() {
     let mut json_out: Option<String> = None;
     let mut selected: Option<Vec<&'static str>> = None;
     let mut timeout_secs: u64 = 120;
+    // None = "same as the statement timeout", i.e. exactly today's behaviour.
+    // Resolved after parsing, because --timeout-secs may arrive either side.
+    let mut probe_timeout_secs: Option<u64> = None;
     let mut expect: Option<BTreeMap<String, i64>> = None;
 
     let mut i = 1;
@@ -689,6 +756,16 @@ fn main() {
                     Ok(n) if n >= 1 => timeout_secs = n,
                     _ => {
                         eprintln!("[lsqb] --timeout-secs needs a positive integer");
+                        usage();
+                    }
+                }
+                i += 2;
+            }
+            "--probe-timeout-secs" => {
+                match take(i).parse::<u64>() {
+                    Ok(n) if n >= 1 => probe_timeout_secs = Some(n),
+                    _ => {
+                        eprintln!("[lsqb] --probe-timeout-secs needs a positive integer");
                         usage();
                     }
                 }
@@ -728,23 +805,31 @@ fn main() {
     }
     let Some(addr) = addr else { usage() };
     let timeout = Duration::from_secs(timeout_secs);
+    // Never longer than the statement's own budget: a probe outliving the
+    // query it guards is the shape this flag exists to stop.
+    let probe_timeout_secs = probe_timeout_secs.unwrap_or(timeout_secs).min(timeout_secs);
+    let probe_timeout = Duration::from_secs(probe_timeout_secs);
     let specs: Vec<&QuerySpec> = match &selected {
-        Some(names) => QUERIES.iter().filter(|q| names.contains(&q.name)).collect(),
-        None => QUERIES.iter().collect(),
+        Some(names) => queries()
+            .iter()
+            .filter(|q| names.contains(&q.name))
+            .collect(),
+        None => queries().iter().collect(),
     };
 
     // ── Census: refuse the vacuous pass before measuring anything ──────────
     let mut meta = RunMeta {
         addr: addr.clone(),
         timeout_secs,
+        probe_timeout_secs,
         census_nodes: None,
         census_persons: None,
         census_error: None,
         expect_used: expect.is_some(),
     };
-    let census_verdict = census(&addr, CENSUS_NODES, timeout).and_then(|n| {
+    let census_verdict = census(&addr, census_nodes(), timeout).and_then(|n| {
         meta.census_nodes = Some(n);
-        census(&addr, CENSUS_PERSONS, timeout).map(|p| {
+        census(&addr, census_persons(), timeout).map(|p| {
             meta.census_persons = Some(p);
             (n, p)
         })
@@ -787,17 +872,18 @@ fn main() {
     // ── The lane ───────────────────────────────────────────────────────────
     let mut outcomes: Vec<QueryOutcome> = Vec::with_capacity(specs.len());
     for spec in &specs {
-        let expected = expect
-            .as_ref()
-            .and_then(|m| m.get(spec.name))
-            .copied();
-        let o = run_one(&addr, spec, timeout, expected);
+        let expected = expect.as_ref().and_then(|m| m.get(spec.name)).copied();
+        let o = run_one(&addr, spec, timeout, probe_timeout, expected);
         eprintln!(
             "[lsqb] {:<3} {:<18} count={:<12} {:>10} ms  probe={}{}",
             o.name,
             o.status.as_str(),
-            o.count.map(|c| c.to_string()).unwrap_or_else(|| "-".to_string()),
-            o.millis.map(|m| format!("{m:.1}")).unwrap_or_else(|| "-".to_string()),
+            o.count
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            o.millis
+                .map(|m| format!("{m:.1}"))
+                .unwrap_or_else(|| "-".to_string()),
             o.probe,
             o.detail
                 .as_deref()
@@ -823,7 +909,9 @@ fn main() {
     if pass {
         eprintln!("[lsqb] PASS — every selected query answered and every zero was proven");
     } else {
-        eprintln!("[lsqb] FAIL — see per-query statuses above; timings from this run are not quotable");
+        eprintln!(
+            "[lsqb] FAIL — see per-query statuses above; timings from this run are not quotable"
+        );
         std::process::exit(1);
     }
 }
@@ -836,10 +924,10 @@ mod tests {
 
     #[test]
     fn table_has_exactly_nine_uniquely_named_entries() {
-        assert_eq!(QUERIES.len(), 9, "LSQB defines nine queries");
-        let names: std::collections::BTreeSet<&str> = QUERIES.iter().map(|q| q.name).collect();
+        assert_eq!(queries().len(), 9, "LSQB defines nine queries");
+        let names: std::collections::BTreeSet<&str> = queries().iter().map(|q| q.name).collect();
         assert_eq!(names.len(), 9, "duplicate query names in the table");
-        for (i, q) in QUERIES.iter().enumerate() {
+        for (i, q) in queries().iter().enumerate() {
             assert_eq!(q.name, format!("q{}", i + 1), "table order must be q1..q9");
             // Exactly one of adapted/unmappable, never both, never neither.
             match (q.adapted, q.unmappable) {
@@ -851,7 +939,10 @@ mod tests {
                     );
                 }
                 (None, Some(reason)) => assert!(!reason.is_empty()),
-                other => panic!("{}: adapted/unmappable must be exclusive, got {other:?}", q.name),
+                other => panic!(
+                    "{}: adapted/unmappable must be exclusive, got {other:?}",
+                    q.name
+                ),
             }
         }
     }
@@ -867,12 +958,12 @@ mod tests {
             .stack_size(engram_cypher::MIN_PARSER_STACK_BYTES)
             .spawn(|| {
                 let mut checked = 0usize;
-                for stmt in [CENSUS_NODES, CENSUS_PERSONS] {
+                for stmt in [census_nodes(), census_persons()] {
                     engram_cypher::parse_statement(stmt)
                         .unwrap_or_else(|e| panic!("census {stmt:?} does not parse: {e:?}"));
                     checked += 1;
                 }
-                for q in QUERIES {
+                for q in queries() {
                     let Some(adapted) = q.adapted else { continue };
                     engram_cypher::parse_statement(adapted)
                         .unwrap_or_else(|e| panic!("{} does not parse: {e:?}", q.name));
@@ -892,16 +983,24 @@ mod tests {
 
     #[test]
     fn probe_derivation_replaces_only_the_final_aggregate() {
-        for q in QUERIES {
+        for q in queries() {
             let Some(adapted) = q.adapted else { continue };
             let probe = probe_for(adapted).unwrap_or_else(|| panic!("{}: no probe", q.name));
             assert!(probe.ends_with("RETURN 1 LIMIT 1"), "{}: {probe}", q.name);
-            assert!(!probe.contains("count("), "{}: aggregate survived: {probe}", q.name);
+            assert!(
+                !probe.contains("count("),
+                "{}: aggregate survived: {probe}",
+                q.name
+            );
             // The pattern (everything before RETURN) is untouched.
             let pat = adapted.strip_suffix("RETURN count(*) AS count").unwrap();
             assert!(probe.starts_with(pat), "{}: pattern was altered", q.name);
         }
-        assert_eq!(probe_for("MATCH (n) RETURN n"), None, "non-count text must refuse");
+        assert_eq!(
+            probe_for("MATCH (n) RETURN n"),
+            None,
+            "non-count text must refuse"
+        );
     }
 
     #[test]
@@ -915,6 +1014,57 @@ mod tests {
         );
         // A positive count against a probe that saw nothing is a divergence.
         assert_eq!(judge(5, &Probe::Absent, None).0, Status::Inconsistent);
+    }
+
+    /// The whole safety argument for `--probe-timeout-secs` in one test.
+    ///
+    /// Capping the probe is only defensible because `judge` already treats a
+    /// probe that could not answer as fatal in exactly ONE place: a count of
+    /// zero. If that ever stops being true, the cap starts hiding a wrong
+    /// answer instead of a slow one, and this test is what says so.
+    #[test]
+    fn a_cut_off_probe_is_fatal_for_a_zero_and_harmless_for_a_count() {
+        let cut = Probe::Failed("probe exceeded its 300s budget".to_string());
+
+        // A zero whose absence was NOT proved still refuses. This is the
+        // property the cap must never weaken.
+        let (status, detail) = judge(0, &cut, None);
+        assert_eq!(
+            status,
+            Status::UnverifiedZero,
+            "a cut-off probe must leave a zero UNVERIFIED, not passing"
+        );
+        assert!(
+            detail.unwrap_or_default().contains("300s"),
+            "the refusal has to name the budget that cut it, or the reader              cannot tell a slow probe from a broken one"
+        );
+
+        // A non-zero count is unaffected: this is ALREADY how a failed probe
+        // was judged before the cap existed, so the cap adds no new verdict.
+        let (status, detail) = judge(42, &cut, None);
+        assert_eq!(status, Status::Ok);
+        assert!(
+            detail
+                .unwrap_or_default()
+                .contains("existence probe failed"),
+            "a non-zero count keeps its note, so a capped probe is visible in              the report rather than silently absent"
+        );
+
+        // And a count that disagrees with --expect still loses, cap or no cap:
+        // the expectation is checked BEFORE the probe is consulted.
+        assert_eq!(judge(41, &cut, Some(42)).0, Status::Mismatch);
+    }
+
+    /// The probe budget is clamped to the statement budget.
+    ///
+    /// A probe outliving the query it guards is the exact shape the flag
+    /// exists to stop, so asking for a longer one cannot produce one.
+    #[test]
+    fn the_probe_budget_never_outlives_the_statement_budget() {
+        let clamp = |probe: Option<u64>, stmt: u64| probe.unwrap_or(stmt).min(stmt);
+        assert_eq!(clamp(None, 7200), 7200, "unflagged runs are unchanged");
+        assert_eq!(clamp(Some(300), 7200), 300, "a lane may ask for less");
+        assert_eq!(clamp(Some(9999), 7200), 7200, "and may not ask for more");
         assert_eq!(judge(5, &Probe::Exists, None).0, Status::Ok);
         assert_eq!(judge(5, &Probe::Failed("x".into()), None).0, Status::Ok);
         // Expectation mismatches fail even when the probe is happy — and an
@@ -941,22 +1091,30 @@ mod tests {
         assert!(overall_pass(&[mk(Status::Ok), mk(Status::Unmappable)]));
         assert!(!overall_pass(&[mk(Status::Unmappable)]), "nothing measured");
         assert!(!overall_pass(&[mk(Status::Ok), mk(Status::Timeout)]));
-        assert!(!overall_pass(&[mk(Status::Ok), mk(Status::ZeroOnPopulated)]));
+        assert!(!overall_pass(&[
+            mk(Status::Ok),
+            mk(Status::ZeroOnPopulated)
+        ]));
         assert!(!overall_pass(&[]), "an empty run compared nothing");
     }
 
     #[test]
     fn extract_count_takes_exactly_one_integer_row() {
         // The wire shape: one RECORD whose field list holds one Int column.
-        assert_eq!(extract_count(&[Value::List(vec![Value::Int(7)])]), Ok(7));
+        assert_eq!(
+            extract_count(&[Value::List((vec![Value::Int(7)]).into())]),
+            Ok(7)
+        );
         // The unwrapped shape stays accepted.
         assert_eq!(extract_count(&[Value::Int(7)]), Ok(7));
         assert!(extract_count(&[]).is_err());
         assert!(extract_count(&[Value::Int(1), Value::Int(2)]).is_err());
         assert!(extract_count(&[Value::Str("7".into())]).is_err());
-        assert!(extract_count(&[Value::List(vec![])]).is_err());
-        assert!(extract_count(&[Value::List(vec![Value::Int(1), Value::Int(2)])]).is_err());
-        assert!(extract_count(&[Value::List(vec![Value::Str("7".into())])]).is_err());
+        assert!(extract_count(&[Value::List((vec![]).into())]).is_err());
+        assert!(
+            extract_count(&[Value::List((vec![Value::Int(1), Value::Int(2)]).into())]).is_err()
+        );
+        assert!(extract_count(&[Value::List((vec![Value::Str("7".into())]).into())]).is_err());
     }
 
     /// Hostile strings must survive the writer: quotes, backslashes, newlines
@@ -979,6 +1137,7 @@ mod tests {
         let meta = RunMeta {
             addr: "127.0.0.1:7687".to_string(),
             timeout_secs: 120,
+            probe_timeout_secs: 120,
             census_nodes: Some(10),
             census_persons: Some(2),
             census_error: None,
@@ -986,11 +1145,17 @@ mod tests {
         };
         let doc = render_json(&meta, &[outcome], false);
         let parsed = from_json(&doc).expect("report must be valid JSON");
-        let Value::Map(m) = parsed else { panic!("report is not an object") };
+        let Value::Map(m) = parsed else {
+            panic!("report is not an object")
+        };
         assert_eq!(m.get("pass"), Some(&Value::Bool(false)));
         assert_eq!(m.get("timeout_secs"), Some(&Value::Int(120)));
-        let Some(Value::List(qs)) = m.get("queries") else { panic!("no queries array") };
-        let Value::Map(q) = &qs[0] else { panic!("query entry is not an object") };
+        let Some(Value::List(qs)) = m.get("queries") else {
+            panic!("no queries array")
+        };
+        let Value::Map(q) = &qs[0] else {
+            panic!("query entry is not an object")
+        };
         assert_eq!(q.get("detail"), Some(&Value::Str(hostile.to_string())));
         assert_eq!(q.get("count"), Some(&Value::Int(3)));
         assert_eq!(q.get("millis"), Some(&Value::Float(12.5)));
@@ -1004,7 +1169,10 @@ mod tests {
         assert_eq!(parse_queries_arg("q9").unwrap(), vec!["q9"]);
         assert!(parse_queries_arg("q10").is_err());
         assert!(parse_queries_arg("Q1").is_err(), "names are case-sensitive");
-        assert!(parse_queries_arg("").is_err(), "selecting nothing must refuse");
+        assert!(
+            parse_queries_arg("").is_err(),
+            "selecting nothing must refuse"
+        );
         assert!(parse_queries_arg(",,").is_err());
     }
 
@@ -1015,10 +1183,9 @@ mod tests {
         assert_eq!(flat.get("q5"), Some(&0));
         // The tool's own report shape: null counts (an upstream timeout) carry
         // no expectation; integer counts do.
-        let own = parse_expect(
-            r#"{"queries":[{"query":"q1","count":7},{"query":"q2","count":null}]}"#,
-        )
-        .unwrap();
+        let own =
+            parse_expect(r#"{"queries":[{"query":"q1","count":7},{"query":"q2","count":null}]}"#)
+                .unwrap();
         assert_eq!(own.get("q1"), Some(&7));
         assert!(!own.contains_key("q2"));
         // Fail-closed refusals: typos, wrong types, empty expectations.

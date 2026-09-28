@@ -8,6 +8,9 @@ description = "M7 — the Cypher front end: tokenizer, Pratt expression parser, 
 
 [dependencies]
 engram-observe.workspace = true
+engram-proc.workspace = true
+regex.workspace = true
+regex-syntax.workspace = true
 tz-rs.workspace = true
 tzdb.workspace = true
 

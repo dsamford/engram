@@ -48,7 +48,11 @@ fn merge_finds_the_node_an_earlier_iteration_of_the_same_statement_created() {
     let mut c = connect(&addr);
     count(&mut c, "CREATE INDEX l_id FOR (n:L) ON (n.id)");
     count(&mut c, "UNWIND [1, 1, 1, 2, 2] AS x MERGE (n:L {id: x})");
-    assert_eq!(count(&mut c, "MATCH (n:L) RETURN n"), 2, "two distinct ids, not five nodes");
+    assert_eq!(
+        count(&mut c, "MATCH (n:L) RETURN n"),
+        2,
+        "two distinct ids, not five nodes"
+    );
     // Again, in a later statement: MERGE against committed rows still matches.
     count(&mut c, "UNWIND [1, 3] AS x MERGE (n:L {id: x})");
     assert_eq!(count(&mut c, "MATCH (n:L) RETURN n"), 3);

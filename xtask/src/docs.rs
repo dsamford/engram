@@ -68,46 +68,60 @@ pub fn run(root: &Path) -> Report {
     collect_markdown(&src, &src, &mut on_disk);
 
     // ── Every page SUMMARY.md links to ─────────────────────────────────────
-    let summary = match fs::read_to_string(src.join("SUMMARY.md")) {
-        Ok(s) => s,
-        Err(e) => {
-            return Report {
-                passed: false,
-                scanned: format!("{BOOK_SRC} — {} markdown file(s)", on_disk.len()),
-                findings: vec![format!("cannot read SUMMARY.md: {e}")],
-            };
-        }
-    };
-    let listed: BTreeSet<String> = links_in(&summary)
-        .into_iter()
-        .filter(|l| l.ends_with(".md"))
-        .map(|l| normalise(&l))
-        .collect();
+    //
+    // A tree can carry the CLI reference WITHOUT the rest of the book — the
+    // ship tree is exactly that, `docs/book/src/reference/cli.md` and nothing
+    // else — and refusing to run there is how this gate came to be absent
+    // from every shipped revision while the CLI reference drifted four flags
+    // out of date. So a missing SUMMARY.md skips the two chapter checks and
+    // runs the flag check regardless.
+    //
+    // It is skipped LOUDLY. `scanned` says on every run whether the chapter
+    // half was checked, because a gate that quietly narrows what it examines
+    // and still prints PASS is the exact failure this gate exists to catch:
+    // the reader sees the verdict, not the scope.
+    let summary = fs::read_to_string(src.join("SUMMARY.md")).ok();
+    if let Some(summary) = &summary {
+        let listed: BTreeSet<String> = links_in(summary)
+            .into_iter()
+            .filter(|l| l.ends_with(".md"))
+            .map(|l| normalise(&l))
+            .collect();
 
-    // ── Orphans: on disk, unreachable from SUMMARY ─────────────────────────
-    for f in on_disk.difference(&listed) {
-        if f == "SUMMARY.md" {
-            continue;
+        // ── Orphans: on disk, unreachable from SUMMARY ─────────────────────
+        for f in on_disk.difference(&listed) {
+            if f == "SUMMARY.md" {
+                continue;
+            }
+            findings.push(format!(
+                "{f} — a page no chapter links to; unreachable in the built book. Add it to \
+                 SUMMARY.md or delete it"
+            ));
         }
-        findings.push(format!(
-            "{f} — a page no chapter links to; unreachable in the built book. Add it to \
-             SUMMARY.md or delete it"
-        ));
-    }
 
-    // ── Listed but absent ──────────────────────────────────────────────────
-    for f in listed.difference(&on_disk) {
-        findings.push(format!("SUMMARY.md links to {f}, which does not exist"));
+        // ── Listed but absent ──────────────────────────────────────────────
+        for f in listed.difference(&on_disk) {
+            findings.push(format!("SUMMARY.md links to {f}, which does not exist"));
+        }
     }
 
     // ── Intra-book links from every page ───────────────────────────────────
+    //
+    // Also gated on the book being present, and for the same reason as the
+    // chapter checks: on a tree carrying ONE page of the book, a link to a
+    // sibling chapter is not dead, the sibling is simply not in this tree.
+    // Reporting those as broken would make the gate unrunnable exactly where
+    // it is most needed, and a gate people cannot run is a gate people delete.
     let mut links_checked = 0usize;
-    for page in &on_disk {
+    for page in on_disk.iter().filter(|_| summary.is_some()) {
         let Ok(text) = fs::read_to_string(src.join(page)) else {
             findings.push(format!("{page} — unreadable"));
             continue;
         };
-        let dir = Path::new(page).parent().map(Path::to_path_buf).unwrap_or_default();
+        let dir = Path::new(page)
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
         for link in links_in(&text) {
             // External URLs, in-page anchors and the generated rustdoc under
             // ../api are out of scope: the first two are not ours to resolve,
@@ -166,22 +180,45 @@ pub fn run(root: &Path) -> Report {
         ));
     }
 
-    // A gate that found no pages must not report a clean book.
-    if on_disk.len() < 2 {
+    // Vacuity guards, one per half, because the two halves can now run
+    // independently and each can be reached with nothing to look at.
+    //
+    // The chapter half: a book that is present must be more than one page, or
+    // the gate's reach is implausible and a clean run means nothing.
+    if summary.is_some() && on_disk.len() < 2 {
         findings.push(format!(
             "only {} markdown file(s) found under {BOOK_SRC} — the gate's reach is \
              implausible, so this is a failure rather than a clean run",
             on_disk.len()
         ));
     }
+    // The flag half, which is now the ONLY half on a CLI-reference-only tree:
+    // no flags parsed means the USAGE shape changed under the parser, and
+    // every comparison below it is between two empty sets.
+    if parsed.len() < 10 || in_usage.len() < 10 {
+        findings.push(format!(
+            "the flag scan found {} parsed / {} in USAGE — too few to be real, so the \
+             agreement between them proves nothing",
+            parsed.len(),
+            in_usage.len()
+        ));
+    }
 
+    let chapters = match &summary {
+        Some(s) => format!(
+            "{} SUMMARY entr(ies)",
+            links_in(s).iter().filter(|l| l.ends_with(".md")).count()
+        ),
+        // Named, not omitted: the reader must see that this run did not check
+        // chapters rather than infer it from a number that isn't there.
+        None => "no SUMMARY.md — chapter checks SKIPPED, flags only".to_string(),
+    };
     Report {
         passed: findings.is_empty(),
         scanned: format!(
-            "{} page(s), {} SUMMARY entr(ies), {links_checked} intra-book link(s), {} CLI \
-             flag(s) parsed / {} in USAGE",
+            "{} page(s), {chapters}, {links_checked} intra-book link(s), {} CLI flag(s) \
+             parsed / {} in USAGE",
             on_disk.len(),
-            listed.len(),
             parsed.len(),
             in_usage.len(),
         ),

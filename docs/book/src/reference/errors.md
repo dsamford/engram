@@ -31,7 +31,7 @@ not.
 |---|---|
 | parse failure | `Neo.ClientError.Statement.SyntaxError` |
 | an unsupported construct | `Neo.ClientError.Statement.NotSupported` |
-| a semantic error, **including the row budget** | `Neo.ClientError.Statement.SemanticError` |
+| a semantic error, **including the row budget and the memory ceiling** | `Neo.ClientError.Statement.SemanticError` |
 | a bad argument or evaluation failure | `Neo.ClientError.Statement.ArgumentError` |
 | a graph-level failure, **including constraint violations** | `Neo.ClientError.Statement.ExecutionFailed` |
 | an internal saturation marker leaking | `Neo.DatabaseError.Statement.ExecutionFailed` |
@@ -43,7 +43,10 @@ an engine bug reported as such.
 Two classifications worth noting because they are not obvious:
 
 - **The row budget is a `SemanticError`**, not a database error. The statement
-  asked for more than the server will build, and rewriting it is the fix.
+  asked for more than the server will build, and rewriting it is the fix. A
+  refusal at the memory ceiling (`memory ceiling reached`) carries the same
+  code, although there the statement is usually not at fault: it queued for
+  memory and none came back, and the server is still serving.
 - **A constraint violation is `ExecutionFailed`**, and the message names the
   label, property and the node that already holds the value.
 
@@ -84,8 +87,11 @@ relationships" — use `DETACH DELETE`.
 | `RecoverError` | `BrokenChain{seq}`, `SequenceGap{expected,found}`, `MalformedPayload{seq}` |
 | `OpenWalError` | `Io`, `Format`, `Recover` |
 | `LockError` | `Held{path,holder}`, `Io` |
-| `AdjacencyError` | `ContentionExhausted`, `CorruptChunk` |
-| `SstError` | `Truncated`, `BadMagic`, … |
+| `AdjacencyError` | `ContentionExhausted`, `CorruptChunk`, `Store` |
+| `SstError` | `Truncated`, `BadMagic`, `UnsupportedVersion`, `HashMismatch`, `Corrupt` |
+
+`AdjacencyError::Store` is how a store refusal reaches an adjacency caller;
+the other two are the adjacency layer's own.
 
 Three of these carry design decisions:
 
@@ -122,11 +128,24 @@ Some conditions take the process down instead, deliberately:
 
 | condition | behaviour | why |
 |---|---|---|
-| the requested data directory cannot be opened | **panic** | starting empty over a directory that was asked for would look like an empty database rather than a failed open — that is how a restore gets overwritten |
+| the requested data or paged directory cannot be opened | **panic** | starting empty over a directory that was asked for would look like an empty database rather than a failed open — that is how a restore gets overwritten |
 | an `fsync` fails during group commit | **abort** | replies for that batch are unsent and unacknowledged; continuing would acknowledge writes that are not durable |
 | the data directory is locked | exit 1, naming the pid | two writers on one WAL leave an unverifiable chain |
-| `--data-dir` with `--paged-dir` | exit 1 | contradictory durability models |
+| `--data-dir` with `--paged-dir` | exit 1 | one store, two on-disk layouts — the durability model is the same either way |
+| `--data-dir` naming a paged directory (one holding `seg-*.seg` files) | exit 1 | resident mode reads only `engram.wal`, so it would ignore every segment and serve an empty or partial database without an error |
 | `--bulk-ingest` with `--data-dir` | exit 1 | durability by re-ingest versus by replay |
+
+The `--data-dir` with `--paged-dir` refusal is not a durability one, though it
+reads like one. Since `--paged-dir` gained its WAL the two modes have the same
+durability model and differ only in on-disk layout — the binary's usage text
+says so, "two layouts, one durability". A store has one backing layout, and
+cannot be both a resident WAL directory and a paged segment directory at once.
+The row after it is the same point made about a directory rather than a pair
+of flags. All three argument refusals happen before the directory is locked or
+the port is bound, so a refused start leaves no stale lock behind. The
+`--bulk-ingest` row is a different case and its reason still holds:
+bulk writes go through `put_unlogged` and never reach the log, so a WAL
+directory served in bulk mode would replay to a partial database.
 
 A panic **inside a session** is different: it is caught, the session is
 dropped, and the worker survives. Before that, one bad statement killed a

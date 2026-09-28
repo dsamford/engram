@@ -61,14 +61,23 @@ fn corpus() -> Graph {
         m.insert("userId".to_string(), Value::Str("u1".into()));
         m.insert("nodeId".to_string(), Value::Str(format!("mail-{i:05}")));
         m.insert("subject".to_string(), Value::Str(format!("subject {i}")));
-        m.insert("createdAt".to_string(), Value::Str(format!("2026-{:02}-{:02}T{:02}:00:00Z", 1 + (i % 12), 1 + (i % 28), i % 24)));
+        m.insert(
+            "createdAt".to_string(),
+            Value::Str(format!(
+                "2026-{:02}-{:02}T{:02}:00:00Z",
+                1 + (i % 12),
+                1 + (i % 28),
+                i % 24
+            )),
+        );
         m.insert("rawData".to_string(), Value::Str(body.clone()));
         let n = g.create_node(&["UserDataNode".into()], &m).expect("email");
         if i % 5 == 0 {
             let mut a = BTreeMap::new();
             a.insert("resolved".to_string(), Value::Bool(i % 10 == 0));
             let ask = g.create_node(&["EmailAsk".into()], &a).expect("ask");
-            g.create_rel(n, "HAS_ASK", ask, &BTreeMap::new()).expect("has ask");
+            g.create_rel(n, "HAS_ASK", ask, &BTreeMap::new())
+                .expect("has ask");
         }
     }
     g
@@ -91,7 +100,11 @@ fn a_survivor_is_hydrated_to_what_the_continuation_reads() {
     assert_eq!(count_of(&c, PROJECTED), 100, "projected, not full: {c:?}");
     // The only whole-node reads are the 20 asks the `THEN a` returns
     // bare; no email body is decoded.
-    assert_eq!(count_of(&c, FULL), 20, "the asks alone, never an email: {c:?}");
+    assert_eq!(
+        count_of(&c, FULL),
+        20,
+        "the asks alone, never an email: {c:?}"
+    );
 }
 
 /// A bare use after the breaker — `RETURN n` — needs the whole node.
@@ -106,7 +119,11 @@ fn a_bare_use_after_the_breaker_hydrates_in_full() {
     let (got, c) = traced(&g, src);
     assert_eq!(got, want);
     assert_eq!(count_of(&c, HYDRATED), 20, "{c:?}");
-    assert_eq!(count_of(&c, PROJECTED), 0, "a bare RETURN keeps the record: {c:?}");
+    assert_eq!(
+        count_of(&c, PROJECTED),
+        0,
+        "a bare RETURN keeps the record: {c:?}"
+    );
     assert_eq!(count_of(&c, FULL), 20, "{c:?}");
 }
 

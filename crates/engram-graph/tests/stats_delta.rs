@@ -65,10 +65,7 @@ fn rolled_back(g: &Graph, src: &str) {
 
 fn counts(g: &Graph) -> Vec<(String, usize)> {
     let mut out = Vec::new();
-    out.push((
-        "nodes".to_string(),
-        rows(g, "MATCH (n) RETURN n").len(),
-    ));
+    out.push(("nodes".to_string(), rows(g, "MATCH (n) RETURN n").len()));
     out.push((
         "rels".to_string(),
         rows(g, "MATCH ()-[r]->() RETURN r").len(),

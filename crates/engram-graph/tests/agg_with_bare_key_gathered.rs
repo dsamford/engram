@@ -58,7 +58,11 @@ fn corpus() -> Graph {
         m.insert("id".to_string(), Value::Str(format!("prop_{i:04}")));
         m.insert(
             "status".to_string(),
-            Value::Str(if i % 3 == 0 { "review".into() } else { "draft".into() }),
+            Value::Str(if i % 3 == 0 {
+                "review".into()
+            } else {
+                "draft".into()
+            }),
         );
         m.insert("priority".to_string(), Value::Int(i % 5));
         m.insert("description".to_string(), Value::Str("d".repeat(2000)));
@@ -84,7 +88,8 @@ const POST_WHERE: &str = "MATCH (p:Pr) WHERE p.status = $s OPTIONAL MATCH (p)-[:
 /// CONTROL: the RETURN uses the key BARE — the full node stays.
 const BARE_RETURN: &str = "MATCH (p:Pr) WHERE p.status = $s OPTIONAL MATCH (p)-[:HA]->(a:Art) WITH p, collect(DISTINCT a.id) AS ids RETURN p, ids ORDER BY p.priority DESC LIMIT 5";
 /// CONTROL: Form B — the aggregating RETURN itself carries the bare key.
-const FORM_B: &str = "MATCH (p:Pr) WHERE p.status = $s RETURN p, count(*) AS n ORDER BY p.id LIMIT 5";
+const FORM_B: &str =
+    "MATCH (p:Pr) WHERE p.status = $s RETURN p, count(*) AS n ORDER BY p.id LIMIT 5";
 
 #[test]
 fn a_bare_carry_read_only_by_property_after_the_with_is_gathered_not_materialised() {
@@ -95,9 +100,19 @@ fn a_bare_carry_read_only_by_property_after_the_with_is_gathered_not_materialise
         let _ = rows(&g, src); // warm the columns the walk keeps
         let (got, c) = traced(&g, src);
         assert_eq!(got, want, "`{src}`");
-        assert!(count_of(&c, OPTIONAL) > 0 || count_of(&c, AGG) > 0, "the pipeline must run `{src}`: {c:?}");
-        assert!(count_of(&c, GATHERED) > 0, "`{src}` gathers the bare carry: {c:?}");
-        assert_eq!(count_of(&c, FULL), 0, "`{src}` materialises nothing in full: {c:?}");
+        assert!(
+            count_of(&c, OPTIONAL) > 0 || count_of(&c, AGG) > 0,
+            "the pipeline must run `{src}`: {c:?}"
+        );
+        assert!(
+            count_of(&c, GATHERED) > 0,
+            "`{src}` gathers the bare carry: {c:?}"
+        );
+        assert_eq!(
+            count_of(&c, FULL),
+            0,
+            "`{src}` materialises nothing in full: {c:?}"
+        );
     }
 }
 
@@ -123,11 +138,18 @@ fn a_bare_return_beside_a_topk_is_gathered_and_hydrated() {
     assert_eq!(want.len(), 5, "fixture: `{src}`");
     let (got, c) = traced(&g, src);
     assert_eq!(got, want, "`{src}`");
-    assert!(count_of(&c, GATHERED) > 0, "`{src}` gathers the carry: {c:?}");
+    assert!(
+        count_of(&c, GATHERED) > 0,
+        "`{src}` gathers the carry: {c:?}"
+    );
     assert_eq!(
         count_of(&c, "interp.agg bare return item hydrated for a survivor"),
         5,
         "`{src}`: {c:?}"
     );
-    assert_eq!(count_of(&c, FULL), 5, "`{src}` decodes only the survivors: {c:?}");
+    assert_eq!(
+        count_of(&c, FULL),
+        5,
+        "`{src}` decodes only the survivors: {c:?}"
+    );
 }

@@ -36,8 +36,16 @@ pub enum EvalError {
     Overflow(&'static str),
     /// Integer division or modulo by zero.
     DivisionByZero,
-    /// `=~` — parsed but not yet evaluable (no regex engine in the core).
-    RegexUnsupported,
+    /// `=~` could not be compiled or could not be run.
+    ///
+    /// Carries the pattern, because a regex error with no pattern in it is
+    /// unactionable when the pattern came from a parameter.
+    Regex {
+        /// The pattern that failed.
+        pattern: String,
+        /// What was wrong with it.
+        detail: String,
+    },
     /// A graph-dependent expression (`EXISTS {}`, `COUNT {}`, a pattern
     /// comprehension) in a scalar context — the clause interpreter owns
     /// these; refusing by name keeps "unsupported" and "unknown" apart.
@@ -67,7 +75,9 @@ impl std::fmt::Display for EvalError {
             EvalError::Type { what, got } => write!(f, "type error in {what}: got {got}"),
             EvalError::Overflow(op) => write!(f, "integer overflow in {op}"),
             EvalError::DivisionByZero => write!(f, "division by zero"),
-            EvalError::RegexUnsupported => write!(f, "`=~` is not yet supported"),
+            EvalError::Regex { pattern, detail } => {
+                write!(f, "=~ `{pattern}`: {detail}")
+            }
             EvalError::GraphDependent(what) => write!(f, "{what} requires a graph context"),
             EvalError::Function { name, detail } => write!(f, "{name}(): {detail}"),
             EvalError::DeletedEntity => {
@@ -206,6 +216,43 @@ const AGGREGATES: &[&str] = &[
     "percentiledisc",
 ];
 
+/// Membership of a NODE in an all-node list, by id, or `None` when the list is
+/// not all nodes and the caller must fall back to the scan.
+///
+/// One cached entry, because the shape this exists for tests one list against
+/// every row of a stream; a second list in the same position would simply
+/// replace it rather than thrash, since the cost recovered is the whole scan.
+fn in_node_set(items: &std::sync::Arc<Vec<Value>>, needle: u64) -> Option<bool> {
+    // an empty list is `false` by the scan anyway, and caching it buys nothing
+    if items.is_empty() {
+        return None;
+    }
+    /// The list last tested, and the node ids it holds.
+    type NodeSetMemo = Option<(std::sync::Arc<Vec<Value>>, std::collections::BTreeSet<u64>)>;
+    thread_local! {
+        static MEMO: std::cell::RefCell<NodeSetMemo> = const { std::cell::RefCell::new(None) };
+    }
+    MEMO.with(|m| {
+        let mut m = m.borrow_mut();
+        if !matches!(&*m, Some((held, _)) if std::sync::Arc::ptr_eq(held, items)) {
+            let mut set = std::collections::BTreeSet::new();
+            for it in items.iter() {
+                match it {
+                    Value::Node { id, .. } => {
+                        set.insert(*id);
+                    }
+                    // not all nodes: do not cache, and let the caller scan
+                    _ => return None,
+                }
+            }
+            counted!("cypher.IN hoisted a node list to a set");
+            *m = Some((items.clone(), set));
+        }
+        let (_, set) = m.as_ref().expect("just populated");
+        Some(set.contains(&needle))
+    })
+}
+
 /// Evaluate an expression in a scope.
 pub fn eval(expr: &Expr, scope: &Scope<'_>) -> Result<Value, EvalError> {
     eval_with(expr, scope, None)
@@ -282,7 +329,8 @@ fn eval_inner(
             items
                 .iter()
                 .map(|e| eval_inner(e, scope, hooks))
-                .collect::<Result<_, _>>()?,
+                .collect::<Result<Vec<_>, _>>()?
+                .into(),
         )),
         Expr::Map(entries) => {
             let mut m = BTreeMap::new();
@@ -291,31 +339,22 @@ fn eval_inner(
             }
             Ok(Value::Map(m))
         }
-        Expr::Prop(of, key) => match eval_inner(of, scope, hooks)? {
-            Value::Null => Ok(Value::Null),
-            Value::Map(m) => Ok(m.get(key).cloned().unwrap_or(Value::Null)),
-            v @ (Value::Node { .. } | Value::Rel { .. }) => {
-                let (id, props, is_rel) = match &v {
-                    Value::Node { id, props, .. } => (*id, props, false),
-                    Value::Rel { id, props, .. } => (*id, props, true),
-                    _ => unreachable!(),
-                };
-                if hooks.is_some_and(|h| h.is_deleted(id, is_rel)) {
-                    return Err(EvalError::DeletedEntity);
-                }
-                Ok(props.get(key).cloned().unwrap_or(Value::Null))
+        Expr::Prop(of, key) => {
+            // A property of a variable or a parameter is read WHERE THE VALUE
+            // LIES. Evaluating `of` returned it owned, so `n.id` cloned the
+            // whole node — its labels, its property map, every key string —
+            // to read one entry: SNB BI bi4 orders 1,228,730 groups by
+            // `forum.id` and `country.id`, and each key cost a node clone.
+            let held = match of.as_ref() {
+                Expr::Var(v) => scope.var(v),
+                Expr::Param(p) => scope.params.get(p),
+                _ => None,
+            };
+            match held {
+                Some(v) => prop_of(v, key, hooks),
+                None => prop_of(&eval_inner(of, scope, hooks)?, key, hooks),
             }
-            t @ (Value::Date(_)
-            | Value::Time { .. }
-            | Value::LocalTime(_)
-            | Value::DateTime { .. }
-            | Value::LocalDateTime { .. }
-            | Value::Duration { .. }) => temporal_component(&t, key),
-            other => Err(EvalError::Type {
-                what: format!("property access `.{key}`"),
-                got: other.type_name().to_string(),
-            }),
-        },
+        }
         Expr::Index(of, idx) => {
             let of = eval_inner(of, scope, hooks)?;
             let idx = eval_inner(idx, scope, hooks)?;
@@ -376,7 +415,9 @@ fn eval_inner(
                 counted!("cypher.subquery operand skipped by a decided connective");
                 Ok(Truth::False.to_value())
             } else {
-                Ok(lt.and(truth_of(&eval_inner(r, scope, hooks)?, "AND")?).to_value())
+                Ok(lt
+                    .and(truth_of(&eval_inner(r, scope, hooks)?, "AND")?)
+                    .to_value())
             }
         }
         Expr::Or(l, r) => {
@@ -385,7 +426,9 @@ fn eval_inner(
                 counted!("cypher.subquery operand skipped by a decided connective");
                 Ok(Truth::True.to_value())
             } else {
-                Ok(lt.or(truth_of(&eval_inner(r, scope, hooks)?, "OR")?).to_value())
+                Ok(lt
+                    .or(truth_of(&eval_inner(r, scope, hooks)?, "OR")?)
+                    .to_value())
             }
         }
         Expr::Xor(l, r) => Ok(truth_of(&eval_inner(l, scope, hooks)?, "XOR")?
@@ -422,14 +465,64 @@ fn eval_inner(
         }
         Expr::In(l, r) => {
             let needle = eval_inner(l, scope, hooks)?;
-            match eval_inner(r, scope, hooks)? {
+            // Fix 110: a list held by a parameter or a bound variable is
+            // tested IN PLACE — `eval_inner` hands every value owned, which
+            // cloned the whole list per evaluation: the production NOT-IN
+            // story pick cloned its 3,000-id `$existingIds` for each of its
+            // 253 candidates, 73 ms of an 85 ms statement. An unknown name
+            // still evaluates through `eval_inner` and raises as before.
+            let owned: Value;
+            let list: &Value = match r.as_ref() {
+                Expr::Param(p) if scope.params.contains_key(p) => {
+                    counted!("cypher.IN tested a held list in place");
+                    &scope.params[p]
+                }
+                Expr::Var(v) if scope.var(v).is_some() => {
+                    counted!("cypher.IN tested a held list in place");
+                    scope.var(v).expect("checked")
+                }
+                _ => {
+                    owned = eval_inner(r, scope, hooks)?;
+                    &owned
+                }
+            };
+            match list {
                 Value::Null => Ok(Value::Null),
                 Value::List(items) => {
+                    // A NODE NEEDLE AGAINST AN ALL-NODE LIST IS A SET LOOKUP.
+                    //
+                    // `IN` is a linear scan, and SNB BI bi4 pays it per row:
+                    // `WHERE topForum2 IN topForums` over a 100-node list,
+                    // measured at SF3 as AT LEAST 61 s of that query (b4e 239 s
+                    // to b4f over 300 s). The comprehension form of this was
+                    // already hoisted; this is the same cost in a `WHERE`,
+                    // where that hoist does not reach.
+                    //
+                    // Narrow for the same reason as the comprehension hoist:
+                    // NODES COMPARE BY IDENTITY, so a set of ids is exactly
+                    // equivalent. `eq3` over anything else is not — Int and
+                    // Float coerce, DateTimes compare by instant, Times
+                    // normalise their offset, Lists recurse — so a needle that
+                    // is not a node, or a list holding anything that is not a
+                    // node, takes the scan unchanged. Nothing here can answer
+                    // Unknown: a node equals a node or it does not.
+                    //
+                    // The memo is keyed on the list's OWN BUFFER, which only
+                    // became possible when `Value::List` started sharing one:
+                    // every row sees the same `Arc`, so one row builds the set
+                    // and the rest hit it. It holds the `Arc` rather than a raw
+                    // pointer, so a freed buffer cannot be reused at the same
+                    // address and answer for a different list.
+                    if let Value::Node { id: needle_id, .. } = needle {
+                        if let Some(hit) = in_node_set(items, needle_id) {
+                            return Ok(Value::Bool(hit));
+                        }
+                    }
                     // openCypher: any True wins; else any Unknown → null;
                     // else false. A null needle against a nonempty list is
                     // Unknown per element, so null — and against [] is false.
                     let mut saw_unknown = false;
-                    for item in &items {
+                    for item in items.iter() {
                         match needle.eq3(item) {
                             Truth::True => return Ok(Value::Bool(true)),
                             Truth::Unknown => saw_unknown = true,
@@ -531,9 +624,94 @@ fn eval_inner(
                     });
                 }
             };
+            // MEMBERSHIP AGAINST A LOOP-INVARIANT LIST IS HOISTED TO A SET.
+            //
+            // `[n IN far WHERE NOT n IN near]` evaluates `n IN near` once per
+            // element of `far`, and `IN` is a LINEAR SCAN, so the comprehension
+            // costs |far| x |near|. SNB BI's bi10 is 22,842 x 17,743 — 405
+            // MILLION `eq3` calls. Measured at SF3 on 2026-09-15 it did not
+            // finish in 300 s, while the two variable-length expansions that
+            // BUILD those lists took 1 s and 0 s: the traversal was never the
+            // cost, the set difference was. Neo4j answers the whole query in
+            // 0 s.
+            //
+            // Narrow deliberately, on two axes:
+            //
+            //  * the haystack must be a bare VARIABLE or PARAMETER, which
+            //    cannot mention the comprehension variable, so evaluating it
+            //    once is sound without a free-variable walk;
+            //  * every element must be a NODE, because nodes compare by
+            //    IDENTITY (`eq3` on two nodes is `a.id == b.id`) and a set of
+            //    ids is then EXACTLY equivalent. `eq3` over other types is not:
+            //    Int and Float coerce, DateTimes compare by instant, Times
+            //    normalise their offset, Lists recurse. A set keyed on anything
+            //    coarser would change answers silently, which is worse than
+            //    being slow.
+            //
+            // A non-node item falls through to the generic path per item, so
+            // a mixed source list still answers exactly as the scan does.
+            let hoisted: Option<(std::collections::BTreeSet<u64>, bool)> = match filter {
+                Some(f) => {
+                    let (negated, inner_f) = match f.as_ref() {
+                        Expr::Not(a) => (true, a.as_ref()),
+                        other => (false, other),
+                    };
+                    match inner_f {
+                        Expr::In(needle, haystack)
+                            if matches!(needle.as_ref(), Expr::Var(v) if v == var)
+                                && matches!(
+                                    haystack.as_ref(),
+                                    Expr::Var(_) | Expr::Param(_)
+                                ) =>
+                        {
+                            match eval_inner(haystack, scope, hooks)? {
+                                Value::List(items)
+                                    if !items.is_empty()
+                                        && items
+                                            .iter()
+                                            .all(|v| matches!(v, Value::Node { .. })) =>
+                                {
+                                    counted!(
+                                        "cypher.comprehension membership hoisted to a set"
+                                    );
+                                    let ids: std::collections::BTreeSet<u64> = items
+                                        .iter()
+                                        .filter_map(|v| match v {
+                                            Value::Node { id, .. } => Some(*id),
+                                            _ => None,
+                                        })
+                                        .collect();
+                                    Some((ids, negated))
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    }
+                }
+                None => None,
+            };
+
             let mut out = Vec::new();
             let mut inner = scope.child();
-            for item in source {
+            for item in source.iter() {
+                if let Some((ids, negated)) = &hoisted {
+                    if let Value::Node { id, .. } = item {
+                        // `n IN near` keeps members; `NOT n IN near` keeps
+                        // non-members. Same answer the scan gives.
+                        if ids.contains(id) == *negated {
+                            continue;
+                        }
+                        out.push(match map {
+                            Some(m) => {
+                                inner.bind(var, item.clone());
+                                eval_inner(m, &inner, hooks)?
+                            }
+                            None => item.clone(),
+                        });
+                        continue;
+                    }
+                }
                 inner.bind(var, item.clone());
                 if let Some(f) = filter {
                     if truth_of(&eval_inner(f, &inner, hooks)?, "comprehension WHERE")?
@@ -544,10 +722,10 @@ fn eval_inner(
                 }
                 out.push(match map {
                     Some(m) => eval_inner(m, &inner, hooks)?,
-                    None => item,
+                    None => item.clone(),
                 });
             }
-            Ok(Value::List(out))
+            Ok(Value::List(out.into()))
         }
         Expr::HasLabels { of, labels } => match eval_inner(of, scope, hooks)? {
             Value::Null => Ok(Value::Null),
@@ -593,8 +771,8 @@ fn eval_inner(
             };
             let mut inner = scope.child();
             let (mut trues, mut unknowns, mut falses) = (0usize, 0usize, 0usize);
-            for item in items {
-                inner.bind(var, item);
+            for item in items.iter() {
+                inner.bind(var, item.clone());
                 match truth_of(&eval_inner(filter, &inner, hooks)?, "a list predicate")? {
                     Truth::True => trues += 1,
                     Truth::Unknown => unknowns += 1,
@@ -714,9 +892,9 @@ fn eval_inner(
             };
             let mut inner = scope.child();
             let mut accum = eval_inner(init, scope, hooks)?;
-            for item in source {
+            for item in source.iter() {
                 inner.bind(acc, accum);
-                inner.bind(var, item);
+                inner.bind(var, item.clone());
                 accum = eval_inner(step, &inner, hooks)?;
             }
             Ok(accum)
@@ -762,9 +940,9 @@ fn slice(of: Value, from: Option<Value>, to: Option<Value>) -> Result<Value, Eva
         return Ok(Value::Null);
     };
     if lo >= hi {
-        return Ok(Value::List(Vec::new()));
+        return Ok(Value::List(Vec::new().into()));
     }
-    Ok(Value::List(items[lo as usize..hi as usize].to_vec()))
+    Ok(Value::List(items[lo as usize..hi as usize].to_vec().into()))
 }
 
 fn bin(op: BinOp, l: Value, r: Value) -> Result<Value, EvalError> {
@@ -789,10 +967,32 @@ fn bin(op: BinOp, l: Value, r: Value) -> Result<Value, EvalError> {
         Gt => return Ok(r.lt3(&l).to_value()),
         Le => return Ok((!r.lt3(&l)).to_value()),
         Regex => {
+            // Null on either side propagates, and does so BEFORE the type
+            // check: `null =~ 3` is null, not a type error, because the
+            // comparison never happens.
             if matches!(l, Value::Null) || matches!(r, Value::Null) {
                 return Ok(Value::Null);
             }
-            return Err(EvalError::RegexUnsupported);
+            let (Value::Str(text), Value::Str(pattern)) = (&l, &r) else {
+                return Err(EvalError::Type {
+                    what: "=~".to_string(),
+                    got: if matches!(l, Value::Str(_)) {
+                        r.type_name().to_string()
+                    } else {
+                        l.type_name().to_string()
+                    },
+                });
+            };
+            let re = crate::regex::compile_cached(pattern).map_err(|e| EvalError::Regex {
+                pattern: pattern.clone(),
+                detail: e.to_string(),
+            })?;
+            // The matcher is a finite automaton, so matching itself cannot
+            // fail: everything that can go wrong went wrong at compile time,
+            // above. There is deliberately no "gave up" answer here — a
+            // refusal reported as a non-match would silently drop the rows
+            // that do match.
+            return Ok(Value::Bool(re.is_full_match(text)));
         }
         _ => {}
     }
@@ -818,17 +1018,20 @@ fn bin(op: BinOp, l: Value, r: Value) -> Result<Value, EvalError> {
             (Value::Int(a), Value::Str(b)) => Ok(Value::Str(format!("{a}{b}"))),
             (Value::Float(a), Value::Str(b)) => Ok(Value::Str(format!("{a}{b}"))),
             (Value::List(mut a), Value::List(b)) => {
-                a.extend(b);
+                // `make_mut` copies ONLY when the list is genuinely shared, so
+                // the common `xs + [y]` on a list nobody else holds still
+                // appends in place.
+                std::sync::Arc::make_mut(&mut a).extend(b.iter().cloned());
                 Ok(Value::List(a))
             }
             (Value::List(mut a), b) => {
-                a.push(b);
+                std::sync::Arc::make_mut(&mut a).push(b);
                 Ok(Value::List(a))
             }
             // scalar + list prepends (openCypher list concatenation is symmetric:
             // `x + [a]` = `[x, a]`), mirroring the list-append arm above.
             (b, Value::List(mut a)) => {
-                a.insert(0, b);
+                std::sync::Arc::make_mut(&mut a).insert(0, b);
                 Ok(Value::List(a))
             }
             (a, b) => Err(EvalError::Type {
@@ -1448,7 +1651,8 @@ fn call_function(
                                 _ => false,
                             })
                             .cloned()
-                            .collect(),
+                            .collect::<Vec<_>>()
+                            .into(),
                     ))
                 }
                 other => Err(EvalError::Function {
@@ -1476,7 +1680,7 @@ fn call_function(
             match args.pop().expect("arity") {
                 Value::Null => Ok(Value::Null),
                 Value::List(mut l) => {
-                    l.reverse();
+                    std::sync::Arc::make_mut(&mut l).reverse();
                     Ok(Value::List(l))
                 }
                 Value::Str(s) => Ok(Value::Str(s.chars().rev().collect())),
@@ -1745,7 +1949,9 @@ fn call_function(
             arity(name, &args, 1)?;
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                Value::List(xs) => Ok(Value::List(xs.iter().skip(1).cloned().collect())),
+                Value::List(xs) => Ok(Value::List(
+                    xs.iter().skip(1).cloned().collect::<Vec<_>>().into(),
+                )),
                 other => Err(EvalError::Function {
                     name: name.to_string(),
                     detail: format!("takes a list, got {}", other.type_name()),
@@ -2145,7 +2351,8 @@ fn call_function(
                 (Value::Str(s), Value::Str(sep)) => Ok(Value::List(
                     s.split(sep.as_str())
                         .map(|p| Value::Str(p.to_string()))
-                        .collect(),
+                        .collect::<Vec<_>>()
+                        .into(),
                 )),
                 (a, b) => Err(EvalError::Function {
                     name: name.to_string(),
@@ -2198,14 +2405,14 @@ fn call_function(
                     None => break,
                 };
             }
-            Ok(Value::List(out))
+            Ok(Value::List(out.into()))
         }
         "keys" => {
             arity(name, &args, 1)?;
             match &args[0] {
                 Value::Null => Ok(Value::Null),
                 Value::Map(m) | Value::Node { props: m, .. } | Value::Rel { props: m, .. } => Ok(
-                    Value::List(m.keys().map(|k| Value::Str(k.clone())).collect()),
+                    Value::List(m.keys().map(|k| Value::Str(k.clone())).collect::<Vec<_>>().into()),
                 ),
                 other => Err(EvalError::Function {
                     name: name.to_string(),
@@ -2218,7 +2425,7 @@ fn call_function(
             match &args[0] {
                 Value::Null => Ok(Value::Null),
                 Value::Node { labels, .. } => Ok(Value::List(
-                    labels.iter().map(|l| Value::Str(l.clone())).collect(),
+                    labels.iter().map(|l| Value::Str(l.clone())).collect::<Vec<_>>().into(),
                 )),
                 other => Err(EvalError::Function {
                     name: name.to_string(),
@@ -2364,12 +2571,12 @@ fn call_function(
                     // First occurrence wins, order preserved — APOC's
                     // behaviour, and the one a dedup caller expects.
                     let mut out: Vec<Value> = Vec::new();
-                    for item in items {
-                        if !out.iter().any(|v| v.eq3(&item) == Truth::True) {
-                            out.push(item);
+                    for item in items.iter() {
+                        if !out.iter().any(|v| v.eq3(item) == Truth::True) {
+                            out.push(item.clone());
                         }
                     }
-                    Ok(Value::List(out))
+                    Ok(Value::List(out.into()))
                 }
                 other => Err(EvalError::Function {
                     name: name.to_string(),
@@ -2383,7 +2590,7 @@ fn call_function(
                 Value::Null => Ok(Value::Null),
                 Value::List(items) => {
                     let mut best: Option<&Value> = None;
-                    for item in items {
+                    for item in items.iter() {
                         if matches!(item, Value::Null) {
                             continue; // nulls are skipped, as the aggregate does
                         }
@@ -2864,6 +3071,32 @@ fn shift_wall(
 }
 
 /// A temporal value's component, via property access (`d.year`).
+/// `value.key` — a map's entry, a node's or relationship's property, a
+/// temporal's component.
+fn prop_of(v: &Value, key: &str, hooks: Option<&dyn GraphHooks>) -> Result<Value, EvalError> {
+    match v {
+        Value::Null => Ok(Value::Null),
+        Value::Map(m) => Ok(m.get(key).cloned().unwrap_or(Value::Null)),
+        Value::Node { id, props, .. } | Value::Rel { id, props, .. } => {
+            let is_rel = matches!(v, Value::Rel { .. });
+            if hooks.is_some_and(|h| h.is_deleted(*id, is_rel)) {
+                return Err(EvalError::DeletedEntity);
+            }
+            Ok(props.get(key).cloned().unwrap_or(Value::Null))
+        }
+        Value::Date(_)
+        | Value::Time { .. }
+        | Value::LocalTime(_)
+        | Value::DateTime { .. }
+        | Value::LocalDateTime { .. }
+        | Value::Duration { .. } => temporal_component(v, key),
+        other => Err(EvalError::Type {
+            what: format!("property access `.{key}`"),
+            got: other.type_name().to_string(),
+        }),
+    }
+}
+
 fn temporal_component(t: &Value, key: &str) -> Result<Value, EvalError> {
     use crate::temporal::civil_from_days;
     let unknown = || EvalError::Function {

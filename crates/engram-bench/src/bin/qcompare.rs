@@ -149,7 +149,9 @@ fn main() {
     if diffs.is_empty() && errors.is_empty() {
         println!("\nPASS — both servers returned identical row counts for every statement");
     } else {
-        println!("\nFAIL — the two servers do not agree; any timing comparison between them is void");
+        println!(
+            "\nFAIL — the two servers do not agree; any timing comparison between them is void"
+        );
         std::process::exit(1);
     }
 }

@@ -1,0 +1,63 @@
+{
+  "family": "graphalytics",
+  "upstream": "LDBC Graphalytics Benchmark specification v1.0",
+  "corpus_note": "Graphalytics corpora are NAMED GRAPHS, not scale factors — kgs, cit-Patents, wiki-Talk, datagen-*. A run stamps its scale as `ga-<graph>` (see `Rig::scale`): a bare `kgs` set beside an `sf10` would read as a third scale factor of the SNB corpus, and the reporter compares scales as TEXT and refuses a table that spans two. The prefix is what keeps a Graphalytics row from ever being averaged with an SNB one.",
+  "protocol_note": "Transcribed from the specification and implemented in `src/bin/graphalytics.rs`: THREE repetitions per algorithm-dataset job, ranked on the ARITHMETIC MEAN of Tp; `EVPS = (V + E) / mean(Tp)` and never the mean of per-run EVPS, which flatters the fast run; Tl (load) reported but EXCLUDED from Tp, which is algorithm execution alone; per-scale ceilings S 900s / M 1800s / L 3600s / XL 7200s / 2XL+ 10800s. A repetition that breaches its ceiling marks the whole job `tim` and carries `mean_is_lower_bound`, because a timed-out run otherwise contributes the TIMEOUT DURATION as its metric — a finite and flattering number that makes a mean lower than any honest measurement.",
+  "conformance_note": "Every kernel must be driven with `graphalytics: true` (`AlgoConfig::graphalytics`, `crates/engram-graph/src/algo/modes.rs`), which gates all five divergences from engram's defaults. Without it the lane validates DEFAULT semantics and proves nothing about conformance.",
+  "validation_note": "The spec's match is RELATIVE with eps = 1e-4, and where the reference value is ZERO only an exact zero passes. An absolute epsilon is the wrong mode for LCC in particular, whose zero-reference rows — every vertex of degree 0 or 1 — are the most numerous rows in the file. The verdict is computed from COUNTS and never sniffed out of the printed text: an earlier cut searched that text for 'DIFFERS' and reported `0/10` as a PASS.",
+  "kernels": {
+    "BFS": {
+      "title": "Breadth-first search",
+      "procedure": "engram.algo.bfs",
+      "yields": "depth",
+      "match": "exact",
+      "reference_suffix": "BFS",
+      "status": "verified",
+      "note": "Unreachable vertices carry the spec's sentinel rather than being absent; a missing vertex is a MISMATCH, not a skip."
+    },
+    "WCC": {
+      "title": "Weakly connected components",
+      "procedure": "engram.algo.wcc",
+      "yields": "componentId",
+      "match": "equivalence",
+      "reference_suffix": "WCC",
+      "status": "verified",
+      "note": "Component IDs are arbitrary labels, so the comparison is a PARTITION equivalence — relabelling must pass and merging two components must fail."
+    },
+    "PR": {
+      "title": "PageRank",
+      "procedure": "engram.algo.pagerank",
+      "yields": "score",
+      "match": "epsilon",
+      "reference_suffix": "PR",
+      "status": "verified"
+    },
+    "SSSP": {
+      "title": "Single-source shortest paths",
+      "procedure": "engram.algo.sssp",
+      "yields": "distance",
+      "match": "epsilon",
+      "reference_suffix": "SSSP",
+      "status": "verified",
+      "note": "Weighted. The graph's declared weight property is read from the dataset's `.properties`/`params.json`; a run that cannot find one must FAIL rather than quietly fall back to unweighted, which answers a different question."
+    },
+    "LCC": {
+      "title": "Local clustering coefficient",
+      "procedure": "engram.algo.localclusteringcoefficient",
+      "yields": "coefficient",
+      "match": "epsilon",
+      "reference_suffix": "LCC",
+      "status": "verified",
+      "note": "Most rows have a ZERO reference (every vertex of degree 0 or 1), so the zero rule carries this kernel. Validated on wiki-Talk: 2,135,249 zero-reference rows, all exact."
+    },
+    "CDLP": {
+      "title": "Community detection by label propagation",
+      "procedure": "engram.algo.labelpropagation",
+      "yields": "communityId",
+      "match": "exact",
+      "reference_suffix": "CDLP",
+      "status": "verified",
+      "note": "Deterministic under the spec's fixed iteration count and tie-break. Its dedup divergence CANNOT surface on an undirected graph, and every competition graph is undirected — so exactness on the DIRECTED wiki-Talk is the first evidence it is closed rather than merely unobservable."
+    }
+  }
+}

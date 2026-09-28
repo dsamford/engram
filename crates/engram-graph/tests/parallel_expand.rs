@@ -183,7 +183,11 @@ fn no_installed_exec_means_the_serial_path_even_with_the_lever_on() {
     let (r, trace) = engram_observe::with_trace(|| rows(&g, TWO_HOP));
     assert!(!r.is_empty());
     assert_eq!(
-        trace.counters().get("interp.expand parallel").copied().unwrap_or(0),
+        trace
+            .counters()
+            .get("interp.expand parallel")
+            .copied()
+            .unwrap_or(0),
         0,
         "exec-absent must decline: {:?}",
         trace.counters()
@@ -216,7 +220,11 @@ fn a_transaction_declines_parallelism_and_still_sees_its_writes() {
         assert_eq!(n, 121, "the buffered edge must be visible in-txn");
     });
     assert_eq!(
-        trace.counters().get("interp.expand parallel").copied().unwrap_or(0),
+        trace
+            .counters()
+            .get("interp.expand parallel")
+            .copied()
+            .unwrap_or(0),
         0,
         "a transaction must decline parallel expand: {:?}",
         trace.counters()

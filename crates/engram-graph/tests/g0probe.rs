@@ -50,7 +50,9 @@ fn numerically_equal_int_and_float_are_one_group_one_distinct_row() {
             &g,
             "UNWIND [1, 1.0, 2] AS x RETURN collect(DISTINCT x) AS xs"
         ),
-        vec![vec![Value::List(vec![Value::Int(1), Value::Int(2)])]]
+        vec![vec![Value::List(
+            (vec![Value::Int(1), Value::Int(2)]).into()
+        )]]
     );
     // Float first: the representative is the float, the KEY is still one.
     assert_eq!(
@@ -110,11 +112,14 @@ fn nan_never_collapses() {
     let g = graph();
     let params: BTreeMap<String, Value> = [(
         "xs".to_string(),
-        Value::List(vec![
-            Value::Float(f64::NAN),
-            Value::Float(f64::NAN),
-            Value::Int(1),
-        ]),
+        Value::List(
+            (vec![
+                Value::Float(f64::NAN),
+                Value::Float(f64::NAN),
+                Value::Int(1),
+            ])
+            .into(),
+        ),
     )]
     .into_iter()
     .collect();
@@ -130,7 +135,7 @@ fn negative_zero_keys_as_zero() {
     let g = graph();
     let params: BTreeMap<String, Value> = [(
         "xs".to_string(),
-        Value::List(vec![Value::Float(0.0), Value::Float(-0.0), Value::Int(0)]),
+        Value::List((vec![Value::Float(0.0), Value::Float(-0.0), Value::Int(0)]).into()),
     )]
     .into_iter()
     .collect();

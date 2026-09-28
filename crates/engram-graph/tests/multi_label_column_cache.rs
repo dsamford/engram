@@ -73,16 +73,27 @@ fn corpus() -> Graph {
     for i in 0..320i64 {
         let mut m = BTreeMap::new();
         m.insert("repoId".to_string(), Value::Str(format!("repo-{i:04}")));
-        m.insert("fullName".to_string(), Value::Str(format!("org{}/name-{i}", i % 9)));
+        m.insert(
+            "fullName".to_string(),
+            Value::Str(format!("org{}/name-{i}", i % 9)),
+        );
         m.insert("orgId".to_string(), Value::Str(format!("org{}", i % 9)));
         m.insert(
             "provider".to_string(),
-            Value::Str(if i % 4 == 0 { "lore".into() } else { "github".into() }),
+            Value::Str(if i % 4 == 0 {
+                "lore".into()
+            } else {
+                "github".into()
+            }),
         );
         if i % 3 != 0 {
             m.insert(
                 "autonomyLevel".to_string(),
-                Value::Str(if i % 6 == 1 { "unmanaged".into() } else { "assisted".into() }),
+                Value::Str(if i % 6 == 1 {
+                    "unmanaged".into()
+                } else {
+                    "assisted".into()
+                }),
             );
         }
         let labels: Vec<String> = if i % 4 == 3 {
@@ -124,10 +135,16 @@ fn a_two_label_projection_reads_through_its_smallest_label_and_is_served_next() 
         assert!(!want.is_empty(), "fixture: `{src}`");
         let (first, c1) = traced(&g, src);
         assert_eq!(first, want, "first `{src}`");
-        assert!(count_of(&c1, THROUGH_SMALLEST) > 0, "`{src}` reads through the smallest label: {c1:?}");
+        assert!(
+            count_of(&c1, THROUGH_SMALLEST) > 0,
+            "`{src}` reads through the smallest label: {c1:?}"
+        );
         let (second, c2) = traced(&g, src);
         assert_eq!(second, want, "second `{src}`");
-        assert!(count_of(&c2, SERVED) > 0, "`{src}` second run is served: {c2:?}");
+        assert!(
+            count_of(&c2, SERVED) > 0,
+            "`{src}` second run is served: {c2:?}"
+        );
         assert_eq!(reads(&c2), 0, "`{src}` second run reads no column: {c2:?}");
     }
 }
@@ -146,16 +163,25 @@ fn the_one_label_and_two_label_spellings_share_the_cache() {
     assert!(count_of(&c1, KEPT) > 0, "{c1:?}");
     let (r2, c2) = traced(&g, two);
     assert_eq!(r2, want);
-    assert!(count_of(&c2, SERVED) > 0, "two-label served by the one-label keep: {c2:?}");
+    assert!(
+        count_of(&c2, SERVED) > 0,
+        "two-label served by the one-label keep: {c2:?}"
+    );
     assert_eq!(reads(&c2), 0, "{c2:?}");
 
     let g = corpus();
     let (r2, c2) = traced(&g, two);
     assert_eq!(r2, want);
-    assert!(count_of(&c2, KEPT) > 0, "the two-label whole walk keeps: {c2:?}");
+    assert!(
+        count_of(&c2, KEPT) > 0,
+        "the two-label whole walk keeps: {c2:?}"
+    );
     let (r1, c1) = traced(&g, one);
     assert_eq!(r1, want);
-    assert!(count_of(&c1, SERVED) > 0, "one-label served by the two-label keep: {c1:?}");
+    assert!(
+        count_of(&c1, SERVED) > 0,
+        "one-label served by the two-label keep: {c1:?}"
+    );
 }
 
 /// A STRICT-SUBSET intersection reads through the smallest label restricted
@@ -165,21 +191,36 @@ fn a_strict_subset_intersection_reads_through_but_is_not_kept_as_the_label() {
     let src = "MATCH (t:Thing:Tagged) RETURN t.k AS k ORDER BY k";
     let g = corpus();
     let want = general(&g, src);
-    assert_eq!(want.len(), 30, "the intersection is a strict subset of :Tagged");
+    assert_eq!(
+        want.len(),
+        30,
+        "the intersection is a strict subset of :Tagged"
+    );
     let (r1, c1) = traced(&g, src);
     assert_eq!(r1, want);
     assert!(count_of(&c1, THROUGH_SMALLEST) > 0, "{c1:?}");
-    assert_eq!(count_of(&c1, KEPT), 0, "a strict subset is not the label's column: {c1:?}");
+    assert_eq!(
+        count_of(&c1, KEPT),
+        0,
+        "a strict subset is not the label's column: {c1:?}"
+    );
     let (r2, c2) = traced(&g, src);
     assert_eq!(r2, want);
-    assert_eq!(count_of(&c2, SERVED), 0, "nothing was kept to serve from: {c2:?}");
+    assert_eq!(
+        count_of(&c2, SERVED),
+        0,
+        "nothing was kept to serve from: {c2:?}"
+    );
 
     // Warm the smallest label whole; the intersection is then served from it.
     let (all, ca) = traced(&g, "MATCH (t:Tagged) RETURN t.k AS k ORDER BY k");
     assert_eq!(all.len(), 50);
     assert!(count_of(&ca, KEPT) > 0, "{ca:?}");
     let (r3, c3) = traced(&g, src);
-    assert_eq!(r3, want, "served through :Tagged, restricted to the intersection");
+    assert_eq!(
+        r3, want,
+        "served through :Tagged, restricted to the intersection"
+    );
     assert!(count_of(&c3, SERVED) > 0, "{c3:?}");
     assert_eq!(reads(&c3), 0, "{c3:?}");
 }
@@ -188,14 +229,16 @@ fn a_strict_subset_intersection_reads_through_but_is_not_kept_as_the_label() {
 /// the next answer.
 #[test]
 fn a_commit_retires_the_two_label_keep() {
-    let src = "MATCH (r:Repo:ManagedRepo) WHERE r.provider = 'lore' RETURN r.repoId AS id ORDER BY id";
+    let src =
+        "MATCH (r:Repo:ManagedRepo) WHERE r.provider = 'lore' RETURN r.repoId AS id ORDER BY id";
     let g = corpus();
     let (before, c1) = traced(&g, src);
     assert!(count_of(&c1, THROUGH_SMALLEST) > 0, "{c1:?}");
     let mut m = BTreeMap::new();
     m.insert("repoId".to_string(), Value::Str("repo-9999".to_string()));
     m.insert("provider".to_string(), Value::Str("lore".to_string()));
-    g.create_node(&["Repo".into(), "ManagedRepo".into()], &m).expect("new repo");
+    g.create_node(&["Repo".into(), "ManagedRepo".into()], &m)
+        .expect("new repo");
     let want = general(&g, src);
     assert_eq!(want.len(), before.len() + 1);
     let (after, _) = traced(&g, src);

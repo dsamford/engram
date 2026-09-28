@@ -23,7 +23,17 @@ fn params(id: &str) -> BTreeMap<String, Value> {
     p.insert("id".to_string(), Value::Str(id.to_string()));
     // wi-0101 → parent wi-0001 (a task, HAS_CHILD); wi-0300 → parent wi-0000
     // (the epic, HAS_EPIC); wi-0777 → parent wi-0077 (a task, HAS_EPIC).
-    p.insert("ids".to_string(), Value::List(vec![Value::Str("wi-0101".into()), Value::Str("wi-0300".into()), Value::Str("wi-0777".into())]));
+    p.insert(
+        "ids".to_string(),
+        Value::List(
+            (vec![
+                Value::Str("wi-0101".into()),
+                Value::Str("wi-0300".into()),
+                Value::Str("wi-0777".into()),
+            ])
+            .into(),
+        ),
+    );
     p
 }
 
@@ -60,10 +70,16 @@ fn corpus() -> Graph {
         m.insert("title".to_string(), Value::Str(format!("work item {i}")));
         m.insert(
             "kind".to_string(),
-            Value::Str(if i % 100 == 0 { "epic".into() } else { "task".into() }),
+            Value::Str(if i % 100 == 0 {
+                "epic".into()
+            } else {
+                "task".into()
+            }),
         );
         m.insert("body".to_string(), Value::Str(body.clone()));
-        let id = g.create_node(&["KMWorkItem".into()], &m).expect("work item");
+        let id = g
+            .create_node(&["KMWorkItem".into()], &m)
+            .expect("work item");
         ids.push(id);
         let mut f = BTreeMap::new();
         f.insert("other".to_string(), Value::Str(format!("filler-{i}")));
@@ -75,7 +91,8 @@ fn corpus() -> Graph {
                 1 => "HAS_TASK",
                 _ => "HAS_CHILD",
             };
-            g.create_rel(parent, rel, id, &BTreeMap::new()).expect("parent edge");
+            g.create_rel(parent, rel, id, &BTreeMap::new())
+                .expect("parent edge");
         }
     }
     g
@@ -92,11 +109,22 @@ fn a_pattern_comprehension_written_from_the_unbound_side_drives_from_the_bound_e
         ORDER BY id";
     let want = rows(&g, forward, "wi-0100");
     assert_eq!(want.len(), 3);
-    assert_eq!(want[0][1], Value::Str("wi-0001".into()), "wi-0101's parent is wi-0001: {want:?}");
-    assert_eq!(want[1][1], Value::Str("wi-0000".into()), "wi-0300's parent is wi-0000: {want:?}");
+    assert_eq!(
+        want[0][1],
+        Value::Str("wi-0001".into()),
+        "wi-0101's parent is wi-0001: {want:?}"
+    );
+    assert_eq!(
+        want[1][1],
+        Value::Str("wi-0000".into()),
+        "wi-0300's parent is wi-0000: {want:?}"
+    );
     let (got, c) = traced(&g, written, "wi-0100");
     assert_eq!(got, want);
-    assert!(count_of(&c, REVERSED) >= 3, "each row's comprehension reverses: {c:?}");
+    assert!(
+        count_of(&c, REVERSED) >= 3,
+        "each row's comprehension reverses: {c:?}"
+    );
     assert!(
         count_of(&c, FULL) < 40,
         "no scan of the label per row (1,500 items × 3 rows before): {c:?}"
@@ -125,7 +153,10 @@ fn a_subquery_body_written_from_the_unbound_side_drives_from_the_bound_end() {
         // A body with a WHERE re-enters the streaming matcher, which drives
         // from the bound end under its own event; either way no label is
         // scanned per row — that is the claim.
-        assert!(count_of(&c, FULL) < 40, "`{written}` scans no label per row: {c:?}");
+        assert!(
+            count_of(&c, FULL) < 40,
+            "`{written}` scans no label per row: {c:?}"
+        );
     }
 }
 
@@ -165,12 +196,16 @@ fn a_two_hop_chain_and_a_null_end_agree_with_the_forward_spelling() {
     // in this fixture (parents are the first hundred, which are roots), so the chain is empty on both spellings.
     let (got, c) = traced(&g, written, "wi-0150");
     assert_eq!(got, rows(&g, forward, "wi-0150"));
-    assert_eq!(got[0][0], Value::List(Vec::new()));
+    assert_eq!(got[0][0], Value::List((Vec::new()).into()));
     assert!(count_of(&c, FULL) < 40, "{c:?}");
 
     let null_end = "MATCH (w:KMWorkItem {id: $id}) OPTIONAL MATCH (w)-[:NOPE]->(x:KMWorkItem) \
         RETURN [(parent:KMWorkItem)-[:HAS_CHILD]->(x) | parent.id] AS parents";
     let (got, _) = traced(&g, null_end, "wi-0100");
     assert_eq!(got.len(), 1);
-    assert_eq!(got[0][0], Value::List(Vec::new()), "a null end binds nothing: {got:?}");
+    assert_eq!(
+        got[0][0],
+        Value::List((Vec::new()).into()),
+        "a null end binds nothing: {got:?}"
+    );
 }

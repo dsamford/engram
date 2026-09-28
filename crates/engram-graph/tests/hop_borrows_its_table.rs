@@ -58,12 +58,18 @@ fn count_of(c: &BTreeMap<String, u64>, key: &str) -> u64 {
 /// to keep.
 fn corpus() -> Graph {
     let g = Graph::new(Store::new(), Realm(1), Namespace(1));
-    ddl(&g, "CREATE INDEX udn_user FOR (n:UserDataNode) ON (n.userId)");
+    ddl(
+        &g,
+        "CREATE INDEX udn_user FOR (n:UserDataNode) ON (n.userId)",
+    );
     let mut mails = Vec::new();
     for i in 0..8000i64 {
         let mut m = BTreeMap::new();
         m.insert("nodeType".to_string(), Value::Str("email".into()));
-        m.insert("userId".to_string(), Value::Str(if i % 4 == 3 { "u2".into() } else { "u1".into() }));
+        m.insert(
+            "userId".to_string(),
+            Value::Str(if i % 4 == 3 { "u2".into() } else { "u1".into() }),
+        );
         m.insert("nodeId".to_string(), Value::Str(format!("mail-{i:05}")));
         mails.push(g.create_node(&["UserDataNode".into()], &m).expect("email"));
     }
@@ -74,12 +80,19 @@ fn corpus() -> Graph {
         ents.push(g.create_node(&["Entity".into()], &e).expect("entity"));
     }
     for i in (0..8000usize).step_by(997) {
-        g.create_rel(mails[i], "REPLIED_TO", mails[(i * 7 + 13) % 8000], &BTreeMap::new())
-            .expect("reply");
+        g.create_rel(
+            mails[i],
+            "REPLIED_TO",
+            mails[(i * 7 + 13) % 8000],
+            &BTreeMap::new(),
+        )
+        .expect("reply");
     }
-    g.create_rel(mails[40], "REPLIED_TO", mails[40], &BTreeMap::new()).expect("self reply");
+    g.create_rel(mails[40], "REPLIED_TO", mails[40], &BTreeMap::new())
+        .expect("self reply");
     for i in (0..8000usize).step_by(53) {
-        g.create_rel(mails[i], "MENTIONS", ents[i % 12], &BTreeMap::new()).expect("mention");
+        g.create_rel(mails[i], "MENTIONS", ents[i % 12], &BTreeMap::new())
+            .expect("mention");
     }
     g
 }
@@ -92,7 +105,10 @@ fn a_directed_hop_from_a_wide_seed_borrows_the_table_once() {
     let _ = rows(&g, src); // the first run may build the table
     let (got, c) = traced(&g, src);
     assert_eq!(got, want);
-    assert!(count_of(&c, HOP_RUNS) + count_of(&c, "interp.pipeline aggregate runs") > 0, "{c:?}");
+    assert!(
+        count_of(&c, HOP_RUNS) + count_of(&c, "interp.pipeline aggregate runs") > 0,
+        "{c:?}"
+    );
     assert!(count_of(&c, BORROWED) > 0, "{c:?}");
 }
 
@@ -116,7 +132,10 @@ fn a_reverse_hop_and_a_projection_keep_their_order() {
         assert_eq!(got, want, "`{src}`");
         borrowed += count_of(&c, BORROWED);
     }
-    assert!(borrowed >= 3, "the pipeline's hops borrow the table: {borrowed}");
+    assert!(
+        borrowed >= 3,
+        "the pipeline's hops borrow the table: {borrowed}"
+    );
 }
 
 /// CONTROL: an undirected hop walks two sides with a self-loop deduped

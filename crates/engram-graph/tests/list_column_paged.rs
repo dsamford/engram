@@ -52,20 +52,29 @@ fn paged_corpus() -> (Graph, std::path::PathBuf) {
         if i % 3 != 0 {
             m.insert(
                 "countries".to_string(),
-                Value::List(if i % 6 == 1 {
-                    vec![Value::Str("USA".into()), Value::Str("CAN".into())]
-                } else {
-                    vec![Value::Str("DEU".into())]
-                }),
+                Value::List(
+                    if i % 6 == 1 {
+                        vec![Value::Str("USA".into()), Value::Str("CAN".into())]
+                    } else {
+                        vec![Value::Str("DEU".into())]
+                    }
+                    .into(),
+                ),
             );
         }
         if i % 7 != 0 {
-            m.insert("startAt".to_string(), Value::Str(format!("2026-08-{:02}", 1 + i % 28)));
+            m.insert(
+                "startAt".to_string(),
+                Value::Str(format!("2026-08-{:02}", 1 + i % 28)),
+            );
         }
         g.create_node(&["Ev".into()], &m).expect("ev");
         for k in 0..2 {
             let mut f = BTreeMap::new();
-            f.insert("other".to_string(), Value::Str(format!("filler-{i}-{k}-{}", "x".repeat(40))));
+            f.insert(
+                "other".to_string(),
+                Value::Str(format!("filler-{i}-{k}-{}", "x".repeat(40))),
+            );
             g.create_node(&["Filler".into()], &f).expect("filler");
         }
     }
@@ -85,8 +94,7 @@ fn paged_corpus() -> (Graph, std::path::PathBuf) {
     (Graph::new(store.clone(), Realm(1), Namespace(1)), dir)
 }
 
-const COALESCE_IN: &str =
-    "MATCH (e:Ev) WHERE e.startAt IS NOT NULL AND $a IN coalesce(e.countries, []) RETURN count(e) AS n";
+const COALESCE_IN: &str = "MATCH (e:Ev) WHERE e.startAt IS NOT NULL AND $a IN coalesce(e.countries, []) RETURN count(e) AS n";
 
 #[test]
 fn the_repeat_read_of_a_list_column_count_is_vectorised_on_a_paged_store() {
@@ -105,8 +113,16 @@ fn the_repeat_read_of_a_list_column_count_is_vectorised_on_a_paged_store() {
         count_of(&c3, VECTORISED) > 0,
         "the third read must be column-at-a-time: {c3:?}"
     );
-    assert_eq!(count_of(&c3, SKIPPED), 0, "nothing re-read on the third run: {c3:?}");
-    assert_eq!(count_of(&c3, SERVED), 0, "no walk at all on the third run: {c3:?}");
+    assert_eq!(
+        count_of(&c3, SKIPPED),
+        0,
+        "nothing re-read on the third run: {c3:?}"
+    );
+    assert_eq!(
+        count_of(&c3, SERVED),
+        0,
+        "no walk at all on the third run: {c3:?}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -119,24 +135,33 @@ fn the_repeat_read_of_a_list_column_count_is_vectorised_on_a_paged_store() {
 #[test]
 fn a_never_written_property_is_an_all_null_column_for_the_vectorised_count() {
     let (g, dir) = paged_corpus();
-    const ABSENT: &str =
-        "MATCH (e:Ev) WHERE e.startAt IS NOT NULL AND $a IN coalesce(e.nothing, []) RETURN count(e) AS n";
+    const ABSENT: &str = "MATCH (e:Ev) WHERE e.startAt IS NOT NULL AND $a IN coalesce(e.nothing, []) RETURN count(e) AS n";
     const ABSENT_PRESENCE: &str = "MATCH (e:Ev) WHERE e.nothing IS NOT NULL RETURN count(e) AS n";
-    const ABSENT_OR: &str =
-        "MATCH (e:Ev) WHERE e.startAt IS NOT NULL AND ($a IN coalesce(e.nothing, []) OR e.startAt = '2026-08-05') RETURN count(e) AS n";
+    const ABSENT_OR: &str = "MATCH (e:Ev) WHERE e.startAt IS NOT NULL AND ($a IN coalesce(e.nothing, []) OR e.startAt = '2026-08-05') RETURN count(e) AS n";
     let (first, _) = traced(&g, ABSENT);
     assert_eq!(first, vec![vec![Value::Int(0)]]);
     let (second, c) = traced(&g, ABSENT);
     assert_eq!(second, first);
-    assert!(count_of(&c, VECTORISED) > 0, "column-at-a-time over a Null column: {c:?}");
-    assert!(count_of(&c, "graph.property column absent everywhere") > 0, "{c:?}");
-    assert!(count_of(&c, "cypher.expressions evaluated") < 100, "no per-member walk: {c:?}");
+    assert!(
+        count_of(&c, VECTORISED) > 0,
+        "column-at-a-time over a Null column: {c:?}"
+    );
+    assert!(
+        count_of(&c, "graph.property column absent everywhere") > 0,
+        "{c:?}"
+    );
+    assert!(
+        count_of(&c, "cypher.expressions evaluated") < 100,
+        "no per-member walk: {c:?}"
+    );
     // Presence of a never-written property: Null everywhere, count 0, vectorised.
     let (r, c) = traced(&g, ABSENT_PRESENCE);
     assert_eq!(r, vec![vec![Value::Int(0)]]);
     assert!(count_of(&c, VECTORISED) > 0, "{c:?}");
     // Beside a real column in an OR: the real one is served, the absent one is Null.
-    let expect = (0..3000i64).filter(|i| i % 7 != 0 && 1 + i % 28 == 5).count() as i64;
+    let expect = (0..3000i64)
+        .filter(|i| i % 7 != 0 && 1 + i % 28 == 5)
+        .count() as i64;
     let _ = traced(&g, ABSENT_OR);
     let (r, c) = traced(&g, ABSENT_OR);
     assert_eq!(r, vec![vec![Value::Int(expect)]]);

@@ -260,11 +260,11 @@ fn plus_concatenates_strings_and_lists() {
     assert_eq!(v("1 + 'a'"), Value::Str("1a".into()));
     assert_eq!(
         v("[1] + [2]"),
-        Value::List(vec![Value::Int(1), Value::Int(2)])
+        Value::List((vec![Value::Int(1), Value::Int(2)]).into())
     );
     assert_eq!(
         v("[1] + 2"),
-        Value::List(vec![Value::Int(1), Value::Int(2)]),
+        Value::List((vec![Value::Int(1), Value::Int(2)]).into()),
         "list appends"
     );
     assert_eq!(v("null + 1"), Value::Null);
@@ -292,23 +292,23 @@ fn property_index_and_slice_semantics() {
     assert_eq!(v("{a: 1}['a']"), Value::Int(1));
     assert_eq!(
         v("[1, 2, 3, 4][1..3]"),
-        Value::List(vec![Value::Int(2), Value::Int(3)])
+        Value::List((vec![Value::Int(2), Value::Int(3)]).into())
     );
     assert_eq!(
         v("[1, 2, 3][..2]"),
-        Value::List(vec![Value::Int(1), Value::Int(2)])
+        Value::List((vec![Value::Int(1), Value::Int(2)]).into())
     );
     assert_eq!(
         v("[1, 2, 3][1..]"),
-        Value::List(vec![Value::Int(2), Value::Int(3)])
+        Value::List((vec![Value::Int(2), Value::Int(3)]).into())
     );
     assert_eq!(
         v("[1, 2, 3][-2..]"),
-        Value::List(vec![Value::Int(2), Value::Int(3)])
+        Value::List((vec![Value::Int(2), Value::Int(3)]).into())
     );
     assert_eq!(
         v("[1, 2][5..9]"),
-        Value::List(vec![]),
+        Value::List((vec![]).into()),
         "out-of-range slice clamps"
     );
     assert_eq!(
@@ -354,21 +354,21 @@ fn both_case_forms_work_and_null_subjects_fall_through() {
 fn list_comprehensions_filter_and_map() {
     assert_eq!(
         v("[x IN [1, 2, 3] WHERE x > 1 | x * 10]"),
-        Value::List(vec![Value::Int(20), Value::Int(30)])
+        Value::List((vec![Value::Int(20), Value::Int(30)]).into())
     );
     assert_eq!(
         v("[x IN [1, 2] | x + 1]"),
-        Value::List(vec![Value::Int(2), Value::Int(3)])
+        Value::List((vec![Value::Int(2), Value::Int(3)]).into())
     );
     assert_eq!(
         v("[x IN [1, 2, 3] WHERE x <> 2]"),
-        Value::List(vec![Value::Int(1), Value::Int(3)])
+        Value::List((vec![Value::Int(1), Value::Int(3)]).into())
     );
     assert_eq!(v("[x IN null | x]"), Value::Null);
     // A null filter verdict fails closed, per row.
     assert_eq!(
         v("[x IN [1, null, 3] WHERE x > 0]"),
-        Value::List(vec![Value::Int(1), Value::Int(3)])
+        Value::List((vec![Value::Int(1), Value::Int(3)]).into())
     );
 }
 
@@ -412,26 +412,26 @@ fn the_scalar_registry() {
     assert_eq!(v("trim('  x ')"), Value::Str("x".into()));
     assert_eq!(
         v("split('a,b', ',')"),
-        Value::List(vec![Value::Str("a".into()), Value::Str("b".into())])
+        Value::List((vec![Value::Str("a".into()), Value::Str("b".into())]).into())
     );
     assert_eq!(
         v("range(0, 3)"),
-        Value::List((0..=3).map(Value::Int).collect()),
+        Value::List((0..=3).map(Value::Int).collect::<Vec<_>>().into()),
         "range is INCLUSIVE of the end"
     );
     assert_eq!(
         v("range(3, 0, -2)"),
-        Value::List(vec![Value::Int(3), Value::Int(1)])
+        Value::List((vec![Value::Int(3), Value::Int(1)]).into())
     );
     assert_eq!(
         v("keys({b: 1, a: 2})"),
-        Value::List(vec![Value::Str("a".into()), Value::Str("b".into())])
+        Value::List((vec![Value::Str("a".into()), Value::Str("b".into())]).into())
     );
     assert_eq!(v("exists(null)"), Value::Bool(false));
     assert_eq!(v("exists(1)"), Value::Bool(true));
     assert_eq!(
         v("reverse([1, 2])"),
-        Value::List(vec![Value::Int(2), Value::Int(1)])
+        Value::List((vec![Value::Int(2), Value::Int(1)]).into())
     );
     assert_eq!(v("abs(-3)"), Value::Int(3));
 }
@@ -450,7 +450,7 @@ fn the_five_apoc_functions_live() {
     );
     assert_eq!(
         v("apoc.convert.fromJsonList('[1, \"a\", null]')"),
-        Value::List(vec![Value::Int(1), Value::Str("a".into()), Value::Null])
+        Value::List((vec![Value::Int(1), Value::Str("a".into()), Value::Null]).into())
     );
     let m = v("apoc.convert.fromJsonMap('{\"k\": {\"n\": 1.5}}')");
     let mut inner = BTreeMap::new();
@@ -460,7 +460,7 @@ fn the_five_apoc_functions_live() {
     assert_eq!(m, Value::Map(outer));
     assert_eq!(
         v("apoc.coll.toSet([3, 1, 3, 2, 1])"),
-        Value::List(vec![Value::Int(3), Value::Int(1), Value::Int(2)]),
+        Value::List((vec![Value::Int(3), Value::Int(1), Value::Int(2)]).into()),
         "first occurrence wins, order preserved"
     );
     assert_eq!(
@@ -490,7 +490,10 @@ fn refusals_are_NAMED_never_null() {
         "count(*) parses and is refused HERE, not at the parser"
     );
     assert!(matches!(err("size(1)"), EvalError::Function { .. }));
-    assert_eq!(err("'a' =~ 'a.*'"), EvalError::RegexUnsupported);
+    // `=~` used to be parsed and then refused; it now evaluates. The full
+    // semantics live in `a_regex_match_is_a_full_match_not_a_search.rs`; this
+    // line stays as the one that would notice the operator going away again.
+    assert_eq!(v("'a' =~ 'a.*'"), Value::Bool(true));
     assert_eq!(
         v("null =~ 'a'"),
         Value::Null,

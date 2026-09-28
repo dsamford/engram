@@ -83,19 +83,31 @@ fn corpus() -> Graph {
         let mut m = BTreeMap::new();
         m.insert("id".into(), s(&format!("item-{i}")));
         m.insert("title".into(), s(&format!("Work item {i}")));
-        m.insert("description".into(), s(&"lorem ipsum dolor sit amet ".repeat(80)));
-        m.insert("status".into(), s(["todo", "doing", "done"][(i % 3) as usize]));
+        m.insert(
+            "description".into(),
+            s(&"lorem ipsum dolor sit amet ".repeat(80)),
+        );
+        m.insert(
+            "status".into(),
+            s(["todo", "doing", "done"][(i % 3) as usize]),
+        );
         m.insert("projectRef".into(), s(&format!("proj-{pi}")));
         m.insert("sortOrder".into(), Value::Int((i * 7919) % 2_400));
         for k in 0..12 {
             m.insert(format!("field{k}"), s(&format!("value {k} of {i}")));
         }
         let w = g.create_node(&["KMWorkItem".into()], &m).expect("item");
-        g.create_rel(w, "BELONGS_TO_PROJECT", projects[pi], &BTreeMap::new()).expect("rel");
+        g.create_rel(w, "BELONGS_TO_PROJECT", projects[pi], &BTreeMap::new())
+            .expect("rel");
         if firsts[pi].len() >= 10 {
             let parent = firsts[pi][(i as usize / 40) % 10];
-            g.create_rel(parent, ["HAS_EPIC", "HAS_TASK", "HAS_CHILD"][(i % 3) as usize], w, &BTreeMap::new())
-                .expect("rel");
+            g.create_rel(
+                parent,
+                ["HAS_EPIC", "HAS_TASK", "HAS_CHILD"][(i % 3) as usize],
+                w,
+                &BTreeMap::new(),
+            )
+            .expect("rel");
         } else {
             firsts[pi].push(w);
         }
@@ -106,7 +118,8 @@ fn corpus() -> Graph {
 const HEAD: &str = "MATCH (w:KMWorkItem) WHERE true AND EXISTS { (w)-[:BELONGS_TO_PROJECT]->(:KMProject {id: $projectId}) } RETURN ";
 const TAIL: &str = " ORDER BY w.sortOrder ASC SKIP toInteger($offset) LIMIT toInteger($limit)";
 const A: &str = "[(w)-[:BELONGS_TO_PROJECT]->(p:KMProject) | p.id][0] AS projectId";
-const B: &str = "[(parent:KMWorkItem)-[:HAS_EPIC|HAS_TASK|HAS_CHILD]->(w) | parent.id][0] AS parentId";
+const B: &str =
+    "[(parent:KMWorkItem)-[:HAS_EPIC|HAS_TASK|HAS_CHILD]->(w) | parent.id][0] AS parentId";
 
 /// The production listing: both comprehensions seeded lean, once per row
 /// each, and the answer byte-identical to the whole-row control.
@@ -130,7 +143,9 @@ fn a_the_km_listing_seeds_both_comprehensions_lean() {
 #[test]
 fn b_what_the_body_reads_of_the_node_survives() {
     let g = corpus();
-    let prop = format!("{HEAD}[(w)-[:BELONGS_TO_PROJECT]->(p:KMProject) | w.title + ' in ' + p.name][0] AS label{TAIL}");
+    let prop = format!(
+        "{HEAD}[(w)-[:BELONGS_TO_PROJECT]->(p:KMProject) | w.title + ' in ' + p.name][0] AS label{TAIL}"
+    );
     let want = control(&g, &prop);
     let (got, c) = traced(&g, &prop);
     assert_eq!(got, want);
@@ -141,14 +156,29 @@ fn b_what_the_body_reads_of_the_node_survives() {
     let want = control(&g, &whole);
     let (got, c) = traced(&g, &whole);
     assert_eq!(got, want);
-    assert!(got.iter().all(|r| matches!(&r[0], Value::Node { props, .. } if props.len() == 18)), "the whole node comes back");
-    assert_eq!(count_of(&c, LEAN), 0, "a whole use keeps the row whole: {c:?}");
+    assert!(
+        got.iter()
+            .all(|r| matches!(&r[0], Value::Node { props, .. } if props.len() == 18)),
+        "the whole node comes back"
+    );
+    assert_eq!(
+        count_of(&c, LEAN),
+        0,
+        "a whole use keeps the row whole: {c:?}"
+    );
 
-    let filtered = format!("{HEAD}[(w)-[:BELONGS_TO_PROJECT]->(p:KMProject) WHERE w.status = 'todo' | p.id] AS todo{TAIL}");
+    let filtered = format!(
+        "{HEAD}[(w)-[:BELONGS_TO_PROJECT]->(p:KMProject) WHERE w.status = 'todo' | p.id] AS todo{TAIL}"
+    );
     let want = control(&g, &filtered);
     let (got, c) = traced(&g, &filtered);
     assert_eq!(got, want);
-    assert_eq!(got.iter().filter(|r| r[0] == Value::List(vec![s("proj-7")])).count(), 20);
+    assert_eq!(
+        got.iter()
+            .filter(|r| r[0] == Value::List((vec![s("proj-7")]).into()))
+            .count(),
+        20
+    );
     assert_eq!(count_of(&c, LEAN), 60, "{c:?}");
 }
 
@@ -158,18 +188,35 @@ fn b_what_the_body_reads_of_the_node_survives() {
 #[test]
 fn c_the_patterns_inline_maps_are_part_of_the_demand() {
     let g = corpus();
-    let on_bound = format!("{HEAD}[(w {{status: 'todo'}})-[:BELONGS_TO_PROJECT]->(p:KMProject) | p.id] AS todo{TAIL}");
+    let on_bound = format!(
+        "{HEAD}[(w {{status: 'todo'}})-[:BELONGS_TO_PROJECT]->(p:KMProject) | p.id] AS todo{TAIL}"
+    );
     let want = control(&g, &on_bound);
     let (got, c) = traced(&g, &on_bound);
     assert_eq!(got, want);
-    assert_eq!(got.iter().filter(|r| r[0] == Value::List(vec![s("proj-7")])).count(), 20);
-    assert_eq!(count_of(&c, LEAN), 0, "a map on the bound node keeps it whole: {c:?}");
+    assert_eq!(
+        got.iter()
+            .filter(|r| r[0] == Value::List((vec![s("proj-7")]).into()))
+            .count(),
+        20
+    );
+    assert_eq!(
+        count_of(&c, LEAN),
+        0,
+        "a map on the bound node keeps it whole: {c:?}"
+    );
 
-    let correlated = format!("{HEAD}[(w)-[:BELONGS_TO_PROJECT]->(p:KMProject {{id: w.projectRef}}) | p.name][0] AS name{TAIL}");
+    let correlated = format!(
+        "{HEAD}[(w)-[:BELONGS_TO_PROJECT]->(p:KMProject {{id: w.projectRef}}) | p.name][0] AS name{TAIL}"
+    );
     let want = control(&g, &correlated);
     let (got, c) = traced(&g, &correlated);
     assert_eq!(got, want);
-    assert!(got.iter().all(|r| r[0] == s("Project 7")), "first rows: {:?}", &got[..2]);
+    assert!(
+        got.iter().all(|r| r[0] == s("Project 7")),
+        "first rows: {:?}",
+        &got[..2]
+    );
     assert_eq!(count_of(&c, LEAN), 60, "{c:?}");
 }
 
@@ -186,7 +233,14 @@ fn d_exists_and_count_bodies_seed_lean_too() {
     let want = control(&g, &src);
     let (got, c) = traced(&g, &src);
     assert_eq!(got, want);
-    assert_eq!(got.iter().filter(|r| r[2] == Value::Bool(true)).count(), 10, "the ten parents");
-    assert!(got.iter().any(|r| matches!(r[1], Value::Int(n) if n > 0)), "some parent has a same-status child");
+    assert_eq!(
+        got.iter().filter(|r| r[2] == Value::Bool(true)).count(),
+        10,
+        "the ten parents"
+    );
+    assert!(
+        got.iter().any(|r| matches!(r[1], Value::Int(n) if n > 0)),
+        "some parent has a same-status child"
+    );
     assert!(count_of(&c, LEAN) >= 60, "{c:?}");
 }

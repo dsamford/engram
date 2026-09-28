@@ -7,6 +7,7 @@
 //! (`IS NULL`, `coalesce`) do.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// A Cypher value. Graph values (nodes, relationships, paths) arrive with the
 /// clause layer; this is the scalar/composite core every expression needs.
@@ -23,13 +24,29 @@ pub enum Value {
     /// A string.
     Str(String),
     /// A list.
-    List(Vec<Value>),
+    ///
+    /// `Arc` BECAUSE A ROW IS CLONED PER OUTPUT ROW. When a MATCH fans one row
+    /// into many, every value the row carries is cloned — and a `Vec<Value>`
+    /// deep-copies every element, each Node carrying a labels `Vec` and a props
+    /// `BTreeMap`. Measured on SNB BI at SF3 with the output row count held at
+    /// 24,328 and only the CARRIED list's size varied: ~100 elements 3 s,
+    /// ~1000 19 s, ~5000 over 100 s, and the same query carrying no list at all
+    /// 1 s. The cost was O(output rows x list size) and the traversal itself
+    /// was free. Neo4j is flat on this shape because a list there is one heap
+    /// object and a row copy copies a reference — which is exactly what `Arc`
+    /// buys, and why bi4, bi8 and bi10 are one defect rather than three.
+    ///
+    /// Sharing is invisible to the language: `Arc<Vec<Value>>` derives `Clone`
+    /// and `PartialEq` through to the contents, so equality stays structural
+    /// and a list is still a value. Mutation goes through `Arc::make_mut`,
+    /// which copies only when the list is genuinely shared.
+    List(Arc<Vec<Value>>),
     /// A PATH: the alternating `[node, rel, node, …]` trail a path variable
     /// (`MATCH p = …`) binds. Structurally a list of nodes and relationships, but
     /// a DISTINCT type — openCypher compares a path to a non-path as incomparable
     /// (`null`), never element-wise like two lists, and `nodes(p)`/`length(p)`
     /// read it as a path. Kept separate from `List` for exactly that reason.
-    Path(Vec<Value>),
+    Path(Arc<Vec<Value>>),
     /// A map. BTreeMap so equality and rendering are order-independent —
     /// two maps with one content are one value.
     Map(BTreeMap<String, Value>),
@@ -179,7 +196,7 @@ impl Value {
                     return Truth::False;
                 }
                 let mut acc = Truth::True;
-                for (x, y) in a.iter().zip(b) {
+                for (x, y) in a.iter().zip(b.iter()) {
                     acc = acc.and(x.eq3(y));
                     if acc == Truth::False {
                         return Truth::False;
@@ -252,7 +269,7 @@ impl Value {
                     return Truth::False;
                 }
                 let mut acc = Truth::True;
-                for (x, y) in a.iter().zip(b) {
+                for (x, y) in a.iter().zip(b.iter()) {
                     acc = acc.and(x.eq3(y));
                     if acc == Truth::False {
                         return Truth::False;

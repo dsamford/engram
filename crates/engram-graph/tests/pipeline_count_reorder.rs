@@ -81,7 +81,16 @@ fn gq3() -> Graph {
         g.create_rel(pe[person], "IS_LOCATED_IN", ci[city], &e)
             .expect("IS_LOCATED_IN");
     }
-    for (a, b) in [(0, 1), (1, 2), (2, 0), (3, 4), (5, 6), (6, 7), (7, 5), (0, 3)] {
+    for (a, b) in [
+        (0, 1),
+        (1, 2),
+        (2, 0),
+        (3, 4),
+        (5, 6),
+        (6, 7),
+        (7, 5),
+        (0, 3),
+    ] {
         g.create_rel(pe[a], "KNOWS", pe[b], &e).expect("KNOWS");
     }
     g
@@ -117,7 +126,8 @@ fn gq2() -> Graph {
             .expect("HAS_CREATOR");
     }
     for (c, o) in [(0, 0), (1, 1), (2, 2), (3, 0)] {
-        g.create_rel(cm[c], "REPLY_OF", po[o], &e).expect("REPLY_OF");
+        g.create_rel(cm[c], "REPLY_OF", po[o], &e)
+            .expect("REPLY_OF");
     }
     g
 }
@@ -162,7 +172,11 @@ fn agrees_and_fires(g: &Graph, src: &str) -> Rows {
         source_order, general,
         "reorder OFF vs general disagree: `{src}`"
     );
-    assert_eq!(counter(g, src, REORDER), 1, "the reorder did not fire: `{src}`");
+    assert_eq!(
+        counter(g, src, REORDER),
+        1,
+        "the reorder did not fire: `{src}`"
+    );
     on
 }
 
@@ -207,16 +221,25 @@ fn q3_shape_drops_the_bare_path_and_folds() {
     // the stamped `:Country` excludes; pe3/pe4 have no triangle.
     assert_eq!(agrees_and_fires(&g, q3), vec![vec![i(6)]], "q3 count");
     assert_eq!(counter(&g, q3, FOLD), 1, "the rewritten q3 must FOLD");
-    // The same pattern already comma-joined in ONE MATCH takes the same route.
-    let q3_commas =
-        "MATCH (country:Country), \
+    // Comma-joined in ONE MATCH it is a DIFFERENT question: openCypher keeps
+    // every relationship of one MATCH distinct, so no two of the three people
+    // may reach the country over the same city's IS_PART_OF edge. pe0 and pe1
+    // both live in ci0, and every ordering of the co0 triangle holds both, so
+    // the comma form counts 0 -- which is why LSQB's own q3 is written as
+    // separate MATCH clauses. The clause is rewritten (`enforce_clause_rel_
+    // uniqueness`); the fold, which implements the separate-clause rule, does
+    // not claim it.
+    let q3_commas = "MATCH (country:Country), \
          (person1:Person)-[:IS_LOCATED_IN]->(city1:City)-[:IS_PART_OF]->(country), \
          (person2:Person)-[:IS_LOCATED_IN]->(city2:City)-[:IS_PART_OF]->(country), \
          (person3:Person)-[:IS_LOCATED_IN]->(city3:City)-[:IS_PART_OF]->(country), \
          (person1)-[:KNOWS]-(person2)-[:KNOWS]-(person3)-[:KNOWS]-(person1) \
          RETURN count(*) AS n";
-    assert_eq!(agrees_and_fires(&g, q3_commas), vec![vec![i(6)]]);
-    assert_eq!(counter(&g, q3_commas, FOLD), 1);
+    let (on, source_order, general) = triple(&g, q3_commas);
+    assert_eq!(on, general, "comma q3: columnar vs general disagree");
+    assert_eq!(source_order, general, "comma q3: reorder OFF vs general disagree");
+    assert_eq!(general, vec![vec![i(0)]], "the clause rule counts 0");
+    assert_eq!(counter(&g, q3_commas, FOLD), 0, "the comma form is not folded");
 }
 
 /// LABEL STAMPING is what makes the bare-path drop safe: `:Country` is written
@@ -226,10 +249,9 @@ fn q3_shape_drops_the_bare_path_and_folds() {
 #[test]
 fn label_stamping_keeps_the_dropped_paths_constraint() {
     let g = gq3();
-    let stamped_by_hand =
-        "MATCH (person1:Person)-[:IS_LOCATED_IN]->(city1:City)-[:IS_PART_OF]->(country:Country), \
-         (person2:Person)-[:IS_LOCATED_IN]->(city2:City)-[:IS_PART_OF]->(country:Country), \
-         (person3:Person)-[:IS_LOCATED_IN]->(city3:City)-[:IS_PART_OF]->(country:Country), \
+    let stamped_by_hand = "MATCH (person1:Person)-[:IS_LOCATED_IN]->(city1:City)-[:IS_PART_OF]->(country:Country) MATCH \
+         (person2:Person)-[:IS_LOCATED_IN]->(city2:City)-[:IS_PART_OF]->(country:Country) MATCH \
+         (person3:Person)-[:IS_LOCATED_IN]->(city3:City)-[:IS_PART_OF]->(country:Country) MATCH \
          (person1)-[:KNOWS]-(person2)-[:KNOWS]-(person3)-[:KNOWS]-(person1) \
          RETURN count(*) AS n";
     let by_hand = triple(&g, stamped_by_hand);
@@ -237,16 +259,19 @@ fn label_stamping_keeps_the_dropped_paths_constraint() {
     assert_eq!(by_hand.0, vec![vec![i(6)]], "the by-hand stamping counts 6");
     // …and with NO label on the place at all the Region's triangle IS counted,
     // so the label the stamp carries is provably load-bearing (6 + 6 = 12).
-    let unlabelled =
-        "MATCH (person1:Person)-[:IS_LOCATED_IN]->(city1:City)-[:IS_PART_OF]->(country), \
-         (person2:Person)-[:IS_LOCATED_IN]->(city2:City)-[:IS_PART_OF]->(country), \
-         (person3:Person)-[:IS_LOCATED_IN]->(city3:City)-[:IS_PART_OF]->(country), \
+    let unlabelled = "MATCH (person1:Person)-[:IS_LOCATED_IN]->(city1:City)-[:IS_PART_OF]->(country) MATCH \
+         (person2:Person)-[:IS_LOCATED_IN]->(city2:City)-[:IS_PART_OF]->(country) MATCH \
+         (person3:Person)-[:IS_LOCATED_IN]->(city3:City)-[:IS_PART_OF]->(country) MATCH \
          (person1)-[:KNOWS]-(person2)-[:KNOWS]-(person3)-[:KNOWS]-(person1) \
          RETURN count(*) AS n";
     let (on, source_order, general) = triple(&g, unlabelled);
     assert_eq!(on, general);
     assert_eq!(source_order, general);
-    assert_eq!(on, vec![vec![i(12)]], "unlabelled admits the Region triangle");
+    assert_eq!(
+        on,
+        vec![vec![i(12)]],
+        "unlabelled admits the Region triangle"
+    );
 }
 
 /// A bare path whose var NOTHING else binds is a genuine cartesian factor —
@@ -373,11 +398,15 @@ fn a_pattern_that_already_folds_keeps_its_source_order() {
         // The same chain written from the SMALLEST label already — nothing to do.
         "MATCH (country:Country)<-[:IS_PART_OF]-(city1:City)<-[:IS_LOCATED_IN]-(person1:Person) RETURN count(*) AS n",
         // A tree out of the seed: three legs, all folded in source order.
-        "MATCH (country:Country)<-[:IS_PART_OF]-(city1:City)<-[:IS_LOCATED_IN]-(person1:Person), \
+        "MATCH (country:Country)<-[:IS_PART_OF]-(city1:City)<-[:IS_LOCATED_IN]-(person1:Person) MATCH \
          (city1)<-[:IS_LOCATED_IN]-(person2:Person) RETURN count(*) AS n",
     ] {
         declines_but_agrees(&g, src);
-        assert_eq!(counter(&g, src, FOLD), 1, "…and it still folds: `{src}`");
+        // the tree spelled as separate clauses (its two IS_LOCATED_IN legs may
+        // share a relationship only across clauses) is not claimed by the fold,
+        // which folds one MATCH; the chains still fold
+        let want = if src.matches("MATCH").count() > 1 { 0 } else { 1 };
+        assert_eq!(counter(&g, src, FOLD), want, "…and the chains still fold: `{src}`");
     }
 }
 

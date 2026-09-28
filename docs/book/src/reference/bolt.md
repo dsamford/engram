@@ -96,11 +96,27 @@ marker itself.
 | integer | tiny ints in the marker, then `INT_8`/`16`/`32`/`64` |
 | float | IEEE-754 double |
 | string, list, map | length in the marker for small sizes, then 8/16/32-bit length |
-| structure | a tag byte plus fields — nodes, relationships, paths, temporals |
+| structure | a tag byte plus fields — nodes, relationships, temporals |
 
-Engram encodes `Node`, `Relationship` and `Path` as the structures drivers
-expect, and the full temporal set — date, time, local time, datetime, local
-datetime and duration.
+Engram encodes `Node` and `Relationship` as the structures drivers expect, and
+the full temporal set — date, time, local time, datetime in both the
+zone-offset and zone-id forms, local datetime and duration.
+
+Three gaps in that sentence are worth having in writing, because a driver
+wired against the list above would otherwise find them at runtime:
+
+- **A `Path` is sent as a plain list** of its alternating nodes and
+  relationships, not as the Bolt `Path` structure. The signature is declared
+  and emitted nowhere, so a driver does not reconstruct a path object from it.
+  The dedicated structure is a follow-up; nothing round-trips a path through
+  Bolt today.
+- **`Point2D`, `Point3D` and `UnboundRelationship` have signature constants
+  and no codec.** Neither an encoder nor a decoder mentions them, so they are
+  reserved tags rather than supported types — stated as an absence rather than
+  discovered.
+- **`Vector` (Bolt 6.0) is decode-only.** A client may send one as a
+  parameter, and it becomes a plain list of numbers because the engine has no
+  vector-typed value; the server never emits one.
 
 ## Limits
 
@@ -126,19 +142,27 @@ An autocommit write statement runs as a read-validated transaction and retries
 on conflict, up to `RETRIES = 4096`, with an escalated-loss bound of 32.
 
 Counters track the outcome: `AUTOCOMMIT_RERUNS`, `WON_AT[5]` (the attempt
-distribution), `ESCALATIONS`, `ESCALATED_LOSSES`, and a six-way conflict-class
-breakdown. See [Counters and observability](./observability.md).
+distribution), `ESCALATIONS` and `ESCALATED_LOSSES` — all of them on the
+periodic counters line. See [Counters and observability](./observability.md).
+
+A six-way **conflict-class** breakdown is recorded on every conflict as well,
+classifying the conflicting key by its row family — but it is not printed
+anywhere and no trace exposes it. Today only the tests read it, so reading it
+on a running server means adding it to that line first.
 
 ## Tracing one statement
 
-Prefix a query with the trace marker and only that statement is traced:
+On a server started with `ENGRAM_TRACE_MARKER=1`, prefix a query with the trace
+marker and only that statement is traced:
 
 ```cypher
 /* engram:trace */ MATCH (p:Person) RETURN count(p)
 ```
 
 Better than `ENGRAM_TRACE_COUNTERS`, which turns the firehose on for a whole
-server.
+server. Without the permission the marker is an ordinary comment: the marker is
+the client's choice and a traced statement's cost is the server's, so honouring
+it is the operator's decision.
 
 ## The server agent
 

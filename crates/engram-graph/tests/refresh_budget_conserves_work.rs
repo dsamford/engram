@@ -32,6 +32,18 @@
 //! budget` — and the canary is the same fixture with a budget large enough that
 //! the over-budget path is NOT taken, so the assertion is about the branch and
 //! not about the fixture always being over budget.
+//!
+//! # What changed under this file, and what did not
+//!
+//! `set_bounded_derived_repair` now TRUNCATES that unavoidable item to what
+//! the budget has left instead of swallowing the whole delta — "one per pass"
+//! bounded the count of oversized repairs and never their cost, and the cost
+//! is what stalled the write levels (see
+//! `a_maintenance_pass_bounds_the_repair_it_cannot_afford`). The claim this
+//! file makes is untouched by that: the table must still be REPAIRED, because
+//! a bounded step is still a step and refusing it is the permanent deferral
+//! the hatch exists to prevent. Only the counter moved, so the over-budget
+//! arm below sets the lever off to keep asserting on the branch it named.
 
 use std::collections::BTreeMap;
 
@@ -94,6 +106,10 @@ fn a_repair_larger_than_the_whole_budget_is_still_taken() {
     let _tok = stale_table_with_a_burst(&g);
     // Far below `1,000 + 1,000 * ADJ_REPAIR_SCAN_ROWS`.
     g.set_refresh_pass_rows(64);
+    // The arm this file was written about: take the whole delta rather than a
+    // slice of it. The default truncates instead and reports a different
+    // counter — pinned next door.
+    g.set_bounded_derived_repair(false);
 
     let (report, trace) = engram_observe::with_trace(|| g.refresh_stale_derived());
     eprintln!("[budget] tiny budget: {report:?} {:?}", trace.counters());
@@ -105,7 +121,10 @@ fn a_repair_larger_than_the_whole_budget_is_still_taken() {
          only grows, so deferring it is permanent: {report:?}"
     );
     assert!(
-        count(&trace, "graph.derived refresh took a repair over its whole budget") >= 1,
+        count(
+            &trace,
+            "graph.derived refresh took a repair over its whole budget"
+        ) >= 1,
         "and it must SAY it went over budget, or this passed for some other \
          reason: {:?}",
         trace.counters()
@@ -130,7 +149,10 @@ fn a_repair_inside_the_budget_does_not_take_the_over_budget_path() {
          are not comparable: {report:?}"
     );
     assert_eq!(
-        count(&trace, "graph.derived refresh took a repair over its whole budget"),
+        count(
+            &trace,
+            "graph.derived refresh took a repair over its whole budget"
+        ),
         0,
         "a repair that fits must not report going over: {:?}",
         trace.counters()
@@ -142,9 +164,19 @@ fn a_repair_inside_the_budget_does_not_take_the_over_budget_path() {
 ///
 /// Without this the fix above reads as "the budget does nothing", which is a
 /// different and much worse change than the one that was made.
+///
+/// THE LEVER IS OFF HERE, and that is the finding rather than an
+/// accommodation. Deferring the second table is what the first-come rule does,
+/// and doing it every pass from a stable iteration order is how that table's
+/// delta grew to a 262,144-entry change set — the deferral this test pins as
+/// the budget working is the same deferral that starved it. The shared-budget
+/// arm serves both and bounds each instead, which
+/// `a_maintenance_pass_bounds_the_repair_it_cannot_afford` pins alongside its
+/// canary; this file keeps the old arm honest and comparable.
 #[test]
 fn the_budget_still_defers_the_second_oversized_table() {
     let g = Graph::new(Store::new(), Realm(1), Namespace(1));
+    g.set_bounded_derived_repair(false);
     g.set_degree_table_after(0);
     g.set_single_node_stale_walk(false);
     let label = vec!["N".to_string()];

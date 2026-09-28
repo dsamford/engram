@@ -291,7 +291,8 @@ fn an_oversized_delta_skips_the_pass_rather_than_truncating_it() {
     let before = engram_store::PHANTOM_CONFLICTS.load(std::sync::atomic::Ordering::Relaxed);
     let (txn, _) = run_in(&t1, txn, "MATCH (t:Total) SET t.v = 1");
     let committed = t1.commit_owned(txn).is_ok();
-    let phantoms = engram_store::PHANTOM_CONFLICTS.load(std::sync::atomic::Ordering::Relaxed) - before;
+    let phantoms =
+        engram_store::PHANTOM_CONFLICTS.load(std::sync::atomic::Ordering::Relaxed) - before;
 
     eprintln!(
         "[precision locking] oversized delta: committed={committed},          predicate aborts={phantoms}"

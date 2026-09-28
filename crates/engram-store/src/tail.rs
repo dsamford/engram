@@ -62,7 +62,9 @@ pub(crate) struct ShardedTail {
 impl ShardedTail {
     pub(crate) fn new() -> Self {
         ShardedTail {
-            shards: (0..TAIL_SHARDS).map(|_| RwLock::new(Shard::new())).collect(),
+            shards: (0..TAIL_SHARDS)
+                .map(|_| RwLock::new(Shard::new()))
+                .collect(),
             counts: (0..TAIL_SHARDS)
                 .map(|_| std::sync::atomic::AtomicUsize::new(0))
                 .collect(),
@@ -295,7 +297,11 @@ pub(crate) struct AllRead<'a> {
 impl AllRead<'_> {
     /// The chains in `[lo, hi)` across every shard, SORTED by key, borrowed
     /// from the held latches.
-    pub(crate) fn range_sorted(&self, lo: &[u8], hi: Option<&[u8]>) -> Vec<(&LogicalKey, &Vec<Version>)> {
+    pub(crate) fn range_sorted(
+        &self,
+        lo: &[u8],
+        hi: Option<&[u8]>,
+    ) -> Vec<(&LogicalKey, &Vec<Version>)> {
         let mut out: Vec<(&LogicalKey, &Vec<Version>)> = Vec::new();
         for g in &self.guards {
             match hi {
@@ -374,10 +380,17 @@ mod tests {
         let all = t.read_all();
         let got = all.range_sorted(&[2u8; engram_key::PREFIX_LEN], None);
         assert_eq!(got.len(), 500);
-        assert!(got.windows(2).all(|w| w[0].0 < w[1].0), "sorted across shards");
+        assert!(
+            got.windows(2).all(|w| w[0].0 < w[1].0),
+            "sorted across shards"
+        );
         drop(all);
         assert_eq!(t.newest_ts(&rows[3]), Some(4));
-        assert_eq!(t.visible_at(&rows[3], 3), None, "nothing at or below 3 for a version stamped 4");
+        assert_eq!(
+            t.visible_at(&rows[3], 3),
+            None,
+            "nothing at or below 3 for a version stamped 4"
+        );
     }
 
     #[test]
@@ -389,7 +402,11 @@ mod tests {
         t.insert_ordered(k.clone(), v(9));
         let chain: Vec<u64> = {
             let all = t.read_all();
-            all.range_sorted(&k, None)[0].1.iter().map(|x| x.commit_ts).collect()
+            all.range_sorted(&k, None)[0]
+                .1
+                .iter()
+                .map(|x| x.commit_ts)
+                .collect()
         };
         assert_eq!(chain, vec![2, 5, 9]);
         assert_eq!(t.newest_ts(&k), Some(9));

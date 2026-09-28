@@ -199,7 +199,7 @@ fn opt_collect_skips_nulls() {
     let (on, _) = both(&g, src, BTreeMap::new());
     // f2 collects [] (its only row is the null-fill row, whose post.len is null).
     assert!(
-        on.contains(&vec![Value::Int(2), Value::List(vec![])]),
+        on.contains(&vec![Value::Int(2), Value::List((vec![]).into())]),
         "a post-less forum collects the empty list: {on:?}"
     );
 }
@@ -214,7 +214,7 @@ fn opt_collect_node_skips_nulls() {
     agrees_and_fires(&g, src);
     let (on, _) = both(&g, src, BTreeMap::new());
     assert!(
-        on.contains(&vec![Value::Int(2), Value::List(vec![])]),
+        on.contains(&vec![Value::Int(2), Value::List((vec![]).into())]),
         "a post-less forum collects no posts: {on:?}"
     );
 }
@@ -628,7 +628,11 @@ fn multi_opt_merge_order_across_rounds() {
         .filter(|(_, r)| r[1] == Value::Null)
         .map(|(i, _)| i)
         .collect();
-    assert_eq!(null_idxs, vec![2, 3], "round-1 null-fills stay in place: {on:?}");
+    assert_eq!(
+        null_idxs,
+        vec![2, 3],
+        "round-1 null-fills stay in place: {on:?}"
+    );
 }
 
 /// The multi-OPTIONAL decline set — each falls back to the general path (the
@@ -946,7 +950,10 @@ fn opt_folds(g: &Graph, src: &str, legs: u64) -> Vec<Vec<Value>> {
     assert_eq!(on, general, "optional fold ON vs general: `{src}`");
     assert_eq!(fold_off, general, "optional fold OFF vs general: `{src}`");
     assert_eq!(legs_folded(g, src), legs, "folded legs: `{src}`");
-    assert!(opt_fired(g, src), "the OPTIONAL operator must answer: `{src}`");
+    assert!(
+        opt_fired(g, src),
+        "the OPTIONAL operator must answer: `{src}`"
+    );
     on
 }
 
@@ -1012,7 +1019,11 @@ fn opt_fold_declines_a_close_onto_a_sibling_leg_var() {
     let (on, fold_off, general) = fold_triple(&g, src);
     assert_eq!(on, general, "columnar vs general disagree");
     assert_eq!(fold_off, general, "fold OFF vs general disagree");
-    assert_eq!(legs_folded(&g, src), 0, "the sibling close declines the leg");
+    assert_eq!(
+        legs_folded(&g, src),
+        0,
+        "the sibling close declines the leg"
+    );
 }
 
 /// The folded leg re-seeds relationship isomorphism exactly as the materialised

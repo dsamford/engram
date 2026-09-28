@@ -4,8 +4,8 @@ An ADR records a decision that is **expensive or impossible to reverse**, with
 the reasoning that produced it and the consequences accepted along with it.
 
 Most decisions here do not need one. A flag, an operator, a threshold — those
-are measurable and reversible, and the [design history](../history/index.md)
-carries their reasoning. An ADR is for the ones where being wrong is permanent.
+are measurable and reversible, and the project's engineering record carries
+their reasoning. An ADR is for the ones where being wrong is permanent.
 
 ## The index
 
@@ -29,8 +29,7 @@ Write an ADR when the decision:
 
 Do **not** write one for a decision a measurement can overturn. This project has
 overturned several, and the record of that belongs in
-[design history](../history/index.md) rather than in a document titled
-"decision".
+the engineering record rather than in a document titled "decision".
 
 ## What one contains
 
@@ -89,4 +88,3 @@ wrong, not a silent edit.
 
 - [ADR-001](./adr-001-on-disk-formats.md)
 - [Key encoding](../architecture/key-encoding.md) — the decision in use.
-- [Design history](../history/index.md) — the reasoning that is not frozen.

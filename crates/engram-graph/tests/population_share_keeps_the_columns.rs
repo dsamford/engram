@@ -71,25 +71,40 @@ const GETS: &str = "store.gets";
 /// `(userId, nodeType)` composite is declared.
 fn corpus() -> Graph {
     let g = Graph::new(Store::new(), Realm(1), Namespace(1));
-    ddl(&g, "CREATE INDEX udn_user_type FOR (n:UserDataNode) ON (n.userId, n.nodeType)");
+    ddl(
+        &g,
+        "CREATE INDEX udn_user_type FOR (n:UserDataNode) ON (n.userId, n.nodeType)",
+    );
     for i in 0..4_000i64 {
         let big = i < 2_000;
         let mut m = BTreeMap::new();
         m.insert("nodeId".into(), s(&format!("n-{i}")));
         m.insert("userId".into(), s(if big { "u-big" } else { "u-other" }));
-        m.insert("nodeType".into(), s(if i % 20 == 0 { "note" } else { "email" }));
+        m.insert(
+            "nodeType".into(),
+            s(if i % 20 == 0 { "note" } else { "email" }),
+        );
         m.insert("classified".into(), Value::Bool(i % 25 != 0));
         if i % 7 == 0 {
-            m.insert("abuseStatus".into(), s(if i % 14 == 0 { "clean" } else { "flagged" }));
+            m.insert(
+                "abuseStatus".into(),
+                s(if i % 14 == 0 { "clean" } else { "flagged" }),
+            );
         }
-        m.insert("sentimentLabel".into(), s(["neutral", "positive", "negative"][(i % 3) as usize]));
+        m.insert(
+            "sentimentLabel".into(),
+            s(["neutral", "positive", "negative"][(i % 3) as usize]),
+        );
         m.insert("sentimentTone".into(), s("automated"));
         m.insert("urgencyScore".into(), Value::Int(i % 5));
         m.insert("contentType".into(), s("newsletter"));
         m.insert("senderType".into(), s("marketing"));
         m.insert("priority".into(), s("informational"));
         m.insert("actionRequired".into(), Value::Bool(i % 9 == 0));
-        m.insert("semanticLabels".into(), Value::List(vec![s("newsletter"), s("promotional")]));
+        m.insert(
+            "semanticLabels".into(),
+            Value::List((vec![s("newsletter"), s("promotional")]).into()),
+        );
         m.insert("subject".into(), s(&format!("Subject line {i}")));
         m.insert("content".into(), s(&"email body text ".repeat(40)));
         g.create_node(&["UserDataNode".into()], &m).expect("node");
@@ -110,18 +125,39 @@ const LISTING: &str = "MATCH (n:UserDataNode {userId: $userId, nodeType: 'email'
 fn a_the_listing_keeps_its_columns_and_the_next_run_reads_nothing() {
     let g = corpus();
     let want = control(&g, LISTING, "u-big");
-    assert_eq!(want.len(), 1_703, "the big user's classified, non-flagged emails");
+    assert_eq!(
+        want.len(),
+        1_703,
+        "the big user's classified, non-flagged emails"
+    );
     let (first, c1) = traced(&g, LISTING, "u-big");
     assert_eq!(first, want);
     assert_eq!(count_of(&c1, WHOLE), 1, "{c1:?}");
-    assert!(count_of(&c1, KEPT) >= 8, "the eight item columns are kept: {c1:?}");
+    assert!(
+        count_of(&c1, KEPT) >= 8,
+        "the eight item columns are kept: {c1:?}"
+    );
     let (second, c2) = traced(&g, LISTING, "u-big");
     assert_eq!(second, want);
-    assert_eq!(count_of(&c2, WHOLE), 0, "nothing to read whole once cached: {c2:?}");
-    assert!(count_of(&c2, SERVED) >= 8, "every item column from the cache: {c2:?}");
+    assert_eq!(
+        count_of(&c2, WHOLE),
+        0,
+        "nothing to read whole once cached: {c2:?}"
+    );
+    assert!(
+        count_of(&c2, SERVED) >= 8,
+        "every item column from the cache: {c2:?}"
+    );
     assert_eq!(count_of(&c2, SCANS), 0, "{c2:?}");
-    assert_eq!(count_of(&c2, GATHER) + count_of(&c2, POINT_GATHER), 0, "{c2:?}");
-    assert!(count_of(&c2, GETS) <= 2, "no record per row on the cached run: {c2:?}");
+    assert_eq!(
+        count_of(&c2, GATHER) + count_of(&c2, POINT_GATHER),
+        0,
+        "{c2:?}"
+    );
+    assert!(
+        count_of(&c2, GETS) <= 2,
+        "no record per row on the cached run: {c2:?}"
+    );
 }
 
 /// A population below the share threshold keeps the population read (no

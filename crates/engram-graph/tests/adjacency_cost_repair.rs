@@ -123,7 +123,11 @@ fn agrees_with_direct_walk(g: &Graph, ids: &[u64], tok: u32, sample: &[usize]) {
             s.sort_unstable();
             s
         };
-        assert_eq!(key(&with_table), key(&direct), "node #{i}: table and direct walk disagree");
+        assert_eq!(
+            key(&with_table),
+            key(&direct),
+            "node #{i}: table and direct walk disagree"
+        );
     }
 }
 
@@ -134,8 +138,14 @@ fn five_thousand_changed_nodes_on_a_million_entry_table_repair() {
     // well under half the span.
     let (g, ids, tok) = seeded(100_000, 10);
     warm_out_tables(&g, ids[0], tok);
-    let table_len = ids.iter().map(|&n| out_row(&g, n, tok).len()).sum::<usize>();
-    assert_eq!(table_len, 1_000_000, "the fixture is not the table it claims to be");
+    let table_len = ids
+        .iter()
+        .map(|&n| out_row(&g, n, tok).len())
+        .sum::<usize>();
+    assert_eq!(
+        table_len, 1_000_000,
+        "the fixture is not the table it claims to be"
+    );
 
     burst(&g, &ids, 5_000, 7);
 
@@ -147,7 +157,11 @@ fn five_thousand_changed_nodes_on_a_million_entry_table_repair() {
         "5k changed nodes on a 1M-entry table must REPAIR: {:?}",
         trace.counters()
     );
-    assert_eq!(count(&trace, "graph.adjacency tables built"), 0, "…not rebuild");
+    assert_eq!(
+        count(&trace, "graph.adjacency tables built"),
+        0,
+        "…not rebuild"
+    );
     assert_eq!(count(&trace, "graph.adjacency repair declined by cost"), 0);
     // Repaired ≡ rebuilt, on changed nodes, unchanged nodes, and the edge of
     // the changed range.
@@ -164,8 +178,16 @@ fn with_the_lever_off_the_same_changes_rebuild_under_the_node_cap() {
     burst(&g, &ids, 5_000, 7);
     let (row, trace) = engram_observe::with_trace(|| out_row(&g, ids[0], tok));
     assert_eq!(row.len(), 11);
-    assert_eq!(count(&trace, "graph.adjacency repair declined by the node cap"), 1);
-    assert_eq!(count(&trace, "graph.adjacency tables built"), 1, "{:?}", trace.counters());
+    assert_eq!(
+        count(&trace, "graph.adjacency repair declined by the node cap"),
+        1
+    );
+    assert_eq!(
+        count(&trace, "graph.adjacency tables built"),
+        1,
+        "{:?}",
+        trace.counters()
+    );
     assert_eq!(count(&trace, "graph.adjacency tables repaired"), 0);
 }
 
@@ -201,8 +223,16 @@ fn a_small_change_set_repairs_on_both_arms() {
         warm_out_tables(&g, ids[0], tok);
         burst(&g, &ids, 100, 3);
         let (_, trace) = engram_observe::with_trace(|| out_row(&g, ids[0], tok));
-        assert_eq!(count(&trace, "graph.adjacency tables repaired"), 1, "lever={lever}");
-        assert_eq!(count(&trace, "graph.adjacency tables built"), 0, "lever={lever}");
+        assert_eq!(
+            count(&trace, "graph.adjacency tables repaired"),
+            1,
+            "lever={lever}"
+        );
+        assert_eq!(
+            count(&trace, "graph.adjacency tables built"),
+            0,
+            "lever={lever}"
+        );
     }
 }
 
@@ -227,8 +257,16 @@ fn under_the_cap_a_table_too_small_for_the_cost_model_still_repairs() {
             "lever={lever}: a change set under the cap must repair whatever the table's size: {:?}",
             trace.counters()
         );
-        assert_eq!(count(&trace, "graph.adjacency tables built"), 0, "lever={lever}");
-        assert_eq!(count(&trace, "graph.adjacency repair declined by cost"), 0, "lever={lever}");
+        assert_eq!(
+            count(&trace, "graph.adjacency tables built"),
+            0,
+            "lever={lever}"
+        );
+        assert_eq!(
+            count(&trace, "graph.adjacency repair declined by cost"),
+            0,
+            "lever={lever}"
+        );
         agrees_with_direct_walk(&g, &ids, tok, &[0, 99, 100, 499]);
     }
 }
@@ -250,11 +288,26 @@ fn changed_rows_at_a_fifth_of_a_million_entry_table_repair() {
         "200k changed rows on a 1M-entry table must REPAIR: {:?}",
         trace.counters()
     );
-    assert_eq!(count(&trace, "graph.adjacency repair admitted by cost over the node cap"), 1);
+    assert_eq!(
+        count(
+            &trace,
+            "graph.adjacency repair admitted by cost over the node cap"
+        ),
+        1
+    );
     assert_eq!(count(&trace, "graph.adjacency tables built"), 0);
     assert_eq!(count(&trace, "graph.adjacency repair declined by cost"), 0);
-    assert_eq!(count(&trace, "derived.change log overflowed"), 0, "the log must hold the burst");
-    agrees_with_direct_walk(&g, &ids, tok, &[0, 1, 9_999, 19_999, 20_000, 50_000, 99_999]);
+    assert_eq!(
+        count(&trace, "derived.change log overflowed"),
+        0,
+        "the log must hold the burst"
+    );
+    agrees_with_direct_walk(
+        &g,
+        &ids,
+        tok,
+        &[0, 1, 9_999, 19_999, 20_000, 50_000, 99_999],
+    );
 }
 
 /// Changed rows that EXCEED the table REBUILD: 110,000 changed rows over
@@ -268,7 +321,11 @@ fn changed_rows_exceeding_the_table_rebuild() {
     burst_each(&g, &ids, 10_000, 11, 17);
     let (row, trace) = engram_observe::with_trace(|| out_row(&g, ids[0], tok));
     assert_eq!(row.len(), 21);
-    assert_eq!(count(&trace, "derived.change log overflowed"), 0, "the log must hold the burst");
+    assert_eq!(
+        count(&trace, "derived.change log overflowed"),
+        0,
+        "the log must hold the burst"
+    );
     assert_eq!(
         count(&trace, "graph.adjacency repair declined by cost"),
         1,

@@ -50,7 +50,91 @@ const RSS_GROWTH_REPORT_BYTES: usize = 32 << 20;
 /// names, in the pod's log, the counters that statement recorded and the
 /// microseconds it took. Nothing is returned to the client; the diagnosis is
 /// the operator's, read from the log.
+///
+/// **Honoured only when the operator permits it** ([`BoltServer::set_trace_marker`],
+/// `ENGRAM_TRACE_MARKER` in the server). The marker is chosen by the CLIENT,
+/// and a traced statement is an order of magnitude more expensive — one LSQB
+/// shape measured 3 s untraced and 35 s traced — and writes the statement's
+/// text into the operator's log. So an unpermitted marker is an ordinary
+/// comment: counted, noted once in the server log so an operator who expected
+/// a trace learns why there was none, and otherwise ignored. Security plan
+/// §2.13.
 pub const TRACE_MARKER: &str = "/* engram:trace */";
+
+/// Whether the one-time "marker ignored" note has been printed. Process-wide
+/// on purpose: the note is for an operator reading one log, and a note per
+/// session would bury the log it is trying to explain.
+static TRACE_MARKER_IGNORED_NOTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Fix 85 (instrument): the paged store's block cache, read before and after
+/// a statement so its report can say how much of the growth was the CACHE
+/// FILLING — a cold statement's resident-set growth on the mirror is mostly
+/// that (the corpus verdict's memory axis failed on every chain since v131:
+/// "3 over the 256 MB budget", the email quarantined `min` at +311 MB, all of
+/// them first touches of blocks the bounded cache then keeps). Registered by
+/// the server when it serves a paged directory (`set_resident_cache_probe`);
+/// absent elsewhere, and then the report carries no cache figure.
+static RESIDENT_CACHE_PROBE: std::sync::OnceLock<Box<dyn Fn() -> usize + Send + Sync>> =
+    std::sync::OnceLock::new();
+
+/// Register the probe that answers the block cache's resident bytes. The
+/// first registration wins; later ones are ignored.
+pub fn set_resident_cache_probe(probe: Box<dyn Fn() -> usize + Send + Sync>) {
+    let _ = RESIDENT_CACHE_PROBE.set(probe);
+}
+
+fn resident_cache_bytes() -> Option<usize> {
+    RESIDENT_CACHE_PROBE.get().map(|f| f())
+}
+
+/// Fix 86: the wall clock the growth report is stamped with, in unix
+/// milliseconds. Registered by the server (this crate reads no clock of its
+/// own — the DST drives it deterministically); absent, the line carries no
+/// stamp, as before.
+static WALL_CLOCK_PROBE: std::sync::OnceLock<Box<dyn Fn() -> u64 + Send + Sync>> =
+    std::sync::OnceLock::new();
+
+/// Register the wall clock the growth report stamps its lines with. The
+/// first registration wins; later ones are ignored.
+pub fn set_wall_clock_probe(probe: Box<dyn Fn() -> u64 + Send + Sync>) {
+    let _ = WALL_CLOCK_PROBE.set(probe);
+}
+
+fn wall_ms_tag() -> String {
+    match WALL_CLOCK_PROBE.get() {
+        Some(f) => format!("t={} ", f()),
+        None => String::new(),
+    }
+}
+
+/// The growth report's line: the resident-set growth, the cache's share of
+/// it when a probe is registered, the before/after figures, the connection
+/// and the statement's head.
+fn growth_report(
+    grew: usize,
+    cache_delta: Option<usize>,
+    before: usize,
+    after: usize,
+    conn: u64,
+    query: &str,
+) -> String {
+    let shown: String = query.chars().take(240).collect();
+    let cache = match cache_delta {
+        Some(c) => format!(" (cache +{} MB)", c >> 20),
+        None => String::new(),
+    };
+    format!(
+        "[bolt] {}statement grew rss by {} MB{} ({} -> {} MB) on conn {}: {}",
+        wall_ms_tag(),
+        grew >> 20,
+        cache,
+        before >> 20,
+        after >> 20,
+        conn,
+        shown.replace('\n', " ")
+    )
+}
 
 /// The process's resident set in bytes from `/proc/self/statm` — Linux, where
 /// the pod runs; `None` elsewhere or when the read fails, and then nothing is
@@ -135,6 +219,9 @@ enum State {
 struct Stream {
     result: QueryResult,
     at: usize,
+    /// Fix 111 (instrument): the traced RUN's arrival time, so the PULL
+    /// that streams its last record can report the bolt-level wall.
+    traced_entry_us: Option<i64>,
 }
 
 /// The server, one per connection.
@@ -180,6 +267,10 @@ pub struct BoltServer {
     txn: Option<GraphTxn>,
     /// The `server` string returned in HELLO's SUCCESS metadata.
     server_agent: String,
+    /// What this server is serving under, reported in HELLO's SUCCESS
+    /// metadata under [`crate::serving::SERVING_KEY`]. `None` puts no key in
+    /// the map at all. See [`BoltServer::set_serving_hint`].
+    serving_hint: Option<crate::serving::ServingHint>,
     /// This connection's id, supplied by the adapter. See
     /// [`BoltServer::set_connection_id`].
     connection_id: u64,
@@ -187,8 +278,19 @@ pub struct BoltServer {
     trace_statements: bool,
     /// See [`BoltServer::set_trace_counters`].
     trace_counters: bool,
+    /// See [`BoltServer::set_trace_marker`]. Off unless the operator permits it.
+    trace_marker: bool,
     /// See [`BoltServer::set_trace_clock`].
     trace_clock: Option<std::sync::Arc<dyn Fn() -> i64 + Send + Sync>>,
+    /// Fix 87 (instrument): how long the running statement's PARSE took, in
+    /// microseconds of the trace clock, for the traced header — `None` when
+    /// the statement is not traced or no clock answers.
+    last_parse_us: std::cell::Cell<Option<i64>>,
+    /// Fix 111 (instrument): the traced RUN's arrival, its parameter decode
+    /// and its engine wall, reported by the PULL that finishes its stream.
+    trace_entry_us: std::cell::Cell<Option<i64>>,
+    trace_decode_us: std::cell::Cell<Option<i64>>,
+    last_engine_us: std::cell::Cell<Option<i64>>,
     /// Whether the version was negotiated through the Manifest v1 exchange —
     /// then HELLO's SUCCESS carries `protocol_version`, which the spec
     /// reserves for exactly that case.
@@ -208,9 +310,9 @@ const OFFERED: [(u8, u8, u8); 2] = [(6, 0, 0), (5, 8, 8)];
 
 /// Whether `(major, minor)` is inside [`OFFERED`].
 fn offered(major: u8, minor: u8) -> bool {
-    OFFERED
-        .iter()
-        .any(|&(maj, min, range)| maj == major && minor <= min && minor >= min.saturating_sub(range))
+    OFFERED.iter().any(|&(maj, min, range)| {
+        maj == major && minor <= min && minor >= min.saturating_sub(range)
+    })
 }
 
 /// The Manifest v1 request: `00 00 01 FF` — major `FF`, minor 1.
@@ -236,7 +338,9 @@ fn read_varint(bytes: &[u8]) -> Result<Option<(u64, usize)>, WireError> {
     let mut value: u64 = 0;
     for (i, &b) in bytes.iter().enumerate() {
         if i >= 10 {
-            return Err(WireError::Protocol("handshake varint longer than 10 bytes".into()));
+            return Err(WireError::Protocol(
+                "handshake varint longer than 10 bytes".into(),
+            ));
         }
         value |= u64::from(b & 0x7F) << (7 * i);
         if b & 0x80 == 0 {
@@ -262,9 +366,17 @@ fn gql_of(code: &str) -> (&'static str, &'static str, &'static str) {
         _ => "CLIENT_ERROR",
     };
     if code.ends_with(".SyntaxError") {
-        ("42001", "error: syntax error or access rule violation - invalid syntax", class)
+        (
+            "42001",
+            "error: syntax error or access rule violation - invalid syntax",
+            class,
+        )
     } else {
-        ("50N42", "error: general processing exception - unexpected error", class)
+        (
+            "50N42",
+            "error: general processing exception - unexpected error",
+            class,
+        )
     }
 }
 
@@ -311,10 +423,16 @@ impl BoltServer {
             txn: None,
             max_message_bytes: MAX_MESSAGE_BYTES,
             server_agent: DEFAULT_SERVER_AGENT.to_string(),
+            serving_hint: None,
             connection_id: 0,
             trace_statements: false,
             trace_counters: false,
+            trace_marker: false,
             trace_clock: None,
+            last_parse_us: std::cell::Cell::new(None),
+            trace_entry_us: std::cell::Cell::new(None),
+            trace_decode_us: std::cell::Cell::new(None),
+            last_engine_us: std::cell::Cell::new(None),
             manifest: false,
         }
     }
@@ -335,6 +453,16 @@ impl BoltServer {
     /// another vendor's mark, and why the override exists anyway.
     pub fn set_server_agent(&mut self, agent: impl Into<String>) {
         self.server_agent = agent.into();
+    }
+
+    /// Report what this server is serving under, in HELLO's SUCCESS metadata.
+    ///
+    /// Unset by default, and an unset hint puts NO key in the map — so a
+    /// server nobody configured sends byte-for-byte the HELLO it always did.
+    /// See [`crate::serving`] for why a benchmark needs to ask rather than be
+    /// told.
+    pub fn set_serving_hint(&mut self, hint: crate::serving::ServingHint) {
+        self.serving_hint = Some(hint);
     }
 
     /// Set this connection's id, reported to the driver as `connection_id`.
@@ -366,6 +494,15 @@ impl BoltServer {
     /// `ENGRAM_TRACE_COUNTERS` is set.
     pub fn set_trace_counters(&mut self, on: bool) {
         self.trace_counters = on;
+    }
+
+    /// Permit the per-statement [`TRACE_MARKER`]. Off by default: the marker
+    /// is the client's choice and the cost is the server's, so honouring it is
+    /// the operator's decision (`ENGRAM_TRACE_MARKER` in the server). Once
+    /// statements carry an authenticated principal this becomes the `TRACE`
+    /// privilege; until then it is all or nothing per server.
+    pub fn set_trace_marker(&mut self, permitted: bool) {
+        self.trace_marker = permitted;
     }
 
     /// The clock the trace header's `(wall)` figure is read from, in
@@ -416,10 +553,12 @@ impl BoltServer {
         // direct read for exactly that reason).
         let t0 = self.trace_now_us(graph);
         let (out, trace) = engram_observe::with_trace(|| run_stmt(graph, parsed, params));
-        let elapsed_ms = match (t0, self.trace_now_us(graph)) {
-            (Some(a), Some(b)) => b.saturating_sub(a) as f64 / 1000.0,
-            _ => -1.0,
+        let elapsed_us = match (t0, self.trace_now_us(graph)) {
+            (Some(a), Some(b)) => Some(b.saturating_sub(a)),
+            _ => None,
         };
+        self.last_engine_us.set(elapsed_us);
+        let elapsed_ms = elapsed_us.map_or(-1.0, |us| us as f64 / 1000.0);
         let mut rows: Vec<(u64, &str)> = trace
             .counters()
             .iter()
@@ -427,11 +566,16 @@ impl BoltServer {
             .collect();
         rows.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
         let shown: String = query.chars().take(200).collect();
+        let parse = match self.last_parse_us.get() {
+            Some(us) => format!("; parse {:.3} ms", us as f64 / 1000.0),
+            None => String::new(),
+        };
         eprintln!(
-            "[trace-counters] conn {} — {} distinct, {:.3} ms (wall): {}",
+            "[trace-counters] conn {} — {} distinct, {:.3} ms (wall{}): {}",
             self.connection_id,
             rows.len(),
             elapsed_ms,
+            parse,
             shown.replace('\n', " ")
         );
         for (v, k) in rows.iter().take(60) {
@@ -485,10 +629,16 @@ impl BoltServer {
             txn: None,
             max_message_bytes: MAX_MESSAGE_BYTES,
             server_agent: DEFAULT_SERVER_AGENT.to_string(),
+            serving_hint: None,
             connection_id: 0,
             trace_statements: false,
             trace_counters: false,
+            trace_marker: false,
             trace_clock: None,
+            last_parse_us: std::cell::Cell::new(None),
+            trace_entry_us: std::cell::Cell::new(None),
+            trace_decode_us: std::cell::Cell::new(None),
+            last_engine_us: std::cell::Cell::new(None),
             manifest: false,
         }
     }
@@ -745,10 +895,16 @@ impl BoltServer {
                     }
                 }
                 let mut meta = BTreeMap::new();
-                meta.insert(
-                    "server".to_string(),
-                    Value::Str(self.server_agent.clone()),
-                );
+                meta.insert("server".to_string(), Value::Str(self.server_agent.clone()));
+                // Absent unless an operator configured one, so the default
+                // HELLO is unchanged and no driver sees a key it did not see
+                // before. See [`crate::serving`].
+                if let Some(hint) = self.serving_hint {
+                    meta.insert(
+                        crate::serving::SERVING_KEY.to_string(),
+                        hint.to_value(),
+                    );
+                }
                 // A UNIQUE id per connection.
                 //
                 // It was the constant `"bolt-0"`, which makes every connection
@@ -790,6 +946,17 @@ impl BoltServer {
                 )
             }
             (State::Ready, MSG_LOGOFF) => {
+                // LOGOFF ends the principal, so it ends everything the principal
+                // left behind — exactly what RESET releases. A driver re-uses a
+                // pooled connection by LOGOFF then LOGON as someone else; an open
+                // stream or transaction surviving that is the next principal
+                // pulling the previous one's rows or committing its writes.
+                self.streams.clear();
+                self.in_explicit_tx = false;
+                if let Some(txn) = self.txn.take() {
+                    self.graph.rollback_owned(txn);
+                    sometimes!("bolt.logoff rolled back an open transaction", true);
+                }
                 self.state = State::AwaitingLogon;
                 self.send(
                     out,
@@ -875,14 +1042,14 @@ impl BoltServer {
                     let mut m = BTreeMap::new();
                     m.insert(
                         "addresses".to_string(),
-                        Value::List(vec![Value::Str("localhost:7687".to_string())]),
+                        Value::List((vec![Value::Str("localhost:7687".to_string())]).into()),
                     );
                     m.insert("role".to_string(), Value::Str(role.to_string()));
                     Value::Map(m)
                 };
                 rt.insert(
                     "servers".to_string(),
-                    Value::List(vec![server("ROUTE"), server("READ"), server("WRITE")]),
+                    Value::List((vec![server("ROUTE"), server("READ"), server("WRITE")]).into()),
                 );
                 let mut meta = BTreeMap::new();
                 meta.insert("rt".to_string(), Value::Map(rt));
@@ -905,6 +1072,37 @@ impl BoltServer {
             Some(Ok(Value::Str(s))) => s,
             _ => return Err(WireError::Protocol("RUN needs a query string".into())),
         };
+        // Fix 111 (instrument): the bolt-level wall — from the RUN message's
+        // arrival at this handler to the PULL that streams its last record —
+        // beside the engine's, so a statement whose round trip dwarfs its
+        // engine wall says where the rest went: the mirror's NOT-IN story
+        // pick ran 1.9 ms in the engine and 85 ms end to end with a 3,000-id
+        // list. Stamped here, before the parameters are decoded.
+        let marked = query.trim_start().starts_with(TRACE_MARKER);
+        if marked {
+            if self.trace_marker {
+                counted!("bolt.trace marker honoured");
+                crate::counters::TRACE_MARKER_HONOURED
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                counted!("bolt.trace marker ignored: tracing not permitted");
+                crate::counters::TRACE_MARKER_IGNORED
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if !TRACE_MARKER_IGNORED_NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "[bolt] a statement carried {TRACE_MARKER} and was not traced: the \
+                         marker is honoured only when the server runs with \
+                         ENGRAM_TRACE_MARKER=1 (noted once per process)"
+                    );
+                }
+            }
+        }
+        let trace_this = self.trace_counters || (marked && self.trace_marker);
+        let t_entry = if trace_this {
+            self.trace_now_us(&self.graph)
+        } else {
+            None
+        };
         let params = match it.next().map(crate::packstream::decode_value) {
             None => BTreeMap::new(),
             Some(Ok(Value::Map(m))) => m,
@@ -912,6 +1110,14 @@ impl BoltServer {
                 return Err(WireError::Protocol("RUN parameters must be a map".into()));
             }
         };
+        if trace_this {
+            let t_decoded = self.trace_now_us(&self.graph);
+            self.trace_entry_us.set(t_entry);
+            self.trace_decode_us.set(match (t_entry, t_decoded) {
+                (Some(a), Some(b)) => Some(b.saturating_sub(a)),
+                _ => None,
+            });
+        }
         counted!("bolt.statements run");
         if self.trace_statements {
             eprintln!("[bolt] conn {} RUN {}", self.connection_id, query);
@@ -924,13 +1130,35 @@ impl BoltServer {
         // statements did it. Two small file reads per statement on Linux;
         // nothing elsewhere.
         let rss_before = rss_bytes();
-        let trace_this = self.trace_counters || query.trim_start().starts_with(TRACE_MARKER);
+        let cache_before = resident_cache_bytes();
+        // Fix 87 (instrument): the PARSE is timed beside the run, so a traced
+        // statement's header says how much of its wall is the statement
+        // text and how much the engine — the Commitment zero-row listing
+        // ran 0.11 ms inside `run_stmt` and 1.4–2.2 ms end to end on the
+        // mirror (Neo4j 0.4–1.0), and nothing said where the rest went.
+        let t_parse = if trace_this {
+            self.trace_now_us(&self.graph)
+        } else {
+            None
+        };
         let parsed = match parse_any(&query) {
             Ok(q) => q,
             Err(e) => {
                 return self.fail(out, "Neo.ClientError.Statement.SyntaxError", &e.to_string());
             }
         };
+        let parse_us: Option<i64> = match (
+            t_parse,
+            if trace_this {
+                self.trace_now_us(&self.graph)
+            } else {
+                None
+            },
+        ) {
+            (Some(a), Some(b)) => Some(b.saturating_sub(a)),
+            _ => None,
+        };
+        self.last_parse_us.set(parse_us);
         // Inside an explicit transaction, install the session's transaction for
         // exactly this statement's execution so its writes buffer into it (and
         // read-your-writes holds); otherwise the statement autocommits. The
@@ -983,19 +1211,21 @@ impl BoltServer {
             let mut guards: Vec<engram_store::LockGuard> = Vec::new();
             loop {
                 let txn = graph.open_txn();
-                let (txn, r) =
-                    graph.with_txn(txn, || {
-                        self.run_traced(&graph, &parsed, params.clone(), trace_this, &query)
-                    });
+                // AUTOCOMMIT, marked as such: this wrapper exists to make ONE
+                // statement's write durable, so it is not the "enclosing
+                // transaction" an algorithm's `write` mode refuses to run
+                // inside. Marking it is what lets that mode be reachable over
+                // Bolt at all — see `Graph::in_explicit_txn`.
+                let (txn, r) = graph.with_autocommit_txn(txn, || {
+                    self.run_traced(&graph, &parsed, params.clone(), trace_this, &query)
+                });
                 match r {
                     Ok(result) => match graph.commit_owned_reporting(txn) {
                         Ok(()) => {
                             crate::counters::record_win(attempt);
                             break Ok(result);
                         }
-                        Err((engram_graph::GraphError::TxnConflict, info))
-                            if attempt < RETRIES =>
-                        {
+                        Err((engram_graph::GraphError::TxnConflict, info)) if attempt < RETRIES => {
                             attempt += 1;
                             crate::counters::AUTOCOMMIT_RERUNS
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1065,14 +1295,20 @@ impl BoltServer {
         if let (Some(before), Some(after)) = (rss_before, rss_bytes()) {
             if after.saturating_sub(before) >= RSS_GROWTH_REPORT_BYTES {
                 counted!("bolt.statements that grew the resident set");
-                let shown: String = query.chars().take(240).collect();
+                let cache_delta = match (cache_before, resident_cache_bytes()) {
+                    (Some(a), Some(b)) => Some(b.saturating_sub(a)),
+                    _ => None,
+                };
                 eprintln!(
-                    "[bolt] statement grew rss by {} MB ({} -> {} MB) on conn {}: {}",
-                    (after - before) >> 20,
-                    before >> 20,
-                    after >> 20,
-                    self.connection_id,
-                    shown.replace('\n', " ")
+                    "{}",
+                    growth_report(
+                        after - before,
+                        cache_delta,
+                        before,
+                        after,
+                        self.connection_id,
+                        &query
+                    )
                 );
             }
         }
@@ -1083,12 +1319,19 @@ impl BoltServer {
                 let mut meta = BTreeMap::new();
                 meta.insert(
                     "fields".to_string(),
-                    Value::List(result.columns.iter().cloned().map(Value::Str).collect()),
+                    Value::List(result.columns.iter().cloned().map(Value::Str).collect::<Vec<_>>().into()),
                 );
                 meta.insert("qid".to_string(), Value::Int(qid));
                 meta.insert("t_first".to_string(), Value::Int(0));
                 self.home_db(&mut meta);
-                self.streams.insert(qid, Stream { result, at: 0 });
+                self.streams.insert(
+                    qid,
+                    Stream {
+                        result,
+                        at: 0,
+                        traced_entry_us: self.trace_entry_us.take(),
+                    },
+                );
                 self.send(out, MSG_SUCCESS, vec![Pack::Value(Value::Map(meta))])
             }
             Err(e) => {
@@ -1131,6 +1374,15 @@ impl BoltServer {
                 }
             },
         };
+        // Fix 111 (instrument): a traced stream reports its bolt-level wall
+        // when its last record has been encoded. The clock is cloned out so
+        // it can be read while the stream is borrowed.
+        let traced_entry = self.streams.get(&qid).and_then(|s| s.traced_entry_us);
+        let clock = traced_entry.and(self.trace_clock.clone());
+        let now =
+            |c: &Option<std::sync::Arc<dyn Fn() -> i64 + Send + Sync>>| c.as_ref().map(|f| f());
+        let out_start = out.len();
+        let t_enc0 = now(&clock);
         let Some(stream) = self.streams.get_mut(&qid) else {
             return self.fail(
                 out,
@@ -1145,23 +1397,58 @@ impl BoltServer {
             (n as usize).min(remaining)
         };
         if emit {
+            // Fix 90: each record is encoded BY REFERENCE into one reused
+            // buffer — the struct header first, then the fields — and
+            // chunked straight onto the wire. Until this every row was
+            // deep-cloned (every `properties(n)` map of every fat
+            // repository), encoded into a fresh Vec, copied behind a fresh
+            // header Vec, and copied again into the chunks: the repository
+            // listing ran 28 ms in the engine and 63 end to end.
             for i in 0..take {
-                let row = stream.result.rows[stream.at + i].clone();
-                let mut field = Vec::new();
-                crate::packstream::encode_size_public(row.len(), &mut field);
-                for v in &row {
-                    encode_value(v, &mut field)?;
+                let row = &stream.result.rows[stream.at + i];
+                // Fix 102: the record is encoded STRAIGHT INTO the connection
+                // buffer behind a two-byte chunk header written in place once
+                // its length is known — one chunk for a payload under 64 KB,
+                // which every listing row is; a longer one is re-chunked from
+                // the buffer. `chunk` copied every fat record a second time
+                // (a 40 KB `properties()` value is one more memory pass per
+                // record: the repository listing's 182 multi-kilobyte rows).
+                let start = out.len();
+                out.extend_from_slice(&[0, 0]);
+                out.push(0xB1);
+                out.push(MSG_RECORD);
+                crate::packstream::encode_size_public(row.len(), out);
+                for v in row {
+                    if let Err(e) = encode_value(v, out) {
+                        out.truncate(start); // never leave a partial record on the wire
+                        return Err(e.into());
+                    }
                 }
-                Self::send_raw(out, MSG_RECORD, &field);
+                Self::frame_in_place(out, start);
                 counted!("bolt.records streamed");
             }
         }
         stream.at += take;
         let done = stream.at == stream.result.rows.len();
+        let t_enc1 = now(&clock);
         let mut meta = BTreeMap::new();
         if done {
             self.streams.remove(&qid);
             meta.insert("bookmark".to_string(), Value::Str(self.bookmark()));
+            if let (Some(entry), Some(a), Some(b)) = (traced_entry, t_enc0, t_enc1) {
+                let ms = |us: i64| us as f64 / 1000.0;
+                eprintln!(
+                    "[trace-bolt] conn {}: RUN arrival → last PULL {:.3} ms (params decode {:.3} ms, parse {:.3} ms, engine {:.3} ms; {} record(s) encoded in {:.3} ms, {} B)",
+                    self.connection_id,
+                    ms(b.saturating_sub(entry)),
+                    ms(self.trace_decode_us.get().unwrap_or(0)),
+                    ms(self.last_parse_us.get().unwrap_or(0)),
+                    ms(self.last_engine_us.get().unwrap_or(0)),
+                    take,
+                    ms(b.saturating_sub(a)),
+                    out.len() - out_start
+                );
+            }
         } else {
             meta.insert("has_more".to_string(), Value::Bool(true));
         }
@@ -1196,7 +1483,10 @@ impl BoltServer {
             let (status, description, class) = gql_of(code);
             meta.insert("neo4j_code".to_string(), Value::Str(code.to_string()));
             meta.insert("gql_status".to_string(), Value::Str(status.to_string()));
-            meta.insert("description".to_string(), Value::Str(description.to_string()));
+            meta.insert(
+                "description".to_string(),
+                Value::Str(description.to_string()),
+            );
             let mut record = BTreeMap::new();
             record.insert("OPERATION".to_string(), Value::Str(String::new()));
             record.insert("OPERATION_CODE".to_string(), Value::Str("0".to_string()));
@@ -1218,17 +1508,93 @@ impl BoltServer {
 
     /// RECORD's field list is pre-encoded (a list header + values), so the
     /// structure is assembled by hand.
-    fn send_raw(out: &mut Vec<u8>, tag: u8, encoded_field: &[u8]) {
-        let mut payload = vec![0xB1, tag];
-        payload.extend_from_slice(encoded_field);
-        Self::chunk(out, &payload);
-    }
-
     fn chunk(out: &mut Vec<u8>, payload: &[u8]) {
         for chunk in payload.chunks(0xFFFF) {
             out.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
             out.extend_from_slice(chunk);
         }
         out.extend_from_slice(&[0, 0]);
+    }
+
+    /// Fix 102: finalise a message encoded IN PLACE after a two-byte
+    /// placeholder at `start` — the same bytes `chunk` would have written
+    /// for the payload: one header filled in when the payload fits a chunk,
+    /// else the payload taken back out and re-chunked.
+    fn frame_in_place(out: &mut Vec<u8>, start: usize) {
+        let len = out.len() - start - 2;
+        if len == 0 {
+            // `chunk` writes no chunk for an empty payload — only the end.
+            out.truncate(start);
+            out.extend_from_slice(&[0, 0]);
+        } else if len <= 0xFFFF {
+            out[start..start + 2].copy_from_slice(&(len as u16).to_be_bytes());
+            out.extend_from_slice(&[0, 0]);
+        } else {
+            let payload = out.split_off(start + 2);
+            out.truncate(start);
+            Self::chunk(out, &payload);
+            counted!("bolt.record re-chunked past one chunk");
+        }
+    }
+}
+
+#[cfg(test)]
+mod frame_in_place_tests {
+    use super::*;
+
+    /// Every payload size — empty, small, exactly one chunk, one over, and
+    /// a multi-chunk blob — frames byte-identically to `chunk`, behind
+    /// whatever the buffer already held.
+    #[test]
+    fn framing_in_place_equals_chunking() {
+        for n in [0usize, 1, 100, 0xFFFF, 0x10000, 200_000] {
+            let payload: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+            let prefix = vec![0xAA, 0xBB, 0xCC];
+            let mut a = prefix.clone();
+            a.extend_from_slice(&[0, 0]);
+            a.extend_from_slice(&payload);
+            BoltServer::frame_in_place(&mut a, prefix.len());
+            let mut b = prefix.clone();
+            BoltServer::chunk(&mut b, &payload);
+            assert_eq!(a, b, "payload of {n} bytes");
+        }
+    }
+}
+
+#[cfg(test)]
+mod growth_report_tests {
+    use super::*;
+
+    /// With a probe registered the report names the cache's share of the
+    /// growth; without one it carries no cache figure. The operator's
+    /// tally subtracts the share before judging a statement.
+    #[test]
+    fn the_report_names_the_caches_share_of_the_growth() {
+        let mb = |n: usize| n << 20;
+        let with = growth_report(
+            mb(311),
+            Some(mb(290)),
+            mb(9448),
+            mb(9759),
+            513,
+            "MATCH (n) RETURN n",
+        );
+        assert_eq!(
+            with,
+            "[bolt] statement grew rss by 311 MB (cache +290 MB) (9448 -> 9759 MB) on conn 513: MATCH (n) RETURN n"
+        );
+        let without = growth_report(mb(40), None, mb(100), mb(140), 7, "RETURN 1\nAS x");
+        assert_eq!(
+            without,
+            "[bolt] statement grew rss by 40 MB (100 -> 140 MB) on conn 7: RETURN 1 AS x"
+        );
+    }
+
+    /// The first probe wins and answers every later read.
+    #[test]
+    fn the_first_probe_registered_answers() {
+        set_resident_cache_probe(Box::new(|| 12_345));
+        set_resident_cache_probe(Box::new(|| 1));
+        assert_eq!(resident_cache_bytes(), Some(12_345));
     }
 }

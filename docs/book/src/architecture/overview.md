@@ -19,7 +19,8 @@ flowchart TB
         A1["accept loop"]
         A2["reader / writer threads<br/>(two per connection)"]
         A3["N engine workers"]
-        A4["maintenance thread"]
+        A4["storage maintenance thread"]
+        A5["derived refresh thread"]
     end
     subgraph wire["engram-bolt — sans-io protocol machine"]
         B1["PackStream v2 codec"]
@@ -44,9 +45,12 @@ flowchart TB
     L["engram-log — WAL + BLAKE3 hash chain"]
     K["engram-key — the frozen key encoding"]
     O["engram-observe — assertions, counters, the determinism trace"]
+    P["engram-proc — the procedure catalogue, as data"]
 
     adapter --> wire --> engine
     engine --> front
+    engine --> P
+    front --> P
     engine --> storage
     storage --> L
     storage --> K
@@ -56,25 +60,28 @@ flowchart TB
     storage --> O
 ```
 
-Arrows point the way dependencies point. `engram-observe` is at the bottom with
-no dependencies of its own; everything can assert.
+Arrows point the way dependencies point. Two crates are at the bottom with no
+dependencies of their own: `engram-observe`, so everything can assert, and
+`engram-proc`, so the front end and the engine can read one declaration of a
+procedure without either depending on the other.
 
 ## Crates
 
 | crate | responsibility |
 |---|---|
 | `engram-observe` | The assertion vocabulary — `always!`, `sometimes!`, `counted!`, crash points, the determinism trace. Zero dependencies; the root of the graph. |
-| `engram-runtime` | The `Runtime` trait (time, randomness, spawning, I/O), a real simulated executor with a virtual clock, and an optional Tokio one. **A dev-dependency of every engine crate** — only `engram-sim` depends on it for real, so it is the simulation lane's executor rather than the serving path's. |
+| `engram-runtime` | The `Runtime` trait (time, randomness, spawning, I/O), a real simulated executor with a virtual clock, and an optional Tokio one. **A dev-dependency of the crates that simulate** — `engram-store`, `engram-graph`, `engram-exec`, `engram-objstore`, `engram-blob` — and a real dependency of `engram-sim` alone, so it is the simulation lane's executor rather than the serving path's. |
 | `engram-key` | The frozen memcomparable key encoding, the KIND registry, and the sealed `Structural` trait that makes the keyspace hygiene rule unrepresentable to break. |
 | `engram-log` | The commit log and write-ahead log: plaintext routing headers, opaque payloads, and a BLAKE3 hash chain. |
-| `engram-store` | MVCC storage: a 64-way sharded memtable, immutable sealed segments, the on-disk SST format, a block cache, range and vector indexes, adjacency posting lists. |
-| `engram-cypher` | The front end: lexer, Pratt expression parser, statement AST, the value model with three-valued logic, temporal types, and the evaluator. Depends only on `engram-observe`. |
-| `engram-graph` | The graph model over the store, the planner, the columnar `DataChunk` pipeline with its morsel-parallel operators, the row-at-a-time interpreter underneath it as the general fallback, derived structures, schema and constraints. The largest crate by far. |
+| `engram-store` | MVCC storage: a 64-way sharded memtable, immutable sealed segments, the on-disk SST format, a block cache, range, vector and trigram indexes, a BM25 term index over one shared text analyzer, adjacency posting lists. |
+| `engram-cypher` | The front end: lexer, Pratt expression parser, statement AST, the value model with three-valued logic, temporal types, the `=~` engine, and the evaluator. Its internal dependencies are `engram-observe` and `engram-proc`; it can reach neither a store nor a graph. |
+| `engram-proc` | The procedure catalogue, as data: every `CALL` surface's name, argument shapes, **default output columns** and mutation class, in one sorted `const` slice. `engram-cypher` reads it to classify a call and check its arity; `engram-graph` reads it to bind `YIELD` and shape the rows. Zero dependencies; the graph's second root. |
+| `engram-graph` | The graph model over the store, the planner, the columnar `DataChunk` pipeline with its morsel-parallel operators, the row-at-a-time interpreter underneath it as the general fallback, derived structures, schema and constraints, and the `engram.algo.*` graph algorithms. The largest crate by far. |
 | `engram-bolt` | A sans-io Bolt v5 state machine and the PackStream v2 codec. Never touches a socket. |
-| `engram-server` | The TCP adapter. The only crate with threads, sockets and a wall clock — and the only one that opts out of the determinism lints. |
+| `engram-server` | The TCP adapter. The only crate with threads, sockets and a wall clock — and the only one **on the serving path** that opts out of the determinism lints. |
 | `engram-sim` | The deterministic simulation harness: one seed, one run, swarm-configured, ending in invariant checks and a coverage floor. |
 | `engram-tck` | The vendored openCypher TCK and its runner. Not published. |
-| `engram-bench` | Nineteen benchmark and loader binaries. Not published. |
+| `engram-bench` | Thirty-two benchmark, loader and probe binaries. Not published. |
 | `engram-exec`, `engram-crypto`, `engram-objstore`, `engram-blob` | Seams that are built and simulated but not on the serving path — see [below](#the-seams). |
 | `xtask` | The gates: `d3`, `c-deps`, `msrv`, `determinism`, `hygiene`, `docs`, `scrub`, `public-tree`. |
 
@@ -157,7 +164,7 @@ carry the detail.
 
 ## Threads
 
-There are exactly six kinds, and all of them live in `engram-server`:
+There are seven kinds by default, and all of them live in `engram-server`:
 
 | thread | count | what it does |
 |---|---|---|
@@ -165,11 +172,30 @@ There are exactly six kinds, and all of them live in `engram-server`:
 | reader | 1 per connection | socket → engine, with a credit loop for backpressure |
 | writer | 1 per connection | engine → socket |
 | engine worker | `--workers`, default 1 | owns its sessions; batches, runs, fsyncs once, replies |
-| maintenance | 1 | compaction, spilling, log truncation, derived-structure refresh |
+| storage maintenance | 1 | compaction, spilling, log truncation |
+| derived refresh | 1 | the derived-structure refresh, on its own thread and its own ask channel so it cannot queue behind a compaction (`--no-split-maintenance` puts it back on the storage thread) |
 | counters | 1 | prints the counter and memory lines every 30s, only when something moved |
 
+Maintenance is split in two because the two halves scale differently: the
+storage work is O(corpus) while the refresh is O(the delta), a paged store
+asks for storage after nearly every batch, and a paged compaction's own comment
+says "the merge runs for minutes". On one shared thread a refresh
+queued behind that merge does not run until it returns, and the derived
+structures fall behind the writes for as long as it lasts.
+
+An eighth kind is transient: with `ENGRAM_QUERY_PARALLELISM` set, the server's
+`ThreadScopeExec` starts morsel helpers inside each parallel step of a
+statement. The engine worker that asked for the step works its morsels too;
+one helper starts at once and joins only if the step outlasts a short ramp,
+and further helpers start two at a time while unclaimed morsels outnumber the
+helpers started but not yet working — all within the process-wide slot budget,
+and all joined before the step returns. They live in `engram-server` too, so
+the second half of the sentence above still holds.
+
 The engine below `engram-server` **never spawns a thread** — `std::thread::spawn`
-is denied workspace-wide, and the server is the only crate that opts out. That
+is denied workspace-wide, and the server is the only crate on the serving path
+that opts out (the benchmark binaries and many integration tests carry the same
+waiver, because they need real threads and a real clock). That
 is not the same as being single-threaded: `--workers N` runs N engine threads
 over a store that is `Send + Sync`, with MVCC and optimistic concurrency control
 keeping them honest. What the rule buys is that every thread in the process is
@@ -201,3 +227,4 @@ a shipped feature, and
 | the write path in detail | [The write path](./write-path.md) |
 | how rows are stored | [The storage engine](./storage-engine.md), [Key encoding](./key-encoding.md) |
 | why the first query after a burst can be slow | [Derived structures](./derived-structures.md) |
+| what the algorithm procedures do, and what they refuse | [Graph algorithms](./graph-algorithms.md) |

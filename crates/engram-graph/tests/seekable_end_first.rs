@@ -68,12 +68,30 @@ fn corpus() -> Graph {
     }
     for i in 0..6000i64 {
         let mut m = BTreeMap::new();
-        m.insert("eventId".to_string(), Value::Str(format!("story-{:04}-ev-{i}", i % 1000)));
+        m.insert(
+            "eventId".to_string(),
+            Value::Str(format!("story-{:04}-ev-{i}", i % 1000)),
+        );
         m.insert("severity".to_string(), Value::Float(0.1 * ((i % 9) as f64)));
-        m.insert("createdAt".to_string(), Value::Str(format!("2026-08-{:02}T{:02}:{:02}:00Z", 1 + (i % 28), i % 24, i % 60)));
-        let e = g.create_node(&["GeopoliticalEvent".into()], &m).expect("event");
-        g.create_rel(e, "DERIVES_FROM_STORY", stories[(i % 1000) as usize], &BTreeMap::new())
-            .expect("derives");
+        m.insert(
+            "createdAt".to_string(),
+            Value::Str(format!(
+                "2026-08-{:02}T{:02}:{:02}:00Z",
+                1 + (i % 28),
+                i % 24,
+                i % 60
+            )),
+        );
+        let e = g
+            .create_node(&["GeopoliticalEvent".into()], &m)
+            .expect("event");
+        g.create_rel(
+            e,
+            "DERIVES_FROM_STORY",
+            stories[(i % 1000) as usize],
+            &BTreeMap::new(),
+        )
+        .expect("derives");
     }
     g
 }
@@ -105,7 +123,11 @@ fn the_first_path_runs_from_its_seekable_end() {
         let (got, c) = traced(&g, written);
         assert_eq!(got, want, "`{written}`");
         assert!(count_of(&c, REVERSED) > 0, "`{written}` reverses: {c:?}");
-        assert_eq!(count_of(&c, SCANNED), 0, "`{written}` scans no label: {c:?}");
+        assert_eq!(
+            count_of(&c, SCANNED),
+            0,
+            "`{written}` scans no label: {c:?}"
+        );
     }
 }
 
@@ -121,7 +143,11 @@ fn seekable_starts_and_bare_limits_are_left_as_written() {
         "MATCH (g:GeopoliticalEvent) WHERE g.severity > 0.7 RETURN count(g) AS n",
     ] {
         let (_, c) = traced(&g, src);
-        assert_eq!(count_of(&c, REVERSED), 0, "`{src}` is left as written: {c:?}");
+        assert_eq!(
+            count_of(&c, REVERSED),
+            0,
+            "`{src}` is left as written: {c:?}"
+        );
     }
     let bare = "MATCH (g:GeopoliticalEvent)-[:DERIVES_FROM_STORY]->(s:NewsStory {storyId: $storyId}) RETURN g.eventId AS id LIMIT 3";
     assert_eq!(rows(&g, bare).len(), 3);

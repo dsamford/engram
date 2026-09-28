@@ -79,7 +79,8 @@ fn corpus() -> Graph {
         .create_node(&["Tag".into()], &BTreeMap::new())
         .expect("tag");
     for (i, m) in mails.iter().enumerate() {
-        g.create_rel(*m, "HAS_TAG", tag, &BTreeMap::new()).expect("tag rel");
+        g.create_rel(*m, "HAS_TAG", tag, &BTreeMap::new())
+            .expect("tag rel");
         // 5 replies from 'me' mails (i = 100, 1100, …), 2 from 'other' mails.
         if i % 1000 == 100 && i < 5000 {
             g.create_rel(*m, "REPLIED_TO", mails[i + 1], &BTreeMap::new())
@@ -97,29 +98,53 @@ fn corpus() -> Graph {
 fn a_sparse_first_hop_seeds_the_chain_from_its_table() {
     let g = corpus();
     for (src, want) in [
-        ("MATCH (n:Mail {userId: $u})-[r:REPLIED_TO]->(t:Mail) RETURN count(r) AS cnt", vec![vec![Value::Int(5)]]),
-        ("MATCH (n:Mail {userId: $u})-[r:REPLIED_TO]->(t:Mail) RETURN count(DISTINCT t.nodeId) AS unique", vec![vec![Value::Int(5)]]),
-        ("MATCH (n:Mail {userId: $u})-[r:REPLIED_TO]->(t) RETURN count(r) AS cnt", vec![vec![Value::Int(5)]]),
-        ("MATCH (n:Mail {userId: $u})-[r:REPLIED_TO]->(t:Mail) RETURN count(r) AS cnt, count(DISTINCT t.nodeId) AS unique", vec![vec![Value::Int(5), Value::Int(5)]]),
+        (
+            "MATCH (n:Mail {userId: $u})-[r:REPLIED_TO]->(t:Mail) RETURN count(r) AS cnt",
+            vec![vec![Value::Int(5)]],
+        ),
+        (
+            "MATCH (n:Mail {userId: $u})-[r:REPLIED_TO]->(t:Mail) RETURN count(DISTINCT t.nodeId) AS unique",
+            vec![vec![Value::Int(5)]],
+        ),
+        (
+            "MATCH (n:Mail {userId: $u})-[r:REPLIED_TO]->(t) RETURN count(r) AS cnt",
+            vec![vec![Value::Int(5)]],
+        ),
+        (
+            "MATCH (n:Mail {userId: $u})-[r:REPLIED_TO]->(t:Mail) RETURN count(r) AS cnt, count(DISTINCT t.nodeId) AS unique",
+            vec![vec![Value::Int(5), Value::Int(5)]],
+        ),
         // The other direction reads the in-table.
-        ("MATCH (t:Mail {userId: $u})<-[r:REPLIED_TO]-(n:Mail) RETURN count(r) AS cnt", vec![vec![Value::Int(7)]]),
+        (
+            "MATCH (t:Mail {userId: $u})<-[r:REPLIED_TO]-(n:Mail) RETURN count(r) AS cnt",
+            vec![vec![Value::Int(7)]],
+        ),
         // A WHERE-form predicate on the seed, and the 'other' user.
-        ("MATCH (n:Mail)-[r:REPLIED_TO]->(t:Mail) WHERE n.userId = 'other' RETURN count(r) AS cnt", vec![vec![Value::Int(2)]]),
+        (
+            "MATCH (n:Mail)-[r:REPLIED_TO]->(t:Mail) WHERE n.userId = 'other' RETURN count(r) AS cnt",
+            vec![vec![Value::Int(2)]],
+        ),
         // A grouped aggregate: the seven sources, one row each.
-        ("MATCH (n:Mail)-[r:REPLIED_TO]->(t:Mail) RETURN n.nodeId AS id, count(r) AS c ORDER BY id", vec![
-            vec![Value::Str("mail-0100".into()), Value::Int(1)],
-            vec![Value::Str("mail-0599".into()), Value::Int(1)],
-            vec![Value::Str("mail-1100".into()), Value::Int(1)],
-            vec![Value::Str("mail-1199".into()), Value::Int(1)],
-            vec![Value::Str("mail-2100".into()), Value::Int(1)],
-            vec![Value::Str("mail-3100".into()), Value::Int(1)],
-            vec![Value::Str("mail-4100".into()), Value::Int(1)],
-        ]),
+        (
+            "MATCH (n:Mail)-[r:REPLIED_TO]->(t:Mail) RETURN n.nodeId AS id, count(r) AS c ORDER BY id",
+            vec![
+                vec![Value::Str("mail-0100".into()), Value::Int(1)],
+                vec![Value::Str("mail-0599".into()), Value::Int(1)],
+                vec![Value::Str("mail-1100".into()), Value::Int(1)],
+                vec![Value::Str("mail-1199".into()), Value::Int(1)],
+                vec![Value::Str("mail-2100".into()), Value::Int(1)],
+                vec![Value::Str("mail-3100".into()), Value::Int(1)],
+                vec![Value::Str("mail-4100".into()), Value::Int(1)],
+            ],
+        ),
     ] {
         assert_eq!(general(&g, src), want, "general path: `{src}`");
         let (got, c) = traced(&g, src);
         assert_eq!(got, want, "`{src}`");
-        assert!(count_of(&c, SEEDED) > 0, "`{src}` seeds from the table: {c:?}");
+        assert!(
+            count_of(&c, SEEDED) > 0,
+            "`{src}` seeds from the table: {c:?}"
+        );
         assert_eq!(count_of(&c, SCANNED), 0, "`{src}` scans no label: {c:?}");
         assert!(
             count_of(&c, EXPRS) < 100,
@@ -138,7 +163,9 @@ fn an_edgeless_type_seeds_nothing() {
     // before any seed and proves nothing here).
     let a = g.create_node(&["Tag".into()], &BTreeMap::new()).expect("a");
     let b = g.create_node(&["Tag".into()], &BTreeMap::new()).expect("b");
-    let r = g.create_rel(a, "FORWARDED_TO", b, &BTreeMap::new()).expect("rel");
+    let r = g
+        .create_rel(a, "FORWARDED_TO", b, &BTreeMap::new())
+        .expect("rel");
     g.delete_rel(r).expect("delete");
     for src in [
         "MATCH (n:Mail {userId: $u})-[r:FORWARDED_TO]->(t:Mail) RETURN count(r) AS cnt",
@@ -147,7 +174,18 @@ fn an_edgeless_type_seeds_nothing() {
         let want = general(&g, src);
         let (got, c) = traced(&g, src);
         assert_eq!(got, want, "`{src}`");
-        assert!(count_of(&c, "interp.pipeline seed emptied by an edgeless type") > 0, "{c:?}");
+        // Fix 101 answers a hop over a type with no live relationship before
+        // any seed; the pipeline's own edgeless-type check stays for the
+        // shapes that reach it.
+        assert!(
+            count_of(&c, "interp.pipeline seed emptied by an edgeless type")
+                + count_of(
+                    &c,
+                    "interp.match over a relationship type with no live relationship matched nothing"
+                )
+                > 0,
+            "{c:?}"
+        );
         assert_eq!(count_of(&c, SCANNED), 0, "`{src}` scans no label: {c:?}");
         assert!(count_of(&c, EXPRS) < 10, "`{src}` judges nothing: {c:?}");
     }
@@ -184,10 +222,21 @@ fn a_write_in_flight_keeps_the_label_seed() {
     assert_eq!(before, vec![vec![Value::Int(5)]]);
     assert!(count_of(&c, SEEDED) > 0);
     g.begin_txn().expect("begin");
-    ddl(&g, "MATCH (n:Mail {nodeId: 'mail-0100'})-[r:REPLIED_TO]->() DELETE r");
+    ddl(
+        &g,
+        "MATCH (n:Mail {nodeId: 'mail-0100'})-[r:REPLIED_TO]->() DELETE r",
+    );
     let (during, c) = traced(&g, src);
-    assert_eq!(during, vec![vec![Value::Int(4)]], "the deleted edge is gone inside the txn");
-    assert_eq!(count_of(&c, SEEDED), 0, "a writing txn keeps the tables out: {c:?}");
+    assert_eq!(
+        during,
+        vec![vec![Value::Int(4)]],
+        "the deleted edge is gone inside the txn"
+    );
+    assert_eq!(
+        count_of(&c, SEEDED),
+        0,
+        "a writing txn keeps the tables out: {c:?}"
+    );
     g.rollback_txn();
     let (after, _) = traced(&g, src);
     assert_eq!(after, vec![vec![Value::Int(5)]]);

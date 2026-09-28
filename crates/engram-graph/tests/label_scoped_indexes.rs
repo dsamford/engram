@@ -46,7 +46,10 @@ fn rows(g: &Graph, src: &str) -> Vec<Vec<Value>> {
 /// and so do 600 `:Bulk` nodes. This is SF1's shape in miniature — `id` is a
 /// property most of the corpus has, and the declared index names one label.
 fn shared_property_corpus(g: &Graph) {
-    ddl(g, "CREATE INDEX churn_id IF NOT EXISTS FOR (n:Churn) ON (n.id)");
+    ddl(
+        g,
+        "CREATE INDEX churn_id IF NOT EXISTS FOR (n:Churn) ON (n.id)",
+    );
     for i in 0..60i64 {
         run(g, &format!("CREATE (:Churn {{id: {i}, nonce: {}}})", i % 7));
     }

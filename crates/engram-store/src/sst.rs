@@ -49,15 +49,20 @@ const MAGIC: [u8; 8] = *b"ENGRSEG1";
 /// parse. Existing paged stores keep serving and existing measurement baselines
 /// stay re-runnable — which is the whole reason for doing it this way rather
 /// than rewriting the layout.
-const FORMAT_VERSION: u32 = 3;
+const FORMAT_VERSION: u32 = 4;
 /// v2 footer: index_offset(8) + index_len(8) + seq(8) + entry_count(8) +
 /// max_commit_ts(8) + format_version(4) + magic(8) + BLAKE3(32).
 pub(crate) const FOOTER_LEN_V2: usize = 8 + 8 + 8 + 8 + 8 + 4 + 8 + 32;
 /// v3 footer: v2 plus tombstones(8) + versions(8).
 pub(crate) const FOOTER_LEN_V3: usize = FOOTER_LEN_V2 + 8 + 8;
+/// v4 footer: BYTE-IDENTICAL to v3. v4 adds the segment's MAXIMUM key to the
+/// tail of the sparse-index region, which a reader already fetches in one
+/// `pread` — so the upper bound costs no extra read and no footer field. The
+/// version alone says whether those bytes are there.
+pub(crate) const FOOTER_LEN_V4: usize = FOOTER_LEN_V3;
 /// What a `paged` open `pread`s from the file's tail — the LARGEST footer any
 /// supported version uses, so one bounded read covers every version.
-pub(crate) const FOOTER_LEN: usize = FOOTER_LEN_V3;
+pub(crate) const FOOTER_LEN: usize = FOOTER_LEN_V4;
 /// Bytes from the END of the footer at which `format_version` starts:
 /// magic(8) + BLAKE3(32) follow it. Version-independent BY CONSTRUCTION, which
 /// is what lets a reader identify the version before parsing the rest.
@@ -66,6 +71,9 @@ const VERSION_FROM_END: usize = 4 + 8 + 32;
 const FOOTER_HASHED_V2: usize = FOOTER_LEN_V2 - 32;
 /// The bytes of a v3 footer the hash covers.
 const FOOTER_HASHED_V3: usize = FOOTER_LEN_V3 - 32;
+/// The bytes of a v4 footer the hash covers — v3's, since the layout is the
+/// same; only the index region grew.
+const FOOTER_HASHED_V4: usize = FOOTER_LEN_V4 - 32;
 /// Retained for callers that only need the current version's hashed span.
 const FOOTER_HASHED: usize = FOOTER_HASHED_V3;
 /// A data block is closed once its payload reaches this many bytes. A block is
@@ -244,6 +252,15 @@ pub(crate) struct SegmentWriter {
     /// file whose sparse index LIES, and every read through it is then wrong in
     /// a way no hash check can catch — the block hashes are all correct.
     last_key: Option<LogicalKey>,
+    /// The greatest key pushed — the segment's upper bound, written at the tail
+    /// of the index region so a reader can refuse a key ABOVE this file.
+    ///
+    /// The MAXIMUM, not the last: ascending order is a `debug_assert` only, so
+    /// in a release build a writer that broke the contract would otherwise
+    /// stamp a bound BELOW keys the file really holds, and the reader would
+    /// prune a key that is present — a wrong answer, where today's cost is
+    /// only a wasted block read.
+    max_key: Option<LogicalKey>,
 }
 
 impl SegmentWriter {
@@ -258,6 +275,7 @@ impl SegmentWriter {
             tombstones: 0,
             versions: 0,
             last_key: None,
+            max_key: None,
         }
     }
 
@@ -287,6 +305,9 @@ impl SegmentWriter {
             "SegmentWriter requires ascending keys"
         );
         self.last_key = Some(key.clone());
+        if self.max_key.as_ref().is_none_or(|m| m < key) {
+            self.max_key = Some(key.clone());
+        }
         if self.block_first.is_none() {
             self.block_first = Some(key.clone());
         }
@@ -317,6 +338,16 @@ impl SegmentWriter {
             self.out.extend_from_slice(&offset.to_le_bytes());
             self.out.extend_from_slice(&len.to_le_bytes());
         }
+        // v4: the segment's maximum key, at the tail of the index region. An
+        // EMPTY segment writes a zero length — "no bound", which prunes
+        // nothing, rather than an empty key, which would prune everything.
+        match &self.max_key {
+            Some(k) => {
+                put_uvarint(&mut self.out, k.len() as u64);
+                self.out.extend_from_slice(k);
+            }
+            None => put_uvarint(&mut self.out, 0),
+        }
         let index_len = self.out.len() as u64 - index_offset;
 
         // Fixed footer, ending in its own hash.
@@ -325,7 +356,8 @@ impl SegmentWriter {
         self.out.extend_from_slice(&index_len.to_le_bytes());
         self.out.extend_from_slice(&seq.to_le_bytes());
         self.out.extend_from_slice(&self.entries.to_le_bytes());
-        self.out.extend_from_slice(&self.max_commit_ts.to_le_bytes());
+        self.out
+            .extend_from_slice(&self.max_commit_ts.to_le_bytes());
         self.out.extend_from_slice(&self.tombstones.to_le_bytes());
         self.out.extend_from_slice(&self.versions.to_le_bytes());
         self.out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
@@ -369,6 +401,9 @@ pub(crate) struct SegmentFooter {
     /// say", NOT "this file holds nothing" — a reader must treat it as absent
     /// rather than as a zero ratio.
     pub(crate) versions: u64,
+    /// The on-disk format this file declares. The INDEX parser needs it: only
+    /// a v4 region carries the segment's maximum key after its handles.
+    pub(crate) format_version: u32,
 }
 
 /// One data block's placement: the first key it holds (the sparse-index search
@@ -404,11 +439,11 @@ pub(crate) fn read_footer(buf: &[u8]) -> Result<SegmentFooter, SstError> {
         return Err(SstError::BadMagic);
     }
     let vpos = buf.len() - VERSION_FROM_END;
-    let format_version =
-        u32::from_le_bytes(buf[vpos..vpos + 4].try_into().expect("4 bytes"));
+    let format_version = u32::from_le_bytes(buf[vpos..vpos + 4].try_into().expect("4 bytes"));
     let (flen, hashed) = match format_version {
         2 => (FOOTER_LEN_V2, FOOTER_HASHED_V2),
         3 => (FOOTER_LEN_V3, FOOTER_HASHED_V3),
+        4 => (FOOTER_LEN_V4, FOOTER_HASHED_V4),
         v => return Err(SstError::UnsupportedVersion(v)),
     };
     if buf.len() < flen {
@@ -447,12 +482,48 @@ pub(crate) fn read_footer(buf: &[u8]) -> Result<SegmentFooter, SstError> {
         max_commit_ts,
         tombstones,
         versions,
+        format_version,
     })
 }
 
 /// Read the sparse index — one [`BlockHandle`] per data block, in key order.
 /// `index_region` is the `[index_offset, index_offset+index_len)` slice.
 pub(crate) fn read_index(index_region: &[u8]) -> Result<Vec<BlockHandle>, SstError> {
+    Ok(read_index_and_max(index_region, 3)?.0)
+}
+
+/// The sparse index, plus the segment's maximum key when the format carries
+/// one (v4+). `None` means the file cannot say — a reader must then prune only
+/// from below, exactly as it did before v4 existed.
+pub(crate) fn read_index_and_max(
+    index_region: &[u8],
+    format_version: u32,
+) -> Result<(Vec<BlockHandle>, Option<LogicalKey>), SstError> {
+    let handles = read_index_handles(index_region)?;
+    if format_version < 4 {
+        return Ok((handles, None));
+    }
+    // Re-walk the handles to find where they end, then read the bound. The
+    // walk is over the resident index bytes only (no block reads), once per
+    // segment open.
+    let mut ip = 0usize;
+    let nblocks = get_uvarint(index_region, &mut ip)?;
+    for _ in 0..nblocks {
+        let klen = get_uvarint(index_region, &mut ip)? as usize;
+        take(index_region, &mut ip, klen, "index first key")?;
+        read_u64(index_region, &mut ip, "index block offset")?;
+        read_u64(index_region, &mut ip, "index block len")?;
+    }
+    let mlen = get_uvarint(index_region, &mut ip)? as usize;
+    let max_key = if mlen == 0 {
+        None
+    } else {
+        Some(take(index_region, &mut ip, mlen, "index max key")?.to_vec())
+    };
+    Ok((handles, max_key))
+}
+
+fn read_index_handles(index_region: &[u8]) -> Result<Vec<BlockHandle>, SstError> {
     let mut ip = 0usize;
     let nblocks = get_uvarint(index_region, &mut ip)?;
     let mut handles = Vec::with_capacity(nblocks as usize);
@@ -887,7 +958,11 @@ mod tests {
     fn cloned_entries_shares_the_bytes_with_the_segment() {
         let seg = Segment::new(1, sample_entries(16 * 1024));
         let key = b"delta".to_vec();
-        let from_seg = seg.get_at(&key, u64::MAX).expect("present").value.expect("live");
+        let from_seg = seg
+            .get_at(&key, u64::MAX)
+            .expect("present")
+            .value
+            .expect("live");
         let cloned = seg.cloned_entries();
         let from_clone = cloned
             .get(&key)

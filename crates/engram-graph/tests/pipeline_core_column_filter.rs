@@ -70,7 +70,10 @@ fn build(interleaved: bool) -> Graph {
     let filler = |g: &Graph, i: i64| {
         if interleaved {
             let mut f = BTreeMap::new();
-            f.insert("other".to_string(), Value::Str(format!("filler-{i}-{}", "x".repeat(40))));
+            f.insert(
+                "other".to_string(),
+                Value::Str(format!("filler-{i}-{}", "x".repeat(40))),
+            );
             g.create_node(&["Filler".into()], &f).expect("filler");
         }
     };
@@ -84,7 +87,11 @@ fn build(interleaved: bool) -> Graph {
         let mut m = BTreeMap::new();
         m.insert(
             "userId".to_string(),
-            Value::Str(if i % 3 == 0 { "u1".into() } else { format!("u{}", 2 + i % 5) }),
+            Value::Str(if i % 3 == 0 {
+                "u1".into()
+            } else {
+                format!("u{}", 2 + i % 5)
+            }),
         );
         m.insert("id".to_string(), Value::Str(format!("rt-{i:05}")));
         let t = g.create_node(&["RT".into()], &m).expect("rt");
@@ -94,7 +101,11 @@ fn build(interleaved: bool) -> Graph {
             pm.insert("id".to_string(), Value::Str(format!("gwp-{i:05}-{k}")));
             pm.insert(
                 "status".to_string(),
-                Value::Str(if (i + k) % 4 == 0 { "pending".into() } else { "done".into() }),
+                Value::Str(if (i + k) % 4 == 0 {
+                    "pending".into()
+                } else {
+                    "done".into()
+                }),
             );
             pm.insert("createdAt".to_string(), Value::Int(5_000_000 - i * 3 - k));
             let p = g.create_node(&["GWP".into()], &pm).expect("gwp");
@@ -144,18 +155,34 @@ fn the_core_path_filters_its_seed_and_its_hop_end_from_columns_on_the_memory_sto
         assert!(!want.is_empty(), "fixture: `{src}`");
         let (got, first) = traced(&g, src);
         assert_eq!(got, want, "`{src}`");
-        assert!(count_of(&first, HOP_RUNS) > 0, "`{src}` runs on the core path: {first:?}");
-        assert!(count_of(&first, SEED_FILTERED) > 0, "`{src}` seed filtered: {first:?}");
-        assert!(count_of(&first, END_FILTERED) > 0, "`{src}` end filtered: {first:?}");
+        assert!(
+            count_of(&first, HOP_RUNS) > 0,
+            "`{src}` runs on the core path: {first:?}"
+        );
+        assert!(
+            count_of(&first, SEED_FILTERED) > 0,
+            "`{src}` seed filtered: {first:?}"
+        );
+        assert!(
+            count_of(&first, END_FILTERED) > 0,
+            "`{src}` end filtered: {first:?}"
+        );
         // The whole-label walk over the END label is kept (the seed's own
         // key is a seek, walked over its sought ids): the second statement
         // is served from the cache and gathers no column for its filters or
         // its ORDER BY key.
         let (again, second) = traced(&g, src);
         assert_eq!(again, want, "`{src}` (second run)");
-        assert!(count_of(&second, SERVED) >= 1, "`{src}` served from the cache: {second:?}");
+        assert!(
+            count_of(&second, SERVED) >= 1,
+            "`{src}` served from the cache: {second:?}"
+        );
         assert!(count_of(&second, END_FILTERED) > 0, "`{src}`: {second:?}");
-        assert_eq!(count_of(&second, GATHER), 0, "`{src}` gathers nothing: {second:?}");
+        assert_eq!(
+            count_of(&second, GATHER),
+            0,
+            "`{src}` gathers nothing: {second:?}"
+        );
     }
 }
 
@@ -167,11 +194,18 @@ fn on_a_paged_interleaved_store_the_second_statement_reads_no_record_for_its_fil
     let (got, first) = traced(&g, CORPUS);
     assert_eq!(got, want);
     assert!(count_of(&first, END_FILTERED) > 0, "{first:?}");
-    assert!(count_of(&first, KEPT) >= 1, "the gathered whole-label column is kept: {first:?}");
+    assert!(
+        count_of(&first, KEPT) >= 1,
+        "the gathered whole-label column is kept: {first:?}"
+    );
     let (again, second) = traced(&g, CORPUS);
     assert_eq!(again, want);
     assert!(count_of(&second, SERVED) >= 2, "{second:?}");
-    assert_eq!(count_of(&second, GATHER), 0, "no per-statement gather for the filters: {second:?}");
+    assert_eq!(
+        count_of(&second, GATHER),
+        0,
+        "no per-statement gather for the filters: {second:?}"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 

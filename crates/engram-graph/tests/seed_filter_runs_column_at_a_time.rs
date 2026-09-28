@@ -69,9 +69,13 @@ fn corpus() -> Graph {
         let mut m = BTreeMap::new();
         m.insert("id".into(), s(&format!("tc-{t}")));
         m.insert("title".into(), s(&format!("Test case {t}")));
-        m.insert("orgId".into(), s(if t % 5 == 0 { "other" } else { "default" }));
+        m.insert(
+            "orgId".into(),
+            s(if t % 5 == 0 { "other" } else { "default" }),
+        );
         let tc = g.create_node(&["TestCase".into()], &m).expect("tc");
-        g.create_rel(tc, "BELONGS_TO", suite, &BTreeMap::new()).expect("belongs");
+        g.create_rel(tc, "BELONGS_TO", suite, &BTreeMap::new())
+            .expect("belongs");
         cases.push(tc);
     }
     for i in 0..2000i64 {
@@ -82,14 +86,23 @@ fn corpus() -> Graph {
         // Moduli independent of the proposal index (i = proposal + 100k):
         // `i % 4` would give every criterion of one proposal the same org.
         let k = i / 100;
-        m.insert("orgId".into(), s(if k % 4 == 3 { "other" } else { "default" }));
+        m.insert(
+            "orgId".into(),
+            s(if k % 4 == 3 { "other" } else { "default" }),
+        );
         m.insert("text".into(), s(&format!("Criterion {i}")));
-        let id = g.create_node(&["AcceptanceCriterion".into()], &m).expect("ac");
+        let id = g
+            .create_node(&["AcceptanceCriterion".into()], &m)
+            .expect("ac");
         if proposal < 50 {
             let mut rm = BTreeMap::new();
-            rm.insert("verifiedAt".into(), s(&format!("2026-09-{:02}T00:00:00Z", 1 + (i % 28))));
+            rm.insert(
+                "verifiedAt".into(),
+                s(&format!("2026-09-{:02}T00:00:00Z", 1 + (i % 28))),
+            );
             let case = ((k * 13 + proposal) % 200) as usize;
-            g.create_rel(id, "VERIFIED_BY", cases[case], &rm).expect("verified");
+            g.create_rel(id, "VERIFIED_BY", cases[case], &rm)
+                .expect("verified");
         }
     }
     g

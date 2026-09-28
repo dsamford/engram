@@ -65,7 +65,8 @@ fn bolt_readers_never_observe_a_torn_or_stale_table_under_the_maintenance_refres
     let addr = start();
     let mut c = connect(&addr);
     for i in 0..PERSONS {
-        c.run(&format!("CREATE (:Person {{id: {i}}})")).expect("person");
+        c.run(&format!("CREATE (:Person {{id: {i}}})"))
+            .expect("person");
     }
     for i in 0..SEED {
         c.run(&format!(
@@ -78,8 +79,16 @@ fn bolt_readers_never_observe_a_torn_or_stale_table_under_the_maintenance_refres
     for p in 0..PERSONS {
         assert_eq!(c.run(&read_query(p)).expect("read"), SEED / PERSONS);
     }
-    let intent: Arc<Vec<AtomicU64>> = Arc::new((0..PERSONS).map(|_| AtomicU64::new(SEED / PERSONS)).collect());
-    let done: Arc<Vec<AtomicU64>> = Arc::new((0..PERSONS).map(|_| AtomicU64::new(SEED / PERSONS)).collect());
+    let intent: Arc<Vec<AtomicU64>> = Arc::new(
+        (0..PERSONS)
+            .map(|_| AtomicU64::new(SEED / PERSONS))
+            .collect(),
+    );
+    let done: Arc<Vec<AtomicU64>> = Arc::new(
+        (0..PERSONS)
+            .map(|_| AtomicU64::new(SEED / PERSONS))
+            .collect(),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let refreshed_before = DERIVED_REFRESHED_BY_MAINTENANCE.load(Ordering::Relaxed);
     let runs_before = MAINTENANCE_REFRESH_RUNS.load(Ordering::Relaxed);
@@ -136,12 +145,21 @@ fn bolt_readers_never_observe_a_torn_or_stale_table_under_the_maintenance_refres
     stop.store(true, Ordering::Relaxed);
     let reads: u64 = readers.into_iter().map(|r| r.join().expect("reader")).sum();
     for p in 0..PERSONS {
-        assert_eq!(c.run(&read_query(p)).expect("final read"), done[p as usize].load(Ordering::SeqCst));
+        assert_eq!(
+            c.run(&read_query(p)).expect("final read"),
+            done[p as usize].load(Ordering::SeqCst)
+        );
     }
     let refreshed = DERIVED_REFRESHED_BY_MAINTENANCE.load(Ordering::Relaxed) - refreshed_before;
     let runs = MAINTENANCE_REFRESH_RUNS.load(Ordering::Relaxed) - runs_before;
     eprintln!("[bolt-concurrent] reads={reads} refresh_runs={runs} refreshed={refreshed}");
-    assert!(reads >= 200, "too few reads to have raced anything: {reads}");
+    assert!(
+        reads >= 200,
+        "too few reads to have raced anything: {reads}"
+    );
     assert!(runs >= 5, "the maintenance thread barely ran: {runs}");
-    assert!(refreshed >= 1, "the maintenance thread refreshed nothing during the race");
+    assert!(
+        refreshed >= 1,
+        "the maintenance thread refreshed nothing during the race"
+    );
 }

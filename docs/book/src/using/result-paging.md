@@ -33,8 +33,12 @@ assume:
 > make the server hold a hundred rows. It holds ten million, and hands you a
 > hundred at a time.
 
-What *does* bound server memory is **`--row-budget`**, and that is why it
-defaults to 20,000,000 rather than to unlimited.
+What *does* bound one statement's memory is **`--row-budget`**, and that is why
+it is never unlimited by default. Unless you name a value, it is derived from
+the memory this process may use — the container's cgroup limit, else the
+machine's `MemTotal` — as a quarter of that ceiling divided by an assumed
+96 bytes per row, clamped between 1,000,000 and 4,000,000,000, and the server
+prints the figure and its source at startup.
 
 ## How the wire protocol pages
 
@@ -98,13 +102,17 @@ MATCH (a:N), (b:N) RETURN count(*) AS c   -- returns 2500
 The second answers correctly under a budget twenty-five times smaller than its
 own result set, because those rows are never built.
 
-**Keep `--row-budget` set.** The default of 20,000,000 refuses a statement that
-would materialise more:
+**Keep `--row-budget` set.** The budget is shared by the statements running at
+once: each gets the budget divided by the number in flight, never less than
+1,000,000 rows (or the whole budget, if that is smaller). A statement that
+would materialise more than its share is refused — here from the run above,
+under `--row-budget 100`:
 
 ```text
 Neo.ClientError.Statement.SemanticError
-row budget exceeded: the statement materialised more than 20000000
-intermediate rows; it would exhaust memory rather than stream
+row budget exceeded: the statement materialised more than 100 intermediate rows
+(its share of 100 across 1 statement(s) in flight); it would exhaust memory
+rather than stream
 ```
 
 The alternative to refusing is the OOM killer, which refuses nothing and takes
@@ -112,7 +120,14 @@ every other session on the process with it. Note the classification: a *client*
 error, not a database one, because the statement asked for more than the server
 will build and rewriting it is the fix.
 
+An explicit `--row-budget N` wins over the derived figure, and is what a
+reproducible run should pin, so that two machines refuse at the same row.
 `--row-budget 0` disables the bound. Do that only when you know the statement.
+
+The row budget bounds one statement between memory samples. Beside it,
+`--memory-max-mb` bounds the process over time: above 90% of that ceiling new
+statements queue, and are refused only after waiting 30 seconds; below 80% they
+are admitted again. It too defaults to the memory the process was given.
 
 ## Timeouts and long results
 

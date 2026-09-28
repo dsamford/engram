@@ -22,7 +22,7 @@ fn params() -> BTreeMap<String, Value> {
     let mut p = BTreeMap::new();
     p.insert(
         "modes".to_string(),
-        Value::List(vec![Value::Str("push".into()), Value::Str("onboarding".into())]),
+        Value::List((vec![Value::Str("push".into()), Value::Str("onboarding".into())]).into()),
     );
     p.insert("limit".to_string(), Value::Int(25));
     p
@@ -67,7 +67,11 @@ fn corpus() -> Graph {
         let mut m = BTreeMap::new();
         m.insert(
             "provider".to_string(),
-            Value::Str(if i % 4 == 0 { "github".into() } else { "lore".into() }),
+            Value::Str(if i % 4 == 0 {
+                "github".into()
+            } else {
+                "lore".into()
+            }),
         );
         match i % 3 {
             0 => {
@@ -83,7 +87,10 @@ fn corpus() -> Graph {
         }
         m.insert("orgId".to_string(), Value::Str(format!("org-{}", i % 7)));
         m.insert("externalId".to_string(), Value::Str(format!("ext-{i:04}")));
-        m.insert("repoId".to_string(), Value::Str(format!("repo-{:04}", (i * 37) % 140)));
+        m.insert(
+            "repoId".to_string(),
+            Value::Str(format!("repo-{:04}", (i * 37) % 140)),
+        );
         if i % 3 != 2 {
             m.insert("defaultBranch".to_string(), Value::Str("trunk".into()));
         }
@@ -131,8 +138,16 @@ fn the_km_listing_runs_on_the_pipeline_and_decodes_nothing_in_full() {
     assert_eq!(got, want);
     assert!(count_of(&c, TOPLEVEL) > 0, "{c:?}");
     assert!(count_of(&c, HOP_RUNS) > 0, "{c:?}");
-    assert_eq!(count_of(&c, FULL), 0, "the repos are gathered, not decoded in full: {c:?}");
-    assert_eq!(count_of(&c, REL_FULL), 0, "the relationship's one property is a column: {c:?}");
+    assert_eq!(
+        count_of(&c, FULL),
+        0,
+        "the repos are gathered, not decoded in full: {c:?}"
+    );
+    assert_eq!(
+        count_of(&c, REL_FULL),
+        0,
+        "the relationship's one property is a column: {c:?}"
+    );
 }
 
 /// Variants of the shape: a value key, a HAVING, several keys, a bare key
@@ -188,5 +203,8 @@ fn shapes_outside_the_class_still_agree() {
     g.set_columnar_scans(false);
     let off = run_query(&g, &q, params()).is_err();
     g.set_columnar_scans(true);
-    assert!(on && off, "both paths refuse a read of the dropped variable");
+    assert!(
+        on && off,
+        "both paths refuse a read of the dropped variable"
+    );
 }

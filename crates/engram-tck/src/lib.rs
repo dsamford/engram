@@ -565,7 +565,7 @@ fn matches_mode(expected: &Expected, actual: &Value, ignore_list_order: bool) ->
                 bag_list_matches(es, as_, ignore_list_order)
             } else {
                 es.iter()
-                    .zip(as_)
+                    .zip(as_.iter())
                     .all(|(e, a)| matches_mode(e, a, ignore_list_order))
             }
         }
@@ -660,7 +660,7 @@ fn scalar_eq_mode(e: &Value, a: &Value, ignore_list_order: bool) -> bool {
                 })
             } else {
                 x.iter()
-                    .zip(y)
+                    .zip(y.iter())
                     .all(|(a, b)| scalar_eq_mode(a, b, ignore_list_order))
             }
         }

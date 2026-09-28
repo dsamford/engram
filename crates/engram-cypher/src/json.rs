@@ -110,7 +110,7 @@ fn parse_value(b: &[u8], i: &mut usize) -> Result<Value, String> {
             skip_ws(b, i);
             if b.get(*i) == Some(&b']') {
                 *i += 1;
-                return Ok(Value::List(items));
+                return Ok(Value::List(items.into()));
             }
             loop {
                 items.push(parse_value(b, i)?);
@@ -119,7 +119,7 @@ fn parse_value(b: &[u8], i: &mut usize) -> Result<Value, String> {
                     Some(b',') => *i += 1,
                     Some(b']') => {
                         *i += 1;
-                        return Ok(Value::List(items));
+                        return Ok(Value::List(items.into()));
                     }
                     _ => return Err(format!("expected `,` or `]` at byte {i}", i = *i)),
                 }

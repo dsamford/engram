@@ -79,7 +79,10 @@ fn corpus(declare: bool, n: i64, every: i64) -> Graph {
     let g = Graph::new(Store::new(), Realm(1), Namespace(1));
     g.set_label_scoped_indexes(true);
     if declare {
-        ddl(&g, "CREATE INDEX ev_id IF NOT EXISTS FOR (n:Ev) ON (n.eventId)");
+        ddl(
+            &g,
+            "CREATE INDEX ev_id IF NOT EXISTS FOR (n:Ev) ON (n.eventId)",
+        );
     }
     for i in 0..n {
         let mut m = BTreeMap::new();
@@ -93,7 +96,10 @@ fn corpus(declare: bool, n: i64, every: i64) -> Graph {
         );
         m.insert("n".to_string(), Value::Int(i));
         if i % 7 != 0 {
-            m.insert("startAt".to_string(), Value::Str(format!("2026-08-{:02}", 1 + i % 28)));
+            m.insert(
+                "startAt".to_string(),
+                Value::Str(format!("2026-08-{:02}", 1 + i % 28)),
+            );
         }
         g.create_node(&["Ev".into()], &m).expect("ev");
     }
@@ -101,18 +107,15 @@ fn corpus(declare: bool, n: i64, every: i64) -> Graph {
 }
 
 const PREFIX_COUNT: &str = "MATCH (e:Ev) WHERE e.eventId STARTS WITH $pre RETURN count(e) AS n";
-const TWO_PREFIXES: &str =
-    "MATCH (e:Ev) WHERE e.eventId STARTS WITH $pre AND e.eventId STARTS WITH $narrow RETURN count(e) AS n";
-const PREFIX_AND_EQ: &str =
-    "MATCH (e:Ev) WHERE e.eventId STARTS WITH $pre AND e.eventId = 'edgar-8k-000004' RETURN count(e) AS n";
+const TWO_PREFIXES: &str = "MATCH (e:Ev) WHERE e.eventId STARTS WITH $pre AND e.eventId STARTS WITH $narrow RETURN count(e) AS n";
+const PREFIX_AND_EQ: &str = "MATCH (e:Ev) WHERE e.eventId STARTS WITH $pre AND e.eventId = 'edgar-8k-000004' RETURN count(e) AS n";
 const PREFIX_AND_RESIDUAL: &str =
     "MATCH (e:Ev) WHERE e.eventId STARTS WITH $pre AND e.n % 5 = 0 RETURN count(e) AS n";
 /// A statement the columnar recognisers do not claim (two MATCH clauses,
 /// the second correlated), so the first MATCH is a general-path clause
 /// scan — the production shape's path. (An UNWIND after the MATCH is
 /// claimed by the columnar stage, which seeks on its own.)
-const GENERAL: &str =
-    "MATCH (e:Ev) WHERE e.eventId STARTS WITH $pre AND e.n % 5 = 0 MATCH (e2:Ev) WHERE e2.n = e.n RETURN count(e2) AS n";
+const GENERAL: &str = "MATCH (e:Ev) WHERE e.eventId STARTS WITH $pre AND e.n % 5 = 0 MATCH (e2:Ev) WHERE e2.n = e.n RETURN count(e2) AS n";
 /// Keeps the `eventId` and `n` columns in the property-column cache: a
 /// whole-label walk whose predicate is not vectorisable (the `%`).
 const WARM: &str = "MATCH (e:Ev) WHERE e.n % 7 = 0 AND e.eventId <> 'x' RETURN count(e) AS n";
@@ -124,8 +127,14 @@ fn a_prefix_only_count_is_answered_from_the_index_range() {
         let (on, off) = both(&g, src);
         assert_eq!(on, off, "covered vs walk disagree on `{src}`");
         let (_, c) = traced(&g, src);
-        assert!(count_of(&c, COVERED_PREFIX) > 0, "`{src}` must seek its prefix: {c:?}");
-        assert!(count_of(&c, COVERED) > 0, "`{src}` must be a covered count: {c:?}");
+        assert!(
+            count_of(&c, COVERED_PREFIX) > 0,
+            "`{src}` must seek its prefix: {c:?}"
+        );
+        assert!(
+            count_of(&c, COVERED) > 0,
+            "`{src}` must be a covered count: {c:?}"
+        );
         assert_eq!(count_of(&c, SEEK_WALKED), 0, "`{src}` must not walk: {c:?}");
     }
     assert_eq!(rows(&g, PREFIX_COUNT), vec![vec![Value::Int(1000)]]);
@@ -139,7 +148,11 @@ fn a_prefix_only_count_is_answered_from_the_index_range() {
     assert_eq!(on, off);
     assert_eq!(on, vec![vec![Value::Int(200)]]);
     let (_, c) = traced(&g, PREFIX_AND_RESIDUAL);
-    assert_eq!(count_of(&c, COVERED), 0, "a residual is never covered: {c:?}");
+    assert_eq!(
+        count_of(&c, COVERED),
+        0,
+        "a residual is never covered: {c:?}"
+    );
 }
 
 /// CONTROL: an undeclared key is never prefix-covered — nothing is built
@@ -166,32 +179,56 @@ fn a_walk_over_a_seek_takes_only_its_ids_from_the_cached_column() {
     // 40% prefixed: 2,400 of 6,000 — past the per-id cap, inside the walk's.
     let g = Graph::new(Store::new(), Realm(1), Namespace(1));
     g.set_label_scoped_indexes(true);
-    ddl(&g, "CREATE INDEX ev_id IF NOT EXISTS FOR (n:Ev) ON (n.eventId)");
+    ddl(
+        &g,
+        "CREATE INDEX ev_id IF NOT EXISTS FOR (n:Ev) ON (n.eventId)",
+    );
     for i in 0..6000i64 {
         let mut m = BTreeMap::new();
         m.insert(
             "eventId".to_string(),
-            Value::Str(if i % 5 < 2 { format!("edgar-8k-{i:06}") } else { format!("other-{i:06}") }),
+            Value::Str(if i % 5 < 2 {
+                format!("edgar-8k-{i:06}")
+            } else {
+                format!("other-{i:06}")
+            }),
         );
         m.insert("n".to_string(), Value::Int(i));
         g.create_node(&["Ev".into()], &m).expect("ev");
     }
     // Keep both columns.
     let (_, warm) = traced(&g, WARM);
-    assert_eq!(count_of(&warm, RESTRICTED), 0, "a whole-label walk restricts nothing: {warm:?}");
+    assert_eq!(
+        count_of(&warm, RESTRICTED),
+        0,
+        "a whole-label walk restricts nothing: {warm:?}"
+    );
     // Now the seek-walk: both columns from the cache, restricted to the
     // 2,400 sought ids.
     let (on, c) = traced(&g, PREFIX_AND_RESIDUAL);
-    assert!(count_of(&c, SEEK_WALKED) > 0, "2,400 of 6,000 walks over the seek: {c:?}");
-    assert_eq!(count_of(&c, SERVED), 2, "eventId and n served from the cache: {c:?}");
-    assert_eq!(count_of(&c, RESTRICTED), 2, "both restricted to the population: {c:?}");
+    assert!(
+        count_of(&c, SEEK_WALKED) > 0,
+        "2,400 of 6,000 walks over the seek: {c:?}"
+    );
+    assert_eq!(
+        count_of(&c, SERVED),
+        2,
+        "eventId and n served from the cache: {c:?}"
+    );
+    assert_eq!(
+        count_of(&c, RESTRICTED),
+        2,
+        "both restricted to the population: {c:?}"
+    );
     g.set_property_seek(false);
     let off = rows(&g, PREFIX_AND_RESIDUAL);
     g.set_property_seek(true);
     assert_eq!(on, off);
     assert_eq!(
         on,
-        vec![vec![Value::Int((0..6000i64).filter(|i| i % 5 < 2 && i % 5 == 0).count() as i64)]]
+        vec![vec![Value::Int(
+            (0..6000i64).filter(|i| i % 5 < 2 && i % 5 == 0).count() as i64
+        )]]
     );
 }
 
@@ -204,8 +241,14 @@ fn the_general_paths_column_filter_walks_over_a_declared_prefix_seek() {
     assert_eq!(on, off, "general path: seek vs scan disagree");
     assert_eq!(on, vec![vec![Value::Int(200)]]); // 200 events, one e2 each
     let (_, c) = traced(&g, GENERAL);
-    assert!(count_of(&c, FILTER_SOUGHT) > 0, "the column filter must seek: {c:?}");
-    assert!(count_of(&c, FILTERED) > 0, "…and still filter by columns: {c:?}");
+    assert!(
+        count_of(&c, FILTER_SOUGHT) > 0,
+        "the column filter must seek: {c:?}"
+    );
+    assert!(
+        count_of(&c, FILTERED) > 0,
+        "…and still filter by columns: {c:?}"
+    );
     // With the columns kept by the first run, the second run's walk over
     // the seek takes only the sought ids' entries.
     let (_, c2) = traced(&g, GENERAL);
@@ -227,8 +270,7 @@ const VECTORISED: &str = "interp.columnar aggregate counted over cached columns"
 /// A vectorisable residual behind a prefix — the shape that vectorised over
 /// the whole label with no short-circuit (`datetime()` per member, 44k of
 /// them for the 3.9k the prefix names).
-const PREFIX_AND_VECTORISABLE: &str =
-    "MATCH (e:Ev) WHERE e.eventId STARTS WITH $pre AND toString(e.n) STARTS WITH '1' RETURN count(e) AS n";
+const PREFIX_AND_VECTORISABLE: &str = "MATCH (e:Ev) WHERE e.eventId STARTS WITH $pre AND toString(e.n) STARTS WITH '1' RETURN count(e) AS n";
 
 /// With the columns cached, a seek naming fewer than an eighth of the label
 /// is walked BEFORE the column-at-a-time count; a wider seek still lets the
@@ -240,9 +282,15 @@ fn a_selective_seek_is_walked_before_the_vectorised_count() {
     let (first, _) = traced(&g, WARM); // keeps `n` and `eventId`
     assert!(!first.is_empty());
     let (on, c) = traced(&g, PREFIX_AND_VECTORISABLE);
-    assert!(count_of(&c, PREFERRED) > 0, "400 of 4,000 walks over the seek: {c:?}");
+    assert!(
+        count_of(&c, PREFERRED) > 0,
+        "400 of 4,000 walks over the seek: {c:?}"
+    );
     assert_eq!(count_of(&c, VECTORISED), 0, "{c:?}");
-    assert!(count_of(&c, RESTRICTED) > 0, "…over the cached columns, restricted: {c:?}");
+    assert!(
+        count_of(&c, RESTRICTED) > 0,
+        "…over the cached columns, restricted: {c:?}"
+    );
     g.set_property_seek(false);
     let off = rows(&g, PREFIX_AND_VECTORISABLE);
     g.set_property_seek(true);
@@ -250,7 +298,9 @@ fn a_selective_seek_is_walked_before_the_vectorised_count() {
     assert_eq!(
         on,
         vec![vec![Value::Int(
-            (0..4000i64).filter(|i| i % 10 == 0 && i.to_string().starts_with('1')).count() as i64
+            (0..4000i64)
+                .filter(|i| i % 10 == 0 && i.to_string().starts_with('1'))
+                .count() as i64
         )]]
     );
     // 1,000 of 4,000: a quarter — the vectorised count keeps the shape.
@@ -258,7 +308,10 @@ fn a_selective_seek_is_walked_before_the_vectorised_count() {
     let _ = traced(&g, WARM);
     let (on, c) = traced(&g, PREFIX_AND_VECTORISABLE);
     assert_eq!(count_of(&c, PREFERRED), 0, "{c:?}");
-    assert!(count_of(&c, VECTORISED) > 0, "a quarter of the label vectorises: {c:?}");
+    assert!(
+        count_of(&c, VECTORISED) > 0,
+        "a quarter of the label vectorises: {c:?}"
+    );
     g.set_property_seek(false);
     let off = rows(&g, PREFIX_AND_VECTORISABLE);
     assert_eq!(on, off);

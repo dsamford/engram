@@ -179,7 +179,11 @@ fn a_settled_store_is_not_rewritten_every_tick() {
         .find(|e| e.path().extension().is_some_and(|x| x == "dsc"))
         .expect("a sidecar")
         .path();
-    let mtime = || std::fs::metadata(&first).ok().and_then(|m| m.modified().ok());
+    let mtime = || {
+        std::fs::metadata(&first)
+            .ok()
+            .and_then(|m| m.modified().ok())
+    };
 
     // THE PROPERTY IS THAT REWRITING STOPS, not that it never happens.
     //

@@ -30,6 +30,12 @@ exactly like a step that passes.
                canary detected 3 of 3
 ```
 
+Those two lines are a recorded run, not today's reading. The counts move with
+the tree — `Cargo.lock` now resolves 44 third-party packages, and the `d3` walk
+now sees over 600 files under `crates/` — so run the gate for current numbers.
+What does not move is the **shape**: every count is reported, and the second
+number on each line is the reach.
+
 That second number exists because **a gate that walked zero files prints "no
 findings" in exactly the same words as one that walked all of them.**
 
@@ -40,7 +46,7 @@ appeared to clear, and a guard whose pattern could not match anything.
 It bites in practice. On its first CI run, `c-deps` reported *39 packages, 0
 inspected* and failed itself — the registry cache is populated as a side effect
 of building, so a cold runner had extracted nothing. The fix was upstream of the
-gate: vendor the lock file so the gate sees all 39 on any host.
+gate: vendor the lock file so the gate sees every package on any host.
 
 ## The gates
 
@@ -70,7 +76,9 @@ what a build happened to extract.
 
 ### `msrv` — every member inherits the declared minimum
 
-Checks all 17 manifests declare the same `rust-version`.
+Checks that every member manifest declares the same `rust-version` — 18 of them
+today, and the gate names the number it read on every run, so a member that
+stopped being walked is visible rather than silently unchecked.
 
 This is the *declaration* half. The other half is CI building on a toolchain
 pinned to that version, which is the only thing that makes the number a
@@ -118,14 +126,35 @@ Four checks:
 | reference | the CLI reference names every flag the CLI parses |
 | usage | `--help` names exactly the flags the CLI parses |
 
-**The flag check is bidirectional on purpose.** "Every documented flag exists"
-passes a reference documenting three of forty. Only the other direction found
-the actual state: **eight flags parsed by `main.rs` and absent from its own
-`USAGE`**, so `--help` was wrong about the program printing it.
+**The `usage` check is bidirectional on purpose.** "Every documented flag
+exists" passes a reference documenting three of forty. Only the other direction
+found the actual state: **eight flags parsed by `main.rs` and absent from its
+own `USAGE`**, so `--help` was wrong about the program printing it.
+
+The `reference` check has **one** direction — parsed, then looked for in the
+reference. Stated as an absence: a row in the CLI reference for a flag the
+binary does not parse is *not* caught here. That direction is why the shipped
+reference could carry four flags belonging to a workstream whose code was not in
+that tree without this gate objecting — they were neither parsed nor in `USAGE`,
+so no comparison it makes had anything to disagree about.
 
 Its own canary is that the two flag sets are read from **different halves** of
 the file. A version reading both from one source would be a tautology passing
 whatever the tree did.
+
+**It runs on a tree that carries the CLI reference and nothing else**, because
+that is what ships. A missing `SUMMARY.md` skips the orphan and link checks and
+runs the flag check anyway — and says so on the line that reports what it
+scanned (`no SUMMARY.md — chapter checks SKIPPED, flags only`), since a gate
+that quietly narrows its scope and still prints PASS is the failure this gate
+exists to catch. Refusing to run there is how the gate came to be absent from
+every shipped revision while the shipped CLI reference documented four flags the
+shipped binary does not have.
+
+Each half then carries its own vacuity floor, because the two halves can now be
+reached independently: a book that is present with fewer than two pages is a
+finding, and so is fewer than ten flags on either side of the comparison. An
+agreement between two empty sets is not an agreement.
 
 ### `scrub` — this tree can be published
 
@@ -136,11 +165,22 @@ carry an embedded private path**. A 28 MB unstripped binary links the paths it
 was built from. So everything is read as bytes, and anything unreadable is a
 **finding**, never a skip.
 
+**The rules are a separate file, and it is not published.** `scrub-rules.txt`
+lives outside `xtask/` and outside the publish allow-list, because the gate
+itself ships. The rules did ship once — and that made the gate written to
+prevent disclosure into the most concentrated disclosure in the tree: every
+private name in one place, each annotated with what it is, better organised than
+anything it catches. Moving them out created a new way to be wrong, so an
+absent, unreadable, empty or rule-less file is a **finding**, proved by
+`a_missing_rules_file_FAILS` rather than assumed. A side benefit: the gate can
+now scan its own source, which it previously had to skip.
+
 Every rule carries **two canaries**: a positive one proving it still catches
 what it is for, and a **negative** one proving it has not started matching
 everything. An over-matching rule is not a safe failure — `production` appears
-192 times in `crates/`, and 79 are the benign execution vocabulary, so a rule
-matching the bare word would demand ~113 edits to correct code.
+hundreds of times in `crates/`, much of it the benign execution vocabulary
+(*production order*), so a rule matching the bare word would demand edits to
+correct code.
 
 The positive canary is a **fixed literal, deliberately not generated from the
 rules**. A canary built by joining the needles is worthless against the failure
@@ -153,7 +193,20 @@ a clean run.
 Copies an **allow-list** into a fresh directory, then scrubs the result.
 
 An allow-list fails **closed** and a `.gitignore` fails **open**: anything added
-after the list was written is left behind by default, which is the point.
+after the list was written is left behind by default, which is the point. What
+it carries is the workspace and toolchain configuration, the legal files, the
+Rust sources and manifests under `crates/` and `xtask/`, the vendored TCK
+features, the book, the CI workflows — and, because the benchmark crate does
+not build or test without them, the harness's statement catalogue
+(`crates/engram-bench/catalogue`), its golden files
+(`crates/engram-bench/tests/golden`) and the checked-in regression baselines
+(`measurements/baselines`). The rest of `measurements/` stays behind.
+
+It **refuses a dirty working tree.** The gate copies a directory, not a commit,
+so pointed at a working tree it would publish whatever happened to be open in an
+editor, and an allow-list copy of a dirty tree prints the same PASS line as one
+of a clean tree. Cut the publishable tree from a clean checkout of a commit
+instead.
 
 Every rule must match at least one file, and the gate fails when one does not —
 because of its own first bug. It allow-listed `crates/engram-tck/tck`; the TCK
@@ -170,21 +223,49 @@ Deliberately. Until a tree is scrubbed it fails by design, and **a gate that is
 always red gets ignored** — which is how the one control protecting a release
 stops being read. It belongs in the release lane, not the developer loop.
 
-The same reasoning keeps `cargo fmt --check` out of CI today: the tree has never
-been rustfmt-clean, so adding the check without the reformat would make the job
-permanently red.
+The same reasoning keeps `cargo fmt --check` out of CI: the tree is not
+rustfmt-clean, so adding the check without the reformat would make the job
+permanently red. The fix is one mechanical command in its own commit, with the
+check added to CI in the same change, so that the tree and the gate become true
+together. See [Contributing](./contributing.md).
 
 ## In CI
 
 | job | what |
 |---|---|
-| build and test | `cargo test --workspace` |
+| build and test | `cargo test --workspace`, less `review_fence_hammer`'s heavy arm (which needs more cores than the runner has), then `cargo test --workspace --examples` |
+| benchmark harness smoke | the harness and its lanes build; every catalogue parses and every family's digest is stable; parameter binding holds; a read battery still refuses to run without its parameters; the regression gate fires in the right direction; then one short stress level end to end against a fresh server, with the regression gate required to pass against itself and to fail against an injected faster baseline |
 | xtask gates | `cargo xtask all` |
-| publishable tree | `public-tree` then `scrub`, plus assertions on what shipped |
+| publishable tree | `public-tree` then `scrub`, plus assertions on what shipped; skipped, and saying so, in a published snapshot, which does not carry the scrub rules |
 | clippy | `--workspace --all-targets` |
 | MSRV | a build on the declared minimum |
 | supply chain | `cargo deny check` |
 | openCypher conformance | the ratcheted TCK |
+| documentation gate | `cargo xtask docs` |
+| the book builds | `mdbook build docs/book` |
+| the API reference builds | `cargo doc --workspace --no-deps`, with `-D warnings` |
+
+The workflow also runs once a day on a schedule, so the benchmark harness is
+exercised even when nothing is pushed: an instrument nobody runs drifts without
+saying so. The smoke job is not a performance measurement — two clients for a
+few seconds on a shared hosted runner — and its timings are never recorded or
+quoted. What it proves is that the lanes still run, still stamp rig and
+fairness, still write a document the reporter accepts, and that the regression
+gate is still wired. See [Benchmarking](./benchmarking.md).
+
+The `--examples` step is the one that keeps the book's runnable claims honest:
+`cargo test --examples` compiles an example without running its `main`, so the
+examples carry a `#[test]` that calls their own body and this step is what runs
+it. See [Testing](./testing.md).
+
+The last three are a second workflow, `docs.yml`. `cargo doc` with
+`RUSTDOCFLAGS: -D warnings` is what makes the `missing_docs` and
+`broken_intra_doc_links` denials real rather than declared. That workflow also
+carries a Pages deploy that is written and **inert**, gated on a repository
+variable: Pages published from a private repository is public on every plan
+below Enterprise Cloud, so turning it on would publish the documentation of a
+codebase `scrub` and `public-tree` exist to keep unpublished — the same
+disclosure, arriving through a side door.
 
 The publishable-tree job also asserts the assembled tree **carries** the book
 and the workflows and **leaves behind** the private material — stated as a class

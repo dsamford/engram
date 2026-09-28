@@ -79,12 +79,26 @@ fn corpus() -> Graph {
             let mut cm = BTreeMap::new();
             cm.insert("conversationId".into(), s(&format!("{prefix}-{ci}")));
             cm.insert("title".into(), s(&format!("Conversation {ci}")));
-            cm.insert("createdAt".into(), s(&format!("2026-06-{:02}T05:33:40.324Z", 1 + ci % 28)));
-            cm.insert("updatedAt".into(), s(&format!("2026-09-{:02}T17:{:02}:36.054Z", 1 + ci % 5, ci % 60)));
-            let c = g.create_node(&["AssistantConversation".into()], &cm).expect("conv");
-            g.create_rel(owner, "HAS_CONVERSATION", c, &BTreeMap::new()).expect("has conv");
+            cm.insert(
+                "createdAt".into(),
+                s(&format!("2026-06-{:02}T05:33:40.324Z", 1 + ci % 28)),
+            );
+            cm.insert(
+                "updatedAt".into(),
+                s(&format!(
+                    "2026-09-{:02}T17:{:02}:36.054Z",
+                    1 + ci % 5,
+                    ci % 60
+                )),
+            );
+            let c = g
+                .create_node(&["AssistantConversation".into()], &cm)
+                .expect("conv");
+            g.create_rel(owner, "HAS_CONVERSATION", c, &BTreeMap::new())
+                .expect("has conv");
             if prefix == "conv" && ci == 1 {
-                g.create_rel(owner, "HAS_CONVERSATION", c, &BTreeMap::new()).expect("dup");
+                g.create_rel(owner, "HAS_CONVERSATION", c, &BTreeMap::new())
+                    .expect("dup");
             }
             let (branches, per_branch) = if prefix != "conv" {
                 (1, 5)
@@ -100,20 +114,35 @@ fn corpus() -> Graph {
             for bi in 0..branches {
                 let mut bm = BTreeMap::new();
                 bm.insert("branchId".into(), s(&format!("{prefix}-{ci}-b{bi}")));
-                let b = g.create_node(&["AssistantBranch".into()], &bm).expect("branch");
-                g.create_rel(c, "HAS_BRANCH", b, &BTreeMap::new()).expect("has branch");
+                let b = g
+                    .create_node(&["AssistantBranch".into()], &bm)
+                    .expect("branch");
+                g.create_rel(c, "HAS_BRANCH", b, &BTreeMap::new())
+                    .expect("has branch");
                 for mi in 0..per_branch {
                     let mut mm = BTreeMap::new();
                     mm.insert("messageId".into(), s(&format!("{prefix}-{ci}-b{bi}-m{mi}")));
-                    mm.insert("timestamp".into(), s(&format!("2026-08-{:02}T{:02}:{:02}:00Z", 1 + (mi / 1440) % 28, (mi / 60) % 24, mi % 60)));
-                    mm.insert("content".into(), s(&format!("message {mi} of {prefix}-{ci}-b{bi}")));
+                    mm.insert(
+                        "timestamp".into(),
+                        s(&format!(
+                            "2026-08-{:02}T{:02}:{:02}:00Z",
+                            1 + (mi / 1440) % 28,
+                            (mi / 60) % 24,
+                            mi % 60
+                        )),
+                    );
+                    mm.insert(
+                        "content".into(),
+                        s(&format!("message {mi} of {prefix}-{ci}-b{bi}")),
+                    );
                     let labels: Vec<String> = if mi % 5 == 4 {
                         vec!["Note".into()]
                     } else {
                         vec!["AssistantMessage".into()]
                     };
                     let m = g.create_node(&labels, &mm).expect("msg");
-                    g.create_rel(b, "HAS_MESSAGE", m, &BTreeMap::new()).expect("has msg");
+                    g.create_rel(b, "HAS_MESSAGE", m, &BTreeMap::new())
+                        .expect("has msg");
                 }
             }
         }
@@ -121,14 +150,19 @@ fn corpus() -> Graph {
     for pi in 0..5i64 {
         let mut pm = BTreeMap::new();
         pm.insert("id".into(), s(&format!("proj-{pi}")));
-        pm.insert("updatedAt".into(), s(&format!("2026-09-0{}T00:00:00Z", 1 + pi)));
+        pm.insert(
+            "updatedAt".into(),
+            s(&format!("2026-09-0{}T00:00:00Z", 1 + pi)),
+        );
         let p = g.create_node(&["Project".into()], &pm).expect("project");
-        g.create_rel(user, "OWNS_PROJECT", p, &BTreeMap::new()).expect("owns");
+        g.create_rel(user, "OWNS_PROJECT", p, &BTreeMap::new())
+            .expect("owns");
         for ti in 0..pi {
             let mut tm = BTreeMap::new();
             tm.insert("id".into(), s(&format!("proj-{pi}-t{ti}")));
             let t = g.create_node(&["Track".into()], &tm).expect("track");
-            g.create_rel(p, "CONTAINS_TRACK", t, &BTreeMap::new()).expect("contains");
+            g.create_rel(p, "CONTAINS_TRACK", t, &BTreeMap::new())
+                .expect("contains");
         }
     }
     g
@@ -193,7 +227,11 @@ fn b_a_plain_match_and_a_labelled_end_keep_their_rows() {
     assert_eq!(got, want);
     assert_eq!(count_of(&c, FOLDED), 1, "{c:?}");
     assert_eq!(count_of(&c, BARE), 0, "{c:?}");
-    assert_eq!(got[0], vec![s("conv-0"), Value::Int(1_920)], "four of every five messages");
+    assert_eq!(
+        got[0],
+        vec![s("conv-0"), Value::Int(1_920)],
+        "four of every five messages"
+    );
     assert!(got.contains(&vec![s("conv-19"), Value::Int(0)]), "{got:?}");
     // A plain MATCH: the branchless conversation has no row. The columnar
     // recognisers claim this pair when they may (a fused MATCH + aggregate
@@ -209,7 +247,10 @@ fn b_a_plain_match_and_a_labelled_end_keep_their_rows() {
     let want_general = unfolded(&g, src, "u-big");
     let (got, c) = traced(&g, src, "u-big");
     g.set_columnar_scans(true);
-    assert_eq!(want_general, want, "the general path and the pipeline agree unfolded");
+    assert_eq!(
+        want_general, want,
+        "the general path and the pipeline agree unfolded"
+    );
     assert_eq!(got, want);
     assert_eq!(count_of(&c, FOLDED), 1, "{c:?}");
     assert_eq!(count_of(&c, BARE), 0, "{c:?}");
@@ -244,8 +285,14 @@ fn c_a_one_hop_return_form_folds() {
         Value::Node { props, .. } => props.get("id").cloned().unwrap_or(Value::Null),
         other => panic!("not a node: {other:?}"),
     };
-    assert_eq!((id_of(&got[0]), got[0][1].clone()), (s("proj-4"), Value::Int(4)));
-    assert_eq!((id_of(&got[4]), got[4][1].clone()), (s("proj-0"), Value::Int(0)));
+    assert_eq!(
+        (id_of(&got[0]), got[0][1].clone()),
+        (s("proj-4"), Value::Int(4))
+    );
+    assert_eq!(
+        (id_of(&got[4]), got[4][1].clone()),
+        (s("proj-0"), Value::Int(0))
+    );
 }
 
 /// Shapes that READ the chain, count it distinctly, count the null row, or

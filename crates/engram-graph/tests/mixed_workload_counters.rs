@@ -44,7 +44,10 @@ fn snb_shaped(persons: i64) -> Graph {
     }
     run(
         &g,
-        &format!("UNWIND range(0, {}) AS i CREATE (:Person {{id: i}})", persons - 1),
+        &format!(
+            "UNWIND range(0, {}) AS i CREATE (:Person {{id: i}})",
+            persons - 1
+        ),
     );
     run(
         &g,
@@ -64,7 +67,10 @@ fn census_of_a_read_heavy_mix() {
     let g = snb_shaped(2_000);
     // Warm every cache so first-touch costs are not attributed to the mix.
     run(&g, "MATCH (p:Person {id: 5}) RETURN p.id");
-    run(&g, "MATCH (m:Message)-[:HAS_CREATOR]->(p:Person {id: 5}) RETURN m.id LIMIT 25");
+    run(
+        &g,
+        "MATCH (m:Message)-[:HAS_CREATOR]->(p:Person {id: 5}) RETURN m.id LIMIT 25",
+    );
 
     const WRITES: u64 = 20;
     const READS_PER_WRITE: u64 = 19; // 5% writes
@@ -116,12 +122,18 @@ fn census_of_a_read_heavy_mix() {
 #[test]
 fn census_of_hot_key_updates_mixed_with_label_scans() {
     let g = snb_shaped(2_000);
-    run(&g, "MATCH (p:Person)-[:IS_LOCATED_IN]->(c:City) RETURN c.name, count(p) AS n");
+    run(
+        &g,
+        "MATCH (p:Person)-[:IS_LOCATED_IN]->(c:City) RETURN c.name, count(p) AS n",
+    );
 
     const ROUNDS: u64 = 20;
     let ((), trace) = engram_observe::with_trace(|| {
         for _ in 0..ROUNDS {
-            run(&g, "MATCH (p:Person {id: 0}) SET p.hits = coalesce(p.hits, 0) + 1");
+            run(
+                &g,
+                "MATCH (p:Person {id: 0}) SET p.hits = coalesce(p.hits, 0) + 1",
+            );
             run(
                 &g,
                 "MATCH (p:Person)-[:IS_LOCATED_IN]->(c:City) RETURN c.name, count(p) AS n",
@@ -135,7 +147,10 @@ fn census_of_hot_key_updates_mixed_with_label_scans() {
     for (name, n) in rows.iter().take(30) {
         eprintln!("  {n:>9}  [{:>7.1}/r]  {name}", *n as f64 / ROUNDS as f64);
     }
-    assert!(!rows.is_empty(), "no counters recorded — the census is blind");
+    assert!(
+        !rows.is_empty(),
+        "no counters recorded — the census is blind"
+    );
 }
 
 /// A richer SNB-shaped corpus for the balanced census: persons in cities,
@@ -150,8 +165,14 @@ fn snb_full(persons: i64) -> Graph {
         run_stmt(&g, &parse_any(stmt).expect("parse index"), BTreeMap::new())
             .expect("create index");
     }
-    run(&g, "UNWIND range(0, 99) AS i CREATE (:City {id: i, name: 'City' + toString(i)})");
-    run(&g, "UNWIND range(0, 49) AS i CREATE (:Tag {id: i, name: 'Tag' + toString(i)})");
+    run(
+        &g,
+        "UNWIND range(0, 99) AS i CREATE (:City {id: i, name: 'City' + toString(i)})",
+    );
+    run(
+        &g,
+        "UNWIND range(0, 49) AS i CREATE (:Tag {id: i, name: 'Tag' + toString(i)})",
+    );
     run(
         &g,
         &format!(
@@ -184,11 +205,26 @@ fn snb_full(persons: i64) -> Graph {
 
 const BALANCED_SHAPES: &[(&str, &str)] = &[
     ("is1-profile", "MATCH (p:Person {id: 7}) RETURN p.name"),
-    ("is3-friends", "MATCH (p:Person {id: 7})-[:KNOWS]-(f:Person) RETURN f.id LIMIT 25"),
-    ("ic-foaf", "MATCH (p:Person {id: 7})-[:KNOWS]-()-[:KNOWS]-(f:Person) RETURN count(DISTINCT f) AS c"),
-    ("is5-by-creator", "MATCH (m:Message)-[:HAS_CREATOR]->(p:Person {id: 7}) RETURN m.id LIMIT 25"),
-    ("agg-by-city", "MATCH (p:Person)-[:IS_LOCATED_IN]->(c:City) RETURN c.name, count(p) AS n ORDER BY n DESC LIMIT 10"),
-    ("ic6-friend-tags", "MATCH (p:Person {id: 7})-[:KNOWS]-(f:Person)<-[:HAS_CREATOR]-(m:Message) MATCH (m)-[:HAS_TAG]->(t:Tag) RETURN t.name, count(*) AS c ORDER BY c DESC LIMIT 10"),
+    (
+        "is3-friends",
+        "MATCH (p:Person {id: 7})-[:KNOWS]-(f:Person) RETURN f.id LIMIT 25",
+    ),
+    (
+        "ic-foaf",
+        "MATCH (p:Person {id: 7})-[:KNOWS]-()-[:KNOWS]-(f:Person) RETURN count(DISTINCT f) AS c",
+    ),
+    (
+        "is5-by-creator",
+        "MATCH (m:Message)-[:HAS_CREATOR]->(p:Person {id: 7}) RETURN m.id LIMIT 25",
+    ),
+    (
+        "agg-by-city",
+        "MATCH (p:Person)-[:IS_LOCATED_IN]->(c:City) RETURN c.name, count(p) AS n ORDER BY n DESC LIMIT 10",
+    ),
+    (
+        "ic6-friend-tags",
+        "MATCH (p:Person {id: 7})-[:KNOWS]-(f:Person)<-[:HAS_CREATOR]-(m:Message) MATCH (m)-[:HAS_TAG]->(t:Tag) RETURN t.name, count(*) AS c ORDER BY c DESC LIMIT 10",
+    ),
 ];
 
 /// The BALANCED census: what does each read shape cost when every read is
@@ -220,7 +256,10 @@ fn census_of_a_balanced_mix_per_shape() {
         )
     };
     const N: u64 = 30;
-    eprintln!("\n{:<18} {:>10} {:>10} {:>7}", "shape", "alone ms", "mixed ms", "ratio");
+    eprintln!(
+        "\n{:<18} {:>10} {:>10} {:>7}",
+        "shape", "alone ms", "mixed ms", "ratio"
+    );
     let mut wi = 0u64;
     for (name, q) in BALANCED_SHAPES {
         // Alone: N reads back to back.
@@ -272,7 +311,10 @@ fn census_of_a_balanced_mix_per_shape() {
             eprintln!("    {:>8.1}/pair  {k}", *v as f64 / N as f64);
         }
     }
-    assert!(wi > 0, "no writes were issued — the census compared nothing");
+    assert!(
+        wi > 0,
+        "no writes were issued — the census compared nothing"
+    );
 }
 
 /// The balanced census's headline finding, pinned: after a message insert
@@ -297,7 +339,11 @@ fn a_message_insert_leaves_the_city_aggregates_adjacency_table_serving_every_hop
         .get("graph.adjacency tables reused")
         .copied()
         .unwrap_or(0);
-    assert!(reused_alone >= 2_000, "warm: every person's hop from the table: {:?}", alone.counters());
+    assert!(
+        reused_alone >= 2_000,
+        "warm: every person's hop from the table: {:?}",
+        alone.counters()
+    );
 
     let ((), mixed) = engram_observe::with_trace(|| {
         run(
@@ -363,5 +409,8 @@ fn census_of_writes_alone() {
     for (name, n) in rows.iter().take(30) {
         eprintln!("  {n:>9}  [{:>7.1}/w]  {name}", *n as f64 / WRITES as f64);
     }
-    assert!(!rows.is_empty(), "no counters recorded — the census is blind");
+    assert!(
+        !rows.is_empty(),
+        "no counters recorded — the census is blind"
+    );
 }

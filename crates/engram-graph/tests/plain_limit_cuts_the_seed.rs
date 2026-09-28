@@ -99,12 +99,18 @@ fn a_plain_limit_over_a_lone_label_scan_reads_only_its_first_members() {
         ),
         (
             "MATCH (s:Story) WITH s SKIP toInteger($off) LIMIT 2 RETURN s.storyId AS id",
-            vec![vec![Value::Str("s-00010".into())], vec![Value::Str("s-00011".into())]],
+            vec![
+                vec![Value::Str("s-00010".into())],
+                vec![Value::Str("s-00011".into())],
+            ],
             12,
         ),
         (
             "MATCH (s:Story) WITH s LIMIT 5 RETURN properties(s) AS s",
-            rows(&Graph::new(Store::new(), Realm(1), Namespace(1)), "RETURN 1 LIMIT 0"), // placeholder, checked below
+            rows(
+                &Graph::new(Store::new(), Realm(1), Namespace(1)),
+                "RETURN 1 LIMIT 0",
+            ), // placeholder, checked below
             5,
         ),
     ] {
@@ -123,13 +129,20 @@ fn a_plain_limit_over_a_lone_label_scan_reads_only_its_first_members() {
         );
     }
     // The bare `properties(s)` page: five full records, every property.
-    let got = rows(&g, "MATCH (s:Story) WITH s LIMIT 5 RETURN properties(s) AS s");
+    let got = rows(
+        &g,
+        "MATCH (s:Story) WITH s LIMIT 5 RETURN properties(s) AS s",
+    );
     assert_eq!(got.len(), 5);
     let Value::Map(m) = &got[4][0] else {
         panic!("{:?}", got[4][0]);
     };
     assert_eq!(m.get("storyId"), Some(&Value::Str("s-00004".into())));
-    assert_eq!(m.get("content").map(|v| matches!(v, Value::Str(s) if s.len() == 4_000)), Some(true));
+    assert_eq!(
+        m.get("content")
+            .map(|v| matches!(v, Value::Str(s) if s.len() == 4_000)),
+        Some(true)
+    );
 }
 
 /// CONTROLS: an ORDER BY (a top-k, not a plain limit), an aggregate, a WHERE
@@ -144,8 +157,11 @@ fn ordered_aggregating_filtered_mapped_multi_label_hopped_and_fed_scans_are_not_
     for i in 0..3i64 {
         let mut m = BTreeMap::new();
         m.insert("storyId".to_string(), Value::Str(format!("z-{i}")));
-        let s = g.create_node(&["Story".into(), "Pinned".into()], &m).expect("pinned");
-        g.create_rel(s, "TAGGED", tag, &BTreeMap::new()).expect("rel");
+        let s = g
+            .create_node(&["Story".into(), "Pinned".into()], &m)
+            .expect("pinned");
+        g.create_rel(s, "TAGGED", tag, &BTreeMap::new())
+            .expect("rel");
     }
     for src in [
         "MATCH (s:Story) WITH s ORDER BY s.storyId DESC LIMIT 3 RETURN s.storyId AS id",

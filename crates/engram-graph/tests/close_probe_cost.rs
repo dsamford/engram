@@ -144,16 +144,20 @@ fn close_cost_isolated_and_in_fold() {
     //
     //    The pod put the difference at ~1,000 ns per leaf. If it reproduces
     //    here the mechanism can be found with a trace instead of guessed at.
-    let twopath = "MATCH (a:P)-[:KNOWS]-(c:P), (a)-[:KNOWS]->(b:P)-[:KNOWS]->(c) RETURN count(*) AS c";
+    let twopath =
+        "MATCH (a:P)-[:KNOWS]-(c:P), (a)-[:KNOWS]->(b:P)-[:KNOWS]->(c) RETURN count(*) AS c";
     let nt = count(&g, twopath);
     assert_eq!(nt, nc, "the two spellings of the close must agree");
     // The hypothesis for the pod: the two-path form MATERIALISES `c` (the fold
     // declines the close) and the close runs as a semijoin over a columnar
     // expand — which allocates a `used_rels` Vec per row. Force that shape here
     // by reading `c` outside the fold, and see whether ~1,000 ns/leaf appears.
-    let materialised =
-        "MATCH (a:P)-[:KNOWS]-(c:P), (a)-[:KNOWS]->(b:P)-[:KNOWS]->(c) WHERE c.id >= 0 RETURN count(*) AS c";
-    assert_eq!(count(&g, materialised), nc, "the materialised spelling must agree too");
+    let materialised = "MATCH (a:P)-[:KNOWS]-(c:P), (a)-[:KNOWS]->(b:P)-[:KNOWS]->(c) WHERE c.id >= 0 RETURN count(*) AS c";
+    assert_eq!(
+        count(&g, materialised),
+        nc,
+        "the materialised spelling must agree too"
+    );
 
     let rounds = 5;
     let mut best_two = f64::MAX;
@@ -224,7 +228,8 @@ fn close_cost_isolated_and_in_fold() {
     let sites = |t: &engram_observe::Trace| {
         let mut m: BTreeMap<(String, String), u64> = BTreeMap::new();
         for e in t.events() {
-            *m.entry((format!("{:?}", e.tag), e.name.clone())).or_insert(0) += 1;
+            *m.entry((format!("{:?}", e.tag), e.name.clone()))
+                .or_insert(0) += 1;
         }
         m
     };

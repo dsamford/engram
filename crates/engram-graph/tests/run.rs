@@ -46,8 +46,8 @@ fn create_then_match_returns_identical_decoded_values() {
             Value::Int(36),
             Value::Float(1.5),
             Value::Bool(true),
-            Value::List(vec![Value::Str("x".into()), Value::Str("y".into())]),
-            Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+            Value::List((vec![Value::Str("x".into()), Value::Str("y".into())]).into()),
+            Value::List((vec![Value::Int(1), Value::Int(2), Value::Int(3)]).into()),
             Value::Null,
         ],
         "every property type round-trips BYTE-IDENTICAL through the store"
@@ -68,11 +68,7 @@ fn a_mixed_int_float_array_promotes_to_doubles() {
     let r = run(&g, "MATCH (n:MX) RETURN n.v");
     assert_eq!(
         r.rows[0][0],
-        Value::List(vec![
-            Value::Float(1.0),
-            Value::Float(0.5),
-            Value::Float(2.0)
-        ])
+        Value::List((vec![Value::Float(1.0), Value::Float(0.5), Value::Float(2.0)]).into())
     );
     // Genuinely mixed still refuses.
     let q = parse_statement("CREATE (:MX {v: [1, 'a']})").expect("parses");
@@ -244,7 +240,7 @@ fn set_forms_and_null_removes() {
             Value::Int(3),
             // Token-mint order — the same rule Neo4j applies (internal token
             // id), so `labels()` is deterministic without being alphabetical.
-            Value::List(vec![Value::Str("S".into()), Value::Str("Extra".into())]),
+            Value::List((vec![Value::Str("S".into()), Value::Str("Extra".into())]).into()),
         ]
     );
     // SET to null REMOVES — and IS NULL must then hold.
@@ -266,7 +262,10 @@ fn remove_prop_and_label() {
     let r = run(&g, "MATCH (n:R1) RETURN n.x, labels(n)");
     assert_eq!(
         r.rows[0],
-        vec![Value::Null, Value::List(vec![Value::Str("R1".into())])]
+        vec![
+            Value::Null,
+            Value::List((vec![Value::Str("R1".into())]).into())
+        ]
     );
     assert!(
         run(&g, "MATCH (n:R2) RETURN n").rows.is_empty(),
@@ -312,13 +311,13 @@ fn aggregation_groups_implicitly() {
                 Value::Str("a".into()),
                 Value::Int(2),
                 Value::Int(3),
-                Value::List(vec![Value::Int(1), Value::Int(2)]),
+                Value::List((vec![Value::Int(1), Value::Int(2)]).into()),
             ],
             vec![
                 Value::Str("b".into()),
                 Value::Int(1),
                 Value::Int(30),
-                Value::List(vec![Value::Int(30)]),
+                Value::List((vec![Value::Int(30)]).into()),
             ],
         ]
     );
@@ -431,9 +430,10 @@ fn exists_count_subqueries_and_pattern_comprehensions() {
         &g,
         "MATCH (n:G {n: 'a'}) RETURN [ (n)-[:R]->(m) | m.n ] AS peers",
     );
-    let Value::List(mut peers) = r.rows[0][0].clone() else {
+    let Value::List(peers) = r.rows[0][0].clone() else {
         panic!()
     };
+    let mut peers = peers.as_ref().clone();
     peers.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
     assert_eq!(peers, vec![Value::Str("b".into()), Value::Str("d".into())]);
 }
@@ -522,7 +522,7 @@ fn graph_functions_and_identity() {
     assert_eq!(
         r.rows[0],
         vec![
-            Value::List(vec![Value::Str("I".into())]),
+            Value::List((vec![Value::Str("I".into())]).into()),
             Value::Str("T".into()),
             Value::Bool(true),
             Value::Bool(false),
@@ -541,8 +541,8 @@ fn procedures_refuse_BY_NAME() {
     // introspection procedures — see tests/introspection_procedures.rs). The
     // property under test is unchanged: an unsupported procedure refuses and
     // the refusal NAMES it.
-    let q = parse_statement("CALL db.schema.visualization() YIELD nodes RETURN nodes")
-        .expect("parses");
+    let q =
+        parse_statement("CALL db.schema.visualization() YIELD nodes RETURN nodes").expect("parses");
     match run_query(&g, &q, BTreeMap::new()) {
         Err(RunError::Unsupported(what)) => assert!(what.contains("db.schema.visualization")),
         other => panic!("expected the named refusal, got {other:?}"),
@@ -1694,7 +1694,7 @@ fn streaming_folds_match_the_reference_fold_on_every_function() {
             Value::Float(2.0),
             Value::Int(1),
             Value::Int(3),
-            Value::List(vec![Value::Int(3), Value::Int(1), Value::Int(2)]),
+            Value::List((vec![Value::Int(3), Value::Int(1), Value::Int(2)]).into()),
         ]]
     );
     let r = run(
@@ -1710,7 +1710,7 @@ fn streaming_folds_match_the_reference_fold_on_every_function() {
             Value::Null,
             Value::Null,
             Value::Null,
-            Value::List(vec![]),
+            Value::List((vec![]).into()),
         ]]
     );
     // Float first: the representative flips, and so does the sum's type.
@@ -2286,11 +2286,17 @@ fn the_hash_index_joins_every_type_exactly_as_the_where_would() {
         vec![
             vec![
                 Value::Int(1),
-                Value::List(vec![Value::Str("x".into()), Value::Str("w".into())])
+                Value::List((vec![Value::Str("x".into()), Value::Str("w".into())]).into())
             ],
-            vec![Value::Int(2), Value::List(vec![Value::Str("y".into())])],
-            vec![Value::Int(3), Value::List(vec![Value::Str("z".into())])],
-            vec![Value::Int(4), Value::List(vec![])],
+            vec![
+                Value::Int(2),
+                Value::List((vec![Value::Str("y".into())]).into())
+            ],
+            vec![
+                Value::Int(3),
+                Value::List((vec![Value::Str("z".into())]).into())
+            ],
+            vec![Value::Int(4), Value::List((vec![]).into())],
         ],
         "1 meets 1.0 and 1; 2.0 meets 2; lists unify elementwise; a missing key joins nothing"
     );
@@ -2307,10 +2313,19 @@ fn the_hash_index_joins_every_type_exactly_as_the_where_would() {
     assert_eq!(
         r.rows,
         vec![
-            vec![Value::Int(1), Value::List(vec![Value::Str("x".into())])],
-            vec![Value::Int(2), Value::List(vec![Value::Str("y".into())])],
-            vec![Value::Int(3), Value::List(vec![Value::Str("z".into())])],
-            vec![Value::Int(4), Value::List(vec![])],
+            vec![
+                Value::Int(1),
+                Value::List((vec![Value::Str("x".into())]).into())
+            ],
+            vec![
+                Value::Int(2),
+                Value::List((vec![Value::Str("y".into())]).into())
+            ],
+            vec![
+                Value::Int(3),
+                Value::List((vec![Value::Str("z".into())]).into())
+            ],
+            vec![Value::Int(4), Value::List((vec![]).into())],
         ]
     );
     // NaN never joins, from either side.
@@ -2326,7 +2341,7 @@ fn the_hash_index_joins_every_type_exactly_as_the_where_would() {
         &g,
         "MATCH (o:HJO {i: 5}) OPTIONAL MATCH (i:HJI) WHERE i.k = o.k RETURN collect(i.n)",
     );
-    assert_eq!(r.rows, vec![vec![Value::List(vec![])]]);
+    assert_eq!(r.rows, vec![vec![Value::List((vec![]).into())]]);
 }
 
 #[test]
@@ -2730,6 +2745,9 @@ fn the_columnar_rel_scan_answers_exactly_what_the_general_path_answers() {
         "MATCH ()-[r:NEVER]->() RETURN count(r) AS c",
         "MATCH ()-[r:SUP]->() WHERE r.w > 100 RETURN r.source AS s, count(*) AS c",
         "MATCH ()-[r:SUP]->() RETURN count(DISTINCT r.source) AS srcs, sum(r.w) AS total, count(r.status) AS withStatus",
+        // Fix 86: a DISTINCT over the relationship ITSELF is a star count —
+        // a directed single hop yields each relationship exactly once.
+        "MATCH ()-[r:SUP]->() RETURN count(r) AS c, count(DISTINCT r) AS d",
         "MATCH ()-[r:OTH]->() WHERE type(r) = 'OTH' AND r.w IN [5, 6] RETURN count(r) AS c",
         // `id(r)` binds from the walk (fix 46): the member IS the id.
         "MATCH ()-[r:SUP]->() RETURN max(id(r)) AS m, min(id(r)) AS lo, count(r) AS c",
@@ -2777,8 +2795,8 @@ fn the_columnar_rel_scan_answers_exactly_what_the_general_path_answers() {
         ]
     );
     // Declines: undirected (each relationship twice), a labelled or named
-    // end, the relationship itself, its endpoints, variable length, a
-    // DISTINCT over the relationship.
+    // end, the relationship itself, its endpoints, variable length. (A
+    // DISTINCT over the relationship declined until fix 86 starred it.)
     for q in [
         "MATCH ()-[r:SUP]-() RETURN count(r) AS c",
         "MATCH (:RS)-[r:SUP]->() RETURN count(r) AS c",
@@ -2786,7 +2804,6 @@ fn the_columnar_rel_scan_answers_exactly_what_the_general_path_answers() {
         "MATCH ()-[r:SUP]->() RETURN collect(r) AS rs",
         "MATCH ()-[r:SUP]->() RETURN count(startNode(r)) AS c",
         "MATCH ()-[r:SUP*1..2]->() RETURN count(r) AS c",
-        "MATCH ()-[r:SUP]->() RETURN count(r) AS c, count(DISTINCT r) AS d",
     ] {
         let (_, t) = engram_observe::with_trace(|| run(&g, q));
         assert_eq!(
@@ -4018,13 +4035,16 @@ fn a_columnar_continuation_folds_the_next_with_without_rows() {
     // the CREATE ran twice: a and c have degree 4, b and d 2, z 0.
     assert_eq!(
         r.rows,
-        vec![vec![Value::List(vec![
-            Value::Int(0),
-            Value::Int(2),
-            Value::Int(2),
-            Value::Int(4),
-            Value::Int(4)
-        ])]]
+        vec![vec![Value::List(
+            (vec![
+                Value::Int(0),
+                Value::Int(2),
+                Value::Int(2),
+                Value::Int(4),
+                Value::Int(4)
+            ])
+            .into()
+        )]]
     );
     assert!(
         t.sometimes_hit()
@@ -4555,7 +4575,13 @@ fn an_identity_equality_in_the_where_is_one_get() {
             "UNWIND $ids AS eid MATCH (n) WHERE elementId(n) = eid RETURN n.i AS i ORDER BY i",
             p(
                 "ids",
-                Value::List(eids.iter().cloned().map(Value::Str).collect()),
+                Value::List(
+                    eids.iter()
+                        .cloned()
+                        .map(Value::Str)
+                        .collect::<Vec<_>>()
+                        .into(),
+                ),
             ),
             vec![
                 vec![Value::Int(7)],

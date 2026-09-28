@@ -178,15 +178,25 @@ fn gpop_interleaved_bare() -> (Graph, engram_store::Store) {
 fn population_scan_interleaved_bare_skips_the_walk_and_gathers() {
     let (g, _store) = gpop_interleaved_bare();
     let (on, off) = both(&g, POP_SRC);
-    assert_eq!(on, off, "interleaved full-population scan vs general disagree");
+    assert_eq!(
+        on, off,
+        "interleaved full-population scan vs general disagree"
+    );
     assert_eq!(on, vec![vec![i(200)], vec![i(900)]], "exact rows + order");
-    assert!(population_scan_fired(&g, POP_SRC), "the scan must FIRE via the gather");
+    assert!(
+        population_scan_fired(&g, POP_SRC),
+        "the scan must FIRE via the gather"
+    );
     assert!(
         counter(&g, POP_SRC, "graph.column point-gather") > 0,
         "a span of 5,002 rows for 2 members must gather"
     );
     assert!(
-        counter(&g, POP_SRC, "interp.columnar column read skipped the span walk for a sparse label") > 0,
+        counter(
+            &g,
+            POP_SRC,
+            "interp.columnar column read skipped the span walk for a sparse label"
+        ) > 0,
         "and the walk must be SKIPPED, not started and abandoned"
     );
     assert_eq!(
@@ -208,7 +218,10 @@ fn population_presence_read_over_a_sparse_label_gathers() {
     let (on, off) = both(&g, SRC);
     assert_eq!(on, off, "presence count columnar vs general disagree");
     assert_eq!(on, vec![vec![i(2)]], "both forums carry val");
-    assert!(population_scan_fired(&g, SRC), "the columnar stage must FIRE");
+    assert!(
+        population_scan_fired(&g, SRC),
+        "the columnar stage must FIRE"
+    );
     assert!(
         counter(&g, SRC, "graph.column presence point-gather") > 0,
         "the presence column must be gathered, not declined to the general path"
@@ -236,9 +249,15 @@ fn population_scan_interleaved_bare_declines_on_rows_visited_and_gathers() {
     let (g, _store) = gpop_interleaved_bare();
     g.set_columnar_column_budget_factor(500);
     let (on, off) = both(&g, POP_SRC);
-    assert_eq!(on, off, "interleaved full-population scan vs general disagree");
+    assert_eq!(
+        on, off,
+        "interleaved full-population scan vs general disagree"
+    );
     assert_eq!(on, vec![vec![i(200)], vec![i(900)]], "exact rows + order");
-    assert!(population_scan_fired(&g, POP_SRC), "the scan must FIRE via the gather");
+    assert!(
+        population_scan_fired(&g, POP_SRC),
+        "the scan must FIRE via the gather"
+    );
     assert!(
         counter(&g, POP_SRC, "graph.column point-gather") > 0,
         "a span of 5,002 rows for a budget of 1,000 must decline the walk and gather"
@@ -248,7 +267,11 @@ fn population_scan_interleaved_bare_declines_on_rows_visited_and_gathers() {
         "and the decline must be the VISIT budget, not the hit budget"
     );
     assert_eq!(
-        counter(&g, POP_SRC, "interp.columnar column read skipped the span walk for a sparse label"),
+        counter(
+            &g,
+            POP_SRC,
+            "interp.columnar column read skipped the span walk for a sparse label"
+        ),
         0,
         "inside eight budgets the pre-check stays out of it"
     );
@@ -263,10 +286,8 @@ fn population_scan_interleaved_bare_on_a_paged_store_stops_fetching_at_the_budge
     let (resident, store) = gpop_interleaved_bare();
     let want = rows(&resident, POP_SRC, BTreeMap::new());
     drop(resident);
-    let dir = std::env::temp_dir().join(format!(
-        "engram_sparse_gather_paged_{}",
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("engram_sparse_gather_paged_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("mkdir");
     // A cache smaller than the span, so blocks a walk crosses are preads.
     let _cache = store.into_paged(&dir, 16 * 1024).expect("into_paged");
@@ -293,7 +314,10 @@ fn population_scan_interleaved_bare_on_a_paged_store_stops_fetching_at_the_budge
     // and crosses every block — the cost this fix removes.
     let (walked, many) = preads_of(1 << 20);
     assert_eq!(walked, want, "the whole-span walk still agrees");
-    assert!(many >= 8, "fixture: the span must cover many blocks ({many})");
+    assert!(
+        many >= 8,
+        "fixture: the span must cover many blocks ({many})"
+    );
     assert!(
         few * 4 < many,
         "the budgeted read must fetch a fraction of the span: {few} preads vs {many}"
@@ -324,7 +348,8 @@ fn population_scan_gathers_every_declined_column_in_one_record_pass() {
         g.create_node(&["Filler".into()], &m).expect("node");
     }
     let _f1 = forum(900, "beta");
-    const SRC: &str = "MATCH (f:Forum) WHERE f.val > 100 RETURN f.val AS v, f.name AS name ORDER BY v";
+    const SRC: &str =
+        "MATCH (f:Forum) WHERE f.val > 100 RETURN f.val AS v, f.name AS name ORDER BY v";
     let (on, off) = both(&g, SRC);
     assert_eq!(on, off, "two-column interleaved scan vs general disagree");
     assert_eq!(
@@ -334,7 +359,10 @@ fn population_scan_gathers_every_declined_column_in_one_record_pass() {
             vec![i(900), Value::Str("beta".into())]
         ]
     );
-    assert!(population_scan_fired(&g, SRC), "the scan must FIRE via the gather");
+    assert!(
+        population_scan_fired(&g, SRC),
+        "the scan must FIRE via the gather"
+    );
     // A filtered projection is TWO-PHASE — the predicate's column over the
     // population, then the items' columns over the survivors — so the bound
     // is one gather per phase, never one per column (three, before).

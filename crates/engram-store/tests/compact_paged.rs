@@ -62,16 +62,24 @@ impl Drop for TmpDir {
 /// shapes retention has to decide about.
 fn build(s: &Store) {
     for i in 0..600u32 {
-        s.put(&pfx(), &i.to_be_bytes(), StoredValue::Plain(vec![1, (i % 251) as u8]))
-            .expect("put");
+        s.put(
+            &pfx(),
+            &i.to_be_bytes(),
+            StoredValue::Plain(vec![1, (i % 251) as u8]),
+        )
+        .expect("put");
         if i % 50 == 0 {
             s.seal();
         }
     }
     // Overwrite a third: multi-version chains.
     for i in (0..600u32).step_by(3) {
-        s.put(&pfx(), &i.to_be_bytes(), StoredValue::Plain(vec![2, (i % 251) as u8]))
-            .expect("overwrite");
+        s.put(
+            &pfx(),
+            &i.to_be_bytes(),
+            StoredValue::Plain(vec![2, (i % 251) as u8]),
+        )
+        .expect("overwrite");
     }
     s.seal();
     // Delete a quarter: tombstones, some over multi-version chains.
@@ -252,10 +260,14 @@ fn a_compaction_unlinks_the_segments_it_merged() {
         v
     };
     let before = seg_files();
-    assert!(before.len() > 1, "the fixture must spill several segments: {before:?}");
+    assert!(
+        before.len() > 1,
+        "the fixture must spill several segments: {before:?}"
+    );
     let want = full_scan(&s);
     let ((retired, _), trace) = engram_observe::with_trace(|| {
-        s.compact_paged_to_dir(dir.path(), &cache).expect("compaction")
+        s.compact_paged_to_dir(dir.path(), &cache)
+            .expect("compaction")
     });
     assert!(retired > 0, "the fixture must retire something");
     let after = seg_files();
@@ -280,5 +292,9 @@ fn a_compaction_unlinks_the_segments_it_merged() {
         before.len(),
         "each input unlinked exactly once"
     );
-    assert_eq!(full_scan(&s), want, "and the store still answers from the merged file");
+    assert_eq!(
+        full_scan(&s),
+        want,
+        "and the store still answers from the merged file"
+    );
 }

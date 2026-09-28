@@ -426,15 +426,13 @@ fn one_phase(plan: &[Step], mode: Mode, batch: usize, bulk: bool, limit: u64) ->
                 }
                 // Label sizes are read AFTER the group so a seek's cost can be
                 // read against the label it actually seeks in.
-                let size = |l: &str| {
-                    match run(&g, &format!("MATCH (n:{l}) RETURN count(n)"))
-                        .rows
-                        .first()
-                        .and_then(|r| r.first())
-                    {
-                        Some(Value::Int(n)) => *n as u64,
-                        _ => 0,
-                    }
+                let size = |l: &str| match run(&g, &format!("MATCH (n:{l}) RETURN count(n)"))
+                    .rows
+                    .first()
+                    .and_then(|r| r.first())
+                {
+                    Some(Value::Int(n)) => *n as u64,
+                    _ => 0,
                 };
                 per_group.push((
                     format!("{} {}->{}", grp.rel_type, grp.src_label, grp.dst_label),
@@ -487,10 +485,7 @@ fn rel_ingest_attribution() {
 
     let t = Instant::now();
     let plan = read_plan(&plan_path);
-    let groups = plan
-        .iter()
-        .filter(|s| matches!(s, Step::Group(_)))
-        .count();
+    let groups = plan.iter().filter(|s| matches!(s, Step::Group(_))).count();
     let pairs: usize = plan
         .iter()
         .map(|s| match s {
@@ -542,7 +537,10 @@ fn rel_ingest_attribution() {
 
     // Per-group operation table, from the traced statement of each group.
     for p in &phases {
-        eprintln!("[relattrib] --- {} per-relationship operations", p.mode.name());
+        eprintln!(
+            "[relattrib] --- {} per-relationship operations",
+            p.mode.name()
+        );
         let mut totals: BTreeMap<&'static str, u64> = BTreeMap::new();
         let mut traced_rels = 0u64;
         for (name, n, t) in &p.traced {
@@ -556,9 +554,7 @@ fn rel_ingest_attribution() {
                 .collect();
             eprintln!("[relattrib]   {name:<34} n={n:<4} {}", compact.join(" "));
         }
-        eprintln!(
-            "[relattrib]   == over {traced_rels} traced rel(s), per relationship:"
-        );
+        eprintln!("[relattrib]   == over {traced_rels} traced rel(s), per relationship:");
         for (k, v) in &totals {
             eprintln!(
                 "[relattrib]      {:>10.3}  {k}",

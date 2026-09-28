@@ -1,9 +1,7 @@
 #![allow(non_snake_case)]
 //! The clause grammar — corpus-shaped statements parsed to inspectable ASTs.
 
-use engram_cypher::{
-    Clause, Expr, ParseError, Query, RelDir, SetItem, SubqueryBody, VarLength, parse_statement,
-};
+use engram_cypher::{Clause, Expr, ParseError, Query, RelDir, SetItem, Shortest, SubqueryBody, VarLength, parse_statement};
 
 fn single(src: &str) -> Vec<Clause> {
     match parse_statement(src).unwrap_or_else(|e| panic!("parse `{src}`: {e}")) {
@@ -141,7 +139,11 @@ fn the_one_shortest_path_shape_in_the_corpus() {
     };
     let path = &pattern.paths[0];
     assert_eq!(path.var.as_deref(), Some("p"));
-    assert!(path.shortest);
+    assert_eq!(
+        path.shortest,
+        Some(Shortest::One),
+        "`shortestPath` parses as the ONE selector; `allShortestPaths` is `All`",
+    );
     assert_eq!(
         path.hops[0].0.length,
         Some(VarLength {
@@ -458,7 +460,11 @@ fn with_where_before_order_by_desugars_to_a_star_with_carrying_the_tail() {
     assert_eq!(proj.items.len(), 2);
     assert!(where_.is_some(), "the filter stays on the projecting WITH");
     assert!(proj.order.is_empty() && proj.skip.is_none() && proj.limit.is_none());
-    let Clause::With { proj: tail, where_: None } = &clauses[2] else {
+    let Clause::With {
+        proj: tail,
+        where_: None,
+    } = &clauses[2]
+    else {
         panic!("{:?}", clauses[2])
     };
     assert!(tail.star && tail.items.is_empty() && !tail.distinct);
@@ -472,7 +478,11 @@ fn with_where_before_order_by_desugars_to_a_star_with_carrying_the_tail() {
 fn with_where_before_order_by_keeps_distinct_and_works_with_limit_alone() {
     let clauses = single("UNWIND [3, 1, 2, 3] AS v WITH DISTINCT v WHERE v > 1 LIMIT 5 RETURN v");
     assert_eq!(clauses.len(), 4);
-    let Clause::With { proj, where_: Some(_) } = &clauses[1] else {
+    let Clause::With {
+        proj,
+        where_: Some(_),
+    } = &clauses[1]
+    else {
         panic!()
     };
     assert!(proj.distinct);
@@ -485,13 +495,21 @@ fn with_where_before_order_by_keeps_distinct_and_works_with_limit_alone() {
 #[test]
 fn the_canonical_with_order_is_untouched_and_a_second_where_is_refused() {
     // ORDER BY before WHERE: one clause, exactly as before.
-    let clauses = single("UNWIND [1, 2, 3] AS v WITH v ORDER BY v DESC LIMIT 2 WHERE v < 4 RETURN v");
+    let clauses =
+        single("UNWIND [1, 2, 3] AS v WITH v ORDER BY v DESC LIMIT 2 WHERE v < 4 RETURN v");
     assert_eq!(clauses.len(), 3);
-    let Clause::With { proj, where_: Some(_) } = &clauses[1] else {
+    let Clause::With {
+        proj,
+        where_: Some(_),
+    } = &clauses[1]
+    else {
         panic!()
     };
     assert_eq!(proj.order.len(), 1);
     assert!(proj.limit.is_some());
     // WHERE … ORDER BY … WHERE: Neo4j refuses the second WHERE; so does this parser.
-    assert!(parse_statement("UNWIND [1, 2, 3] AS v WITH v WHERE v > 1 ORDER BY v WHERE v < 3 RETURN v").is_err());
+    assert!(
+        parse_statement("UNWIND [1, 2, 3] AS v WITH v WHERE v > 1 ORDER BY v WHERE v < 3 RETURN v")
+            .is_err()
+    );
 }

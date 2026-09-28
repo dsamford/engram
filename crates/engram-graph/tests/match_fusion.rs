@@ -23,7 +23,10 @@ fn corpus() -> Graph {
     )
     .unwrap();
     run(&g, "UNWIND range(0, 99) AS i CREATE (:Person {id: i})");
-    run(&g, "UNWIND range(0, 19) AS i CREATE (:Tag {id: i, name: 'tag' + toString(i)})");
+    run(
+        &g,
+        "UNWIND range(0, 19) AS i CREATE (:Tag {id: i, name: 'tag' + toString(i)})",
+    );
     run(
         &g,
         "MATCH (a:Person), (b:Person) \
@@ -122,7 +125,10 @@ fn the_fused_ic6_shape_actually_runs_the_pipeline() {
         "fusion must fire: {c:?}"
     );
     assert!(
-        c.get("interp.pipeline aggregate runs").copied().unwrap_or(0) > 0,
+        c.get("interp.pipeline aggregate runs")
+            .copied()
+            .unwrap_or(0)
+            > 0,
         "the fused shape must run the PIPELINE, not stream: {c:?}"
     );
 }

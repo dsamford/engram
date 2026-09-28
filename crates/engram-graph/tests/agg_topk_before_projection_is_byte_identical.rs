@@ -104,9 +104,15 @@ const CHAIN: &str = "MATCH (p:P {id: 0})-[:HAS_M]->(m:M) MATCH (m)-[:HAS_TAG]->(
 #[test]
 fn ties_resolve_in_first_seen_order_desc() {
     let g = fixture();
-    let (on, off) = both(&g, &format!("{CHAIN} RETURN t.name AS name, count(*) AS c ORDER BY c DESC LIMIT 5"));
+    let (on, off) = both(
+        &g,
+        &format!("{CHAIN} RETURN t.name AS name, count(*) AS c ORDER BY c DESC LIMIT 5"),
+    );
     assert_eq!(on.len(), 5);
-    assert_eq!(on, off, "top-5 under dense ties must match the full sort's tie order");
+    assert_eq!(
+        on, off,
+        "top-5 under dense ties must match the full sort's tie order"
+    );
     // Every survivor carries the maximal count (7) — the key was honoured.
     for r in &on {
         assert_eq!(r[1], Value::Int(7), "{r:?}");
@@ -116,7 +122,10 @@ fn ties_resolve_in_first_seen_order_desc() {
 #[test]
 fn ascending_keys_select_the_smallest() {
     let g = fixture();
-    let (on, off) = both(&g, &format!("{CHAIN} RETURN t.name AS name, count(*) AS c ORDER BY c ASC LIMIT 4"));
+    let (on, off) = both(
+        &g,
+        &format!("{CHAIN} RETURN t.name AS name, count(*) AS c ORDER BY c ASC LIMIT 4"),
+    );
     assert_eq!(on, off);
     for r in &on {
         assert_eq!(r[1], Value::Int(1));
@@ -126,7 +135,10 @@ fn ascending_keys_select_the_smallest() {
 #[test]
 fn skip_counts_toward_the_survivor_set() {
     let g = fixture();
-    let (on, off) = both(&g, &format!("{CHAIN} RETURN t.name AS name, count(*) AS c ORDER BY c DESC SKIP 37 LIMIT 6"));
+    let (on, off) = both(
+        &g,
+        &format!("{CHAIN} RETURN t.name AS name, count(*) AS c ORDER BY c DESC SKIP 37 LIMIT 6"),
+    );
     // 40 groups carry count 7 (ids 6, 13, …); skipping 37 leaves 3 of them,
     // then the 6-count level starts — a survivor set of `limit` alone would
     // have cut this short.
@@ -139,7 +151,10 @@ fn skip_counts_toward_the_survivor_set() {
 #[test]
 fn a_node_group_key_projects_only_the_survivors_identically() {
     let g = fixture();
-    let (on, off) = both(&g, &format!("{CHAIN} RETURN t, count(*) AS c ORDER BY c DESC LIMIT 3"));
+    let (on, off) = both(
+        &g,
+        &format!("{CHAIN} RETURN t, count(*) AS c ORDER BY c DESC LIMIT 3"),
+    );
     assert_eq!(on, off);
     assert_eq!(on.len(), 3);
 }
@@ -149,7 +164,10 @@ fn a_group_key_property_in_order_by_declines_and_still_answers() {
     let g = fixture();
     // `t.name` is not an aggregate: the mechanism must decline, the general
     // path answers, and the lever is invisible either way.
-    let (on, off) = both(&g, &format!("{CHAIN} RETURN t.name AS name, count(*) AS c ORDER BY name ASC LIMIT 3"));
+    let (on, off) = both(
+        &g,
+        &format!("{CHAIN} RETURN t.name AS name, count(*) AS c ORDER BY name ASC LIMIT 3"),
+    );
     assert_eq!(on, off);
     assert_eq!(on[0][0], Value::Str("tag000".into()));
 }
@@ -157,7 +175,10 @@ fn a_group_key_property_in_order_by_declines_and_still_answers() {
 #[test]
 fn a_limit_that_does_not_shrink_the_set_is_identical() {
     let g = fixture();
-    let (on, off) = both(&g, &format!("{CHAIN} RETURN t.name AS name, count(*) AS c ORDER BY c DESC LIMIT 1000"));
+    let (on, off) = both(
+        &g,
+        &format!("{CHAIN} RETURN t.name AS name, count(*) AS c ORDER BY c DESC LIMIT 1000"),
+    );
     assert_eq!(on.len() as i64, TAGS);
     assert_eq!(on, off);
 }

@@ -50,7 +50,9 @@ fn race(create_commits_first: bool) {
         (delete, create)
     };
     g.commit_owned(first).expect("the first commit wins");
-    let e = g.commit_owned(second).expect_err("the second must conflict");
+    let e = g
+        .commit_owned(second)
+        .expect_err("the second must conflict");
     assert!(
         matches!(e, GraphError::TxnConflict),
         "expected TxnConflict, got {e:?}"
@@ -77,11 +79,21 @@ fn a_rel_create_and_a_node_delete_conflict_when_the_delete_commits_first() {
 #[test]
 fn distinct_endpoint_creates_do_not_conflict_with_each_other() {
     let g = Graph::new(Store::new(), Realm(1), Namespace(1));
-    run(&g, "CREATE (:Hub {id: 1}), (:Hub {id: 2}), (:Sat {id: 3}), (:Sat {id: 4})");
-    let a = buffered(&g, "MATCH (h:Hub {id: 1}), (s:Sat {id: 3}) CREATE (s)-[:R]->(h)");
-    let b = buffered(&g, "MATCH (h:Hub {id: 2}), (s:Sat {id: 4}) CREATE (s)-[:R]->(h)");
+    run(
+        &g,
+        "CREATE (:Hub {id: 1}), (:Hub {id: 2}), (:Sat {id: 3}), (:Sat {id: 4})",
+    );
+    let a = buffered(
+        &g,
+        "MATCH (h:Hub {id: 1}), (s:Sat {id: 3}) CREATE (s)-[:R]->(h)",
+    );
+    let b = buffered(
+        &g,
+        "MATCH (h:Hub {id: 2}), (s:Sat {id: 4}) CREATE (s)-[:R]->(h)",
+    );
     g.commit_owned(a).expect("disjoint endpoints");
-    g.commit_owned(b).expect("disjoint endpoints do not serialise");
+    g.commit_owned(b)
+        .expect("disjoint endpoints do not serialise");
     assert_eq!(rows(&g, "MATCH ()-[r:R]->() RETURN id(r)"), 2);
 }
 
@@ -94,8 +106,14 @@ fn two_creates_sharing_an_endpoint_no_longer_abort_each_other() {
     // with no re-run at all.
     let g = Graph::new(Store::new(), Realm(1), Namespace(1));
     run(&g, "CREATE (:Hub {id: 1}), (:Sat {id: 2}), (:Sat {id: 3})");
-    let a = buffered(&g, "MATCH (h:Hub {id: 1}), (s:Sat {id: 2}) CREATE (s)-[:R]->(h)");
-    let b = buffered(&g, "MATCH (h:Hub {id: 1}), (s:Sat {id: 3}) CREATE (s)-[:R]->(h)");
+    let a = buffered(
+        &g,
+        "MATCH (h:Hub {id: 1}), (s:Sat {id: 2}) CREATE (s)-[:R]->(h)",
+    );
+    let b = buffered(
+        &g,
+        "MATCH (h:Hub {id: 1}), (s:Sat {id: 3}) CREATE (s)-[:R]->(h)",
+    );
     g.commit_owned(a).expect("first hub write");
     g.commit_owned(b)
         .expect("a second write to the same endpoint is not a conflict");
@@ -111,14 +129,23 @@ fn with_the_exemption_off_two_creates_still_serialise() {
     let g = Graph::new(Store::new(), Realm(1), Namespace(1));
     g.set_guard_put_put_exempt(false);
     run(&g, "CREATE (:Hub {id: 1}), (:Sat {id: 2}), (:Sat {id: 3})");
-    let a = buffered(&g, "MATCH (h:Hub {id: 1}), (s:Sat {id: 2}) CREATE (s)-[:R]->(h)");
-    let b = buffered(&g, "MATCH (h:Hub {id: 1}), (s:Sat {id: 3}) CREATE (s)-[:R]->(h)");
+    let a = buffered(
+        &g,
+        "MATCH (h:Hub {id: 1}), (s:Sat {id: 2}) CREATE (s)-[:R]->(h)",
+    );
+    let b = buffered(
+        &g,
+        "MATCH (h:Hub {id: 1}), (s:Sat {id: 3}) CREATE (s)-[:R]->(h)",
+    );
     g.commit_owned(a).expect("first hub write");
     let e = g
         .commit_owned(b)
         .expect_err("with the exemption off, a shared endpoint conflicts");
     assert!(matches!(e, GraphError::TxnConflict));
-    let retry = buffered(&g, "MATCH (h:Hub {id: 1}), (s:Sat {id: 3}) CREATE (s)-[:R]->(h)");
+    let retry = buffered(
+        &g,
+        "MATCH (h:Hub {id: 1}), (s:Sat {id: 3}) CREATE (s)-[:R]->(h)",
+    );
     g.commit_owned(retry).expect("the re-run lands");
     assert_eq!(rows(&g, "MATCH (:Hub {id: 1})<-[r:R]-() RETURN id(r)"), 2);
     assert_eq!(g.verify_rel_endpoints().expect("fsck"), Vec::<u64>::new());
@@ -133,7 +160,9 @@ fn rel_delete_also_moves_both_guards() {
     let del_rel = buffered(&g, "MATCH (:Sat {id: 2})-[r:R]->(:Hub {id: 1}) DELETE r");
     let del_hub = buffered(&g, "MATCH (h:Hub {id: 1}) DETACH DELETE h");
     g.commit_owned(del_rel).expect("rel delete commits");
-    let e = g.commit_owned(del_hub).expect_err("the node delete must re-run");
+    let e = g
+        .commit_owned(del_hub)
+        .expect_err("the node delete must re-run");
     assert!(matches!(e, GraphError::TxnConflict));
     let retry = buffered(&g, "MATCH (h:Hub {id: 1}) DETACH DELETE h");
     g.commit_owned(retry).expect("re-run on fresh state");

@@ -135,7 +135,8 @@ fn paged_query_results_equal_resident() {
 
 #[test]
 fn persisted_index_is_loaded_at_open_and_served_without_rebuild() {
-    // INDEX-AT-SEAL: an index persisted next to the segments (`idx-<token>.idx`)
+    // INDEX-AT-SEAL: an index persisted next to the segments
+    // (`idx-<realm><ns>-<token>.idx`)
     // is loaded when the store is reopened and served to the first query WITHOUT
     // a rebuild — while remaining byte-identical to the from-scratch answer.
     let (store, realm, ns) = build_resident();

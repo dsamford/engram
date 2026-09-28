@@ -195,7 +195,9 @@ fn run_export(doc: &BTreeMap<String, Value>) -> (Tally, Vec<String>) {
                 // `canon_list` (which sorts) applies only to nested collect()
                 // columns — mirror the engram side (below) exactly.
                 let v = match row {
-                    Value::List(cols) => Value::List(cols.iter().map(canon_incumbent).collect()),
+                    Value::List(cols) => {
+                        Value::List(cols.iter().map(canon_incumbent).collect::<Vec<_>>().into())
+                    }
                     other => canon_incumbent(other),
                 };
                 (json::to_json(&v), v)
@@ -205,7 +207,7 @@ fn run_export(doc: &BTreeMap<String, Value>) -> (Tally, Vec<String>) {
             .rows
             .iter()
             .map(|row| {
-                let v = Value::List(row.iter().map(canon_engram).collect());
+                let v = Value::List(row.iter().map(canon_engram).collect::<Vec<_>>().into());
                 (json::to_json(&v), v)
             })
             .collect();
@@ -390,7 +392,14 @@ fn main() {
     );
     rep.insert(
         "diverged".to_string(),
-        Value::List(t.diverged.iter().cloned().map(Value::Str).collect()),
+        Value::List(
+            t.diverged
+                .iter()
+                .cloned()
+                .map(Value::Str)
+                .collect::<Vec<_>>()
+                .into(),
+        ),
     );
     rep.insert(
         "engram_parse_errors".to_string(),
@@ -399,12 +408,20 @@ fn main() {
                 .iter()
                 .cloned()
                 .map(Value::Str)
-                .collect(),
+                .collect::<Vec<_>>()
+                .into(),
         ),
     );
     rep.insert(
         "engram_run_errors".to_string(),
-        Value::List(t.engram_run_error.iter().cloned().map(Value::Str).collect()),
+        Value::List(
+            t.engram_run_error
+                .iter()
+                .cloned()
+                .map(Value::Str)
+                .collect::<Vec<_>>()
+                .into(),
+        ),
     );
     rep.insert("neo4j_errors".to_string(), Value::Int(t.neo4j_error as i64));
     rep.insert(
@@ -421,7 +438,14 @@ fn main() {
     );
     rep.insert(
         "divergence_details".to_string(),
-        Value::List(details.iter().cloned().map(Value::Str).collect()),
+        Value::List(
+            details
+                .iter()
+                .cloned()
+                .map(Value::Str)
+                .collect::<Vec<_>>()
+                .into(),
+        ),
     );
     std::fs::write(&out_path, json::to_json(&Value::Map(rep))).expect("write report");
     eprintln!("[decoded] report written to {out_path}");

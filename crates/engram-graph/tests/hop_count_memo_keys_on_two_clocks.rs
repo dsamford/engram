@@ -134,11 +134,17 @@ fn the_lever_changes_cost_and_not_answers() {
     let g = fixture();
     g.set_hop_count_memo(true);
     let (on, on_trace) = engram_observe::with_trace(|| {
-        (hop(&g, "P", Dir::Out, "T", &[]), hop(&g, "P", Dir::Out, "T", &[]))
+        (
+            hop(&g, "P", Dir::Out, "T", &[]),
+            hop(&g, "P", Dir::Out, "T", &[]),
+        )
     });
     g.set_hop_count_memo(false);
     let (off, off_trace) = engram_observe::with_trace(|| {
-        (hop(&g, "P", Dir::Out, "T", &[]), hop(&g, "P", Dir::Out, "T", &[]))
+        (
+            hop(&g, "P", Dir::Out, "T", &[]),
+            hop(&g, "P", Dir::Out, "T", &[]),
+        )
     });
     g.set_hop_count_memo(true);
     assert_eq!(on, off, "the memo must be invisible in the answers");

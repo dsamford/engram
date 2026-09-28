@@ -261,18 +261,17 @@ fn agg2_global_aggregate() {
         "MATCH (a:Ag)-[:R]->(b:Bg) RETURN count(*) AS c, sum(b.bk) AS s, avg(b.bk) AS a, collect(b.bk) AS l",
         // 2-hop global.
         "MATCH (a:Ag)-[:R]->(b:Bg)-[:R2]->(c:Cg) RETURN count(*) AS c, max(c.ck) AS mx",
-        // Global over ZERO rows (unminted type) — one row, count 0 / sum 0 / avg null.
-        "MATCH (a:Ag)-[:NOPE]->(b:Bg) RETURN count(*) AS c, sum(b.bk) AS s, avg(b.bk) AS a",
     ];
     for src in cases {
         agrees_and_fires(&g, src);
     }
-    // The empty-global contract explicitly.
-    let (on, _) = both(
-        &g,
-        "MATCH (a:Ag)-[:NOPE]->(b:Bg) RETURN count(*) AS c, sum(b.bk) AS s, avg(b.bk) AS a",
-        BTreeMap::new(),
-    );
+    // Global over ZERO rows (unminted type) — one row, count 0 / sum 0 / avg
+    // null. Fix 101: a hop over a type that holds no relationship is answered
+    // before any operator runs, so the pipeline need not fire here — the
+    // two paths still agree, and the contract holds.
+    let dead = "MATCH (a:Ag)-[:NOPE]->(b:Bg) RETURN count(*) AS c, sum(b.bk) AS s, avg(b.bk) AS a";
+    let (on, off) = both(&g, dead, BTreeMap::new());
+    assert_eq!(on, off, "columnar vs general disagree: `{dead}`");
     assert_eq!(
         on,
         vec![vec![Value::Int(0), Value::Int(0), Value::Null]],
@@ -313,7 +312,11 @@ fn agg2_null_handling() {
     assert_eq!(z[2], Value::Null, "avg over all-null → null");
     assert_eq!(z[3], Value::Null, "min over all-null → null");
     assert_eq!(z[4], Value::Null, "max over all-null → null");
-    assert_eq!(z[5], Value::List(vec![]), "collect skips nulls → []");
+    assert_eq!(
+        z[5],
+        Value::List((vec![]).into()),
+        "collect skips nulls → []"
+    );
     let y = on
         .iter()
         .find(|r| r[0] == Value::Str("Y".into()))
@@ -322,7 +325,7 @@ fn agg2_null_handling() {
     assert_eq!(y[2], Value::Float(30.0), "avg over the two non-null → 30");
     assert_eq!(
         y[5],
-        Value::List(vec![Value::Int(30), Value::Int(30)]),
+        Value::List((vec![Value::Int(30), Value::Int(30)]).into()),
         "collect skips the null"
     );
 }

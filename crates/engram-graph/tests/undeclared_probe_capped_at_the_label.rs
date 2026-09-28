@@ -68,10 +68,19 @@ fn corpus() -> Graph {
         let mut m = BTreeMap::new();
         m.insert("id".into(), s(&format!("track-{i}")));
         m.insert("userId".into(), s(&format!("u{}", i % 4)));
-        m.insert("createdAt".into(), s(&format!("2026-08-{:02}T00:{:02}:{:02}Z", 1 + (i / 60) % 28, (i / 60) % 60, i % 60)));
+        m.insert(
+            "createdAt".into(),
+            s(&format!(
+                "2026-08-{:02}T00:{:02}:{:02}Z",
+                1 + (i / 60) % 28,
+                (i / 60) % 60,
+                i % 60
+            )),
+        );
         let t = g.create_node(&["UserTrack".into()], &m).expect("track");
         if i % 3 == 0 {
-            g.create_rel(t, "PERFORMED_BY", artist, &BTreeMap::new()).expect("performed");
+            g.create_rel(t, "PERFORMED_BY", artist, &BTreeMap::new())
+                .expect("performed");
         }
     }
     for i in 0..3i64 {
@@ -126,5 +135,8 @@ fn b_a_narrow_probe_still_seeks() {
     let (got, c) = traced(&g, ORIG, "u9");
     assert_eq!(got, want);
     assert_eq!(count_of(&c, CAPPED), 0, "{c:?}");
-    assert!(count_of(&c, GETS) <= 12, "three sought tracks, not a label scan: {c:?}");
+    assert!(
+        count_of(&c, GETS) <= 12,
+        "three sought tracks, not a label scan: {c:?}"
+    );
 }

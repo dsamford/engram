@@ -72,7 +72,11 @@ fn corpus() -> Graph {
         let mut m = BTreeMap::new();
         m.insert(
             "userId".to_string(),
-            Value::Str(if i % 3 == 0 { "u1".into() } else { format!("u{}", 2 + i % 5) }),
+            Value::Str(if i % 3 == 0 {
+                "u1".into()
+            } else {
+                format!("u{}", 2 + i % 5)
+            }),
         );
         m.insert("id".to_string(), Value::Str(format!("rt-{i:05}")));
         let t = g.create_node(&["RT".into()], &m).expect("rt");
@@ -112,9 +116,15 @@ fn a_prefix_with_demands_only_what_the_rest_of_the_stage_reads() {
         assert!(count_of(&c, PREFIX_PROPS) > 0, "`{src}`: {c:?}");
     }
     // CONTROL: a bare later use keeps the full node.
-    let (got, c) = traced(&g, "MATCH (t:RT) WHERE t.userId = $u WITH t RETURN t ORDER BY t.id LIMIT 2");
+    let (got, c) = traced(
+        &g,
+        "MATCH (t:RT) WHERE t.userId = $u WITH t RETURN t ORDER BY t.id LIMIT 2",
+    );
     assert_eq!(got.len(), 2);
-    assert!(count_of(&c, FULL) > 0, "a bare RETURN t is a whole use: {c:?}");
+    assert!(
+        count_of(&c, FULL) > 0,
+        "a bare RETURN t is a whole use: {c:?}"
+    );
 }
 
 #[test]
@@ -125,7 +135,11 @@ fn a_var_free_pattern_map_joins_the_column_filtered_seed() {
     assert_eq!(got, vec![vec![Value::Int(400)]]);
     assert!(count_of(&c, MAP_TAKEN) > 0, "{c:?}");
     assert!(count_of(&c, FILTERED) > 0, "{c:?}");
-    assert_eq!(count_of(&c, FULL), 0, "the map is tested from the column, not the record: {c:?}");
+    assert_eq!(
+        count_of(&c, FULL),
+        0,
+        "the map is tested from the column, not the record: {c:?}"
+    );
     // With the hop after the WITH — the production shape.
     let (got, c) = traced(
         &g,
@@ -168,6 +182,10 @@ fn the_pipelines_seed_predicates_are_answered_from_the_cached_column() {
     assert!(count_of(&c3, SEED_PREDS) > 0, "{c3:?}");
     // STRICT: a non-boolean seed predicate is not silently dropped — the
     // statement still raises, as it always did.
-    let q = parse_statement("MATCH (t:RT)-[:PGW]->(p:GWP) WHERE t.userId RETURN count(p) AS n").unwrap();
-    assert!(run_query(&g, &q, params()).is_err(), "a string is not a predicate");
+    let q = parse_statement("MATCH (t:RT)-[:PGW]->(p:GWP) WHERE t.userId RETURN count(p) AS n")
+        .unwrap();
+    assert!(
+        run_query(&g, &q, params()).is_err(),
+        "a string is not a predicate"
+    );
 }

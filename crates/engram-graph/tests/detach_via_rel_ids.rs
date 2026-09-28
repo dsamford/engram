@@ -127,7 +127,11 @@ fn detach_delete_is_identical_on_both_arms() {
         finals[0], finals[1],
         "the enumeration may change what the delete PAYS, never what it LEAVES"
     );
-    assert_eq!(finals[0], (12, 0, 0), "and the hub and all its edges are gone");
+    assert_eq!(
+        finals[0],
+        (12, 0, 0),
+        "and the hub and all its edges are gone"
+    );
 }
 
 /// A plain DELETE of a connected node must still be refused — on both arms.
@@ -164,7 +168,8 @@ fn an_unconnected_node_deletes_on_both_arms() {
             Some(Value::Int(i)) => *i as u64,
             other => panic!("expected an id, got {other:?}"),
         };
-        g.delete_node(id, false).expect("an unconnected node deletes");
+        g.delete_node(id, false)
+            .expect("an unconnected node deletes");
         assert!(rows(&g, "MATCH (n:Lonely) RETURN n.x").is_empty());
     }
 }

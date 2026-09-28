@@ -147,6 +147,21 @@ impl<'a> Parser<'a> {
         r
     }
 
+    /// Fix 104: parse an expression in a PREDICATE position — the WHERE of
+    /// a list comprehension, a pattern comprehension or a list predicate —
+    /// where a bare relationship pattern is a predicate whatever position
+    /// the comprehension itself sits in. The production chat unread query
+    /// wrote `size([x IN msgs WHERE (x)-[:MENTIONS]->(u)])` in its RETURN
+    /// and was refused as UnexpectedSyntax, the one corpus statement engram
+    /// could not run at all.
+    pub(crate) fn predicate_expr(&mut self) -> Result<Expr, ParseError> {
+        let saved = self.allow_bare_pattern;
+        self.allow_bare_pattern = true;
+        let r = self.expr();
+        self.allow_bare_pattern = saved;
+        r
+    }
+
     pub(crate) fn peek(&self) -> &TokenKind {
         &self.tokens[self.at].kind
     }
@@ -572,8 +587,9 @@ impl<'a> Parser<'a> {
             // `count(*) AS count` and then writes `WHERE count > 1`, which
             // is legal Cypher (only clause words are truly reserved).
             TokenKind::Keyword(
-                "COUNT" | "EXISTS" | "SHOW" | "VECTOR" | "FULLTEXT" | "OPTIONS" | "EACH" | "INDEX"
-                | "CONSTRAINT" | "REQUIRE" | "YIELD" | "BY" | "ON" | "KEY" | "ALL",
+                "COUNT" | "EXISTS" | "SHOW" | "VECTOR" | "FULLTEXT" | "TRIGRAM" | "OPTIONS"
+                | "EACH" | "INDEX" | "CONSTRAINT" | "REQUIRE" | "YIELD" | "BY" | "ON" | "KEY"
+                | "ALL",
             ) => {
                 let name = self.name_token("a variable")?;
                 Ok(Expr::Var(name))
@@ -586,14 +602,28 @@ impl<'a> Parser<'a> {
                 let saved = self.at;
                 if let Ok(path) = self.path_pattern() {
                     if !path.hops.is_empty() {
-                        if !self.allow_bare_pattern {
-                            // A pattern is not a value here (RETURN/WITH/ORDER
-                            // BY/SET) — openCypher `UnexpectedSyntax`. Wrap it in
-                            // `exists(...)` to test existence.
-                            return self.refuse(
-                                "a relationship pattern is not a value here (UnexpectedSyntax); use exists(...)",
-                            );
-                        }
+                        // ACCEPTED IN VALUE POSITION TOO, as of the SNB
+                        // Interactive parse ledger.
+                        //
+                        // Strict openCypher calls this `UnexpectedSyntax` and
+                        // this used to refuse it, naming `exists(...)` as the
+                        // remedy. But LDBC's PUBLISHED IC7 text is
+                        //
+                        //     not((liker)-[:KNOWS]-(person)) AS isNew
+                        //
+                        // in its RETURN, Neo4j accepts it, and it was the ONE
+                        // statement of the twenty in the Interactive catalogue
+                        // that this engine could not read. Refusing the
+                        // benchmark's own query text to uphold a stricter
+                        // reading of the grammar buys nothing: a pattern
+                        // predicate evaluates to a BOOLEAN through the same
+                        // `exists` hook wherever it appears (`eval.rs`), so a
+                        // projection can hold one exactly as a `WHERE` can.
+                        //
+                        // `allow_bare_pattern` is kept because it still
+                        // distinguishes the positions for anything that needs
+                        // to; it no longer gates the parse.
+                        let _ = self.allow_bare_pattern;
                         return Ok(Expr::PatternPredicate(Box::new(path)));
                     }
                 }
@@ -725,7 +755,7 @@ impl<'a> Parser<'a> {
                     && matches!(self.peek(), TokenKind::Pipe | TokenKind::Keyword("WHERE"))
                 {
                     let filter = if self.eat_kw("WHERE") {
-                        Some(Box::new(self.expr()?))
+                        Some(Box::new(self.predicate_expr()?))
                     } else {
                         None
                     };
@@ -754,7 +784,7 @@ impl<'a> Parser<'a> {
                 {
                     path.var = Some(pv);
                     let filter = if self.eat_kw("WHERE") {
-                        Some(Box::new(self.expr()?))
+                        Some(Box::new(self.predicate_expr()?))
                     } else {
                         None
                     };
@@ -778,7 +808,7 @@ impl<'a> Parser<'a> {
             self.bump();
             let source = self.expr()?;
             let filter = if self.eat_kw("WHERE") {
-                Some(Box::new(self.expr()?))
+                Some(Box::new(self.predicate_expr()?))
             } else {
                 None
             };
@@ -865,7 +895,7 @@ impl<'a> Parser<'a> {
         if !self.eat_kw("WHERE") {
             return self.refuse("WHERE (a list predicate needs one)");
         }
-        let filter = self.expr()?;
+        let filter = self.predicate_expr()?;
         self.expect(&TokenKind::RParen, "`)` closing the predicate")?;
         Ok(Expr::ListPredicate {
             kind,

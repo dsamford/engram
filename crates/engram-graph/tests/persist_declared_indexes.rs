@@ -78,7 +78,10 @@ fn only_declared_properties_are_offered_for_persistence() {
     );
 
     ddl(&g, "CREATE INDEX a IF NOT EXISTS FOR (n:Churn) ON (n.id)");
-    ddl(&g, "CREATE INDEX b IF NOT EXISTS FOR (n:Other) ON (n.nonce)");
+    ddl(
+        &g,
+        "CREATE INDEX b IF NOT EXISTS FOR (n:Other) ON (n.nonce)",
+    );
     // A property that is written a lot but NOT declared must not appear.
     for i in 0..20i64 {
         run(&g, &format!("CREATE (:Churn {{id: {i}, undeclared: {i}}})"));
@@ -99,14 +102,18 @@ fn a_persisted_index_is_loaded_on_reopen_instead_of_rebuilt() {
     let store = Store::new();
     {
         let g = Graph::new(store.clone(), Realm(1), Namespace(1));
-        ddl(&g, "CREATE INDEX churn_id IF NOT EXISTS FOR (n:Churn) ON (n.id)");
+        ddl(
+            &g,
+            "CREATE INDEX churn_id IF NOT EXISTS FOR (n:Churn) ON (n.id)",
+        );
         for i in 0..400i64 {
-            run(&g, &format!("CREATE (:Churn {{id: {i}, nonce: {}}})", i % 7));
+            run(
+                &g,
+                &format!("CREATE (:Churn {{id: {i}, nonce: {}}})", i % 7),
+            );
         }
         // Page the store out to the directory, exactly as the server does.
-        store
-            .into_paged(dir.path(), 8 << 20)
-            .expect("into_paged");
+        store.into_paged(dir.path(), 8 << 20).expect("into_paged");
         let props = g.declared_index_props();
         let refs: Vec<&str> = props.iter().map(String::as_str).collect();
         let written = g.persist_indexes(dir.path(), &refs).expect("persist");
@@ -126,7 +133,9 @@ fn a_persisted_index_is_loaded_on_reopen_instead_of_rebuilt() {
         .prop_token_peek("id")
         .expect("the property token survives in the reopened store");
     assert!(
-        g2.shared_store().persisted_index(token).is_some(),
+        g2.shared_store()
+            .persisted_index(Realm(1), Namespace(1), token)
+            .is_some(),
         "the reopened store must carry the persisted index, so the first query \
          does not pay a partition scan"
     );
@@ -140,7 +149,10 @@ fn a_corrupt_sidecar_is_refused_rather_than_trusted() {
     let store = Store::new();
     {
         let g = Graph::new(store.clone(), Realm(1), Namespace(1));
-        ddl(&g, "CREATE INDEX churn_id IF NOT EXISTS FOR (n:Churn) ON (n.id)");
+        ddl(
+            &g,
+            "CREATE INDEX churn_id IF NOT EXISTS FOR (n:Churn) ON (n.id)",
+        );
         for i in 0..200i64 {
             run(&g, &format!("CREATE (:Churn {{id: {i}}})"));
         }

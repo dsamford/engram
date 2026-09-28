@@ -1,0 +1,25 @@
+[package]
+name = "engram-proc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The procedure catalogue — every CALL surface's name, arity, default output columns and mutation class, as data."
+
+# NO DEPENDENCIES BEYOND `engram-observe`, deliberately, and that one is not
+# needed yet.
+#
+# This crate exists to resolve one tension: `engram-cypher` must classify a
+# procedure (read-only or not) and check its arity at compile time, but it may
+# depend only on `engram-observe` and knows nothing of a graph. Putting the
+# SIGNATURES here and the BODIES in `engram-graph` lets both sides read the
+# same declaration without either depending on the other.
+#
+# THE RULE, also recorded in the crate map: engram-proc is DATA, NOT BEHAVIOUR.
+# It may not depend on anything that can read a graph. The moment it can, the
+# front end can too, and the layering that makes the parser testable without a
+# store is gone.
+[dependencies]
+
+[lints]
+workspace = true

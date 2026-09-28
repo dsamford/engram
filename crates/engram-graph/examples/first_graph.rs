@@ -97,11 +97,7 @@ fn demo() {
         "MATCH (m:Person {name: 'Mary Somerville'})-[*1..2]->(p:Person)
          RETURN DISTINCT p.name AS reached ORDER BY reached",
     );
-    assert_eq!(
-        reached.len(),
-        2,
-        "Ada and Charles, each once: {reached:?}"
-    );
+    assert_eq!(reached.len(), 2, "Ada and Charles, each once: {reached:?}");
 
     // ── OPTIONAL MATCH keeps the row, and count(r) counts non-nulls ──────
     //

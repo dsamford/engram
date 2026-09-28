@@ -75,14 +75,16 @@ normally.
 3. **Restart without `--bulk-ingest`.**
 4. **Read the `warmed in` line** to confirm the corpus is what you expect:
    ```text
-   [engram-server] warmed in 340 ms: 1482301 nodes, 5290114 out-edges, …
+   [engram-server] warmed in <ms> ms: <nodes> nodes, <out-edges> out-edges, …
    ```
 5. **Create indexes and constraints** now.
 
 ## The benchmark loaders
 
-Three binaries in `engram-bench`, useful beyond benchmarking because they are
-the reference implementation of a correct load.
+Binaries in `engram-bench`, useful beyond benchmarking because they are the
+reference implementation of a correct load. Every corpus the harness measures
+is kept in one format — `nodes.jsonl`, `rels.jsonl` and `meta.json` — and every
+engine is loaded from it.
 
 ### `snbgen` — make a corpus
 
@@ -118,9 +120,21 @@ later as a performance difference and gets attributed to the query engine.
 Loading both through one binary removes the load path and the data shape as
 variables, leaving the thing actually under test.
 
+At a size where loading Neo4j over Bolt one batch at a time is impractical,
+`jsonl2neo4j` turns the same JSONL corpus into `neo4j-admin database import`
+files. It reads the corpus through the same parse `snbload` uses, so the ids
+and properties Neo4j receives are the ones every other engine loads rather than
+the output of a second implementation.
+
 ### `datagen2jsonl` — convert official LDBC output
 
 For when you have real Datagen output rather than `snbgen`'s.
+
+Three more converters write the same format: `finbench2jsonl` for an LDBC
+FinBench snapshot, `ga2jsonl` for an LDBC Graphalytics graph (it also writes the
+graph's algorithm parameters to `params.json`), and `fbgen`, which generates
+FinBench-schema data at any scale. `fbgen`'s output is this project's data on
+FinBench's schema, not LDBC's generator output.
 
 ## Tuning the load
 
@@ -128,7 +142,7 @@ For when you have real Datagen output rather than `snbgen`'s.
 |---|---|
 | `--bulk-ingest` | the big one; see above |
 | `--id-reservation N` | ids per durable counter write; bulk mode sets 4096 |
-| `--seal-after N` | how much sits in the volatile tail before sealing |
+| `--seal-after N` | how much sits in the tail before it is sealed — and, during a load, how much a crash can lose, because bulk ingest writes no log records |
 | `--paged-cache-mb N` | the block-cache budget, if paged |
 | `--no-group-commit` | do **not** use during a load; group commit is the win |
 
@@ -137,7 +151,7 @@ For when you have real Datagen output rather than `snbgen`'s.
 | symptom | cause |
 |---|---|
 | the load dies and the store is empty | bulk-ingest durability is by re-ingest — run it again |
-| the load dies in paged mode and *some* data survives | only sealed segments are durable; the tail was lost |
+| the load dies in paged mode and *some* data survives | a bulk load writes no log records at all, so only the sealed segments are on disk. That is bulk ingest's trade and not paged mode's — a paged server serving normally has its WAL |
 | "refusing to start" with both flags | `--bulk-ingest` and `--data-dir` are incompatible |
 | a constraint violation mid-load | the corpus has duplicates; the message names the offending node |
 | memory grows through the load | in resident mode the corpus is memory; use `--paged-dir` |

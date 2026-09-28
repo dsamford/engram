@@ -89,7 +89,7 @@ fn list(g: &Graph, ids: &[u64]) -> BTreeMap<String, Value> {
     let mut p = BTreeMap::new();
     p.insert(
         "list".to_string(),
-        Value::List(ids.iter().map(|&i| node(g, i)).collect()),
+        Value::List(ids.iter().map(|&i| node(g, i)).collect::<Vec<_>>().into()),
     );
     p
 }
@@ -229,7 +229,7 @@ fn unwind_topk_empty_and_nomatch() {
     let mut p = BTreeMap::new();
     p.insert(
         "list".to_string(),
-        Value::List(vec![node(&g, f[0]), Value::Null, node(&g, f[1])]),
+        Value::List((vec![node(&g, f[0]), Value::Null, node(&g, f[1])]).into()),
     );
     let (on, off) = both(
         &g,

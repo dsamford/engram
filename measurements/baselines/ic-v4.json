@@ -1,0 +1,107 @@
+{
+  "_temporal_encoding": "typed",
+  "_note": "Derived from the corpus by snbparams. Every value was checked to match a non-zero number of rows. These are NOT LDBC's curated parameters: LDBC selects by percentile so each substitution costs about the same, which needs its paramgen. A number measured with these may be compared with another ENGINE on the same parameters, and may NOT be compared with a published LDBC figure.",
+  "IC1": {
+    "firstName": "Faisal",
+    "personId": "17049",
+    "personId@ldbc": "15393162799074"
+  },
+  "IC10": {
+    "month": "5",
+    "personId": "17049",
+    "personId@ldbc": "15393162799074"
+  },
+  "IC11": {
+    "countryName": "China",
+    "personId": "17049",
+    "personId@ldbc": "15393162799074",
+    "workFromYear": "2011"
+  },
+  "IC12": {
+    "personId": "17049",
+    "personId@ldbc": "15393162799074",
+    "tagClassName": "Country"
+  },
+  "IC13": {
+    "person1Id": "17049",
+    "person1Id@ldbc": "15393162799074",
+    "person2Id": "16128",
+    "person2Id@ldbc": "19791209302403"
+  },
+  "IC14": {
+    "person1Id": "17049",
+    "person1Id@ldbc": "15393162799074",
+    "person2Id": "16128",
+    "person2Id@ldbc": "19791209302403"
+  },
+  "IC2": {
+    "maxDate": "2012-01-10T19:58:29.414Z",
+    "personId": "17049",
+    "personId@ldbc": "15393162799074"
+  },
+  "IC3": {
+    "countryXName": "China",
+    "countryYName": "India",
+    "endDate": "2012-01-10T19:58:29.414Z",
+    "personId": "17049",
+    "personId@ldbc": "15393162799074",
+    "startDate": "2010-09-04T16:44:00.867Z"
+  },
+  "IC4": {
+    "endDate": "2012-01-10T19:58:29.414Z",
+    "personId": "17049",
+    "personId@ldbc": "15393162799074",
+    "startDate": "2010-09-04T16:44:00.867Z"
+  },
+  "IC5": {
+    "minDate": "2010-09-04T16:44:00.867Z",
+    "personId": "17049",
+    "personId@ldbc": "15393162799074"
+  },
+  "IC6": {
+    "personId": "17049",
+    "personId@ldbc": "15393162799074",
+    "tagName": "Louis_IX_of_France"
+  },
+  "IC7": {
+    "personId": "17049",
+    "personId@ldbc": "15393162799074"
+  },
+  "IC8": {
+    "personId": "17049",
+    "personId@ldbc": "15393162799074"
+  },
+  "IC9": {
+    "maxDate": "2012-01-10T19:58:29.414Z",
+    "personId": "17049",
+    "personId@ldbc": "15393162799074"
+  },
+  "IS1": {
+    "personId": "17049",
+    "personId@ldbc": "15393162799074"
+  },
+  "IS2": {
+    "personId": "17049",
+    "personId@ldbc": "15393162799074"
+  },
+  "IS3": {
+    "personId": "17049",
+    "personId@ldbc": "15393162799074"
+  },
+  "IS4": {
+    "messageId": "511844",
+    "messageId@ldbc": "1649275843421"
+  },
+  "IS5": {
+    "messageId": "511844",
+    "messageId@ldbc": "1649275843421"
+  },
+  "IS6": {
+    "messageId": "511844",
+    "messageId@ldbc": "1649275843421"
+  },
+  "IS7": {
+    "messageId": "511844",
+    "messageId@ldbc": "1649275843421"
+  }
+}

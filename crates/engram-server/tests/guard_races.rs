@@ -110,6 +110,9 @@ fn racing_hub_rel_creates_all_land_serialised_through_the_guard() {
     let degree = c
         .run("MATCH (:Hub {k: 424242})<-[r:R]-() RETURN id(r)")
         .expect("degree read");
-    assert_eq!(degree, acked, "every acked edge exists — serialised, not lost");
+    assert_eq!(
+        degree, acked,
+        "every acked edge exists — serialised, not lost"
+    );
     assert_eq!(g.verify_rel_endpoints().expect("fsck"), Vec::<u64>::new());
 }

@@ -19,7 +19,9 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, Instant};
 
 use engram_bolt::client::Client;
-use engram_graph::counters::{ADJ_TABLES_BUILT, ADJ_TABLES_REPAIRED, DERIVED_REFRESHED_BY_MAINTENANCE};
+use engram_graph::counters::{
+    ADJ_TABLES_BUILT, ADJ_TABLES_REPAIRED, DERIVED_REFRESHED_BY_MAINTENANCE,
+};
 use engram_key::{Namespace, Realm};
 use engram_server::counters::MAINTENANCE_REFRESH_RUNS;
 use engram_store::Store;
@@ -72,7 +74,8 @@ const READ: &str = "MATCH (m:Message)-[:HAS_CREATOR]->(p:Person {id: 7}) RETURN 
 /// Seed persons and messages, build the HAS_CREATOR table with one read.
 fn seed(c: &mut Client) {
     for i in 0..PERSONS {
-        c.run(&format!("CREATE (:Person {{id: {i}}})")).expect("person");
+        c.run(&format!("CREATE (:Person {{id: {i}}})"))
+            .expect("person");
     }
     for i in 0..SEED {
         c.run(&format!(
@@ -95,7 +98,10 @@ fn wait_for_passes(n: u64) {
     let target = MAINTENANCE_REFRESH_RUNS.load(Relaxed) + n;
     let deadline = Instant::now() + Duration::from_secs(20);
     while MAINTENANCE_REFRESH_RUNS.load(Relaxed) < target {
-        assert!(Instant::now() < deadline, "the maintenance thread never ticked");
+        assert!(
+            Instant::now() < deadline,
+            "the maintenance thread never ticked"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -131,7 +137,11 @@ fn after_a_write_only_burst_the_tick_refreshes_and_the_first_read_builds_nothing
     // THE CLAIM: the first read after the burst finds the table current.
     let built = ADJ_TABLES_BUILT.load(Relaxed);
     let repaired = ADJ_TABLES_REPAIRED.load(Relaxed);
-    assert_eq!(c.run(READ).expect("read"), (SEED + BURST) / PERSONS, "the read must see the burst");
+    assert_eq!(
+        c.run(READ).expect("read"),
+        (SEED + BURST) / PERSONS,
+        "the read must see the burst"
+    );
     assert_eq!(
         ADJ_TABLES_BUILT.load(Relaxed),
         built,
@@ -157,7 +167,10 @@ fn with_the_refresh_off_the_first_read_pays_for_the_burst() {
     // The maintenance thread still ticks (paged seals live there) but must
     // not refresh; give it the same window the claim above got.
     std::thread::sleep(TICK * 3);
-    assert_eq!(DERIVED_REFRESHED_BY_MAINTENANCE.load(Relaxed), refreshed_before);
+    assert_eq!(
+        DERIVED_REFRESHED_BY_MAINTENANCE.load(Relaxed),
+        refreshed_before
+    );
 
     let built = ADJ_TABLES_BUILT.load(Relaxed);
     let repaired = ADJ_TABLES_REPAIRED.load(Relaxed);

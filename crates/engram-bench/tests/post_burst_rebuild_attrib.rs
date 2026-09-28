@@ -148,9 +148,9 @@ fn shape(name: &str, key: u64, space: u64) -> String {
         // NOT a harness shape: the OUT side of HAS_CREATOR, whose changed
         // set is the burst's NEW message nodes (always > ADJ_REPAIR_MAX for a
         // 5k burst, whatever the person count).
-        "has-creator-out" => format!(
-            "MATCH (m:Message {{id: {key}}})-[:HAS_CREATOR]->(p:Person) RETURN p.id"
-        ),
+        "has-creator-out" => {
+            format!("MATCH (m:Message {{id: {key}}})-[:HAS_CREATOR]->(p:Person) RETURN p.id")
+        }
         other => unreachable!("unknown shape {other}"),
     }
 }
@@ -185,7 +185,9 @@ fn maintenance_refresh(g: &Graph, what: &str) -> (engram_graph::RefreshReport, f
     eprintln!("[maint] refresh ({what}) {ms:>10.2} ms  {report:?}");
     let mut rows: Vec<(&String, u64)> = trace.counters().iter().map(|(k, v)| (k, *v)).collect();
     rows.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
-    for (k, v) in rows.iter().filter(|(k, _)| FAMILY.contains(&k.as_str()) || k.contains("maintenance") || k.contains("declined")) {
+    for (k, v) in rows.iter().filter(|(k, _)| {
+        FAMILY.contains(&k.as_str()) || k.contains("maintenance") || k.contains("declined")
+    }) {
         eprintln!("[maint]     {v:>9}  {k}");
     }
     (report, ms)
@@ -242,7 +244,10 @@ fn load(dir: &str) -> (Graph, u64) {
     ] {
         run(&g, ddl);
     }
-    for probe in ["MATCH (p:Person {id: 1}) RETURN p.id", "MATCH (m:Message {id: 1}) RETURN m.id"] {
+    for probe in [
+        "MATCH (p:Person {id: 1}) RETURN p.id",
+        "MATCH (m:Message {id: 1}) RETURN m.id",
+    ] {
         let (ms, _, t) = traced(&g, probe);
         eprintln!("[burst-attrib] index build (first seek) {ms:.0} ms  {probe}  {t:?}");
     }
@@ -287,8 +292,14 @@ fn which_statement_pays_after_a_write_only_burst() {
     let payer_name = "is5-by-creator";
     let payer = shape(payer_name, 821 % persons, persons);
     let after: Vec<(&str, String)> = vec![
-        ("is5-anchored", shape("is5-anchored", 821 % persons, persons)),
-        ("ic6-friend-tags", shape("ic6-friend-tags", 821 % persons, persons)),
+        (
+            "is5-anchored",
+            shape("is5-anchored", 821 % persons, persons),
+        ),
+        (
+            "ic6-friend-tags",
+            shape("ic6-friend-tags", 821 % persons, persons),
+        ),
         ("has-creator-out", shape("has-creator-out", 5, persons)),
         ("agg-by-city", shape("agg-by-city", 0, persons)),
         ("ic-foaf", shape("ic-foaf", 821 % persons, persons)),
@@ -297,7 +308,11 @@ fn which_statement_pays_after_a_write_only_burst() {
     // ── Steady state: every shape three times, the third traced ──────────
     eprintln!("\n[steady] every shape ×3 warm, third run traced");
     let mut steady: BTreeMap<&str, f64> = BTreeMap::new();
-    for (name, src) in pre_reads.iter().chain(std::iter::once(&(payer_name, payer.clone()))).chain(after.iter()) {
+    for (name, src) in pre_reads
+        .iter()
+        .chain(std::iter::once(&(payer_name, payer.clone())))
+        .chain(after.iter())
+    {
         run(&g, src);
         run(&g, src);
         let (ms, rows, t) = traced(&g, src);
@@ -319,9 +334,13 @@ fn which_statement_pays_after_a_write_only_burst() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    eprintln!("\n[burst] {n} × `MATCH (p:Person {{id: seq % {persons}}}) CREATE (m:Message:Comment)-[:HAS_CREATOR]->(p)`");
+    eprintln!(
+        "\n[burst] {n} × `MATCH (p:Person {{id: seq % {persons}}}) CREATE (m:Message:Comment)-[:HAS_CREATOR]->(p)`"
+    );
     if maint > 0 {
-        eprintln!("[burst] maintenance refresh every {maint} writes and at the end (ENGRAM_BURST_ATTRIB_MAINT)");
+        eprintln!(
+            "[burst] maintenance refresh every {maint} writes and at the end (ENGRAM_BURST_ATTRIB_MAINT)"
+        );
     }
     let t0 = Instant::now();
     let mut trace = engram_observe::Trace::default();
@@ -344,7 +363,11 @@ fn which_statement_pays_after_a_write_only_burst() {
         }
         seq = end;
         if maint > 0 {
-            let what = if seq < n { format!("after {seq} writes") } else { "the tick".to_string() };
+            let what = if seq < n {
+                format!("after {seq} writes")
+            } else {
+                "the tick".to_string()
+            };
             let (r, ms) = maintenance_refresh(&g, &what);
             maint_ms += ms;
             maint_reports.push(r);
@@ -367,8 +390,16 @@ fn which_statement_pays_after_a_write_only_burst() {
     for (k, v) in rows.iter().filter(|(k, _)| FAMILY.contains(&k.as_str())) {
         eprintln!("[burst]     {v:>9}  [{:>7.2}/w]  {k}", *v as f64 / n as f64);
     }
-    let burst_built = trace.counters().get("graph.adjacency tables built").copied().unwrap_or(0);
-    let burst_repaired = trace.counters().get("graph.adjacency tables repaired").copied().unwrap_or(0);
+    let burst_built = trace
+        .counters()
+        .get("graph.adjacency tables built")
+        .copied()
+        .unwrap_or(0);
+    let burst_repaired = trace
+        .counters()
+        .get("graph.adjacency tables repaired")
+        .copied()
+        .unwrap_or(0);
 
     // ── After the burst: the level's sequence, each statement traced ─────
     eprintln!("\n[post] the contention level's sequence after the burst (each statement traced)");
@@ -405,12 +436,26 @@ fn which_statement_pays_after_a_write_only_burst() {
     eprintln!("\n[ratio] first-post-burst / steady (ms)");
     for (name, (ms, _)) in &post {
         if let Some(s) = steady.get(name.trim_end_matches("-again")) {
-            eprintln!("[ratio] {name:<26} {ms:>10.2} / {s:>8.2} = {:>8.1}x", ms / s.max(1e-6));
+            eprintln!(
+                "[ratio] {name:<26} {ms:>10.2} / {s:>8.2} = {:>8.1}x",
+                ms / s.max(1e-6)
+            );
         }
     }
-    let get = |name: &str, k: &str| post.get(name).and_then(|(_, t)| t.get(k)).copied().unwrap_or(0);
-    let maint_adj: usize = maint_reports.iter().map(|r| r.adjacency_repaired + r.adjacency_rebuilt).sum();
-    let maint_members: usize = maint_reports.iter().map(|r| r.members_caught_up + r.members_rebuilt).sum();
+    let get = |name: &str, k: &str| {
+        post.get(name)
+            .and_then(|(_, t)| t.get(k))
+            .copied()
+            .unwrap_or(0)
+    };
+    let maint_adj: usize = maint_reports
+        .iter()
+        .map(|r| r.adjacency_repaired + r.adjacency_rebuilt)
+        .sum();
+    let maint_members: usize = maint_reports
+        .iter()
+        .map(|r| r.members_caught_up + r.members_rebuilt)
+        .sum();
     eprintln!(
         "\n[verdict] levers={} maintenance: adjacency={maint_adj} members={maint_members} ({maint_ms:.0} ms) | \
          burst: built={burst_built} repaired={burst_repaired} | \
@@ -439,7 +484,8 @@ fn which_statement_pays_after_a_write_only_burst() {
     // finding and are read, not frozen.
     assert_eq!(burst_built, 0, "a write never rebuilds an adjacency table");
     assert_eq!(
-        get("hot-set", "graph.adjacency tables built") + get("hot-set", "graph.adjacency tables repaired"),
+        get("hot-set", "graph.adjacency tables built")
+            + get("hot-set", "graph.adjacency tables repaired"),
         0,
         "the hot SET touches no adjacency-derived structure"
     );
@@ -450,7 +496,10 @@ fn which_statement_pays_after_a_write_only_burst() {
             is5_work, 0,
             "with the maintenance cadence the first HAS_CREATOR read must find its table current"
         );
-        assert!(maint_adj >= 1, "the maintenance refresh must have brought an adjacency table current");
+        assert!(
+            maint_adj >= 1,
+            "the maintenance refresh must have brought an adjacency table current"
+        );
     } else {
         assert!(
             is5_work >= 1,
@@ -495,7 +544,10 @@ fn delete_churn_census_and_thread_scaling() {
             let seq = base + i;
             if seq % 2 == 1 && live.len() >= 16 {
                 let id: u64 = live.pop_front().expect("floor");
-                out.push((true, format!("MATCH (n:Churn {{id: {id}, nonce: {nonce}}}) DETACH DELETE n")));
+                out.push((
+                    true,
+                    format!("MATCH (n:Churn {{id: {id}, nonce: {nonce}}}) DETACH DELETE n"),
+                ));
             } else {
                 live.push_back(seq);
                 out.push((
@@ -536,12 +588,21 @@ fn delete_churn_census_and_thread_scaling() {
             acc.count(k, *v);
         }
     }
-    for (what, n, tot, tr) in [("create", cn, cms, &create_t), ("DETACH DELETE", dn, dms, &delete_t)] {
-        eprintln!("\n[churn] {what}: {n} ops, {:.3} ms/op — counters per op:", tot / n.max(1) as f64);
+    for (what, n, tot, tr) in [
+        ("create", cn, cms, &create_t),
+        ("DETACH DELETE", dn, dms, &delete_t),
+    ] {
+        eprintln!(
+            "\n[churn] {what}: {n} ops, {:.3} ms/op — counters per op:",
+            tot / n.max(1) as f64
+        );
         let mut rows: Vec<(&String, u64)> = tr.counters().iter().map(|(k, v)| (k, *v)).collect();
         rows.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
         for (k, v) in rows.iter().take(40) {
-            eprintln!("[churn]     {v:>9}  [{:>8.3}/op]  {k}", *v as f64 / n.max(1) as f64);
+            eprintln!(
+                "[churn]     {v:>9}  [{:>8.3}/op]  {k}",
+                *v as f64 / n.max(1) as f64
+            );
         }
     }
 
@@ -556,7 +617,10 @@ fn delete_churn_census_and_thread_scaling() {
     if pad > 0 {
         run(
             &g,
-            &format!("UNWIND range(0, {}) AS i CREATE (:Churn {{id: 900000000 + i, cid: 99, nonce: 999}})", pad - 1),
+            &format!(
+                "UNWIND range(0, {}) AS i CREATE (:Churn {{id: 900000000 + i, cid: 99, nonce: 999}})",
+                pad - 1
+            ),
         );
         let live = first_int(&run(&g, "MATCH (n:Churn) RETURN count(*) AS c"));
         eprintln!("[churn-threads] padded the :Churn label to {live} live nodes before the levels");
@@ -565,7 +629,10 @@ fn delete_churn_census_and_thread_scaling() {
     for (level, &k) in threads.iter().enumerate() {
         let nonce = 100 + level as u64;
         for cid in 0..k as u64 {
-            run(&g, &format!("CREATE (:ChurnAnchor {{cid: {cid}, nonce: {nonce}}})"));
+            run(
+                &g,
+                &format!("CREATE (:ChurnAnchor {{cid: {cid}, nonce: {nonce}}})"),
+            );
         }
         let t0 = Instant::now();
         let mut merged: BTreeMap<String, u64> = BTreeMap::new();
@@ -600,15 +667,31 @@ fn delete_churn_census_and_thread_scaling() {
         );
         let mut rows: Vec<(&String, u64)> = merged.iter().map(|(k, v)| (k, *v)).collect();
         rows.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
-        for (kk, v) in rows.iter().filter(|(kk, _)| FAMILY.contains(&kk.as_str()) || kk.contains("conflict")) {
-            eprintln!("[churn-threads]     {v:>9}  [{:>8.3}/op]  {kk}", *v as f64 / total as f64);
+        for (kk, v) in rows
+            .iter()
+            .filter(|(kk, _)| FAMILY.contains(&kk.as_str()) || kk.contains("conflict"))
+        {
+            eprintln!(
+                "[churn-threads]     {v:>9}  [{:>8.3}/op]  {kk}",
+                *v as f64 / total as f64
+            );
         }
-        let survivors = first_int(&run(&g, &format!("MATCH (n:Churn {{nonce: {nonce}}}) RETURN count(*) AS c")));
+        let survivors = first_int(&run(
+            &g,
+            &format!("MATCH (n:Churn {{nonce: {nonce}}}) RETURN count(*) AS c"),
+        ));
         eprintln!("[churn-threads] survivors with nonce {nonce}: {survivors}");
     }
     // What the churn left behind for the NEXT `id` seek: the churn statements
     // never seek (label-scan plan), so nobody consumed the `id` property log
     // while every create/delete recorded into it.
     let (ms, rows, t) = traced(&g, "MATCH (p:Person {id: 1}) RETURN p.id");
-    report("churn-after", "Person.id seek", "MATCH (p:Person {id: 1}) RETURN p.id", ms, rows, &t);
+    report(
+        "churn-after",
+        "Person.id seek",
+        "MATCH (p:Person {id: 1}) RETURN p.id",
+        ms,
+        rows,
+        &t,
+    );
 }

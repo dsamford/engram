@@ -93,6 +93,20 @@ fn agrees_and_folds(g: &Graph, src: &str) -> Rows {
     on
 }
 
+/// Separate MATCH clauses (deliberate relationship reuse: openCypher scopes
+/// isomorphism to one clause) are held to the general path's answer only: the
+/// fold claims ONE MATCH, and reaches separate clauses only where fusion hands
+/// them over as one, so whether it fires is not this test's claim. A
+/// single-MATCH statement must fold as before. When the pipeline learns the
+/// clause rule for comma paths, these go back to one MATCH and fold again (§44).
+fn folds_if_one_clause(g: &Graph, src: &str) -> Rows {
+    if src.matches("MATCH").count() > 1 {
+        agrees(g, src)
+    } else {
+        agrees_and_folds(g, src)
+    }
+}
+
 fn i(n: i64) -> Value {
     Value::Int(n)
 }
@@ -181,10 +195,7 @@ fn gladder(width: usize, levels: usize) -> Graph {
         for j in 0..width {
             let mut p = BTreeMap::new();
             p.insert("k".to_string(), Value::Int(j as i64));
-            ids.push(
-                g.create_node(&[format!("L{k}")], &p)
-                    .expect("node"),
-            );
+            ids.push(g.create_node(&[format!("L{k}")], &p).expect("node"));
         }
         ranks.push(ids);
     }
@@ -220,8 +231,8 @@ fn both_self_loops_single_and_parallel_under_fold_filter_and_inline() {
     let folds: &[&str] = &[
         // A folded UNTRACKED close over Both onto the hop's own var: the
         // parallel self-loops on p0 count once each, never twice (O then I).
-        "MATCH (a:P)-[:K]-(b:P), (b)-[:K]-(b) RETURN count(*) AS n",
-        "MATCH (a:P)-[:K]-(b:P), (b)-[:K]-(b) RETURN a.pk AS k, count(*) AS n ORDER BY k",
+        "MATCH (a:P)-[:K]-(b:P) MATCH (b)-[:K]-(b) RETURN count(*) AS n",
+        "MATCH (a:P)-[:K]-(b:P) MATCH (b)-[:K]-(b) RETURN a.pk AS k, count(*) AS n ORDER BY k",
         // A TRACKED close onto the hop's own source var (`used` excludes the
         // self-loop the walk arrived over).
         "MATCH (a:P)-[:K]-(b:P)-[:K]-(b) RETURN count(*) AS n",
@@ -262,10 +273,10 @@ fn both_self_loops_single_and_parallel_under_fold_filter_and_inline() {
         "MATCH (a:P)-[:K]-(b:P)-[:K]-(c:P)-[:HI]->(t:Tag) WHERE NOT (a)-[:K]-(c) AND a <> c RETURN count(*) AS n",
         "MATCH (a:P)-[:M]-(b:P)-[:K]-(c:P)-[:HI]->(t:Tag) WHERE NOT (a)-[:K]-(c) RETURN count(*) AS n",
         // Two roots off the seed, one of them closing onto the seed.
-        "MATCH (a:P)-[:K]-(b:P), (a)-[:M]-(c:P)-[:K]-(a) RETURN a.pk AS k, count(*) AS n ORDER BY k",
+        "MATCH (a:P)-[:K]-(b:P) MATCH (a)-[:M]-(c:P)-[:K]-(a) RETURN a.pk AS k, count(*) AS n ORDER BY k",
     ];
     for src in folds {
-        agrees_and_folds(&g, src);
+        folds_if_one_clause(&g, src);
     }
     // The memo-ON == memo-OFF arm over the same statements.
     for src in folds {
@@ -284,14 +295,14 @@ fn both_self_loops_single_and_parallel_under_fold_filter_and_inline() {
     // a=p1: 2·2 + 2·0 = 4; a=p2: b=p3 → 1; a=p3: b=p3 → 1; a=p4: b=p3 → 1 AND
     // b=p0 → 2, so 3. Total 13.
     //
-    // The close is its own PATH (the comma), so it is `reset`: rel-iso does not
-    // reach across it, and the arriving hop's rel is not excluded from the
+    // The close is its own MATCH CLAUSE, so it is `reset`: rel-iso does not
+    // reach across clauses, and the arriving hop's rel is not excluded from the
     // close's — which is why b=p0 contributes 2 per row and not 1. The tracked
     // spelling below (`-[:K]-(b)-[:K]-(b)`, one path) is the case where the
     // arriving self-loop IS excluded.
-    let on = agrees_and_folds(
+    let on = folds_if_one_clause(
         &g,
-        "MATCH (a:P)-[:K]-(b:P), (b)-[:K]-(b) RETURN a.pk AS k, count(*) AS n ORDER BY k",
+        "MATCH (a:P)-[:K]-(b:P) MATCH (b)-[:K]-(b) RETURN a.pk AS k, count(*) AS n ORDER BY k",
     );
     assert_eq!(
         on,
@@ -310,7 +321,7 @@ fn both_self_loops_single_and_parallel_under_fold_filter_and_inline() {
     assert_eq!(
         agrees(
             &g,
-            "MATCH (a:P)-[:K]-(b:P), (b)-[:K]-(b) WHERE a.pk = 4 RETURN b.pk AS j ORDER BY j"
+            "MATCH (a:P)-[:K]-(b:P) MATCH (b)-[:K]-(b) WHERE a.pk = 4 RETURN b.pk AS j ORDER BY j"
         ),
         vec![vec![i(0)], vec![i(0)], vec![i(3)]],
         "a=p4's rows under the untracked self-loop close"
@@ -325,7 +336,11 @@ fn both_self_loops_single_and_parallel_under_fold_filter_and_inline() {
     let src = "MATCH (a:P)-[:K]->(b:P) WHERE (b)-[:K]-(b) RETURN a.pk AS ak, b.pk AS bk, count(*) AS n ORDER BY ak, bk";
     let on = agrees(&g, src);
     assert_eq!(counter(&g, src, FILTER), Some(1), "filter form fires");
-    assert_eq!(counter(&g, src, FOLD), None, "both group keys are read: no fold");
+    assert_eq!(
+        counter(&g, src, FOLD),
+        None,
+        "both group keys are read: no fold"
+    );
     assert_eq!(
         on,
         vec![
@@ -339,8 +354,13 @@ fn both_self_loops_single_and_parallel_under_fold_filter_and_inline() {
     // The same shape as a plain projection, one row per walk — and NOT the
     // pipeline's: no chunk filter fires, which is why the assertion above is on
     // the aggregate spelling.
-    let src = "MATCH (a:P)-[:K]->(b:P) WHERE (b)-[:K]-(b) RETURN a.pk AS ak, b.pk AS bk ORDER BY ak, bk";
-    assert_eq!(counter(&g, src, FILTER), None, "a plain projection is not the pipeline's");
+    let src =
+        "MATCH (a:P)-[:K]->(b:P) WHERE (b)-[:K]-(b) RETURN a.pk AS ak, b.pk AS bk ORDER BY ak, bk";
+    assert_eq!(
+        counter(&g, src, FILTER),
+        None,
+        "a plain projection is not the pipeline's"
+    );
     assert_eq!(
         agrees(&g, src),
         vec![
@@ -359,7 +379,7 @@ fn both_self_loops_single_and_parallel_under_fold_filter_and_inline() {
     // a=p3 → b=p3 over p3's ONLY loop, which the close may not reuse: 0.
     // a=p3 → b=p4: 0. a=p4 → b=p0 over the (p4,p0) edge, which is not a loop,
     // so BOTH of p0's loops close: 2. a=p1 → b=p2: 0.
-    let on = agrees_and_folds(
+    let on = folds_if_one_clause(
         &g,
         "MATCH (a:P)-[:K]->(b:P)-[:K]->(b) RETURN a.pk AS k, count(*) AS n ORDER BY k",
     );
@@ -399,11 +419,11 @@ fn memo_with_inline_pred_against_a_grandparent_level() {
         // close's TARGET (never the level) so the two spellings reach the SAME
         // plan. Both must therefore fold — the second is what the un-fold rule
         // in `plan_count_fold` buys.
-        "MATCH (a:A)-[:R]->(d:B), (a)-[:R]->(b:B)-[:S]->(c:C), (c)-[:U]->(d) RETURN d.bk AS k, count(*) AS n ORDER BY k",
-        "MATCH (a:A)-[:R]->(d:B), (a)-[:R]->(b:B)-[:S]->(c:C), (c)-[:U]->(d) RETURN count(*) AS n",
+        "MATCH (a:A)-[:R]->(d:B) MATCH (a)-[:R]->(b:B)-[:S]->(c:C) MATCH (c)-[:U]->(d) RETURN d.bk AS k, count(*) AS n ORDER BY k",
+        "MATCH (a:A)-[:R]->(d:B) MATCH (a)-[:R]->(b:B)-[:S]->(c:C) MATCH (c)-[:U]->(d) RETURN count(*) AS n",
         // Two group keys, a tie, the key bound AFTER the root.
-        "MATCH (a:A)-[:R]->(b:B)-[:S]->(c:C), (a)-[:R]->(d:B) RETURN d.bk AS k, a.ak AS j, count(*) AS n ORDER BY n DESC LIMIT 2",
-        "MATCH (a:A)-[:R]->(b:B)-[:S]->(c:C), (a)-[:R]->(d:B) RETURN d.bk AS k, a.ak AS j, count(*) AS n ORDER BY n DESC, k, j",
+        "MATCH (a:A)-[:R]->(b:B)-[:S]->(c:C) MATCH (a)-[:R]->(d:B) RETURN d.bk AS k, a.ak AS j, count(*) AS n ORDER BY n DESC LIMIT 2",
+        "MATCH (a:A)-[:R]->(b:B)-[:S]->(c:C) MATCH (a)-[:R]->(d:B) RETURN d.bk AS k, a.ak AS j, count(*) AS n ORDER BY n DESC, k, j",
     ] {
         agrees_and_folds(&g, src);
     }
@@ -420,7 +440,7 @@ fn memo_with_inline_pred_against_a_grandparent_level() {
     // (`d`'s index is above the root's end var) — the level un-folds and the
     // statement DECLINES, still agreeing with the interpreter on the number.
     let boundary =
-        "MATCH (a:A)-[:R]->(b:B)-[:S]->(c:C), (a)-[:R]->(d:B), (c)-[:U]->(d) RETURN count(*) AS n";
+        "MATCH (a:A)-[:R]->(b:B)-[:S]->(c:C) MATCH (a)-[:R]->(d:B) MATCH (c)-[:U]->(d) RETURN count(*) AS n";
     let declined = agrees(&g, boundary);
     assert_eq!(
         counter_in_source_order(&g, boundary, FOLD),
@@ -431,7 +451,7 @@ fn memo_with_inline_pred_against_a_grandparent_level() {
         declined,
         rows(
             &g,
-            "MATCH (a:A)-[:R]->(d:B), (a)-[:R]->(b:B)-[:S]->(c:C), (c)-[:U]->(d) RETURN count(*) AS n"
+            "MATCH (a:A)-[:R]->(d:B) MATCH (a)-[:R]->(b:B)-[:S]->(c:C) MATCH (c)-[:U]->(d) RETURN count(*) AS n"
         ),
         "the folded and declined spellings count the same walks"
     );
@@ -460,7 +480,10 @@ fn zero_count_rows_vanish_under_const_key_and_with_form() {
         &g,
         "MATCH (a:A)-[:R]->(b:B)-[:S]->(c:C)-[:U]->(d:C) RETURN 1 AS k, count(*) AS n",
     );
-    assert!(on.is_empty(), "a keyed count over zero rows has no group: {on:?}");
+    assert!(
+        on.is_empty(),
+        "a keyed count over zero rows has no group: {on:?}"
+    );
     let on = agrees_and_folds(
         &g,
         "MATCH (a:A)-[:R]->(b:B)-[:S]->(c:C)-[:U]->(d:C) RETURN count(*) AS n",
@@ -515,34 +538,36 @@ fn cleared_sorted_flags_force_the_walk_and_agree() {
     let stmts: &[&str] = &[
         "MATCH (a:P)-[:K]-(b:P)-[:K]-(c:P) WHERE NOT (a)-[:K]-(c) RETURN count(*) AS n",
         "MATCH (a:P)-[:K]->(b:P)-[:K]->(c:P) WHERE NOT (a)-[:K]->(c) RETURN a.pk AS k, count(*) AS n ORDER BY k",
-        "MATCH (a:P)-[:K]-(b:P), (b)-[:K]-(b) RETURN a.pk AS k, count(*) AS n ORDER BY k",
+        "MATCH (a:P)-[:K]-(b:P) MATCH (b)-[:K]-(b) RETURN a.pk AS k, count(*) AS n ORDER BY k",
         "MATCH (a:P)-[:K]->(b:P)-[:M]->(a) RETURN a.pk AS k, count(*) AS n ORDER BY k",
-        "MATCH (a:P)-[:K]->(b:P), (b)-[:K]->(a) RETURN a.pk AS k, b.pk AS j ORDER BY k, j",
+        "MATCH (a:P)-[:K]->(b:P) MATCH (b)-[:K]->(a) RETURN a.pk AS k, b.pk AS j ORDER BY k, j",
         "MATCH (a:P)-[:K]->(b:P) WHERE NOT (b)-[:K]->(a) RETURN a.pk AS k, b.pk AS j ORDER BY k, j",
         // The MATERIALISED counted close over a Both self-loop: `b` is the group
         // key, so it is read and the fold declines — `DataChunk::semijoin` takes
         // its `edge_count_slim` fast path instead. Without this statement the
         // list has no counted close at all (the fold absorbs every other one),
         // and the CLOSE assertion below would be vacuous.
-        "MATCH (a:P)-[:K]-(b:P), (b)-[:K]-(b) RETURN b.pk AS j, count(*) AS n ORDER BY j",
+        "MATCH (a:P)-[:K]-(b:P) MATCH (b)-[:K]-(b) RETURN b.pk AS j, count(*) AS n ORDER BY j",
     ];
     // Warm: tables are built on first use.
     let before: Vec<Rows> = stmts.iter().map(|s| rows(&g, s)).collect();
-    let (again, trace) = engram_observe::with_trace(|| {
-        stmts.iter().map(|s| rows(&g, s)).collect::<Vec<Rows>>()
-    });
+    let (again, trace) =
+        engram_observe::with_trace(|| stmts.iter().map(|s| rows(&g, s)).collect::<Vec<Rows>>());
     assert_eq!(before, again);
     let searched = trace
         .counters()
         .get("graph.edge probe binary search")
         .copied()
         .unwrap_or(0);
-    assert!(searched > 0, "the warm run never binary-searched: {:?}", trace.counters());
+    assert!(
+        searched > 0,
+        "the warm run never binary-searched: {:?}",
+        trace.counters()
+    );
     let flipped = g.clear_adjacency_sorted_flags();
     assert!(flipped > 0, "the canary cleared no table");
-    let (walked, trace) = engram_observe::with_trace(|| {
-        stmts.iter().map(|s| rows(&g, s)).collect::<Vec<Rows>>()
-    });
+    let (walked, trace) =
+        engram_observe::with_trace(|| stmts.iter().map(|s| rows(&g, s)).collect::<Vec<Rows>>());
     assert_eq!(before, walked, "the walk must answer what the search did");
     assert_eq!(
         trace
@@ -564,8 +589,15 @@ fn cleared_sorted_flags_force_the_walk_and_agree() {
     // var is unread, plus the self-close `(b)-[:K]-(b)` (folded at b's own
     // level — `bind[b]` is the level's node). The two plain-projection
     // statements are not aggregates, and the seventh reads `b`.
-    assert_eq!(trace.counters().get(FOLD).copied(), Some(4), "the folds still ran");
-    assert!(trace.counters().get(CLOSE).copied().unwrap_or(0) > 0, "the counted close still ran");
+    assert_eq!(
+        trace.counters().get(FOLD).copied(),
+        Some(3),
+        "the folds still ran (three: the separate-clause statements are not folded)"
+    );
+    assert!(
+        trace.counters().get(CLOSE).copied().unwrap_or(0) > 0,
+        "the counted close still ran"
+    );
     // And the general path, for the record.
     g.set_columnar_scans(false);
     let general: Vec<Rows> = stmts.iter().map(|s| rows(&g, s)).collect();
@@ -630,7 +662,7 @@ fn fold_and_anti_join_over_the_paged_store_equal_resident() {
     let g = gself();
     let stmts: &[&str] = &[
         "MATCH (a:P)-[:K]-(b:P)-[:K]-(c:P) WHERE NOT (a)-[:K]-(c) AND a <> c RETURN count(*) AS n",
-        "MATCH (a:P)-[:K]-(b:P), (b)-[:K]-(b) RETURN a.pk AS k, count(*) AS n ORDER BY k",
+        "MATCH (a:P)-[:K]-(b:P) MATCH (b)-[:K]-(b) RETURN a.pk AS k, count(*) AS n ORDER BY k",
         "MATCH (a:P)-[:K]->(b:P)-[:K]->(b) RETURN a.pk AS k, count(*) AS n ORDER BY k",
         "MATCH (a:P)-[:K]-(b:P)-[:K]-(c:P)-[:K]-(a) RETURN a.pk AS k, count(*) AS n ORDER BY k",
         "MATCH (a:P)-[:K]-(b:P)-[:M]-(c:P)-[:HI]->(t:Tag) RETURN count(*) AS n",
@@ -647,11 +679,15 @@ fn fold_and_anti_join_over_the_paged_store_equal_resident() {
     let paged = Graph::new(store.clone(), realm, ns);
     paged.set_degree_table_after(0);
     let (got, trace) = engram_observe::with_trace(|| {
-        stmts.iter().map(|s| agrees(&paged, s)).collect::<Vec<Rows>>()
+        stmts
+            .iter()
+            .map(|s| agrees(&paged, s))
+            .collect::<Vec<Rows>>()
     });
     assert_eq!(resident, got, "paged vs resident");
     assert!(trace.counters().get("paged.pread").copied().unwrap_or(0) > 0);
-    assert!(trace.counters().get(FOLD).copied().unwrap_or(0) >= 5);
+    // five of these fold; the one spelled as separate clauses is not claimed
+    assert!(trace.counters().get(FOLD).copied().unwrap_or(0) >= 4);
     drop(paged);
     let (reopened, _cache2) =
         engram_store::Store::open_paged_dir(&dir, 8 * 1024).expect("open_paged_dir");

@@ -229,22 +229,35 @@ fn the_floor_reaches_a_store_that_never_writes() {
         let g = Graph::new(Store::new(), Realm(1), Namespace(1));
         for round in 0..4u64 {
             for i in 0..50u64 {
-                let q = engram_cypher::parse_statement(&format!("CREATE (:C {{k: {}}})", round * 100 + i))
-                    .expect("parse");
+                let q = engram_cypher::parse_statement(&format!(
+                    "CREATE (:C {{k: {}}})",
+                    round * 100 + i
+                ))
+                .expect("parse");
                 engram_graph::run_query(&g, &q, Default::default()).expect("create");
             }
             g.shared_store().seal().expect("seal");
         }
         let cache = engram_store::paged::BlockCache::new(8 << 20);
-        let n = g.shared_store().spill_sealed_into(&paged, &cache).expect("spill");
-        assert!(n > 1, "the fixture must hold several sealed segments, spilled {n}");
+        let n = g
+            .shared_store()
+            .spill_sealed_into(&paged, &cache)
+            .expect("spill");
+        assert!(
+            n > 1,
+            "the fixture must hold several sealed segments, spilled {n}"
+        );
         n
     }
 
     fn serve_readonly(dir: &std::path::Path, interval: Option<Duration>) -> u16 {
         let paged = dir.join("paged");
         let (store, cache) = Store::open_paged_dir(&paged, 8 << 20).expect("open paged dir");
-        assert!(store.segment_count() > 1, "reopened with {} segment(s)", store.segment_count());
+        assert!(
+            store.segment_count() > 1,
+            "reopened with {} segment(s)",
+            store.segment_count()
+        );
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let cfg = ServerConfig {
@@ -281,7 +294,10 @@ fn the_floor_reaches_a_store_that_never_writes() {
     let _p = serve_readonly(&dir_off, None);
     std::thread::sleep(Duration::from_millis(800));
     let off = PAGED_COMPACTIONS.load(Ordering::Relaxed) - before_off;
-    assert_eq!(off, 0, "a read-only multi-segment store with no floor must not compact ({off})");
+    assert_eq!(
+        off, 0,
+        "a read-only multi-segment store with no floor must not compact ({off})"
+    );
 
     // The floor: the same store, only ever read, compacts on an idle tick.
     let dir_on = scratch("ro-on");
@@ -292,9 +308,17 @@ fn the_floor_reaches_a_store_that_never_writes() {
     std::thread::sleep(Duration::from_millis(1200));
     let on = PAGED_COMPACTIONS.load(Ordering::Relaxed) - before_on;
     let by_cadence = PAGED_COMPACTIONS_BY_CADENCE.load(Ordering::Relaxed) - before_cad;
-    eprintln!("[cadence] read-only store: {on} compaction(s) with a floor ({by_cadence} by cadence), {off} without");
-    assert!(on > 0, "a read-only multi-segment store with a floor must be compacted on an idle tick: {on}");
-    assert_eq!(on, by_cadence, "and attributed to the cadence -- no volume trigger can fire on a store that never writes");
+    eprintln!(
+        "[cadence] read-only store: {on} compaction(s) with a floor ({by_cadence} by cadence), {off} without"
+    );
+    assert!(
+        on > 0,
+        "a read-only multi-segment store with a floor must be compacted on an idle tick: {on}"
+    );
+    assert_eq!(
+        on, by_cadence,
+        "and attributed to the cadence -- no volume trigger can fire on a store that never writes"
+    );
     let _ = std::fs::remove_dir_all(&dir_off);
     let _ = std::fs::remove_dir_all(&dir_on);
 }

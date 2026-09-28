@@ -30,7 +30,7 @@ fn s(v: &str) -> Value {
 }
 
 fn l(items: &[&str]) -> Value {
-    Value::List(items.iter().map(|i| s(i)).collect())
+    Value::List(items.iter().map(|i| s(i)).collect::<Vec<_>>().into())
 }
 
 #[test]
@@ -41,7 +41,10 @@ fn show_indexes_lists_every_kind_with_its_scope() {
     // it, which both misreported the index here and let the node planner
     // consult it.
     run(&g, "CREATE INDEX ix_rel FOR ()-[r:KNOWS]-() ON (r.since)");
-    run(&g, "CREATE VECTOR INDEX ix_vec FOR (n:Doc) ON (n.embedding)");
+    run(
+        &g,
+        "CREATE VECTOR INDEX ix_vec FOR (n:Doc) ON (n.embedding)",
+    );
     run(
         &g,
         "CREATE FULLTEXT INDEX ix_full FOR (n:Doc|Post) ON EACH [n.title, n.body]",

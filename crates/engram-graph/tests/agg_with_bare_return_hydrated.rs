@@ -63,7 +63,11 @@ fn corpus() -> Graph {
         let mut m = BTreeMap::new();
         m.insert(
             "status".to_string(),
-            Value::Str(if i % 3 == 0 { "pending".into() } else { "done".into() }),
+            Value::Str(if i % 3 == 0 {
+                "pending".into()
+            } else {
+                "done".into()
+            }),
         );
         m.insert("priority".to_string(), Value::Int(i % 7));
         m.insert("proposedAt".to_string(), Value::Int(1_000_000 - i));
@@ -74,13 +78,15 @@ fn corpus() -> Graph {
             let mut am = BTreeMap::new();
             am.insert("id".to_string(), Value::Str(format!("art-{i}-{k}")));
             let a = g.create_node(&["Artifact".into()], &am).expect("artifact");
-            g.create_rel(p, "HAS_ARTIFACT", a, &BTreeMap::new()).expect("has");
+            g.create_rel(p, "HAS_ARTIFACT", a, &BTreeMap::new())
+                .expect("has");
         }
         if i % 2 == 0 {
             let mut rm = BTreeMap::new();
             rm.insert("id".to_string(), Value::Str(format!("repo-{}", i % 11)));
             let r = g.create_node(&["Repo".into()], &rm).expect("repo");
-            g.create_rel(p, "FOR_REPO", r, &BTreeMap::new()).expect("for");
+            g.create_rel(p, "FOR_REPO", r, &BTreeMap::new())
+                .expect("for");
         }
     }
     g
@@ -101,7 +107,11 @@ fn the_listing_hydrates_only_its_survivors_on_the_optional_pipeline() {
     assert_eq!(got, want);
     assert!(count_of(&c, OPTIONAL_RUNS) > 0, "{c:?}");
     assert_eq!(count_of(&c, HYDRATED), 25, "{c:?}");
-    assert_eq!(count_of(&c, FULL), 25, "only the survivors are decoded in full: {c:?}");
+    assert_eq!(
+        count_of(&c, FULL),
+        25,
+        "only the survivors are decoded in full: {c:?}"
+    );
     let Value::Node { props, .. } = &got[0][0] else {
         panic!("first column is the node: {:?}", got[0][0]);
     };
@@ -135,9 +145,15 @@ fn aggregate_and_distinct_tails_hydrate_their_survivors() {
         assert_eq!(want.len(), k, "`{src}`");
         let (got, c) = traced(&g, src);
         assert_eq!(got, want, "`{src}`");
-        assert!(count_of(&c, AGG_RUNS) + count_of(&c, HOP_RUNS) > 0, "`{src}`: {c:?}");
+        assert!(
+            count_of(&c, AGG_RUNS) + count_of(&c, HOP_RUNS) > 0,
+            "`{src}`: {c:?}"
+        );
         assert!(count_of(&c, HYDRATED) >= k as u64, "`{src}`: {c:?}");
-        assert!(count_of(&c, FULL) <= count_of(&c, HYDRATED), "`{src}`: nothing beyond the survivors: {c:?}");
+        assert!(
+            count_of(&c, FULL) <= count_of(&c, HYDRATED),
+            "`{src}`: nothing beyond the survivors: {c:?}"
+        );
     }
 }
 

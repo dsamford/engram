@@ -84,11 +84,18 @@ fn a_scoped_slot_takes_the_persisted_index_restricted_to_its_label() {
             .expect("servable")
     });
     let c = tr.counters();
-    assert_eq!(ids, small_pending, "the scoped probe answers the label's ids alone");
-    assert_eq!(count_of(c,RESTRICTED), 1, "{c:?}");
-    assert_eq!(count_of(c,"index.restricted to a label"), 1, "{c:?}");
-    assert_eq!(count_of(c,BUILT), 0, "no rebuild: {c:?}");
-    assert_eq!(count_of(c,WHOLE), 0, "the scoped slot did not take the whole index: {c:?}");
+    assert_eq!(
+        ids, small_pending,
+        "the scoped probe answers the label's ids alone"
+    );
+    assert_eq!(count_of(c, RESTRICTED), 1, "{c:?}");
+    assert_eq!(count_of(c, "index.restricted to a label"), 1, "{c:?}");
+    assert_eq!(count_of(c, BUILT), 0, "no rebuild: {c:?}");
+    assert_eq!(
+        count_of(c, WHOLE),
+        0,
+        "the scoped slot did not take the whole index: {c:?}"
+    );
 
     // The second scoped probe is a cache hit on the restricted index.
     let (again, tr) = engram_observe::with_trace(|| {
@@ -98,8 +105,8 @@ fn a_scoped_slot_takes_the_persisted_index_restricted_to_its_label() {
     });
     let c = tr.counters();
     assert_eq!(again, small_pending);
-    assert_eq!(count_of(c,HIT), 1, "{c:?}");
-    assert_eq!(count_of(c,RESTRICTED), 0, "{c:?}");
+    assert_eq!(count_of(c, HIT), 1, "{c:?}");
+    assert_eq!(count_of(c, RESTRICTED), 0, "{c:?}");
 
     // The UNSCOPED probe still takes the persisted index whole.
     let (all, tr) = engram_observe::with_trace(|| {
@@ -109,12 +116,15 @@ fn a_scoped_slot_takes_the_persisted_index_restricted_to_its_label() {
     });
     let c = tr.counters();
     assert_eq!(all.len(), 2_004);
-    assert_eq!(count_of(c,WHOLE), 1, "{c:?}");
-    assert_eq!(count_of(c,RESTRICTED), 0, "{c:?}");
+    assert_eq!(count_of(c, WHOLE), 1, "{c:?}");
+    assert_eq!(count_of(c, RESTRICTED), 0, "{c:?}");
 
     // Through the engine, both labels answer their own counts.
     assert_eq!(
-        rows(&g, "MATCH (s:Small {status: 'pending'}) RETURN count(s) AS n"),
+        rows(
+            &g,
+            "MATCH (s:Small {status: 'pending'}) RETURN count(s) AS n"
+        ),
         vec![vec![Value::Int(4)]]
     );
     assert_eq!(
@@ -122,7 +132,10 @@ fn a_scoped_slot_takes_the_persisted_index_restricted_to_its_label() {
         vec![vec![Value::Int(2_000)]]
     );
     assert_eq!(
-        rows(&g, "MATCH (s:Small {status: 'done'}) RETURN s.n AS n ORDER BY n"),
+        rows(
+            &g,
+            "MATCH (s:Small {status: 'done'}) RETURN s.n AS n ORDER BY n"
+        ),
         [1i64, 2, 4, 5, 7, 8]
             .iter()
             .map(|i| vec![Value::Int(*i)])

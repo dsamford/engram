@@ -1,6 +1,6 @@
 # Durability and recovery
 
-Engram has **three storage modes**, and they lose different things. Choosing
+Engram has **four storage modes**, and they lose different things. Choosing
 one is the most consequential flag decision you will make, so this page states
 what each survives and then demonstrates it.
 
@@ -8,11 +8,18 @@ what each survives and then demonstrates it.
 |---|---|---|
 | In-memory | *(default)* | **everything** |
 | WAL-durable | `--data-dir DIR` | **nothing acknowledged** |
-| Paged | `--paged-dir DIR` | **the unsealed tail** |
+| Paged | `--paged-dir DIR` | **nothing acknowledged** |
 | Bulk ingest | `--bulk-ingest` | **everything since the load began** |
 
-`--data-dir` and `--paged-dir` are mutually exclusive, and the server exits
-rather than guess. `--bulk-ingest` is refused with `--data-dir`.
+`--data-dir` and `--paged-dir` are two on-disk layouts under one durability
+model rather than two durability models. Both carry a write-ahead log, both
+`fsync` before they acknowledge, and both lose nothing that was acknowledged;
+what differs is how much of the corpus has to be resident. They are mutually
+exclusive, and the server exits rather than guess.
+
+`--bulk-ingest` is the exception, and is refused with `--data-dir`. A bulk load
+writes no log records at all, so while one is running the paged tail genuinely
+is volatile — that is the trade the mode announces.
 
 ## WAL-durable — the mode you want
 
@@ -50,7 +57,23 @@ data/
 ```
 
 The empty WAL is a 64-byte header: the magic `ENGRWAL1`, a format version, and
-the genesis hash of the chain.
+an anchor — the sequence of the first record in the file, and the chain hash
+immediately before it. A log that has never been rotated anchors at sequence 0
+and the genesis hash; a paged checkpoint moves the anchor forward.
+
+A paged directory holds the same two entries, with its segments beside them:
+
+```text
+paged/
+  LOCK             the directory lock
+  engram.wal       the write-ahead log fronting the unsealed tail
+  seg-<seq>.seg    one file per sealed segment
+```
+
+The two layouts are not interchangeable even though both hold a file called
+`engram.wal`: a paged directory's log is a checkpointed suffix, and pointing
+`--data-dir` at one is refused rather than replayed. See
+[What recovery refuses](#what-recovery-refuses).
 
 ### The rule underneath it
 
@@ -75,7 +98,7 @@ eight ways.
 `--no-group-commit` restores one fsync per write. It exists for A/B measurement
 and is slower under concurrent writers.
 
-## Paged — bigger than RAM, and not the durable mode
+## Paged — bigger than RAM, and durable
 
 ```sh
 engram-server 127.0.0.1:7687 --paged-dir ./paged --paged-cache-mb 4096
@@ -85,34 +108,48 @@ Sealed segments spill to `seg-<seq>.seg` files and are read block-by-block
 through a bounded cache, so the **working set** rather than the corpus sets the
 memory floor.
 
-**Durability is at seal boundaries only.** A version reaches disk when its
-segment is spilled; the unsealed tail is volatile. The server says so at
-startup, unprompted:
+`DIR/engram.wal` fronts the unsealed tail, and it is not something you switch
+on: `--paged-dir` opens it unconditionally and no flag selects it. The ordering
+is the one `--data-dir` gives — appended and `fsync`ed **before** the
+acknowledgement — and the log is replayed into the tail on open. A spill then
+checkpoints it behind the segments it wrote.
 
-```text
-[engram-server] paged: ./paged — cache 4096 MiB, 0 segment(s) on disk.
-                Durability at seal boundaries — the unsealed tail is LOST on
-                crash; not the durable mode.
-```
+So paged mode is the combination of a graph larger than memory and the
+durability promise of `--data-dir`. The two flags choose a layout, which is to
+say how much of the corpus has to be resident. They do not choose what a crash
+costs.
+
+The startup line is worth reading rather than skipping. It names the cache
+budget, how many segments are on disk, the path of the WAL, and **how many
+versions the open replayed out of it** — that last number is the tail the
+restart recovered, which is what tells you the log did its job.
+
+What the log does not hold in paged mode is the whole history: a checkpoint
+drops the prefix the segments already carry. A paged WAL therefore restores the
+tail, not a past point in time — and there is no point-in-time-restore tooling
+in either mode, which is stated with the rest of the absences
+[below](#what-does-not-exist).
 
 ### Demonstrated
 
-The same three-node test, in paged mode, killed the same way:
+The demonstration worth having in this mode is the one where nothing had been
+sealed and the data came back regardless, because that is precisely what the WAL
+buys. The engine asserts it: 50 acknowledged writes into a paged directory, a
+`kill -9`, and then two restarts, each required to answer 50
+(`acknowledged_writes_survive_kill_9_in_paged_mode`, in the server's durability
+suite). The second restart is not redundant — it is what checks that the replay
+is idempotent, that the first restart's replayed tail is still the tail.
 
-```text
-before kill:   MATCH (v:Vol) RETURN count(v)  →  3
-seg files on disk: 0
-=== hard kill ===
-after restart: MATCH (v:Vol) RETURN count(v)  →  0
-```
+The store's own suite pins the pieces underneath it: that writes after a paged
+open survive a crash, that a spill checkpoints the WAL behind the segments it
+wrote, that a crash between a spill and its checkpoint replays no row twice, and
+that a torn tail after a rotation costs the tail rather than the prefix.
 
-Nothing had been sealed — three nodes is far below `--seal-after`'s default of
-65,536 versions — so nothing was on disk, and the restart came back empty. This
-is the documented behaviour working exactly as specified, and it is why paged
-mode is the benchmark and bulk-serving mode rather than the durable one.
-
-If you need both durability and a graph larger than memory, that combination
-does not exist today. See [Roadmap](../roadmap.md).
+Earlier versions of this page showed a paged restart answering `0`, and quoted a
+startup banner announcing that the tail was volatile. That was true of a paged
+store before the WAL fronted its tail; it is not true of this build, and the
+banner is not a line this binary prints. Both are removed rather than re-taken,
+because a transcript nobody has re-run is worse than none.
 
 ### Forcing a checkpoint
 
@@ -121,8 +158,28 @@ CALL engram.checkpoint() YIELD spilled, segments, resident, tail
 RETURN spilled, segments, resident, tail
 ```
 
-Paged mode only; refused otherwise. This is what a drain-before-shutdown hook
-calls.
+Paged mode only; refused otherwise rather than silently doing nothing.
+
+It seals the tail and spills every resident sealed segment into the paged
+directory, so `resident` falls and `segments` rises. It does **not** rotate the
+WAL: it spills without asking for the durable boundary back, so nothing
+checkpoints the log behind it and the next open still replays the same records.
+
+The rotation is the automatic spill's, not this call's — the boot spill and the
+maintenance thread's storage pass take the boundary from the spill and
+checkpoint below it. When they do, the log is rotated to an anchor — the
+sequence of its first surviving record, and the chain hash immediately before
+it — so the records it keeps still verify as a chain rather than as a suffix of
+one. The group-commit `fsync` handle moves to the successor inside the same
+critical section, so a commit racing the rotation fsyncs the old file or the new
+one and never the old handle for a record only the new file holds; and the
+successor is complete before it is renamed over its predecessor, so a crash
+mid-checkpoint leaves one whole file or the other.
+
+This is what a drain-before-shutdown hook calls. It is not what makes paged mode
+durable — the WAL already does that, and a hook that never ran costs no
+acknowledged write. What it buys is a bounded resident set at shutdown, not a
+shorter replay.
 
 ## In-memory — the default, announced loudly
 
@@ -179,11 +236,19 @@ rather than continue past damage:
 | a sequence gap | refuses — an entry was removed or reordered |
 | a malformed payload | refuses at that sequence |
 | the file is not an Engram WAL | refuses — *"not an engram WAL (expected magic …, found …) — refusing to touch it"* |
+| the WAL was rotated by a paged checkpoint | refuses — *"WAL was rotated (its chain starts at seq N, not genesis): it fronts a paged store's sealed segments and cannot be opened as a whole-history log"* |
 | the directory cannot be opened | **panics** |
 
 That last one is deliberate. Starting empty over a data directory that was
 explicitly requested would look like an empty database rather than a failed
 open — which is how a restore gets overwritten.
+
+The rotated row is the one an operator meets by accident, because both directory
+layouts hold a file called `engram.wal`: pointing `--data-dir` at a directory
+that was served with `--paged-dir` reaches exactly this refusal. It refuses
+rather than opening partially because the records below the anchor live in the
+segments, and replaying the suffix as the whole database would drop them
+silently.
 
 ## Integrity beyond replay
 
@@ -220,7 +285,7 @@ diverges while reporting healthy. It is a primitive, not a product; see
 
 | flag | default | effect |
 |---|---|---|
-| `--seal-after N` | 65,536 versions | how much sits in the volatile tail — in paged mode, how much a crash can lose |
+| `--seal-after N` | 65,536 versions | how much sits in the write tail before it is sealed — what a restart replays, and what a span read may have to merge. Not what a crash costs, except under `--bulk-ingest`, where the tail carries no log records |
 | `--compact-after N` | 8 segments | how many segments a point read may walk |
 | `--no-group-commit` | *(group commit on)* | one fsync per write instead of per batch |
 | `--compact-every S` | off | paged only: a time floor under full compaction |

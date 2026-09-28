@@ -141,8 +141,14 @@ fn fixture() -> Graph {
     // that starved the pod's q2: the deep table's first probe always arrives
     // nested under a live serve.
     stmt(&g, "CREATE (:Q {id: 100})");
-    stmt(&g, "MATCH (x:P {id: 5}), (y:Q {id: 100}) CREATE (x)-[:LIKES]->(y)");
-    stmt(&g, "MATCH (x:Q {id: 100}), (y:P {id: 20}) CREATE (x)-[:FOLLOWS]->(y)");
+    stmt(
+        &g,
+        "MATCH (x:P {id: 5}), (y:Q {id: 100}) CREATE (x)-[:LIKES]->(y)",
+    );
+    stmt(
+        &g,
+        "MATCH (x:Q {id: 100}), (y:P {id: 20}) CREATE (x)-[:FOLLOWS]->(y)",
+    );
     g.shared_store().seal();
     g
 }
@@ -199,7 +205,8 @@ fn directions_do_not_share_a_snapshot() {
     // Two hops on the ASYMMETRIC type, so the two directions differ by count
     // and not merely by which peers they name.
     let fwd = "MATCH (a:P)-[:FOLLOWS]->(b:P)-[:FOLLOWS]->(c:P) WHERE a.id = 0 RETURN count(*) AS c";
-    let back = "MATCH (a:P)<-[:FOLLOWS]-(b:P)<-[:FOLLOWS]-(c:P) WHERE a.id = 0 RETURN count(*) AS c";
+    let back =
+        "MATCH (a:P)<-[:FOLLOWS]-(b:P)<-[:FOLLOWS]-(c:P) WHERE a.id = 0 RETURN count(*) AS c";
 
     let (f, b) = (count(&g, fwd), count(&g, back));
     assert_eq!(f, 2, "0 -> 1 -> {{5, 6}}");
@@ -360,13 +367,11 @@ fn the_lever_changes_cost_and_not_answers() {
     ];
 
     g.set_adj_snap_memo(true);
-    let (on, on_trace) = engram_observe::with_trace(|| {
-        queries.iter().map(|q| count(&g, q)).collect::<Vec<i64>>()
-    });
+    let (on, on_trace) =
+        engram_observe::with_trace(|| queries.iter().map(|q| count(&g, q)).collect::<Vec<i64>>());
     g.set_adj_snap_memo(false);
-    let (off, off_trace) = engram_observe::with_trace(|| {
-        queries.iter().map(|q| count(&g, q)).collect::<Vec<i64>>()
-    });
+    let (off, off_trace) =
+        engram_observe::with_trace(|| queries.iter().map(|q| count(&g, q)).collect::<Vec<i64>>());
     g.set_adj_snap_memo(true);
 
     assert_eq!(

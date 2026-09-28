@@ -51,7 +51,10 @@ fn fresh(n: i64) -> Graph {
     .expect("create index");
     run(
         &g,
-        &format!("UNWIND range(0, {}) AS i CREATE (:T {{k: i, tag: 'a'}})", n - 1),
+        &format!(
+            "UNWIND range(0, {}) AS i CREATE (:T {{k: i, tag: 'a'}})",
+            n - 1
+        ),
     );
     g
 }
@@ -66,7 +69,9 @@ fn index_work(t: &engram_observe::Trace) -> u64 {
     c.get("graph.range index cache hit").copied().unwrap_or(0)
         + c.get("graph.range index builds").copied().unwrap_or(0)
         + c.get("graph.range index caught up").copied().unwrap_or(0)
-        + c.get("graph.range index still current").copied().unwrap_or(0)
+        + c.get("graph.range index still current")
+            .copied()
+            .unwrap_or(0)
 }
 
 /// Answer `src` both ways and require agreement — WITHOUT requiring that the
@@ -89,7 +94,8 @@ fn agree_either_plan(g: &Graph, src: &str, what: &str) -> usize {
     };
     let (sk, sc) = (key(&mut seek), key(&mut scan));
     assert_eq!(
-        sk, sc,
+        sk,
+        sc,
         "the maintained index and the scan disagree after {what}\n  \
          `{src}`\n  index seek returned {} row(s)\n  label scan returned {} row(s)",
         sk.len(),
@@ -176,7 +182,11 @@ fn agrees_after_plain_creates() {
     both_ways_agree(&g, "MATCH (n:T {k: 5}) RETURN n.k", "40 creates (old row)");
     // A key that was never written must be empty on BOTH arms — a stale entry
     // shows up here and nowhere else.
-    let n = both_ways_agree(&g, "MATCH (n:T {k: 99999}) RETURN n.k", "40 creates (absent)");
+    let n = both_ways_agree(
+        &g,
+        "MATCH (n:T {k: 99999}) RETURN n.k",
+        "40 creates (absent)",
+    );
     assert_eq!(n, 0, "a key that was never written matched {n} row(s)");
 }
 
@@ -194,7 +204,11 @@ fn agrees_after_updates_that_move_a_row_to_a_new_key() {
     run(&g, "MATCH (n:T {k: 3}) SET n.k = 10777");
     let old = both_ways_agree(&g, "MATCH (n:T {k: 3}) RETURN n.k", "moving k 3 -> 10777");
     assert_eq!(old, 0, "the vacated key 3 still matched {old} row(s)");
-    let new = both_ways_agree(&g, "MATCH (n:T {k: 10777}) RETURN n.k", "moving k 3 -> 10777");
+    let new = both_ways_agree(
+        &g,
+        "MATCH (n:T {k: 10777}) RETURN n.k",
+        "moving k 3 -> 10777",
+    );
     assert_eq!(new, 1, "the new key 10777 matched {new} row(s), expected 1");
 }
 
@@ -204,7 +218,11 @@ fn agrees_after_a_null_set_removes_the_property() {
     run(&g, "MATCH (n:T {k: 12}) SET n.k = null");
     let gone = both_ways_agree(&g, "MATCH (n:T {k: 12}) RETURN n.k", "SET n.k = null");
     assert_eq!(gone, 0, "a removed property still matched {gone} row(s)");
-    both_ways_agree(&g, "MATCH (n:T {k: 13}) RETURN n.k", "SET n.k = null (neighbour)");
+    both_ways_agree(
+        &g,
+        "MATCH (n:T {k: 13}) RETURN n.k",
+        "SET n.k = null (neighbour)",
+    );
 }
 
 #[test]
@@ -243,13 +261,22 @@ fn agrees_when_several_rows_share_a_key() {
 fn agrees_across_a_long_interleaving() {
     let g = fresh(1_000);
     for round in 0..30i64 {
-        run(&g, &format!("CREATE (:T {{k: {}, tag: 'r'}})", 50_000 + round));
-        run(&g, &format!("MATCH (n:T {{k: {round}}}) SET n.k = {}", 60_000 + round));
+        run(
+            &g,
+            &format!("CREATE (:T {{k: {}, tag: 'r'}})", 50_000 + round),
+        );
+        run(
+            &g,
+            &format!("MATCH (n:T {{k: {round}}}) SET n.k = {}", 60_000 + round),
+        );
         if round % 3 == 0 {
             run(&g, &format!("MATCH (n:T {{k: {}}}) DELETE n", 500 + round));
         }
         if round % 5 == 0 {
-            run(&g, &format!("MATCH (n:T {{k: {}}}) SET n.k = null", 700 + round));
+            run(
+                &g,
+                &format!("MATCH (n:T {{k: {}}}) SET n.k = null", 700 + round),
+            );
         }
         both_ways_agree(
             &g,
@@ -293,7 +320,15 @@ fn agrees_across_a_transaction() {
         &g,
         "MATCH (n:T {k: 30}) SET n.k = 31337 WITH n MATCH (m:T {k: 31}) SET m.tag = 'txn'",
     );
-    both_ways_agree(&g, "MATCH (n:T {k: 31337}) RETURN n.k", "a multi-write statement");
-    let old = both_ways_agree(&g, "MATCH (n:T {k: 30}) RETURN n.k", "a multi-write statement");
+    both_ways_agree(
+        &g,
+        "MATCH (n:T {k: 31337}) RETURN n.k",
+        "a multi-write statement",
+    );
+    let old = both_ways_agree(
+        &g,
+        "MATCH (n:T {k: 30}) RETURN n.k",
+        "a multi-write statement",
+    );
     assert_eq!(old, 0, "the vacated key 30 still matched {old} row(s)");
 }

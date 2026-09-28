@@ -22,11 +22,11 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-Be aware that `cargo test --workspace` links **276 integration test binaries**
-and runs about 1,700 test functions. At the dev profile's default optimisation
-level that is slow, because this engine's tests move real data — one repairs a
-table of a fifth of a million entries. CI raises the optimisation level while
-keeping debug assertions on:
+Be aware that `cargo test --workspace` links roughly **500 integration test
+binaries** and runs about 3,100 tests. At the dev profile's default
+optimisation level that is slow, because this engine's tests move real data —
+one repairs a table of a fifth of a million entries. CI raises the optimisation
+level while keeping debug assertions on:
 
 ```sh
 CARGO_PROFILE_TEST_OPT_LEVEL=2 CARGO_PROFILE_TEST_DEBUG_ASSERTIONS=true \
@@ -65,10 +65,17 @@ actually build.
 
 ## The workspace
 
-Seventeen members sharing **one version** (`version.workspace = true`). It was a
-literal in all seventeen manifests, which makes a release bump seventeen edits
-and a missed one a crate published at the wrong version — permanent on
-crates.io.
+Eighteen members sharing **one version** (`version.workspace = true`). It was a
+literal in every manifest, which makes a release bump one edit per crate and a
+missed one a crate published at the wrong version — permanent on crates.io.
+
+The eighteenth is `engram-proc`, the procedure catalogue: every `CALL`
+surface's name, arity, default output columns and mutation class, declared as
+data with **no dependencies at all**. It is a member rather than a module
+because `engram-cypher` has to classify a procedure and check its arity while
+knowing nothing of a graph, and `engram-graph` has to bind `YIELD` fields and
+shape the result — so the signatures live where both can read them and neither
+owns them.
 
 Every internal dependency carries **both a path and a version**, because
 `cargo publish` refuses a dependency with no version requirement — and it does
@@ -100,8 +107,8 @@ The clippy denials are the determinism first line; see
 
 ## Dependencies
 
-**39 third-party crates**, all permissively licensed, no copyleft. Direct
-dependencies are only:
+**44 third-party crates** resolve in `Cargo.lock`, all permissively licensed, no
+copyleft. Direct dependencies are only:
 
 | crate | used by | for |
 |---|---|---|
@@ -109,8 +116,19 @@ dependencies are only:
 | `arc-swap` | store, graph | lock-free publish of sealed sets and derived slots |
 | `ring` | crypto | AES-256-GCM and HKDF |
 | `tz-rs`, `tzdb` | cypher | IANA zone resolution for temporal values |
+| `regex`, `regex-syntax` | cypher | the `=~` engine, and the trigram index's pattern analysis |
 | `tokio` | runtime (optional feature) | the non-simulated `Runtime` |
 | `mimalloc` | server, bench, **musl only** | musl's single-arena allocator serialises concurrent allocation |
+
+`regex` is the newest of them and the manifest records why it is not a
+departure: it is a finite automaton, so it cannot backtrack and its cost is
+linear in the input, and it is pure Rust with no build script, no thread and no
+clock — which leaves the one-`cc`-invocation rule and the determinism gate
+untouched. `regex-syntax` is taken **separately** because the trigram index
+derives which trigrams a matching value must contain by analysing the parsed
+pattern, and building that on the same HIR the matcher uses removes a class of
+disagreement between what the index believes a pattern means and what the
+matcher does. See [Regular expressions](../reference/regex.md).
 
 ### The one-`cc`-invocation rule
 
@@ -134,8 +152,8 @@ cargo deny check
 
 **musl** builds link `mimalloc`. The multi-worker server would otherwise
 serialise concurrent allocation-heavy queries on the single-arena system
-allocator's lock; one measured workload went 73 → 324 queries/s. Native builds
-keep the system allocator the determinism baselines run on.
+allocator's lock. Native builds keep the system allocator the determinism
+baselines run on.
 
 **Linux** is the only platform where RSS reporting and stale-lock takeover work:
 RSS comes from `/proc/self/statm`, and liveness from `/proc/<pid>`. Elsewhere a
@@ -157,7 +175,7 @@ cargo doc --workspace --no-deps
 |---|---|
 | a `cc` not found error | no C compiler for `ring`/`blake3` |
 | the MSRV job fails, local builds pass | 1.85 warns where 1.95 does not; `-D warnings` turns that into an error |
-| the linker dies with a bus error | linking 276 test binaries with full debug info; use `CARGO_PROFILE_TEST_DEBUG=line-tables-only` |
+| the linker dies with a bus error | linking roughly 500 test binaries with full debug info; use `CARGO_PROFILE_TEST_DEBUG=line-tables-only` |
 | a golden byte test fails on a fresh clone | CRLF checkout — `.gitattributes` normalises, so check your git config |
 
 ## Next

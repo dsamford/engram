@@ -65,12 +65,21 @@ fn track_props(i: i64) -> BTreeMap<String, Value> {
     m.insert("title".into(), s(&format!("Track {i}")));
     m.insert(
         "userId".into(),
-        s(if i % 2 == 0 { "u1" } else { ["u2", "u3", "u4"][(i % 3) as usize] }),
+        s(if i % 2 == 0 {
+            "u1"
+        } else {
+            ["u2", "u3", "u4"][(i % 3) as usize]
+        }),
     );
     // Unique per track, so `ORDER BY createdAt DESC` is a total order.
     m.insert(
         "createdAt".into(),
-        s(&format!("2026-08-{:02}T00:{:02}:{:02}Z", 1 + (i / 60) % 28, (i / 60) % 60, i % 60)),
+        s(&format!(
+            "2026-08-{:02}T00:{:02}:{:02}Z",
+            1 + (i / 60) % 28,
+            (i / 60) % 60,
+            i % 60
+        )),
     );
     m.insert("kind".into(), s(if i % 3 == 0 { "live" } else { "studio" }));
     m
@@ -103,10 +112,15 @@ fn corpus() -> (Graph, Vec<Track>) {
             None
         } else {
             let j = (i % 20) as usize;
-            g.create_rel(id, "PERFORMED_BY", artists[j], &BTreeMap::new()).expect("performed");
+            g.create_rel(id, "PERFORMED_BY", artists[j], &BTreeMap::new())
+                .expect("performed");
             Some(format!("Artist {j}"))
         };
-        tracks.push(Track { props, media, artist });
+        tracks.push(Track {
+            props,
+            media,
+            artist,
+        });
     }
     (g, tracks)
 }
@@ -148,14 +162,20 @@ fn a_bound_start_without_a_map_is_reused_by_the_optional_hop() {
     let (got, c) = traced(&g, ORIG);
     assert_eq!(got, want);
     assert_eq!(count_of(&c, REUSED), 300, "{c:?}");
-    assert_eq!(count_of(&c, FULL), 300, "one full decode per track, not two: {c:?}");
+    assert_eq!(
+        count_of(&c, FULL),
+        300,
+        "one full decode per track, not two: {c:?}"
+    );
 }
 
 /// A map on the later start keeps the re-read — its keys are tested on
-/// the re-materialised node — and so does a path variable, whose trail
-/// wants the whole node.
+/// the re-materialised node — and so does a path variable whose trail's
+/// nodes are READ (`nodes(p)`), which wants the whole node. A path variable
+/// nothing reads walks a bare trail (`bare_trail_paths`), and the start is
+/// reused.
 #[test]
-fn b_a_map_or_a_path_variable_keeps_the_re_read() {
+fn b_a_map_or_a_read_path_variable_keeps_the_re_read() {
     let (g, tracks) = corpus();
     let mapped = ORIG.replace("OPTIONAL MATCH (n)-", "OPTIONAL MATCH (n {kind: 'live'})-");
     let want = expected(&tracks, |t| t.props.get("kind") == Some(&s("live")));
@@ -164,11 +184,21 @@ fn b_a_map_or_a_path_variable_keeps_the_re_read() {
     assert_eq!(got, want);
     assert_eq!(count_of(&c, REUSED), 0, "{c:?}");
 
-    let pathed = ORIG.replace("OPTIONAL MATCH (n)-", "OPTIONAL MATCH p = (n)-");
+    // `size(nodes(p)) > 0` holds for every match, so the rows are the same.
+    let pathed = ORIG.replace(
+        "OPTIONAL MATCH (n)-[:PERFORMED_BY]->(a:UserArtist)",
+        "OPTIONAL MATCH p = (n)-[:PERFORMED_BY]->(a:UserArtist) WHERE size(nodes(p)) > 0",
+    );
+    assert_ne!(pathed, ORIG, "the replacement must apply");
     let want = expected(&tracks, |_| true);
     let (got, c) = traced(&g, &pathed);
     assert_eq!(got, want);
     assert_eq!(count_of(&c, REUSED), 0, "{c:?}");
+
+    let unread = ORIG.replace("OPTIONAL MATCH (n)-", "OPTIONAL MATCH p = (n)-");
+    let (got, c) = traced(&g, &unread);
+    assert_eq!(got, want);
+    assert_eq!(count_of(&c, REUSED), 300, "{c:?}");
 }
 
 /// A pattern label the bound node does not list falls back to the re-read,
@@ -179,8 +209,14 @@ fn c_a_label_the_bound_node_lacks_falls_back_to_the_re_read() {
     let (g, tracks) = corpus();
     let media = ORIG.replace("OPTIONAL MATCH (n)-", "OPTIONAL MATCH (n:Media)-");
     let want = expected(&tracks, |t| t.media);
-    assert!(want.iter().any(|r| r[1] != Value::Null), "fixture: some Media track has an artist");
-    assert!(want.iter().any(|r| r[1] == Value::Null), "fixture: some track is not Media");
+    assert!(
+        want.iter().any(|r| r[1] != Value::Null),
+        "fixture: some Media track has an artist"
+    );
+    assert!(
+        want.iter().any(|r| r[1] == Value::Null),
+        "fixture: some track is not Media"
+    );
     let _ = rows(&g, &media);
     let (got, c) = traced(&g, &media);
     assert_eq!(got, want);

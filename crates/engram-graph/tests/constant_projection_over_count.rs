@@ -47,24 +47,37 @@ fn fixture() -> Graph {
     let countries: Vec<u64> = (0..3).map(|i| node("Country", i)).collect();
     // (city, country)
     let city_of = [(0usize, 0usize), (1, 0), (2, 1), (3, 2)];
-    let cities: Vec<u64> = city_of.iter().map(|(c, _)| node("City", *c as i64)).collect();
+    let cities: Vec<u64> = city_of
+        .iter()
+        .map(|(c, _)| node("City", *c as i64))
+        .collect();
     for (ci, (_, co)) in city_of.iter().enumerate() {
-        g.create_rel(cities[ci], "IS_PART_OF", countries[*co], &e).expect("part");
+        g.create_rel(cities[ci], "IS_PART_OF", countries[*co], &e)
+            .expect("part");
     }
     // (person, city)
     let person_city = [0usize, 0, 1, 1, 2, 2, 2, 3, 3];
-    let persons: Vec<u64> = (0..person_city.len()).map(|i| node("Person", i as i64)).collect();
+    let persons: Vec<u64> = (0..person_city.len())
+        .map(|i| node("Person", i as i64))
+        .collect();
     for (pi, ci) in person_city.iter().enumerate() {
-        g.create_rel(persons[pi], "IS_LOCATED_IN", cities[*ci], &e).expect("loc");
+        g.create_rel(persons[pi], "IS_LOCATED_IN", cities[*ci], &e)
+            .expect("loc");
     }
     for (a, b) in [
-        (0usize, 1usize), (1, 2), (2, 0), // triangle 0,1,2
-        (2, 3), (3, 1), // triangle 1,2,3 (shares 1-2)
+        (0usize, 1usize),
+        (1, 2),
+        (2, 0), // triangle 0,1,2
+        (2, 3),
+        (3, 1), // triangle 1,2,3 (shares 1-2)
         (0, 3), // chord: 0-3 — triangles 0,1,3? 0-1,1-3,3-0 yes; 0,2,3? 0-2,2-3,3-0 yes
-        (4, 5), (5, 6), (6, 4), // triangle 4,5,6
+        (4, 5),
+        (5, 6),
+        (6, 4), // triangle 4,5,6
         (7, 8), // no triangle
     ] {
-        g.create_rel(persons[a], "KNOWS", persons[b], &e).expect("knows");
+        g.create_rel(persons[a], "KNOWS", persons[b], &e)
+            .expect("knows");
     }
     g
 }
@@ -81,7 +94,11 @@ fn run(g: &Graph, src: &str, params: BTreeMap<String, Value>) -> QueryResult {
 }
 
 /// ON and OFF, each under a trace: the results and how often the path fired.
-fn arms(g: &Graph, src: &str, params: &BTreeMap<String, Value>) -> (QueryResult, u64, QueryResult, u64) {
+fn arms(
+    g: &Graph,
+    src: &str,
+    params: &BTreeMap<String, Value>,
+) -> (QueryResult, u64, QueryResult, u64) {
     g.set_const_projection_fold(true);
     let (on, t_on) = engram_observe::with_trace(|| run(g, src, params.clone()));
     g.set_const_projection_fold(false);
@@ -93,8 +110,14 @@ fn arms(g: &Graph, src: &str, params: &BTreeMap<String, Value>) -> (QueryResult,
 
 fn assert_identical_and_fired(g: &Graph, src: &str, params: BTreeMap<String, Value>) {
     let (on, fired_on, off, fired_off) = arms(g, src, &params);
-    assert!(fired_on > 0, "`{src}`: the ON arm never took the path — this test proved nothing");
-    assert_eq!(fired_off, 0, "`{src}`: the lever is off and the path still ran");
+    assert!(
+        fired_on > 0,
+        "`{src}`: the ON arm never took the path — this test proved nothing"
+    );
+    assert_eq!(
+        fired_off, 0,
+        "`{src}`: the lever is off and the path still ran"
+    );
     assert_eq!(on.columns, off.columns, "`{src}`: column names differ");
     assert_eq!(on.rows, off.rows, "`{src}`: rows differ");
 }
@@ -114,7 +137,11 @@ fn the_existence_probe_is_byte_identical_and_takes_the_path() {
     let src = format!("{Q3_PATTERN} RETURN 1 LIMIT 1");
     assert_identical_and_fired(&g, &src, BTreeMap::new());
     let r = run(&g, &src, BTreeMap::new());
-    assert_eq!(r.columns, vec!["1".to_string()], "an unaliased literal is named by its source text");
+    assert_eq!(
+        r.columns,
+        vec!["1".to_string()],
+        "an unaliased literal is named by its source text"
+    );
     assert_eq!(r.rows, vec![vec![Value::Int(1)]]);
 }
 
@@ -124,7 +151,13 @@ fn every_match_is_one_copy_of_the_constant_row() {
     // over the undirected KNOWS walk from every rotation and direction, are
     // exactly what `count(*)` reports — pin the two agree.
     let g = fixture();
-    let n = match run(&g, &format!("{Q3_PATTERN} RETURN count(*) AS c"), BTreeMap::new()).rows[0][0] {
+    let n = match run(
+        &g,
+        &format!("{Q3_PATTERN} RETURN count(*) AS c"),
+        BTreeMap::new(),
+    )
+    .rows[0][0]
+    {
         Value::Int(n) => n as usize,
         ref v => panic!("count returned {v:?}"),
     };
@@ -134,14 +167,27 @@ fn every_match_is_one_copy_of_the_constant_row() {
     let r = run(&g, &src, BTreeMap::new());
     assert_eq!(r.columns, vec!["present".to_string(), "tag".to_string()]);
     assert_eq!(r.rows.len(), n);
-    assert!(r.rows.iter().all(|row| row == &vec![Value::Bool(true), Value::Str("q3".into())]));
+    assert!(
+        r.rows
+            .iter()
+            .all(|row| row == &vec![Value::Bool(true), Value::Str("q3".into())])
+    );
 }
 
 #[test]
 fn skip_and_limit_cut_the_run_of_identical_rows() {
     let g = fixture();
-    let n = run(&g, &format!("{Q3_PATTERN} RETURN 1"), BTreeMap::new()).rows.len();
-    for (skip, limit) in [(0usize, 3usize), (2, 4), (n - 1, 5), (n, 1), (n + 7, 2), (0, 0)] {
+    let n = run(&g, &format!("{Q3_PATTERN} RETURN 1"), BTreeMap::new())
+        .rows
+        .len();
+    for (skip, limit) in [
+        (0usize, 3usize),
+        (2, 4),
+        (n - 1, 5),
+        (n, 1),
+        (n + 7, 2),
+        (0, 0),
+    ] {
         let src = format!("{Q3_PATTERN} RETURN 1 SKIP {skip} LIMIT {limit}");
         assert_identical_and_fired(&g, &src, BTreeMap::new());
         let got = run(&g, &src, BTreeMap::new()).rows.len();
@@ -163,7 +209,10 @@ fn parameters_are_constants_too_in_the_items_and_in_the_cut() {
     assert_identical_and_fired(&g, &src, params.clone());
     let r = run(&g, &src, params);
     assert_eq!(r.columns, vec!["m".to_string(), "42".to_string()]);
-    assert_eq!(r.rows, vec![vec![Value::Str("hit".into()), Value::Int(42)]; 2]);
+    assert_eq!(
+        r.rows,
+        vec![vec![Value::Str("hit".into()), Value::Int(42)]; 2]
+    );
 }
 
 #[test]
@@ -182,11 +231,16 @@ fn zero_matches_give_zero_rows_with_the_columns_still_named() {
 fn a_where_on_the_pattern_is_honoured() {
     // Only country 1's triangle (persons 4,5,6) — the count must fall with it.
     let g = fixture();
-    let all = run(&g, &format!("{Q3_PATTERN} RETURN 1"), BTreeMap::new()).rows.len();
+    let all = run(&g, &format!("{Q3_PATTERN} RETURN 1"), BTreeMap::new())
+        .rows
+        .len();
     let src = format!("{Q3_PATTERN} WHERE country.id = 1 RETURN 1");
     assert_identical_and_fired(&g, &src, BTreeMap::new());
     let some = run(&g, &src, BTreeMap::new()).rows.len();
-    assert!(some > 0 && some < all, "WHERE must select a strict subset: {some} of {all}");
+    assert!(
+        some > 0 && some < all,
+        "WHERE must select a strict subset: {some} of {all}"
+    );
 }
 
 #[test]
@@ -201,8 +255,16 @@ fn a_single_path_pattern_is_accepted_too() {
 #[test]
 fn a_projected_variable_or_property_declines() {
     let g = fixture();
-    assert_declined(&g, &format!("{Q3_PATTERN} RETURN person1.id LIMIT 1"), BTreeMap::new());
-    assert_declined(&g, &format!("{Q3_PATTERN} RETURN 1, country LIMIT 1"), BTreeMap::new());
+    assert_declined(
+        &g,
+        &format!("{Q3_PATTERN} RETURN person1.id LIMIT 1"),
+        BTreeMap::new(),
+    );
+    assert_declined(
+        &g,
+        &format!("{Q3_PATTERN} RETURN 1, country LIMIT 1"),
+        BTreeMap::new(),
+    );
 }
 
 #[test]
@@ -211,19 +273,43 @@ fn a_function_call_declines_even_when_pure() {
     // `rand()` and `timestamp()` look the same to a shape check and would
     // replicate one draw across every row.
     let g = fixture();
-    assert_declined(&g, &format!("{Q3_PATTERN} RETURN toUpper('x') LIMIT 1"), BTreeMap::new());
+    assert_declined(
+        &g,
+        &format!("{Q3_PATTERN} RETURN toUpper('x') LIMIT 1"),
+        BTreeMap::new(),
+    );
     // `rand()` cannot be compared run-to-run (that is the point); only the
     // decline is checkable.
-    let (_, fired_on, _, fired_off) = arms(&g, &format!("{Q3_PATTERN} RETURN rand() LIMIT 1"), &BTreeMap::new());
-    assert_eq!((fired_on, fired_off), (0, 0), "rand() must never ride the replay");
+    let (_, fired_on, _, fired_off) = arms(
+        &g,
+        &format!("{Q3_PATTERN} RETURN rand() LIMIT 1"),
+        &BTreeMap::new(),
+    );
+    assert_eq!(
+        (fired_on, fired_off),
+        (0, 0),
+        "rand() must never ride the replay"
+    );
 }
 
 #[test]
 fn distinct_order_by_and_star_decline() {
     let g = fixture();
-    assert_declined(&g, &format!("{Q3_PATTERN} RETURN DISTINCT 1"), BTreeMap::new());
-    assert_declined(&g, &format!("{Q3_PATTERN} RETURN 1 ORDER BY 1 LIMIT 1"), BTreeMap::new());
-    assert_declined(&g, &format!("{Q3_PATTERN} RETURN *, 1 LIMIT 1"), BTreeMap::new());
+    assert_declined(
+        &g,
+        &format!("{Q3_PATTERN} RETURN DISTINCT 1"),
+        BTreeMap::new(),
+    );
+    assert_declined(
+        &g,
+        &format!("{Q3_PATTERN} RETURN 1 ORDER BY 1 LIMIT 1"),
+        BTreeMap::new(),
+    );
+    assert_declined(
+        &g,
+        &format!("{Q3_PATTERN} RETURN *, 1 LIMIT 1"),
+        BTreeMap::new(),
+    );
 }
 
 #[test]
@@ -247,17 +333,48 @@ fn a_limited_probe_stops_the_fold_at_its_cap_and_a_count_never_does() {
     let g = fixture();
     let cap_hits = |src: &str| {
         let (_, t) = engram_observe::with_trace(|| run(&g, src, BTreeMap::new()));
-        t.counters().get("pipeline.count fold stopped at the probe cap").copied().unwrap_or(0)
+        t.counters()
+            .get("pipeline.count fold stopped at the probe cap")
+            .copied()
+            .unwrap_or(0)
     };
-    assert!(cap_hits(&format!("{Q3_PATTERN} RETURN 1 LIMIT 1")) > 0, "LIMIT 1 must stop the fold early");
-    assert_eq!(cap_hits(&format!("{Q3_PATTERN} RETURN count(*) AS c")), 0, "a count sums every row");
-    assert_eq!(cap_hits(&format!("{Q3_PATTERN} RETURN 1")), 0, "no LIMIT, no cap: every copy is owed");
+    assert!(
+        cap_hits(&format!("{Q3_PATTERN} RETURN 1 LIMIT 1")) > 0,
+        "LIMIT 1 must stop the fold early"
+    );
+    assert_eq!(
+        cap_hits(&format!("{Q3_PATTERN} RETURN count(*) AS c")),
+        0,
+        "a count sums every row"
+    );
+    assert_eq!(
+        cap_hits(&format!("{Q3_PATTERN} RETURN 1")),
+        0,
+        "no LIMIT, no cap: every copy is owed"
+    );
     // A SKIP past every match leaves the cap unreached: the exact total, zero rows.
-    let n = run(&g, &format!("{Q3_PATTERN} RETURN 1"), BTreeMap::new()).rows.len();
-    assert_eq!(cap_hits(&format!("{Q3_PATTERN} RETURN 1 SKIP {} LIMIT 2", n + 3)), 0);
-    assert!(run(&g, &format!("{Q3_PATTERN} RETURN 1 SKIP {} LIMIT 2", n + 3), BTreeMap::new()).rows.is_empty());
+    let n = run(&g, &format!("{Q3_PATTERN} RETURN 1"), BTreeMap::new())
+        .rows
+        .len();
+    assert_eq!(
+        cap_hits(&format!("{Q3_PATTERN} RETURN 1 SKIP {} LIMIT 2", n + 3)),
+        0
+    );
+    assert!(
+        run(
+            &g,
+            &format!("{Q3_PATTERN} RETURN 1 SKIP {} LIMIT 2", n + 3),
+            BTreeMap::new()
+        )
+        .rows
+        .is_empty()
+    );
     // And the capped answer is still byte-identical to the general path's.
-    assert_identical_and_fired(&g, &format!("{Q3_PATTERN} RETURN 1 LIMIT 1"), BTreeMap::new());
+    assert_identical_and_fired(
+        &g,
+        &format!("{Q3_PATTERN} RETURN 1 LIMIT 1"),
+        BTreeMap::new(),
+    );
 }
 
 #[test]
@@ -268,11 +385,22 @@ fn the_canary_bites_on_a_miscounted_cut() {
     // statement is changed between them.
     let g = fixture();
     g.set_const_projection_fold(true);
-    let on = run(&g, &format!("{Q3_PATTERN} RETURN 1 LIMIT 3"), BTreeMap::new());
+    let on = run(
+        &g,
+        &format!("{Q3_PATTERN} RETURN 1 LIMIT 3"),
+        BTreeMap::new(),
+    );
     g.set_const_projection_fold(false);
-    let off = run(&g, &format!("{Q3_PATTERN} RETURN 1 LIMIT 2"), BTreeMap::new());
+    let off = run(
+        &g,
+        &format!("{Q3_PATTERN} RETURN 1 LIMIT 2"),
+        BTreeMap::new(),
+    );
     g.set_const_projection_fold(true);
-    assert_ne!(on.rows, off.rows, "the arms must be able to disagree, or the equality above is vacuous");
+    assert_ne!(
+        on.rows, off.rows,
+        "the arms must be able to disagree, or the equality above is vacuous"
+    );
 }
 
 // ─── OPTIONAL MATCH legs (the q7 shape) ─────────────────────────────────────
@@ -296,12 +424,27 @@ fn optional_legs_ride_along_and_the_probe_no_longer_enumerates() {
     let g = fixture();
     assert_identical_and_fired(&g, &format!("{Q7_SHAPE} RETURN 1 LIMIT 1"), BTreeMap::new());
     assert_identical_and_fired(&g, &format!("{Q7_SHAPE} RETURN 1"), BTreeMap::new());
-    assert_identical_and_fired(&g, &format!("{Q7_SHAPE} RETURN 'x' AS k SKIP 2 LIMIT 5"), BTreeMap::new());
+    assert_identical_and_fired(
+        &g,
+        &format!("{Q7_SHAPE} RETURN 'x' AS k SKIP 2 LIMIT 5"),
+        BTreeMap::new(),
+    );
     // The optional legs' multiplicity is part of the count: the row set is
     // larger than the leading MATCH alone, or the legs were dropped.
-    let with = run(&g, &format!("{Q7_SHAPE} RETURN 1"), BTreeMap::new()).rows.len();
-    let without = run(&g, "MATCH (a:Person)-[:KNOWS]-(b:Person) RETURN 1", BTreeMap::new()).rows.len();
-    assert!(with > without, "optional legs multiplied nothing: {with} vs {without}");
+    let with = run(&g, &format!("{Q7_SHAPE} RETURN 1"), BTreeMap::new())
+        .rows
+        .len();
+    let without = run(
+        &g,
+        "MATCH (a:Person)-[:KNOWS]-(b:Person) RETURN 1",
+        BTreeMap::new(),
+    )
+    .rows
+    .len();
+    assert!(
+        with > without,
+        "optional legs multiplied nothing: {with} vs {without}"
+    );
 }
 
 #[test]

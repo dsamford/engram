@@ -92,7 +92,10 @@ a test pinning exactly that: `verification_requires_no_key`.
 
 ## The WAL
 
-The durable sink. `engram.wal` opens with a 64-byte header:
+The durable sink, in both on-disk layouts: `--data-dir` puts it at the root, and
+`--paged-dir DIR` carries `DIR/engram.wal` in front of the paged tail.
+
+`engram.wal` opens with a 64-byte header — this one is a **genesis** file:
 
 ```text
 00000000: 454e 4752 5741 4c31 0000 0001 0000 0000  ENGRWAL1........
@@ -101,7 +104,50 @@ The durable sink. `engram.wal` opens with a 64-byte header:
 00000030: 844c 1b8e 0000 0000 0000 0000 0000 0000  .L..............
 ```
 
-Magic `ENGRWAL1`, format version, and the genesis hash.
+Magic `ENGRWAL1`, format version, then the anchor, then 12 reserved bytes.
+
+### Zero-filled ahead, synced with `fdatasync`
+
+The file runs on past its last record. The WAL writes **zero-filled space ahead
+of its end** — 256 KiB when it is opened or rotated, then extensions that double
+up to 8 MiB each, written whenever less than a quarter of the last step is left
+— and a commit syncs with `fdatasync` rather than a full `fsync`.
+
+The two go together. A sync after an append that grows the file must also
+journal the new file size; an append into blocks that were already written and
+synced is a data-only sync. The space is **written** with zeros rather than
+extended with `set_len` or `fallocate`, because on XFS and ext4 only written
+blocks give that. Should an append outrun the space, Linux's `fdatasync` still
+flushes the size change, so the durability promise holds either way. The
+creation, rotation and open paths keep the full `fsync`.
+
+So the file's size says nothing about how much log it holds. Recovery reads the
+zeroed space as the end of the log and **truncates** it, exactly as it
+truncates a torn tail — it must, since bytes past the last valid record could
+hold a complete, chain-valid record that was never acknowledged — then writes
+the space afresh and syncs it before the first append lands. `Wal::logical_len`
+answers where the log ends, for tools that used to read the file size.
+
+### The anchor, and the two forms of the file
+
+The two fields between the version and the reserved tail are an **anchor**:
+`first_seq`, the sequence of the first record in this file, and `prev_hash`, the
+chain hash immediately before it.
+
+A file that has never been checkpointed anchors at genesis — `first_seq` 0 and
+the genesis hash, as above — and its chain is verified from there.
+
+A **checkpoint** rotates the file below a sequence and writes the anchor of what
+it now starts at, so its records verify against that anchor rather than against
+genesis. That is what lets a durable prefix be dropped without breaking chain
+verification: the records below the anchor are in sealed segments on disk. The
+rotation also swaps the shared group-commit fsync handle to the new file, in the
+same critical section as the sink, so a write acknowledged after a rotation
+lands in the new file rather than being fsync'd on the old handle.
+
+A rotated file is **refused** by the whole-history open, naming the sequence it
+starts at, because replaying a suffix as the database would silently drop
+everything before the anchor.
 
 A foreign file is refused rather than touched:
 
@@ -120,15 +166,37 @@ exactly there and assert what recovery does.
 
 ### Group commit
 
-A worker drains its inbox as a batch, appends every write, **holds every reply**,
-pays one `fsync`, and only then releases them.
+A worker drains its inbox as a batch, appends every write and **holds every
+reply**. No reply leaves before every record appended up to the end of the batch
+is on disk — other workers' records included, because a write is visible on
+append, before its sync, and a read in the batch may have observed one.
 
-With one client nothing queues during the fsync, so it degrades to one fsync per
-write. With eight, the fsync is long enough that all eight send their next
-request during it, so the next batch shares one fsync eight ways.
+The sync itself belongs to one **flusher thread**, so no worker waits on the
+disk:
 
-**An `fsync` failure aborts the process.** The replies for that batch are unsent
-and unacknowledged; continuing would acknowledge writes that are not durable.
+- If the records the batch needs are already durable, and none of the worker's
+  earlier hand-offs is still queued, the replies go at once. That test reads a
+  lock-free **durable sequence number** — the log sequence up to which records
+  are known to be on stable storage — rather than the mutex a running sync
+  holds.
+- Otherwise the worker hands the held replies to the flusher and takes its next
+  batch. While a hand-off of its is queued, its later replies go through the
+  flusher as well, so none overtakes an earlier one on its connection.
+- The flusher drains every queued hand-off, pays **one** sync — which flushes
+  and syncs everything appended before it runs, from every worker — releases
+  the replies in order, and then runs the seal check.
+
+With one client nothing queues during the sync, so it degrades to one sync per
+write. With more, the requests that arrive while a sync runs share the next one.
+`--no-group-commit` restores a sync inside every write as the A/B arm.
+
+What group commit does **not** do is publish a write to readers only once it is
+durable. A write is still visible on append, which is why a read's reply can
+wait for a sync it did not ask for.
+
+**A sync failure aborts the process.** The replies for that batch are unsent
+and unacknowledged, the writes are already visible to readers on every worker,
+and continuing would acknowledge writes that are not durable.
 
 ## Recovery
 
@@ -139,17 +207,32 @@ Replay verifies as it goes and **refuses** rather than continuing past damage:
 | a hash does not follow from its predecessor | refuses at that sequence, naming it |
 | a sequence gap | refuses — an entry was removed or reordered |
 | a malformed payload | refuses at that sequence |
+| a rotated file opened as the whole history | refuses, naming the sequence it starts at |
 
-Three distinct facts with three distinct variants, because "the chain is broken"
-and "an entry is missing" call for different responses.
+The first three are distinct facts with distinct error variants, because "the
+chain is broken" and "an entry is missing" call for different responses. The
+fourth is not damage at all — the file is intact, and it is refused because it
+is only part of the history.
 
-## Truncation at a seal
+## Truncation: two different things
 
-The in-memory log is released at a seal — about **150 bytes per version**,
-growing with the corpus, and the term that put one paged load at ~17 GB.
+The section title used to name one mechanism and now names two. Neither loses a
+durable byte; both are about how much is kept in front of the segments.
 
+**The in-memory log, released at a seal** — about **150 bytes per version**,
+which would otherwise grow with every write for the life of the process.
 `--keep-full-log` retains it, and is needed **only** by a change-data-capture
 consumer tailing `log_tail`.
+
+**The on-disk WAL, rotated behind a spill.** `Store::checkpoint_wal(seq)` drops
+the records below `seq` from the file, because the segments the spill has just
+written hold them, fsync'd. This is what bounds `engram.wal` in paged mode. Every
+spill the server runs reports that boundary and rotates the file behind it —
+the boot spill, the maintenance thread's storage pass, and `CALL
+engram.checkpoint()`, which spills every resident segment and checkpoints the WAL
+behind them so the next boot replays nothing into a fresh segment. A failed
+checkpoint is reported and is not a durability event: the file keeps its prefix
+and grows until a later checkpoint succeeds.
 
 ## The replica
 
@@ -173,7 +256,6 @@ end, and no tooling. See [Roadmap](../roadmap.md).
 
 ## Next
 
-- [Durability and recovery](../using/durability.md) — what this buys you,
-  demonstrated.
+- [Durability and recovery](../using/durability.md) — what this buys you.
 - [The storage engine](./storage-engine.md) — what publishes after the log.
 - [Key encoding](./key-encoding.md) — the chain rule as a frozen format.

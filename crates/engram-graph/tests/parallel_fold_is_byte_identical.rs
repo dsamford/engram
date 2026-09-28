@@ -164,14 +164,21 @@ fn the_parallel_path_actually_ran() {
         })
     });
     assert!(
-        on.counters().get("interp.pipeline fold parallel").copied().unwrap_or(0) > 0,
+        on.counters()
+            .get("interp.pipeline fold parallel")
+            .copied()
+            .unwrap_or(0)
+            > 0,
         "the ON arm never took the parallel path — this file proved nothing"
     );
     let (_, off) = engram_observe::with_trace(|| {
         let _ = rows(&g, QUERIES[0]);
     });
     assert_eq!(
-        off.counters().get("interp.pipeline fold parallel").copied().unwrap_or(0),
+        off.counters()
+            .get("interp.pipeline fold parallel")
+            .copied()
+            .unwrap_or(0),
         0,
         "the lever is off and the parallel path still ran"
     );
@@ -190,10 +197,17 @@ fn a_transaction_stays_serial() {
             "MATCH (a:P {id: 0}), (b:P {id: 30}) CREATE (a)-[:KNOWS]->(b)",
         );
         let (r, trace) = engram_observe::with_trace(|| {
-            rows(&g, "MATCH (a:P)-[:KNOWS]->(b:P)-[:LIKES]->(c:P) RETURN count(*) AS c")
+            rows(
+                &g,
+                "MATCH (a:P)-[:KNOWS]->(b:P)-[:LIKES]->(c:P) RETURN count(*) AS c",
+            )
         });
         assert_eq!(
-            trace.counters().get("interp.pipeline fold parallel").copied().unwrap_or(0),
+            trace
+                .counters()
+                .get("interp.pipeline fold parallel")
+                .copied()
+                .unwrap_or(0),
             0,
             "an active transaction must keep the fold serial"
         );

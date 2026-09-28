@@ -19,8 +19,8 @@
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::collections::BTreeMap;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use engram_graph::counters::DERIVED_REFRESHED_BY_MAINTENANCE;
 use engram_graph::{Dir, Graph};
@@ -47,7 +47,9 @@ fn fixture() -> (Arc<Graph>, Vec<u64>, u64, u32) {
     g.set_degree_table_after(0);
     let label = vec!["N".to_string()];
     let none = BTreeMap::new();
-    let ids: Vec<u64> = (0..NODES).map(|_| g.create_node(&label, &none).expect("node")).collect();
+    let ids: Vec<u64> = (0..NODES)
+        .map(|_| g.create_node(&label, &none).expect("node"))
+        .collect();
     let hub = g.create_node(&label, &none).expect("hub");
     let mut rng = Lcg(0x9E37_79B9_7F4A_7C15);
     for &src in &ids {
@@ -90,12 +92,18 @@ fn a_repair_whose_fenced_publish_loses_is_reported_deferred_not_repaired() {
     // with no writer in flight; nothing is written before the delete's
     // fence reads that same clock.
     assert_eq!(g.adjacent_slim(ids[0], Dir::Out, &Some(vec![u])).len(), 1);
-    assert_eq!(g.members(Some("N")).expect("members").len(), NODES as usize + 1);
+    assert_eq!(
+        g.members(Some("N")).expect("members").len(),
+        NODES as usize + 1
+    );
     let del = start_hub_delete(&g, hub);
     // Behind the fence: one U write and one N node make both structures
     // stale (their epochs move past the slots' stamp).
-    g.create_rel(ids[1], "U", ids[2], &none).expect("U after the fence registered");
-    let extra = g.create_node(&["N".to_string()], &none).expect("N after the fence registered");
+    g.create_rel(ids[1], "U", ids[2], &none)
+        .expect("U after the fence registered");
+    let extra = g
+        .create_node(&["N".to_string()], &none)
+        .expect("N after the fence registered");
 
     let counter_before = DERIVED_REFRESHED_BY_MAINTENANCE.load(Ordering::Relaxed);
     let (first, trace) = engram_observe::with_trace(|| g.refresh_stale_derived());
@@ -104,23 +112,71 @@ fn a_repair_whose_fenced_publish_loses_is_reported_deferred_not_repaired() {
     let counter_during = DERIVED_REFRESHED_BY_MAINTENANCE.load(Ordering::Relaxed);
     del.join().expect("delete");
     eprintln!("[fenced] first={first:?} second={second:?} writer_still_in_flight={still_running}");
-    assert!(still_running, "the fixture is too small: the delete finished before the passes ran");
+    assert!(
+        still_running,
+        "the fixture is too small: the delete finished before the passes ran"
+    );
 
     // The work WAS done (the repair and the catch-up ran and were fenced)...
-    assert_eq!(count(&trace, "graph.adjacency tables repaired"), 1, "{:?}", trace.counters());
-    assert_eq!(count(&trace, "graph.membership snapshots caught up"), 1, "{:?}", trace.counters());
-    assert!(count(&trace, "graph.publish stamp fenced below an in-flight writer") >= 2, "{:?}", trace.counters());
-    assert_eq!(count(&trace, "graph.adjacency repair publish lost, slot unchanged"), 1, "{:?}", trace.counters());
-    assert_eq!(count(&trace, "graph.membership catch-up publish lost, slot unchanged"), 1, "{:?}", trace.counters());
+    assert_eq!(
+        count(&trace, "graph.adjacency tables repaired"),
+        1,
+        "{:?}",
+        trace.counters()
+    );
+    assert_eq!(
+        count(&trace, "graph.membership snapshots caught up"),
+        1,
+        "{:?}",
+        trace.counters()
+    );
+    assert!(
+        count(
+            &trace,
+            "graph.publish stamp fenced below an in-flight writer"
+        ) >= 2,
+        "{:?}",
+        trace.counters()
+    );
+    assert_eq!(
+        count(
+            &trace,
+            "graph.adjacency repair publish lost, slot unchanged"
+        ),
+        1,
+        "{:?}",
+        trace.counters()
+    );
+    assert_eq!(
+        count(
+            &trace,
+            "graph.membership catch-up publish lost, slot unchanged"
+        ),
+        1,
+        "{:?}",
+        trace.counters()
+    );
     // ...but the slots did not move, and the pass must say so.
     for (which, r) in [("first", first), ("second", second)] {
-        assert_eq!(r.adjacency_repaired, 0, "{which}: a repair whose publish LOST was reported repaired: {r:?}");
+        assert_eq!(
+            r.adjacency_repaired, 0,
+            "{which}: a repair whose publish LOST was reported repaired: {r:?}"
+        );
         assert_eq!(r.adjacency_rebuilt, 0, "{which}: {r:?}");
-        assert_eq!(r.adjacency_deferred, 1, "{which}: the lost publish must be reported deferred: {r:?}");
-        assert_eq!(r.members_caught_up, 0, "{which}: a catch-up whose publish LOST was reported caught up: {r:?}");
+        assert_eq!(
+            r.adjacency_deferred, 1,
+            "{which}: the lost publish must be reported deferred: {r:?}"
+        );
+        assert_eq!(
+            r.members_caught_up, 0,
+            "{which}: a catch-up whose publish LOST was reported caught up: {r:?}"
+        );
         assert_eq!(r.members_rebuilt, 0, "{which}: {r:?}");
         assert_eq!(r.members_deferred, 1, "{which}: {r:?}");
-        assert!(!r.any(), "{which}: a pass that advanced nothing claims to have brought something current: {r:?}");
+        assert!(
+            !r.any(),
+            "{which}: a pass that advanced nothing claims to have brought something current: {r:?}"
+        );
     }
     assert_eq!(
         counter_during, counter_before,
@@ -131,10 +187,32 @@ fn a_repair_whose_fenced_publish_loses_is_reported_deferred_not_repaired() {
     let counter_before = DERIVED_REFRESHED_BY_MAINTENANCE.load(Ordering::Relaxed);
     let third = g.refresh_stale_derived();
     eprintln!("[settled] third={third:?}");
-    assert_eq!((third.adjacency_repaired, third.adjacency_rebuilt, third.adjacency_deferred), (1, 0, 0), "{third:?}");
-    assert_eq!((third.members_caught_up, third.members_rebuilt, third.members_deferred), (1, 0, 0), "{third:?}");
-    assert_eq!(DERIVED_REFRESHED_BY_MAINTENANCE.load(Ordering::Relaxed), counter_before + 2);
-    assert!(!g.refresh_stale_derived().any(), "a fourth pass must find nothing stale");
+    assert_eq!(
+        (
+            third.adjacency_repaired,
+            third.adjacency_rebuilt,
+            third.adjacency_deferred
+        ),
+        (1, 0, 0),
+        "{third:?}"
+    );
+    assert_eq!(
+        (
+            third.members_caught_up,
+            third.members_rebuilt,
+            third.members_deferred
+        ),
+        (1, 0, 0),
+        "{third:?}"
+    );
+    assert_eq!(
+        DERIVED_REFRESHED_BY_MAINTENANCE.load(Ordering::Relaxed),
+        counter_before + 2
+    );
+    assert!(
+        !g.refresh_stale_derived().any(),
+        "a fourth pass must find nothing stale"
+    );
     // And the structures are right: the reader finds them current, with
     // the post-fence write and the delete both applied.
     let ((row, members), trace) = engram_observe::with_trace(|| {
@@ -144,10 +222,34 @@ fn a_repair_whose_fenced_publish_loses_is_reported_deferred_not_repaired() {
         )
     });
     assert_eq!(row, 2, "ids[1]'s original U plus the post-fence one");
-    assert_eq!(members.len(), NODES as usize + 1, "{NODES} + the extra node - the deleted hub");
+    assert_eq!(
+        members.len(),
+        NODES as usize + 1,
+        "{NODES} + the extra node - the deleted hub"
+    );
     assert!(members.contains(extra) && !members.contains(hub));
-    assert_eq!(count(&trace, "graph.adjacency tables built"), 0, "{:?}", trace.counters());
-    assert_eq!(count(&trace, "graph.adjacency tables repaired"), 0, "{:?}", trace.counters());
-    assert_eq!(count(&trace, "graph.membership snapshots built"), 0, "{:?}", trace.counters());
-    assert_eq!(count(&trace, "graph.membership snapshots caught up"), 0, "{:?}", trace.counters());
+    assert_eq!(
+        count(&trace, "graph.adjacency tables built"),
+        0,
+        "{:?}",
+        trace.counters()
+    );
+    assert_eq!(
+        count(&trace, "graph.adjacency tables repaired"),
+        0,
+        "{:?}",
+        trace.counters()
+    );
+    assert_eq!(
+        count(&trace, "graph.membership snapshots built"),
+        0,
+        "{:?}",
+        trace.counters()
+    );
+    assert_eq!(
+        count(&trace, "graph.membership snapshots caught up"),
+        0,
+        "{:?}",
+        trace.counters()
+    );
 }

@@ -142,22 +142,23 @@ rather than 1.
 
 ## Prove it survived
 
-Stop the server, start it again on the same `--data-dir`, and read the third
-startup line:
+Stop the server, start it again on the same `--data-dir`, and read the
+`warmed in` line at the end of its startup output:
 
 ```text
 [engram-server] listening on bolt://127.0.0.1:7687
 [engram-server] durable: ./data/engram.wal
-[engram-server] warmed in 0 ms: 3 nodes, 3 out-edges, 3 in-edges, 8 adjacency table(s) holding 0 MB in 0 MB allocated
+[engram-server] warmed in 0 ms: 3 nodes, 3 out-edges, 3 in-edges, 8 adjacency table(s) holding 0 MB in 0 MB allocated; …
 ```
 
 Three nodes and three relationships, replayed from the log and counted before
 the listener opened. Re-run any query above and the answers are unchanged.
 
 The `8 adjacency table(s)` are [derived structures](../architecture/derived-structures.md) —
-one per (relationship type, direction) — rebuilt at startup so your first query
-does not pay for them. On a graph this size that is instant; the mechanism
-exists because on a large one it is not.
+one per (relationship type, direction), plus an untyped table per direction for
+patterns that name no type, so three types give eight — rebuilt at startup so
+your first query does not pay for them. On a graph this size that is instant;
+the mechanism exists because on a large one it is not.
 
 ## What to read next
 

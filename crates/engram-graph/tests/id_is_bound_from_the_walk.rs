@@ -48,12 +48,16 @@ fn corpus() -> Graph {
     for i in 0..3000i64 {
         let mut m = BTreeMap::new();
         m.insert("key".to_string(), Value::Str(format!("k-{i:05}")));
-        m.insert("kind".to_string(), Value::Str(if i % 3 == 0 { "a".into() } else { "b".into() }));
+        m.insert(
+            "kind".to_string(),
+            Value::Str(if i % 3 == 0 { "a".into() } else { "b".into() }),
+        );
         m.insert("body".to_string(), Value::Str("x".repeat(2000)));
         ids.push(g.create_node(&["Item".into()], &m).expect("item"));
     }
     for i in (0..3000usize).step_by(17) {
-        g.create_rel(ids[i], "LINKS", ids[(i * 7 + 3) % 3000], &BTreeMap::new()).expect("link");
+        g.create_rel(ids[i], "LINKS", ids[(i * 7 + 3) % 3000], &BTreeMap::new())
+            .expect("link");
     }
     g
 }
@@ -70,7 +74,10 @@ fn check(g: &Graph, src: &str) -> BTreeMap<String, u64> {
 #[test]
 fn an_id_span_reads_no_record() {
     let g = corpus();
-    let c = check(&g, "MATCH (n:Item) RETURN min(id(n)) AS lo, max(id(n)) AS hi, count(*) AS c");
+    let c = check(
+        &g,
+        "MATCH (n:Item) RETURN min(id(n)) AS lo, max(id(n)) AS hi, count(*) AS c",
+    );
     assert!(count_of(&c, BOUND) > 0, "{c:?}");
     assert_eq!(count_of(&c, FULL), 0, "{c:?}");
 }

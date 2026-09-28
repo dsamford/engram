@@ -400,7 +400,9 @@ impl CommitLog {
     /// makes durable everything the others flushed first.
     pub fn flush_to_os(&mut self) -> std::io::Result<u64> {
         if let Some(sink) = &mut self.sink {
-            std::io::Write::flush(&mut sink.w)?;
+            // Also extends the WAL's zero-filled space when it runs low — here,
+            // under whatever lock guards this log, and never in the fsync.
+            sink.flush()?;
         }
         self.dirty = false;
         Ok(self.len())
@@ -428,7 +430,10 @@ impl CommitLog {
     /// below the anchor had been appended and then truncated. The replayed
     /// suffix then verifies and extends the chain the file carries.
     pub fn seed_anchor(&mut self, anchor: WalAnchor) {
-        assert!(self.entries.is_empty() && self.truncated == 0, "seed_anchor on a used log");
+        assert!(
+            self.entries.is_empty() && self.truncated == 0,
+            "seed_anchor on a used log"
+        );
         if anchor.first_seq > 0 {
             self.truncated = anchor.first_seq;
             self.truncated_head = Some(anchor.prev_hash);
@@ -643,6 +648,51 @@ pub struct Wal {
     /// Where the file lives — a rotation writes the successor beside it and
     /// renames over it.
     path: std::path::PathBuf,
+    /// The LOGICAL end: the byte after the last record written through this
+    /// sink (flushed or still buffered) — where the next record lands.
+    end: u64,
+    /// The file is zero-filled from `end` up to here.
+    ///
+    /// PRE-WRITTEN SPACE, and why it is written rather than `set_len`'d: a
+    /// commit's `fdatasync` must also journal a change of file SIZE, and on
+    /// XFS (the bench volume) and ext4 a size extended with `set_len` or
+    /// `fallocate` still costs that journal commit on the next sync — only
+    /// blocks that were WRITTEN (zeros) and synced make an append inside them
+    /// a data-only sync. PostgreSQL's `wal_init_zero` exists for the same
+    /// reason. On 2026-09-27 an engram commit cost ~5.6 ms at one client on
+    /// the bench volume against PostgreSQL's ~2.4 ms on the same disk.
+    ///
+    /// Recovery reads a zeroed tail as the end of the log (a zero op byte
+    /// never decodes, and the sequence and chain hash would reject it anyway)
+    /// and TRUNCATES it, as it truncates any torn tail — which it must: bytes
+    /// past the last valid record can hold a complete, chain-valid record
+    /// that was never acknowledged — so the space is re-written after every
+    /// open.
+    alloc: u64,
+    /// The size of the last extension; the next one doubles it, up to
+    /// [`WAL_PREALLOC_MAX_STEP`].
+    step: u64,
+}
+
+/// The zero-filled space a WAL writes ahead of its end when it is opened or
+/// rotated. Small, because most WALs a test suite opens hold a few records;
+/// each extension doubles the step up to [`WAL_PREALLOC_MAX_STEP`], so a busy
+/// log reaches the large step after a few MiB of records.
+pub const WAL_PREALLOC_FIRST: u64 = 256 << 10;
+/// The largest single extension.
+pub const WAL_PREALLOC_MAX_STEP: u64 = 8 << 20;
+
+/// Write `n` zero bytes at the file's current position.
+fn zero_fill(file: &mut std::fs::File, mut n: u64) -> std::io::Result<()> {
+    use std::io::Write;
+    const CHUNK: usize = 1 << 20;
+    let zeros = vec![0u8; CHUNK];
+    while n > 0 {
+        let k = n.min(CHUNK as u64) as usize;
+        file.write_all(&zeros[..k])?;
+        n -= k as u64;
+    }
+    Ok(())
 }
 
 /// Where a WAL file's chain starts: the sequence of its first record and the
@@ -800,12 +850,9 @@ impl Wal {
     /// — is discarded, and only because the commit that wrote it was never
     /// `fsync`'d, so losing it is correct.
     pub fn open(path: &std::path::Path) -> Result<(Vec<Entry>, Wal), WalError> {
-        let (anchor, entries, wal) = Self::open_anchored(path)?;
-        if anchor.first_seq != 0 {
-            return Err(WalError::Rotated {
-                first_seq: anchor.first_seq,
-            });
-        }
+        // A ROTATED file is refused before anything is written to it: the
+        // refusal leaves it byte-for-byte as it was, torn tail and all.
+        let (_, entries, wal) = Self::open_inner(path, true)?;
         Ok((entries, wal))
     }
 
@@ -814,8 +861,13 @@ impl Wal {
     /// than genesis, and the anchor comes back so the caller can seed its
     /// commit log's sequence and head from it. A never-rotated file anchors
     /// at genesis and behaves exactly as `open`.
-    pub fn open_anchored(
+    pub fn open_anchored(path: &std::path::Path) -> Result<(WalAnchor, Vec<Entry>, Wal), WalError> {
+        Self::open_inner(path, false)
+    }
+
+    fn open_inner(
         path: &std::path::Path,
+        refuse_rotated: bool,
     ) -> Result<(WalAnchor, Vec<Entry>, Wal), WalError> {
         use std::io::{Read, Seek, SeekFrom};
         let mut file = std::fs::OpenOptions::new()
@@ -829,16 +881,25 @@ impl Wal {
 
         // ── Header: identify the file BEFORE parsing or truncating anything ──
         if buf.is_empty() {
-            // A fresh file: write the header and start empty.
+            // A fresh file: the header, the first zero-filled space, one
+            // fsync for both, and the DIRECTORY fsync that makes the new
+            // name itself durable (a crash could otherwise lose the file).
             let anchor = WalAnchor::genesis();
             Self::write_header(&mut file, &anchor)?;
+            zero_fill(&mut file, WAL_PREALLOC_FIRST)?;
             file.sync_all()?;
+            sync_parent_dir(path)?;
+            let end = WAL_HEADER_LEN as u64;
+            file.seek(SeekFrom::Start(end))?;
             return Ok((
                 anchor,
                 Vec::new(),
                 Wal {
                     w: std::io::BufWriter::new(file),
                     path: path.to_path_buf(),
+                    end,
+                    alloc: end + WAL_PREALLOC_FIRST,
+                    step: WAL_PREALLOC_FIRST,
                 },
             ));
         }
@@ -864,7 +925,49 @@ impl Wal {
             first_seq,
             prev_hash,
         };
+        if refuse_rotated && anchor.first_seq != 0 {
+            return Err(WalError::Rotated {
+                first_seq: anchor.first_seq,
+            });
+        }
 
+        let (entries, good) = Self::scan(&buf, &anchor);
+        if good != buf.len() {
+            // Drop the torn tail — and the zero-filled space the previous
+            // sink left, which reads exactly like one. Truncating it is
+            // REQUIRED, not tidy: bytes past `good` can hold a complete,
+            // chain-valid record that was never acknowledged (the disk wrote
+            // it before the crash, the fsync never returned), and if the next
+            // append reproduced its predecessor's hash it would chain validly
+            // and come back after a second crash.
+            file.set_len(good as u64)?;
+        }
+        // Re-write the zero-filled space ahead of the end, and make it (and
+        // the truncation) durable before the first append lands in it.
+        file.seek(SeekFrom::Start(good as u64))?;
+        zero_fill(&mut file, WAL_PREALLOC_FIRST)?;
+        file.sync_all()?;
+        file.seek(SeekFrom::Start(good as u64))?;
+        let end = good as u64;
+        Ok((
+            anchor,
+            entries,
+            Wal {
+                w: std::io::BufWriter::new(file),
+                path: path.to_path_buf(),
+                end,
+                alloc: end + WAL_PREALLOC_FIRST,
+                step: WAL_PREALLOC_FIRST,
+            },
+        ))
+    }
+
+    /// Replay the COMPLETE, chain-valid records after the header, returning
+    /// them and the byte offset where the valid prefix ends — the logical end.
+    /// Stops at the first record that is short, does not decode, or fails its
+    /// sequence or chain-hash check: a torn tail, a bit flip, or the
+    /// zero-filled space a sink writes ahead of its end.
+    fn scan(buf: &[u8], anchor: &WalAnchor) -> (Vec<Entry>, usize) {
         let mut entries: Vec<Entry> = Vec::new();
         // The valid prefix INCLUDES the header, so a torn-tail truncation can
         // never cut into it — which is what made `good == 0` destructive.
@@ -906,18 +1009,30 @@ impl Wal {
             off = end;
             good = end;
         }
-        if good != buf.len() {
-            file.set_len(good as u64)?; // drop the torn tail
+        (entries, good)
+    }
+
+    /// The LOGICAL length of the WAL at `path`: the byte after its last
+    /// complete, chain-valid record. The file itself runs on past this in
+    /// zero-filled space (see the `alloc` field of `Wal`), so its metadata length says
+    /// nothing about how much log it holds. `None` for a file that is absent,
+    /// empty, or not a WAL. Read-only.
+    pub fn logical_len(path: &std::path::Path) -> Option<u64> {
+        let buf = std::fs::read(path).ok()?;
+        if buf.len() < WAL_HEADER_LEN || buf[..8] != WAL_MAGIC {
+            return None;
         }
-        file.seek(SeekFrom::Start(good as u64))?;
-        Ok((
-            anchor,
-            entries,
-            Wal {
-                w: std::io::BufWriter::new(file),
-                path: path.to_path_buf(),
+        let first_seq = u64::from_be_bytes(buf[12..20].try_into().ok()?);
+        let mut prev_hash = [0u8; 32];
+        prev_hash.copy_from_slice(&buf[20..52]);
+        let (_, good) = Self::scan(
+            &buf,
+            &WalAnchor {
+                first_seq,
+                prev_hash,
             },
-        ))
+        );
+        Some(good as u64)
     }
 
     /// The anchor recorded in `path`'s header — `None` for a file that is
@@ -969,6 +1084,7 @@ impl Wal {
         use std::io::{Seek, SeekFrom, Write};
         let path = self.path.clone();
         let successor = path.with_extension("wal.rotating");
+        let mut end = WAL_HEADER_LEN as u64;
         {
             let mut file = std::fs::OpenOptions::new()
                 .create(true)
@@ -979,14 +1095,20 @@ impl Wal {
             Self::write_header(&mut file, &anchor)?;
             let mut w = std::io::BufWriter::new(file);
             for e in keep {
-                debug_assert!(e.seq >= anchor.first_seq, "a kept record precedes the anchor");
+                debug_assert!(
+                    e.seq >= anchor.first_seq,
+                    "a kept record precedes the anchor"
+                );
                 w.write_all(&e.seq.to_be_bytes())?;
                 w.write_all(&e.header.encode())?;
                 w.write_all(&(e.payload.len() as u32).to_be_bytes())?;
                 w.write_all(&e.payload)?;
                 w.write_all(&e.hash)?;
+                end += Self::record_len(e.payload.len());
             }
             w.flush()?;
+            // The successor's zero-filled space, synced with its records.
+            zero_fill(w.get_mut(), WAL_PREALLOC_FIRST)?;
             w.get_ref().sync_all()?;
         }
         // Everything above left `self` untouched: a failure there keeps the
@@ -996,9 +1118,17 @@ impl Wal {
         self.w.flush()?;
         std::fs::rename(&successor, &path)?;
         sync_parent_dir(&path)?;
-        let mut file = std::fs::OpenOptions::new().read(true).write(true).open(&path)?;
-        file.seek(SeekFrom::End(0))?;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        // At the LOGICAL end: the file continues in zeros past the last kept
+        // record, and an append at the physical end would land after them.
+        file.seek(SeekFrom::Start(end))?;
         self.w = std::io::BufWriter::new(file);
+        self.end = end;
+        self.alloc = end + WAL_PREALLOC_FIRST;
+        self.step = WAL_PREALLOC_FIRST;
         counted!("wal.rotated");
         Ok(())
     }
@@ -1010,14 +1140,57 @@ impl Wal {
         self.w.write_all(&(e.payload.len() as u32).to_be_bytes())?;
         self.w.write_all(&e.payload)?;
         self.w.write_all(&e.hash)?;
+        self.end += Self::record_len(e.payload.len());
         Ok(())
     }
 
-    fn sync(&mut self) -> std::io::Result<()> {
-        use std::io::Write;
+    /// The on-disk size of one record with a `plen`-byte payload.
+    fn record_len(plen: usize) -> u64 {
+        (8 + HEADER_LEN + 4 + plen + 32) as u64
+    }
+
+    /// Hand every buffered record to the OS — and, when the zero-filled space
+    /// ahead of the end is running out, write more of it (see the `alloc` field of `Wal`).
+    ///
+    /// The extension runs HERE, where the caller already holds the lock that
+    /// orders appends and the buffer has just been emptied, so the file's
+    /// offset can move to the allocation frontier and back without racing an
+    /// append. It is not synced on its own: the next commit's sync makes it
+    /// durable along with the records, and costs one slower sync per step.
+    fn flush(&mut self) -> std::io::Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
         self.w.flush()?;
+        if self.alloc.saturating_sub(self.end) < self.step / 4 {
+            let from = self.alloc.max(self.end);
+            let step = (self.step * 2).min(WAL_PREALLOC_MAX_STEP);
+            let f = self.w.get_mut();
+            let filled = f
+                .seek(SeekFrom::Start(from))
+                .and_then(|_| zero_fill(f, step));
+            // Back to the logical end WHATEVER the fill did: an extension that
+            // failed part-way (a full disk) must not leave the offset where
+            // the next append would land after a gap, which replay would read
+            // as the end of the log and drop everything after it.
+            f.seek(SeekFrom::Start(self.end))?;
+            filled?;
+            self.alloc = from + step;
+            self.step = step;
+            counted!("wal.zero-filled space extended");
+        }
+        Ok(())
+    }
+
+    /// Make every record written so far durable.
+    ///
+    /// `sync_data` (fdatasync), not `sync_all`: the records land inside space
+    /// that was written and synced before them, so there is no metadata a
+    /// data sync would miss — and on Linux `fdatasync` still flushes a size
+    /// change when an append outruns the space, so the durability promise
+    /// holds even then. The creation, rotation and open paths keep `sync_all`.
+    fn sync(&mut self) -> std::io::Result<()> {
+        self.flush()?;
         FSYNCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.w.get_ref().sync_all()
+        self.w.get_ref().sync_data()
     }
 }
 

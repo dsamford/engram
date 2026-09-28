@@ -82,7 +82,14 @@ authentication.
 The expected shape:
 
 1. **Add a lever.** A `--no-*` flag or an env toggle, so the mechanism has a
-   control. This is why there are forty flags and why most are not settings.
+   control. This is why the [CLI reference](../reference/cli.md) is as long as
+   it is and why most of what it lists is not a setting. The rule is a ratchet
+   rather than an accomplished fact: four levers shipped documented and
+   reachable from nothing but a unit test, which meant the fixes behind them
+   could not be A/B'd at all, and
+   `every_lever_is_reachable_from_the_server` now freezes the remaining debt at
+   a named list — a lever not on the list must be wired, and one on it that
+   becomes wired must be removed, so the debt can only shrink.
 2. **Write the test, then break it.** Establish that it fails without the
    mechanism — "proven to bite".
 3. **Pair the guarantee with its negative** where it is load-bearing: one test
@@ -122,30 +129,44 @@ dead links, and the CLI reference and `--help` both agreeing with what
 Two things worth knowing if you write a page:
 
 **Run what you document.** Writing this book against a live server caught two
-errors that reading the source had not: `CALL dbms.components()` returns no
-rows without `YIELD … RETURN`, and explicit-null versus absent properties are
-indistinguishable at the query level.
+errors that reading the source had not: that `CALL dbms.components()` returned
+no rows without `YIELD … RETURN`, and that explicit-null versus absent
+properties are indistinguishable at the query level.
 
-**Check the code, not the design notes.** Several `docs/` documents are dated
-plans, and the tree has moved past some of them. Three claims in early drafts of
-this book came from design documents and were wrong: that morsel parallelism did
-not exist, that frontier-BFS expansion was unimplemented, and that the engine
-loses on analytical queries.
+The first has since been closed — a `CALL` that ends a query now returns the
+procedure's declared output columns — and that is the other half of the same
+lesson. A documented gap needs something that fails when the gap closes, or the
+page is left telling people not to use what now works. See
+[Testing](./testing.md) for the example that does this, and for how its
+assertions were inverted as the gaps closed.
+
+**Check the code, not the design notes.** Design documents are dated plans, and
+the tree moves past them. Three claims in early drafts of this book came from
+design documents and were wrong: that morsel parallelism did not exist, that
+frontier-BFS expansion was unimplemented, and that the engine loses on
+analytical queries.
 
 ## Style
 
-- `rustfmt` defaults. **Note:** the tree is not currently rustfmt-clean — 177
-  files differ — so `cargo fmt --all --check` is not in CI. Format what you
-  touch; the whole-tree reformat belongs in its own commit.
+- `rustfmt` defaults. **Note:** the tree is not yet rustfmt-clean, so
+  `cargo fmt --all --check` is not in CI. Format what you touch; the whole-tree
+  reformat belongs in its own commit, reviewed as the mechanical change it is,
+  and the check should join CI in the same change. Run
+  `cargo fmt --all --check` for the current count of files that differ rather
+  than trusting a number written down.
 - No `unsafe`. The workspace denies it.
 - `BTreeMap`/`BTreeSet`, not `HashMap`/`HashSet` — denied types, because
   iteration order must be deterministic.
 - Time from the injected clock, never `Instant::now`.
-- No `thread::spawn` outside `engram-server`.
+- No `thread::spawn` in an engine crate. `engram-server` owns the server's
+  threads; `engram-bench`'s client harnesses spawn their own, because a
+  concurrency harness cannot measure concurrency without them. Both are
+  adapter-class, outside the simulation envelope.
 
 ## Adding a dependency
 
-A high bar. 39 today, all permissively licensed, no copyleft.
+A high bar. 44 packages resolve in `Cargo.lock` today, all permissively
+licensed, no copyleft.
 
 - `cargo deny check` must pass — allow-listed licences, advisories, banned
   crates.

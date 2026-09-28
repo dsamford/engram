@@ -26,7 +26,10 @@ accept unenumerated:
 | | |
 |---|---|
 | PackStream nesting | bounded (`MAX_DEPTH`); an unbounded recursion used to abort the process |
-| Cypher expression nesting | bounded, with a declared minimum parser stack |
+| Cypher expression nesting | bounded, with a declared minimum parser stack; engine and morsel worker threads run on that stack, so the deepest statement the parser accepts cannot overflow a worker and abort the server |
+| `LOGOFF` | releases open result streams and the explicit transaction, as `RESET` does, so the next principal on a connection cannot pull or commit the previous one's work |
+| Statement tracing | the `/* engram:trace */` marker is honoured only when the server sets `ENGRAM_TRACE_MARKER=1`; a client cannot switch on its cost or its logging |
+| Persisted index files | keyed by realm, namespace and property, so a restart cannot serve one namespace another namespace's index |
 | Message size | bounded (`MAX_MESSAGE_BYTES`, 64 MiB) |
 | Per-connection queued bytes | bounded, with real backpressure |
 | Concurrent connections | bounded (`--max-connections`) |

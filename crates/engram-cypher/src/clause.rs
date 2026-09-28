@@ -11,7 +11,7 @@ use crate::ast::Expr;
 use crate::parser::{ParseError, Parser};
 use crate::stmt::{
     Clause, NodePattern, OrderItem, PathPattern, Pattern, ProjItem, Projection, Query, RelDir,
-    RelPattern, RemoveItem, SetItem, SingleQuery, SubqueryBody, VarLength,
+    RelPattern, RemoveItem, SetItem, Shortest, SingleQuery, SubqueryBody, VarLength,
 };
 use crate::token::TokenKind;
 
@@ -560,12 +560,18 @@ impl Parser<'_> {
         } else {
             None
         };
-        let shortest = if matches!(self.peek(), TokenKind::Keyword("SHORTESTPATH")) {
-            self.bump();
-            self.expect(&TokenKind::LParen, "`(` after shortestPath")?;
-            true
-        } else {
-            false
+        let shortest = match self.peek() {
+            TokenKind::Keyword("SHORTESTPATH") => {
+                self.bump();
+                self.expect(&TokenKind::LParen, "`(` after shortestPath")?;
+                Some(Shortest::One)
+            }
+            TokenKind::Keyword("ALLSHORTESTPATHS") => {
+                self.bump();
+                self.expect(&TokenKind::LParen, "`(` after allShortestPaths")?;
+                Some(Shortest::All)
+            }
+            _ => None,
         };
         let start = self.node_pattern()?;
         let mut hops = Vec::new();
@@ -574,8 +580,14 @@ impl Parser<'_> {
             let node = self.node_pattern()?;
             hops.push((rel, node));
         }
-        if shortest {
-            self.expect(&TokenKind::RParen, "`)` closing shortestPath")?;
+        if let Some(kind) = shortest {
+            self.expect(
+                &TokenKind::RParen,
+                match kind {
+                    Shortest::One => "`)` closing shortestPath",
+                    Shortest::All => "`)` closing allShortestPaths",
+                },
+            )?;
         }
         Ok(PathPattern {
             var,
@@ -676,6 +688,8 @@ impl Parser<'_> {
             dir,
             props,
             length,
+            // never written in source; the interpreter lifts it from WHERE
+            each: None,
         })
     }
 
@@ -725,7 +739,7 @@ pub fn parse_any(src: &str) -> Result<Stmt, ParseError> {
         || (matches!(p.peek(), TokenKind::Keyword("CREATE"))
             && matches!(
                 p.peek_at(1),
-                TokenKind::Keyword("CONSTRAINT" | "VECTOR" | "FULLTEXT" | "INDEX")
+                TokenKind::Keyword("CONSTRAINT" | "VECTOR" | "FULLTEXT" | "TRIGRAM" | "INDEX")
             ));
     if !is_schema {
         let q = p.query()?;
@@ -976,6 +990,36 @@ impl Parser<'_> {
                 if_not_exists,
                 labels,
                 props,
+            });
+        }
+        if self.eat_kw("TRIGRAM") {
+            if !self.eat_kw("INDEX") {
+                return self.refuse("INDEX after TRIGRAM");
+            }
+            let name = self.name_token("an index name")?;
+            let if_not_exists = self.if_not_exists()?;
+            if !self.eat_kw("FOR") {
+                return self.refuse("FOR");
+            }
+            self.expect(&TokenKind::LParen, "`(` after FOR")?;
+            let var = self.name_token("a variable")?;
+            self.expect(&TokenKind::Colon, "`:` before the label")?;
+            let label = self.name_token("a label")?;
+            self.expect(&TokenKind::RParen, "`)` closing FOR")?;
+            if !self.eat_kw("ON") {
+                return self.refuse("ON");
+            }
+            // `ON (n.prop)`, the RANGE index's shape rather than the fulltext
+            // form's `ON EACH [...]` — one property, so a list would only
+            // invite a second one that this index does not support.
+            self.expect(&TokenKind::LParen, "`(` after ON")?;
+            let prop = self.prop_ref(&var)?;
+            self.expect(&TokenKind::RParen, "`)` closing ON")?;
+            return Ok(SchemaCmd::CreateTrigramIndex {
+                name,
+                if_not_exists,
+                label,
+                prop,
             });
         }
         if self.eat_kw("INDEX") {

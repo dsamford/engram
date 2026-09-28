@@ -41,13 +41,15 @@ harm the process.
 | | |
 |---|---|
 | PackStream nesting | bounded (`MAX_DEPTH`, 64); an unbounded recursion used to abort the process |
-| Cypher expression nesting | bounded (64), with a declared minimum parser stack (4 MiB) so the bound is reachable rather than academic |
+| Cypher expression nesting | bounded (64), with a declared minimum parser stack (4 MiB) so the bound is reachable rather than academic — and the server's engine and morsel workers run on that stack. They once ran on the platform default, where the deepest statement the parser accepted overflowed a worker and aborted the process |
 | Message size | bounded — `MAX_MESSAGE_BYTES`, 64 MiB |
 | Per-connection queued bytes | bounded, with real backpressure: the reader parks rather than growing an unbounded queue |
 | Concurrent connections | bounded (`--max-connections`, default 512), because each costs two OS threads |
 | Idle and write timeouts | set (`--read-timeout-secs`, default 300), so a silent peer cannot hold a thread pair — the slowloris shape |
 | Query row budget | set by the server (`--row-budget`, default 20M), not left unbounded |
 | A panic in one session | contained; it no longer kills the worker and silently strands every connection pinned to it |
+| Per-statement tracing | honoured only when the server runs with `ENGRAM_TRACE_MARKER=1`; any client could previously switch it on with a comment, making its own statements up to an order of magnitude slower and writing their text into the server log |
+| Re-authenticating a connection | `LOGOFF` drops every open result stream and rolls back an open transaction, as `RESET` does, so a connection re-used for another user cannot hand the next user the previous one's rows or writes |
 
 Note the fourth and last rows in particular: both were cases where one
 misbehaving connection could degrade or kill service for every other connection
@@ -94,18 +96,26 @@ early.
 
 But it is a *layout* property, not an access-control one. With no
 authentication, there is no identity to bind a realm to, so today the tenancy
-machinery isolates data rather than users. Cross-tenant reports become
-meaningful when authentication exists — which is exactly how the
-[security policy](#reporting-a-vulnerability) scopes them.
+machinery isolates data rather than users. It isolates data only where every
+structure is keyed by the tenant as well as the key layout is: persisted index
+sidecars were once named by property token alone, and tokens repeat across
+graphs, so a restart could serve one namespace's index to another. They are now
+keyed by realm and namespace, and a sidecar in the old form is adopted by no
+one. Cross-tenant reports become meaningful when authentication exists — which
+is exactly how the [security policy](#reporting-a-vulnerability) scopes them.
 
 ## Memory safety and the supply chain
 
 - **No `unsafe`.** The workspace denies it, and there is none. A memory-safety
   fault would therefore be in a dependency or in the compiler, and either is
   worth knowing about.
-- **39 dependencies**, gated by `cargo deny check`: an allow-list of licences,
+- **44 dependencies**, gated by `cargo deny check`: an allow-list of licences,
   a deny-list of specific crates, and advisory checks. All permissive, no
-  copyleft.
+  copyleft. It was 39 until the regex engine arrived: `regex`, `regex-syntax`,
+  `regex-automata`, `aho-corasick` and `memchr` are what `=~` and the trigram
+  index rest on, and they are the only crates added since that count was taken.
+  Count them yourself — they are the `name =` entries in `Cargo.lock` that are
+  not workspace members.
 - **`ring` is the only cryptographic dependency.** `aws-lc-rs` and `aws-lc-sys`
   are banned by name, and `deny.toml` records what that costs — they are
   FIPS-validated and `ring` is not.

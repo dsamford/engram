@@ -62,7 +62,15 @@ const NODE_FULL: &str = "graph.nodes materialised in full";
 fn corpus() -> Graph {
     let g = Graph::new(Store::new(), Realm(1), Namespace(1));
     ddl(&g, "CREATE INDEX kmp_id FOR (n:KMProject) ON (n.id)");
-    const STATUSES: [&str; 7] = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
+    const STATUSES: [&str; 7] = [
+        "backlog",
+        "todo",
+        "in_progress",
+        "in_review",
+        "blocked",
+        "done",
+        "cancelled",
+    ];
     let mut projects = Vec::new();
     for pi in 0..40i64 {
         let mut m = BTreeMap::new();
@@ -82,7 +90,13 @@ fn corpus() -> Graph {
         }
         m.insert("priority".into(), Value::Int(i % 4));
         let w = g.create_node(&["KMWorkItem".into()], &m).expect("item");
-        g.create_rel(w, "BELONGS_TO_PROJECT", projects[(i % 40) as usize], &BTreeMap::new()).expect("rel");
+        g.create_rel(
+            w,
+            "BELONGS_TO_PROJECT",
+            projects[(i % 40) as usize],
+            &BTreeMap::new(),
+        )
+        .expect("rel");
     }
     g
 }
@@ -105,10 +119,17 @@ fn a_the_dashboard_loads_the_status_column_once_and_vectorises_every_body() {
     let (first, c1) = traced(&g, DASH);
     assert_eq!(first, want);
     assert_eq!(count_of(&c1, LOADED), 1, "{c1:?}");
-    assert_eq!(count_of(&c1, VECTORISED), 4 * 40, "four bodies per project: {c1:?}");
+    assert_eq!(
+        count_of(&c1, VECTORISED),
+        4 * 40,
+        "four bodies per project: {c1:?}"
+    );
     // The forty projected reads are the outer seeds (`p.id`), one per
     // project — no neighbour is read by any body.
-    assert!(count_of(&c1, PROJECTED) <= 40, "no neighbour read per body: {c1:?}");
+    assert!(
+        count_of(&c1, PROJECTED) <= 40,
+        "no neighbour read per body: {c1:?}"
+    );
     let (second, c2) = traced(&g, DASH);
     assert_eq!(second, want);
     assert_eq!(count_of(&c2, LOADED), 0, "{c2:?}");
@@ -117,7 +138,10 @@ fn a_the_dashboard_loads_the_status_column_once_and_vectorises_every_body() {
     // The numbers themselves: 60 items per project, six of them without a
     // status (counted as backlog), the rest spread over seven statuses.
     let row0 = &first[0];
-    assert!(matches!(row0[1], Value::Int(n) if n > 6), "backlog counts the absent statuses too: {row0:?}");
+    assert!(
+        matches!(row0[1], Value::Int(n) if n > 6),
+        "backlog counts the absent statuses too: {row0:?}"
+    );
     assert!(matches!(row0[4], Value::Int(n) if n > 30), "{row0:?}");
 }
 
@@ -135,7 +159,17 @@ fn b_exists_and_presence_reads_load_the_column_the_same_way() {
     assert_eq!(got, want);
     assert_eq!(count_of(&c, LOADED), 1, "{c:?}");
     assert_eq!(count_of(&c, VECTORISED), 2 * 40, "{c:?}");
-    assert!(count_of(&c, PROJECTED) + count_of(&c, NODE_FULL) <= 40, "the outer seeds only: {c:?}");
-    assert!(got.iter().all(|r| r[1] == Value::Bool(true)), "every project has a blocked item");
-    assert!(got.iter().all(|r| matches!(r[2], Value::Int(54))), "54 of 60 carry a status: {:?}", &got[0]);
+    assert!(
+        count_of(&c, PROJECTED) + count_of(&c, NODE_FULL) <= 40,
+        "the outer seeds only: {c:?}"
+    );
+    assert!(
+        got.iter().all(|r| r[1] == Value::Bool(true)),
+        "every project has a blocked item"
+    );
+    assert!(
+        got.iter().all(|r| matches!(r[2], Value::Int(54))),
+        "54 of 60 carry a status: {:?}",
+        &got[0]
+    );
 }

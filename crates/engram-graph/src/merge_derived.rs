@@ -87,6 +87,13 @@ pub(crate) struct MergeDerived {
     over_budget: bool,
 }
 
+/// Held for the whole of `Graph::persist_derived_now`, and for the whole of
+/// `Graph::adopt_derived_sidecar`: one persist or adoption at a time in the
+/// process, whichever thread and graph asks. Persists are rare and minutes
+/// apart, and adoption runs once at open, so serialising them costs nothing
+/// measurable.
+static PERSIST_DERIVED: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The vintage a written sidecar is remembered by: the sealed set it describes
 /// and how many adjacency / membership bases it holds. See
 /// `Graph::persisted_vintage` for why the count is part of it.
@@ -96,7 +103,8 @@ fn derived_vintage(sealed_id: u64, n_adj: usize, n_members: usize) -> u64 {
     // move to a colliding pair, and a redundant write otherwise.
     let mut h = sealed_id ^ 0x9E37_79B9_7F4A_7C15;
     h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9) ^ (n_adj as u64).wrapping_mul(0x94D0_49BB_1331_11EB);
-    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9) ^ (n_members as u64).wrapping_mul(0x2545_F491_4F6C_DD1D);
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9)
+        ^ (n_members as u64).wrapping_mul(0x2545_F491_4F6C_DD1D);
     h ^ (h >> 31)
 }
 
@@ -471,7 +479,8 @@ impl Graph {
                 Ok(()) => self.note_persisted(
                     sealed_id,
                     derived_vintage(sealed_id, published_adj.len(), published_members.len()),
-                    self.last_tick_secs.load(std::sync::atomic::Ordering::Relaxed),
+                    self.last_tick_secs
+                        .load(std::sync::atomic::Ordering::Relaxed),
                 ),
                 Err(e) => {
                     // A sidecar that cannot be written costs a rebuild at the
@@ -521,9 +530,38 @@ impl Graph {
     /// reads none of its own (a direct clock read is invisible to the
     /// simulation); it is what the growth-rewrite interval is measured on.
     pub fn persist_derived_now(&self, dir: &std::path::Path, now_secs: u64) -> bool {
+        self.persist_derived_paced(dir, now_secs, true)
+    }
+
+    /// `persist_derived_now` for a GRACEFUL STOP (`CALL engram.checkpoint()`'s
+    /// drain): the growth interval does not apply.
+    ///
+    /// The interval paces a RECURRING tick, which would otherwise rewrite the
+    /// whole file once per base the traffic builds. A stop is one explicit
+    /// request whose whole purpose is that the next start adopts what this
+    /// process built; deferring it leaves those bases unwritten for good. Since
+    /// an adoption records its file's vintage, every server stopped within the
+    /// interval of its start would otherwise have dropped what it built.
+    /// Everything else holds: an unchanged vintage skips, a stale base or a
+    /// write landing mid-serialise declines.
+    pub fn persist_derived_at_stop(&self, dir: &std::path::Path, now_secs: u64) -> bool {
+        self.persist_derived_paced(dir, now_secs, false)
+    }
+
+    fn persist_derived_paced(&self, dir: &std::path::Path, now_secs: u64, paced: bool) -> bool {
         if !self.persist_derived.get() {
             return false;
         }
+        // ONE PERSIST AT A TIME, held from the vintage check to the rename.
+        // The maintenance tick and the drained checkpoint call this from
+        // different threads; a caller that waited here reads the vintage the
+        // other just recorded and skips, where a racing pair once published
+        // an empty file (see `derived_sidecar::WRITING`). The checkpoint
+        // waiting is the point: it must return with a current file on disk,
+        // not beside a persist its caller's restart is about to kill.
+        let _one_at_a_time = PERSIST_DERIVED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         self.last_tick_secs
             .store(now_secs, std::sync::atomic::Ordering::Relaxed);
         // SKIP IF THE SEALED SET HAS NOT MOVED since the last file we wrote.
@@ -564,7 +602,11 @@ impl Graph {
         // 0 is the never-written sentinel: a real vintage hashing to 0 costs
         // one redundant write, which is the harmless direction.
         let vintage_now = derived_vintage(sealed_now, n_adj, n_members);
-        if self.persisted_vintage.load(std::sync::atomic::Ordering::Relaxed) == vintage_now {
+        if self
+            .persisted_vintage
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == vintage_now
+        {
             counted!("graph.derived sidecar skipped: the sealed set has not moved");
             return false;
         }
@@ -573,9 +615,16 @@ impl Graph {
         // have, and the next start would refuse it). v84 in production wrote
         // the 1.3 GB file nine times in four minutes — once per membership the
         // shadow traffic built — with no limit here.
-        if self.persisted_sealed_id.load(std::sync::atomic::Ordering::Relaxed) == sealed_now {
-            let since = now_secs
-                .saturating_sub(self.persisted_at_secs.load(std::sync::atomic::Ordering::Relaxed));
+        if paced
+            && self
+                .persisted_sealed_id
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == sealed_now
+        {
+            let since = now_secs.saturating_sub(
+                self.persisted_at_secs
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            );
             let interval = self
                 .persist_growth_interval_secs
                 .load(std::sync::atomic::Ordering::Relaxed);
@@ -631,7 +680,9 @@ impl Graph {
                 folded = snap.value.folded();
                 &folded
             };
-            if w.add_adj(key, &table.index, &table.entries, table.sorted_by_peer).is_err() {
+            if w.add_adj(key, &table.index, &table.entries, table.sorted_by_peer)
+                .is_err()
+            {
                 counted!("graph.derived sidecar write failed");
                 w.abandon();
                 return false;
@@ -675,7 +726,11 @@ impl Graph {
                 // Keyed on what was COUNTED, not on `w.len()`: a base published
                 // between the count and the write is one the next tick should
                 // find "more than the file holds" and write.
-                self.note_persisted(sealed_id, derived_vintage(sealed_id, n_adj, n_members), now_secs);
+                self.note_persisted(
+                    sealed_id,
+                    derived_vintage(sealed_id, n_adj, n_members),
+                    now_secs,
+                );
                 true
             }
             Err(_) => {
@@ -705,9 +760,32 @@ impl Graph {
     /// adopts NOTHING and every structure is built on first use, which is the
     /// behaviour before this item existed.
     pub fn adopt_derived_sidecar(&self, dir: &std::path::Path) -> usize {
+        self.adopt_derived_sidecar_observing(dir, &mut |_, _| {})
+    }
+
+    /// `adopt_derived_sidecar`, calling `each(i, total)` after record `i` is
+    /// adopted — the seam a test uses to act in the middle of an adoption.
+    #[doc(hidden)]
+    pub fn adopt_derived_sidecar_observing(
+        &self,
+        dir: &std::path::Path,
+        each: &mut dyn FnMut(usize, usize),
+    ) -> usize {
         if !self.persist_derived.get() {
             return 0;
         }
+        // NO PERSIST WHILE ADOPTING. The maintenance tick starts before the
+        // server adopts, and adoption publishes one record at a time. A settled
+        // tick in the middle of it counted the few bases published so far and
+        // wrote them over the full file, and the growth interval then deferred
+        // the fuller rewrite past the life of a short server. Measured on the
+        // bench pod: an SF10 server whose cold adoption took 55 s left a file of
+        // 1 structure where it had adopted 39, and the next start built the
+        // other tables inside its first queries (16-40 s each). A tick that
+        // fires now waits, and then finds the vintage noted below and skips.
+        let _one_at_a_time = PERSIST_DERIVED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // The refusal REASONS are reported, not merely counted.
         //
         // A sidecar that is silently declined looks exactly like one that was
@@ -753,7 +831,10 @@ impl Graph {
         let now = self.store.now_ts();
         if now > reader.stamp() {
             counted!("graph.derived sidecar refused: store is newer");
-            sometimes!("graph.derived sidecar refused for a store above its stamp", true);
+            sometimes!(
+                "graph.derived sidecar refused for a store above its stamp",
+                true
+            );
             eprintln!(
                 "[engram-graph] derived sidecar REFUSED: the store's clock is {now}, above the                  sidecar's stamp {}. It covers the segments it was written from and nothing                  above them, and at open there is no change log to carry the difference — so                  the structures are rebuilt.",
                 reader.stamp()
@@ -768,6 +849,8 @@ impl Graph {
         // records are on disk, not in memory — the whole point of v2, after
         // the dense v1 file OOM-killed a 12Gi pod at this exact step.
         let mut adopted = 0usize;
+        let (mut adopted_adj, mut adopted_members) = (0usize, 0usize);
+        let mut whole = true; // every record read; false after a refused one
         let mut held = 0usize; // bytes the adopted tables hold, for the log line
         let total = reader.len();
         for i in 0..total {
@@ -793,6 +876,7 @@ impl Graph {
                         value: std::sync::Arc::new(table),
                     })) {
                         adopted += 1;
+                        adopted_adj += 1;
                         held += bytes;
                         counted!("graph.adjacency tables adopted from disk");
                     }
@@ -806,6 +890,7 @@ impl Graph {
                         std::sync::Arc::new(MembersView::from_base(std::sync::Arc::new(ids))),
                     ) {
                         adopted += 1;
+                        adopted_members += 1;
                         counted!("graph.membership snapshots adopted from disk");
                     }
                 }
@@ -818,9 +903,26 @@ impl Graph {
                     eprintln!(
                         "[engram-graph] derived sidecar record {i} of {total} REFUSED (corrupt or                          malformed); {adopted} adopted before it, the rest are rebuilt on first use."
                     );
+                    whole = false;
                     break;
                 }
             }
+            each(i, total);
+        }
+        // THE FILE ON DISK IS WHAT WAS JUST ADOPTED, so it is recorded as this
+        // process's persisted vintage: the next tick skips unless more has been
+        // published since, where before it saw "never written" and rewrote the
+        // same file. Counted as `persist_derived_now` counts, from what was
+        // adopted; a base some other path published meanwhile makes the counts
+        // differ and the fuller file is written, the harmless direction. A file
+        // with a refused record is not recorded: the next tick replaces it.
+        if whole && adopted > 0 {
+            self.note_persisted(
+                want,
+                derived_vintage(want, adopted_adj, adopted_members),
+                self.last_tick_secs
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            );
         }
         if adopted > 0 {
             eprintln!(
@@ -845,7 +947,10 @@ fn write_sidecar<'a>(
 ) -> std::io::Result<()> {
     let mut w = crate::derived_sidecar::SidecarWriter::create(dir, prefix)?;
     for (key, table) in adj {
-        debug_assert!(table.overlay.is_empty(), "a compaction-built table has no overlay");
+        debug_assert!(
+            table.overlay.is_empty(),
+            "a compaction-built table has no overlay"
+        );
         w.add_adj(key, &table.index, &table.entries, table.sorted_by_peer)?;
     }
     for (token, ids) in members {

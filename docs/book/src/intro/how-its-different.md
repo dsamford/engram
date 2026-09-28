@@ -9,8 +9,8 @@ buys and costs against the systems you have probably already used.
 The short version: Engram is architecturally closest to an LSM key-value store
 with a graph model welded on, serving a wire protocol. That shape makes writes
 and point lookups cheap by construction; the analytical traversals were won
-back operator by operator, and — as of the most recent same-window
-measurement — they were won. See [the measured standing](#the-measured-standing).
+back operator by operator and plan by plan. Where that leaves it against Neo4j
+and PostgreSQL today is [the measured standing](#the-measured-standing).
 
 ## The comparison set
 
@@ -234,54 +234,45 @@ architectural as adopting one.
 
 ## The measured standing
 
-Architecture arguments are cheap, so here is what was actually measured.
+Architecture arguments are cheap, so here is what was measured.
 
-**Against Neo4j 5.26-community at LDBC SNB SF1, in same-window paired runs on
-one host, N=3 medians, with identical answer counts on every query: Engram
-leads on all nineteen workloads.**
+**Engram build rev70 against Neo4j 5.26.31 Community and PostgreSQL 17.11, each
+alone in a 40-CPU, 140 GiB container on the same server, on LDBC-derived
+workloads at two data sizes each: Engram answered every query of every family
+at both sizes — the only one of the three to do so — and was faster than Neo4j
+on 103 of the 119 queries both answered and faster than PostgreSQL on 90 of
+126.** The tables are not repeated here. They live once, with their method, on
+[Three engines at SF3 and SF10](../measurements/three-engines-sf3-sf10.md),
+which is where a correction has to land.
 
-LSQB — the Labelled Subgraph Query Benchmark, which is *complex analytical
-joins*, not point lookups:
+Three things about the shape of those numbers bear on the architecture above.
 
-| query | engram (ms) | Neo4j (ms) | ahead |
-|---|---:|---:|---|
-| q1 | 266 | 9,284 | **34.9×** |
-| q2 | 886 | 1,716 | **1.94×** |
-| q3 | 5,614 | 14,171 | **2.5×** |
-| q4 | 584 | 14,948 | **25.6×** |
-| q5 | 2,176 | 10,588 | **4.9×** |
-| q6 | 658 | 35,646 | **54.2×** |
-| q7 | 3,328 | 16,477 | **5.0×** |
-| q8 | 2,647 | 37,825 | **14.3×** |
-| q9 | 5,086 | 53,282 | **10.5×** |
+**Where the LSM bargain shows.** Writes that collide on one record are where a
+log-structured store with derived adjacency is strongest: at SF3 with 64
+clients Engram completes 7,553 updates a second on one hot record against about
+650 on both other engines. Plain inserts are where it is not: PostgreSQL writes
+about 12,000 new rows a second there against Engram's 7,600.
 
-The stress suite, ten mixed read/write profiles at one and eight clients —
-twenty levels, ahead on every one:
+**Where the row-at-a-time fallback shows.** Engram's losses concentrate on
+short statements whose cost is per-row interpretation rather than traversal —
+BI 5, Interactive IS3, and FinBench's transfer-path queries — which is the
+[two paths](#two-paths-and-which-one-a-statement-gets) cost model showing
+through. PostgreSQL's wins are the heavy BI joins LDBC's SQL is tuned for,
+where vectorised hash joins stream columns rather than resolving one adjacency
+row at a time.
 
-| profile | @1 | @8 |
-|---|---|---|
-| read-only | 1.46× | 1.35× |
-| read-heavy | 1.35× | 1.45× |
-| balanced | 1.82× | 1.58× |
-| write-heavy | 3.94× | 1.58× |
-| write-only | 5.64× | 1.41× |
-| contention | 1.39× | 1.46× |
-| rel-create | 8.21× | 6.71× |
-| rel-hub | 9.00× | 7.03× |
-| unique-create | 10.76× | 5.54× |
-| delete-churn | 8.25× | 4.88× |
-
-The write-side margins are the LSM bargain from
-[Axis 2](#adjacency-is-derived-not-stored) showing up as numbers: relationship
-creation, hub writes, unique-constrained creates and delete churn are where an
-append-only store with derived adjacency should win, and it does.
+**The parallelism seam is off by default.** Every figure above ran with
+`ENGRAM_QUERY_PARALLELISM=40`. The morsel executor lives entirely behind that
+variable, with no CLI flag, so a default install runs each statement on one
+thread.
 
 ### The q2 story, because it is the honest one
 
-q2 is the smallest margin on the board at 1.94×. It began the campaign at
-**14.6× behind**, and the path from there is the useful part: a join order
-driven from the wrong side, then a repeated estimation, then an unpriced first
-estimation. **Three defects, none of them in the executor.**
+LSQB q2 began the optimisation campaign well behind Neo4j and is now one of
+Engram's largest leads: 240 ms at SF3 against Neo4j's 6,891 and PostgreSQL's
+1,785. The path there is the useful part: a join order driven from the wrong
+side, then a repeated estimation, then an unpriced first estimation. **Three
+defects, none of them in the executor.**
 
 That is worth knowing before concluding anything from architecture alone. The
 analytical gap this page's execution-model section describes was real, and most
@@ -292,21 +283,21 @@ of what closed it was planning rather than operators.
 The measurement discipline here is strict, so the caveats travel with the
 result:
 
-- **SF1 only.** SF10 and SF100 have not been run. Do not read these margins as
-  scale-free; the project's own plan says so in as many words.
-- **Neo4j 5.26-community**, not Enterprise.
-- **The SNB Interactive suite has not been re-baselined.** Its last numbers
-  predate the memos, the estimator and clause fusion, and several were losses.
-  Until it is re-run, treat IC as unmeasured rather than as won or lost.
-- **Kuzu and LadybugDB have not been measured head to head.** Only a smoke pass
-  exists, explicitly not a measurement, and this page does not quote it.
+- **One rig, one start per family.** Some queries move with the server's
+  start: BI 16 and BI 10 at SF10 each have two stable speeds that depend on it.
+- **SF10 is the largest size run.** SF30 and SF100 have not been.
+- **Neo4j is the Community edition**, which runs each query on one thread. Its
+  Enterprise parallel runtime was not measured.
+- **Kuzu and LadybugDB are not in the current comparison.**
 - **`shortestPath` is fast only for the bound-endpoint shape.** Other shapes —
   multi-hop, `min > 1`, an unbounded endpoint — still fall back to enumeration.
+- **These are not official LDBC results.** The workloads are derived from
+  LDBC's benchmarks and run with this project's harness and rules.
 
-So the defensible claim is precise: *against Neo4j community at SF1, on these
-nineteen workloads, in the same window, Engram leads on all of them.* It is not
-"Engram is faster than every graph database", and the project's own house rules
-would refuse that sentence.
+So the defensible claim is precise: *on these workloads, on this rig, Engram
+leads Neo4j on most queries and PostgreSQL on a majority, and each of them
+leads Engram somewhere specific.* It is not "Engram is faster than every graph
+database", and the project's own house rules would refuse that sentence.
 
 ## Axis 4 — concurrency and isolation
 
@@ -350,7 +341,7 @@ See [Transactions and isolation](../using/transactions.md).
 Less glamorous, occasionally decisive:
 
 - **No `unsafe`.** The workspace denies it outright.
-- **39 third-party crates**, all permissively licensed, no copyleft anywhere.
+- **44 third-party crates**, all permissively licensed, no copyleft anywhere.
 - **A native dependency may need one `cc` invocation** — no cmake, no bindgen,
   no external shared library, no build-time process. Enforced by a gate that
   keys on `links`/build-script presence rather than on crate names.
@@ -365,8 +356,8 @@ Honestly:
 
 - **Choose Kuzu/LadybugDB or DuckDB** if your workload is analytical, embedded
   suits you, and you want the best vectorized execution available today.
-- **Choose Neo4j** if you need clustering, authentication, a mature operational
-  story, or heavy analytical traversal right now.
+- **Choose Neo4j** if you need clustering, authentication, or a mature
+  operational story.
 - **Engram is interesting** when you want a graph over a *wire protocol*
   without a JVM or a cluster, your workload is write-heavy or point-lookup
   heavy, you need a graph larger than memory from a single process, or you

@@ -35,26 +35,37 @@ fn try_run(g: &Graph, src: &str) -> Result<Vec<Vec<Value>>, String> {
 fn demo() {
     let g = Graph::new(Store::new(), Realm(1), Namespace(1));
 
-    // ── `=~` parses, then refuses at evaluation ──────────────────────────
+    // ── `=~` EVALUATES, over a finite automaton ──────────────────────────
     //
-    // The distinction the page draws: the GRAMMAR accepts it, the evaluator
-    // does not. If it ever starts answering, cypher-support.md and
-    // known-limits.md both need the entry removed.
-    let regex = try_run(&g, "RETURN 'abc' =~ 'a.*' AS m");
-    let msg = regex.expect_err("`=~` must still refuse — see cypher-support.md");
-    assert!(
-        msg.contains("=~"),
-        "the refusal should name the operator so a user can find the page: {msg}"
-    );
+    // This assertion was inverted on 2026-09-09. It used to require a
+    // refusal, and it was right to: the grammar accepted `=~` while the
+    // evaluator did not. `crates/engram-cypher/src/regex/` closed that gap,
+    // and this canary is how the documentation pass found out — it is the
+    // guard doing its job, not a test that rotted.
+    //
+    // What it pins now is the other direction. If `=~` ever stops answering,
+    // cypher-support.md, known-limits.md and reference/regex.md all describe
+    // an operator that no longer works.
+    let regex =
+        try_run(&g, "RETURN 'abc' =~ 'a.*' AS m").expect("`=~` evaluates — see reference/regex.md");
+    assert_eq!(regex.len(), 1, "a full-match boolean is one row: {regex:?}");
 
-    // ── UNION inside CALL {} is refused ──────────────────────────────────
-    let union_in_call = try_run(
-        &g,
-        "CALL { RETURN 1 AS x UNION RETURN 2 AS x } RETURN x",
-    );
-    assert!(
-        union_in_call.is_err(),
-        "UNION inside CALL {{}} must still refuse — see cypher-support.md"
+    // ── UNION inside CALL {} now ANSWERS ─────────────────────────────────
+    //
+    // It refused until SNB BI bi4 needed it: that query's subquery counts
+    // messages per person in one arm and adds back the top-forum members who
+    // have none in the other, and `UNION ALL` between them is the only way to
+    // say it. Each arm runs against the same seed row and the arms concatenate.
+    //
+    // Pinned as BEHAVIOUR rather than as a refusal, for the same reason `=~`
+    // is: if this stops answering, cypher-support.md describes a feature the
+    // engine no longer has.
+    let union_in_call = try_run(&g, "CALL { RETURN 1 AS x UNION RETURN 2 AS x } RETURN x")
+        .expect("UNION inside CALL {} is supported — see cypher-support.md");
+    assert_eq!(
+        union_in_call.len(),
+        2,
+        "two arms, two distinct values, two rows: {union_in_call:?}"
     );
 
     // ── ...while a top-level UNION works ─────────────────────────────────
@@ -64,18 +75,26 @@ fn demo() {
         .expect("top-level UNION is supported and the page says so");
     assert_eq!(union_ok.len(), 2, "UNION ALL semantics: two rows");
 
-    // ── A standalone CALL yields no rows ─────────────────────────────────
+    // ── A standalone CALL returns its declared output columns ────────────
     //
-    // The quiet one, and the reason it is called out on three pages: it does
-    // not error, it returns nothing. A Neo4j user reads that as an empty
-    // database rather than as a missing YIELD.
+    // Inverted on 2026-09-09, alongside the `=~` assertion above and for the
+    // same reason. This used to require an EMPTY result, and it was the
+    // quiet gap called out on four pages: a bare `CALL` did not error, it
+    // simply answered nothing, which a Neo4j user reads as an empty database
+    // rather than as a missing `YIELD`. A `CALL` that ends a query is now
+    // itself the result, per openCypher, taking its columns from the
+    // procedure catalogue.
+    //
+    // `YIELD` is still required when the `CALL` is not the last clause, and
+    // the assertion below this one pins that half.
     let bare = try_run(&g, "CALL dbms.components()")
-        .expect("a bare CALL is accepted, it simply answers nothing");
+        .expect("a standalone CALL is its own result — see reference/procedures.md");
     assert!(
-        bare.is_empty(),
-        "a standalone CALL yields no rows here; if it starts yielding, \
-         getting-started.md, cypher-support.md, procedures.md and \
-         known-limits.md all describe behaviour that no longer exists: {bare:?}"
+        !bare.is_empty(),
+        "a standalone CALL returns the procedure's declared output columns; \
+         if it goes back to answering nothing, getting-started.md, \
+         cypher-support.md, procedures.md and known-limits.md all describe \
+         behaviour that no longer exists: {bare:?}"
     );
 
     // ── ...and YIELD + RETURN is the form that works ─────────────────────

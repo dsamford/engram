@@ -304,9 +304,7 @@ impl Store {
                     dropped_keys += 1;
                 } else {
                     if let Some(o) = observer.as_deref_mut() {
-                        if prefixes.is_empty()
-                            || prefixes.iter().any(|p| key.starts_with(p))
-                        {
+                        if prefixes.is_empty() || prefixes.iter().any(|p| key.starts_with(p)) {
                             // The NEWEST surviving version decides liveness —
                             // chains are stored ascending, so that is the last.
                             let live = kept.last().is_some_and(|v| v.value.is_some());
@@ -348,11 +346,9 @@ impl Store {
             .collect();
         let mut new_segments: Vec<Arc<SealedSegment>> = vec![Arc::new(paged)];
         new_segments.extend(carried);
-        self.inner
-            .sealed
-            .store(Arc::new(Sealed {
-                segments: new_segments,
-            }));
+        self.inner.sealed.store(Arc::new(Sealed {
+            segments: new_segments,
+        }));
         // The observer is told LAST, after the new segment is published. A
         // derived structure stamped with this must not become visible before
         // the segment it describes — the reverse order would let a reader adopt
@@ -389,7 +385,9 @@ impl Store {
                 if std::fs::remove_file(&p).is_ok() {
                     engram_observe::counted!("store.paged compaction unlinked an input segment");
                 } else {
-                    engram_observe::counted!("store.paged compaction could not unlink an input segment");
+                    engram_observe::counted!(
+                        "store.paged compaction could not unlink an input segment"
+                    );
                 }
             }
         }

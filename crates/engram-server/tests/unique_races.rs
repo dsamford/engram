@@ -89,7 +89,10 @@ fn racing_creates_of_one_value_admit_exactly_one() {
             "round {round}: population is one"
         );
     }
-    assert_eq!(g.verify_constraint_markers().expect("fsck"), Vec::<String>::new());
+    assert_eq!(
+        g.verify_constraint_markers().expect("fsck"),
+        Vec::<String>::new()
+    );
 }
 
 #[test]
@@ -127,5 +130,8 @@ fn racing_merges_of_one_value_converge_on_one_node() {
             "round {round}: MERGE converged"
         );
     }
-    assert_eq!(g.verify_constraint_markers().expect("fsck"), Vec::<String>::new());
+    assert_eq!(
+        g.verify_constraint_markers().expect("fsck"),
+        Vec::<String>::new()
+    );
 }

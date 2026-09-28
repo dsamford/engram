@@ -17,6 +17,7 @@
 pub mod ast;
 pub mod bindings;
 pub mod clause;
+pub mod regex;
 pub use bindings::VarMap;
 pub mod eval;
 pub mod json;
@@ -32,8 +33,8 @@ pub use eval::{EvalError, GraphHooks, Scope, eval, eval_with};
 pub use parser::{MIN_PARSER_STACK_BYTES, ParseError, parse_expression};
 pub use stmt::{
     Clause, ConstraintKind, NodePattern, OrderItem, PathPattern, Pattern, ProjItem, Projection,
-    Query, RelDir, RelPattern, RemoveItem, SchemaCmd, SetItem, SingleQuery, Stmt, SubqueryBody,
-    VarLength,
+    Query, RelDir, RelPattern, RemoveItem, SchemaCmd, SetItem, Shortest, SingleQuery, Stmt,
+    SubqueryBody, VarLength,
 };
 pub use temporal::{FixedZones, ZoneProvider};
 pub use token::{LexError, Token, TokenKind, tokenize};
@@ -121,6 +122,8 @@ impl Subsystem for CypherFrontend {
             .counter("cypher.expressions parsed")
             .counter("cypher.statements parsed")
             .counter("cypher.expressions evaluated")
+            .counter("cypher.IN tested a held list in place")
+            .counter("cypher.regex evaluations")
             .gate(
                 Gate::new(
                     "null fails closed everywhere a predicate reads it",

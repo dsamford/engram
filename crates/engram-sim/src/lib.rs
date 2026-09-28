@@ -1070,6 +1070,241 @@ pub fn run_seed(seed: u64) -> RunReport {
             }
         }
 
+        // ── The text-search and algorithm scenario ──────────────────────
+        // Every state the trigram index, the BM25 term index, the procedure
+        // catalogue and the algorithm layer DECLARE as reachable, reached —
+        // because a `sometimes!` nobody can reach is a claim nobody tested,
+        // and the coverage floor is what says so.
+        {
+            use engram_cypher::{Value, parse_any, parse_statement};
+            use engram_graph::algo::{AlgoConfig, Algorithm, ProjectionKey};
+            use engram_graph::{Dir, Graph, ScopedExec, run_query, run_stmt};
+
+            let g = Graph::new(Store::new(), Realm(1), Namespace(1));
+            g.set_wall_ms(1_600_000_000_000 + (seed as i64) * 3_600_000);
+            let ddl = |src: &str| {
+                let _ = run_stmt(&g, &parse_any(src).expect("ddl parses"), Default::default());
+            };
+            // ASSERTS SUCCESS. It discarded the result AND the error before,
+            // which made every statement in this scenario a test that could
+            // not fail: a `CALL` that errored on every seed still counted as
+            // coverage, because nothing looked. "Executed" is not "verified",
+            // and the difference is one `expect`.
+            let q = |src: &str| {
+                run_query(
+                    &g,
+                    &parse_statement(src).expect("statement parses"),
+                    Default::default(),
+                )
+                .unwrap_or_else(|e| panic!("sim statement failed: {src}
+  {e:?}"));
+            };
+            // The deliberate refusals. Naming them separately is what keeps
+            // `q` able to assert: a scenario that mixes "this must work" and
+            // "this must not" into one helper can assert neither.
+            let q_refused = |src: &str| {
+                let r = run_query(
+                    &g,
+                    &parse_statement(src).expect("statement parses"),
+                    Default::default(),
+                );
+                assert!(
+                    r.is_err(),
+                    "expected a refusal but the statement succeeded: {src}"
+                );
+            };
+
+            // A corpus big enough for a seek to be worth probing at all — the
+            // planner declines below `PROPERTY_SEEK_MIN_LABEL`, so a smaller
+            // one would exercise only the decline.
+            let mut rng = Rng::new(seed ^ 0x7E27);
+            let n = 520 + rng.below(40);
+            for i in 0..n {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("path".to_string(), Value::Str(format!("f{i}.rs")));
+                m.insert(
+                    "content".to_string(),
+                    Value::Str(if i % 97 == 0 {
+                        format!("a zqx marker on line {i} in file{i}.rs")
+                    } else {
+                        format!("ordinary text on line {i} with nothing special")
+                    }),
+                );
+                let _ = g.create_node(&["Doc".into()], &m);
+            }
+            ddl("CREATE TRIGRAM INDEX doc_content FOR (d:Doc) ON (d.content)");
+            ddl("CREATE FULLTEXT INDEX doc_ft FOR (d:Doc) ON EACH [d.content]");
+
+            // A selective predicate SEEKS; an unselective one and a
+            // match-everything pattern DECLINE, each for its own reason.
+            q("MATCH (d:Doc) WHERE d.content CONTAINS 'zqx' RETURN count(d)");
+            q("MATCH (d:Doc) WHERE d.content CONTAINS 'ordinary' RETURN count(d)");
+            q("MATCH (d:Doc) WHERE d.content =~ '.*' RETURN count(d)");
+            q("MATCH (d:Doc) WHERE d.content =~ '.*zqx.*' RETURN count(d)");
+            q("MATCH (d:Doc) WHERE d.content ENDS WITH '.rs' RETURN count(d)");
+            // A shape the columnar lane does not recognise — a relationship in
+            // the pattern — so the INTERPRETER's seed chooses the index.
+            q("MATCH (d:Doc)-[:LINKS]->(o) WHERE d.content CONTAINS 'zqx' RETURN count(o)");
+            q("MATCH (d:Doc) WHERE d.content CONTAINS 'zqx' RETURN d.path ORDER BY d.path");
+
+            // A write inside the same statement as the probe: the buffered row
+            // is not in the store, so its id joins the candidate set unfiltered.
+            q("CREATE (d:Doc {path: 'txn.rs', content: 'a zqx inside a statement'}) \
+               WITH d MATCH (x:Doc) WHERE x.content CONTAINS 'zqx' RETURN count(x)");
+
+            // A node that GAINS the label after the index was built: the
+            // membership moved and no property was written.
+            q("CREATE (d:Draft {path: 'late.rs', content: 'a zqx arriving late'})");
+            q("MATCH (d:Draft {path: 'late.rs'}) SET d:Doc");
+            q("MATCH (d:Doc) WHERE d.content CONTAINS 'zqx' RETURN count(d)");
+
+            // A non-string under the indexed property: the trigram index
+            // disables itself, the fulltext index counts it and carries on.
+            q("CREATE (d:Doc {path: 'num.rs', content: 42})");
+            q("MATCH (d:Doc) WHERE d.content CONTAINS 'zqx' RETURN count(d)");
+            q("CALL db.index.fulltext.queryNodes('doc_ft', 'zqx') YIELD node, score \
+               RETURN count(node)");
+
+            // The fulltext index declining, so the scan answers.
+            g.set_bm25_scoring(false);
+            q("CALL db.index.fulltext.queryNodes('doc_ft', 'ordinary') YIELD score \
+               RETURN count(score)");
+            g.set_bm25_scoring(true);
+
+            // The regex compile cache, past its capacity.
+            for i in 0..80 {
+                let _ = run_query(
+                    &g,
+                    &parse_statement(&format!(
+                        "MATCH (d:Doc) WHERE d.path =~ 'f{i}[0-9]*\\.rs' RETURN count(d)"
+                    ))
+                    .expect("parses"),
+                    Default::default(),
+                );
+            }
+
+            // A standalone CALL, and one refused for not being last.
+            q("CALL dbms.components()");
+            let _ = run_query(
+                &g,
+                &parse_statement("CALL db.labels() RETURN 1 AS one").expect("parses"),
+                Default::default(),
+            );
+
+            // ── The algorithm layer ─────────────────────────────────────
+            let a = g.create_node(&["A".into()], &Default::default()).expect("a");
+            let b = g.create_node(&["A".into()], &Default::default()).expect("b");
+            let c = g.create_node(&["A".into()], &Default::default()).expect("c");
+            let outside = g.create_node(&["B".into()], &Default::default()).expect("o");
+            for (x, y) in [(a, b), (b, c), (c, a)] {
+                let _ = g.create_rel(x, "R", y, &Default::default());
+            }
+            // An edge whose other end is NOT in the projection.
+            let _ = g.create_rel(a, "R", outside, &Default::default());
+            // One relationship WITH the weight property and one without: the
+            // property must exist for the weighted build to look for it at
+            // all, and the one lacking it is what reaches the missing-weight
+            // path.
+            let mut wprops = std::collections::BTreeMap::new();
+            wprops.insert("w".to_string(), Value::Float(2.0));
+            let _ = g.create_rel(c, "R", b, &wprops);
+            let _ = g.create_rel(b, "R", a, &Default::default());
+
+            struct Wide(usize);
+            impl ScopedExec for Wide {
+                fn width(&self) -> usize {
+                    self.0
+                }
+                fn for_each(&self, n: usize, f: &(dyn Fn(usize) + Sync)) {
+                    for i in 0..n {
+                        f(i);
+                    }
+                }
+            }
+
+            let proj = ProjectionKey {
+                labels: vec!["A".into()],
+                types: vec!["R".into()],
+                dir: Dir::Out,
+                weight: None,
+            };
+            // More than one morsel, and a fixpoint that converges.
+            let cfg = AlgoConfig {
+                projection: proj.clone(),
+                max_iterations: 50,
+                ..AlgoConfig::default()
+            };
+            let _ = g.algo_run(Algorithm::PageRank, &cfg, &Wide(4));
+            // A fixpoint that hits its cap instead.
+            let capped = AlgoConfig {
+                projection: proj.clone(),
+                max_iterations: 1,
+                tolerance: 0.0,
+                ..AlgoConfig::default()
+            };
+            let _ = g.algo_run(Algorithm::PageRank, &capped, &Wide(1));
+            // A weighted run over relationships that carry no weight.
+            let weighted = AlgoConfig {
+                projection: ProjectionKey {
+                    weight: Some("w".into()),
+                    ..proj.clone()
+                },
+                ..AlgoConfig::default()
+            };
+            let _ = g.algo_run(Algorithm::Degree, &weighted, &Wide(1));
+            // Label propagation over a bipartite-ish shape, which is where
+            // synchronous propagation can oscillate.
+            let bip: Vec<u64> = (0..8)
+                .map(|_| g.create_node(&["A".into()], &Default::default()).expect("n"))
+                .collect();
+            for i in 0..4 {
+                let _ = g.create_rel(bip[i], "R", bip[i + 4], &Default::default());
+                let _ = g.create_rel(bip[i + 4], "R", bip[(i + 1) % 4], &Default::default());
+            }
+            let _ = g.algo_run(Algorithm::LabelPropagation, &cfg, &Wide(2));
+            let _ = g.algo_run(Algorithm::Louvain, &cfg, &Wide(1));
+
+            // mutate, then read back after a write so the result reports stale;
+            // and a write mode batched across more than one transaction.
+            q("CALL engram.algo.wcc.mutate({nodeLabels: ['A'], mutateKey: 'k'}) \
+               YIELD mutateKey RETURN mutateKey");
+            let _ = g.create_node(&["A".into()], &Default::default());
+            q("CALL engram.algo.result.list() YIELD stale RETURN stale");
+            q("CALL engram.algo.degree.write({nodeLabels: ['A'], writeProperty: 'deg', \
+               writeBatchSize: 2}) YIELD nodesWritten RETURN nodesWritten");
+
+            // ── The path procedures ─────────────────────────────────────
+            // A diamond, so `allShortestPaths` has more than one route to
+            // return and Yen runs out of distinct routes before its `k`.
+            let d: Vec<u64> = (0..4)
+                .map(|_| g.create_node(&["P".into()], &Default::default()).expect("p"))
+                .collect();
+            for (x, y) in [(0usize, 1usize), (0, 2), (1, 3), (2, 3)] {
+                let _ = g.create_rel(d[x], "Q", d[y], &Default::default());
+            }
+            q(&format!(
+                "MATCH p = allShortestPaths((a)-[*]->(b)) WHERE id(a) = {} AND id(b) = {} \
+                 RETURN count(p)",
+                d[0], d[3]
+            ));
+            q(&format!(
+                "CALL engram.algo.kshortestpaths.stream({{nodeLabels: ['P'], \
+                 relationshipTypes: ['Q'], sourceNode: {}, targetNode: {}, k: 9}}) \
+                 YIELD index RETURN count(index)",
+                d[0], d[3]
+            ));
+            // Betweenness, and its all-pairs refusal.
+            q("CALL engram.algo.betweenness.stream({nodeLabels: ['P'], \
+               relationshipTypes: ['Q'], orientation: 'UNDIRECTED'}) \
+               YIELD score RETURN count(score)");
+            // The all-pairs ceiling REFUSING: a state worth reaching, and not a
+            // statement that should succeed.
+            g.set_algo_work_ceiling(1);
+            q_refused("CALL engram.algo.betweenness.stats({nodeLabels: ['P']}) \
+               YIELD nodeCount RETURN nodeCount");
+            g.set_algo_work_ceiling(10_000_000_000);
+        }
+
         // ── The interpreter scenario ────────────────────────────────────
         // Seeded statements end to end against a real store, firing every
         // declared graph/interp event, with decoded values asserted.
@@ -1958,8 +2193,13 @@ pub fn run_seed(seed: u64) -> RunReport {
             // unnoticed. The known procedure is now asserted to ANSWER (its
             // own labels among the rows) and an unknown one to refuse.
             match run("CALL db.labels() YIELD label RETURN label") {
-                Ok(r) if r.rows.iter().any(|row| row == &vec![Value::Str("S".into())]) => {}
-                other => violations.push(format!("db.labels() did not list the seeded label: {other:?}")),
+                Ok(r)
+                    if r.rows
+                        .iter()
+                        .any(|row| row == &vec![Value::Str("S".into())]) => {}
+                other => violations.push(format!(
+                    "db.labels() did not list the seeded label: {other:?}"
+                )),
             }
             match run("CALL db.noSuchProcedure() YIELD x RETURN x") {
                 Err(RunError::Unsupported(_)) => {}
@@ -2071,7 +2311,11 @@ pub fn run_seed(seed: u64) -> RunReport {
                 g
             };
             let run_on = |g: &Graph, src: &str| -> Result<engram_graph::QueryResult, RunError> {
-                run_stmt(g, &parse_any(src).expect("declared-state statements parse"), Default::default())
+                run_stmt(
+                    g,
+                    &parse_any(src).expect("declared-state statements parse"),
+                    Default::default(),
+                )
             };
             let count_of = |g: &Graph, src: &str| -> Option<i64> {
                 match run_on(g, src) {
@@ -2092,7 +2336,14 @@ pub fn run_seed(seed: u64) -> RunReport {
                 let mut rng = Rng::new(seed ^ 0x5EEC);
                 let n = 4 + rng.below(6) as i64;
                 for i in 0..n {
-                    let _ = run_on(&g, &format!("CREATE (:MK {{a: {}, b: {i}}}), (:MQ {{x: {}, y: {i}}})", i % 3, i % 2));
+                    let _ = run_on(
+                        &g,
+                        &format!(
+                            "CREATE (:MK {{a: {}, b: {i}}}), (:MQ {{x: {}, y: {i}}})",
+                            i % 3,
+                            i % 2
+                        ),
+                    );
                 }
                 // MERGE is the statement that matches through `match_path`
                 // (a count is claimed by the pipeline first): a MERGE of a row
@@ -2103,11 +2354,15 @@ pub fn run_seed(seed: u64) -> RunReport {
                 ] {
                     match run_on(&g, stmt) {
                         Ok(r) if r.rows.len() == 1 => {}
-                        other => violations.push(format!("multi-key merge `{stmt}` answered {other:?}")),
+                        other => {
+                            violations.push(format!("multi-key merge `{stmt}` answered {other:?}"))
+                        }
                     }
                     match count_of(&g, &format!("MATCH (n:{label}) RETURN count(n)")) {
                         Some(c) if c == want => {}
-                        other => violations.push(format!("multi-key merge changed :{label} to {other:?}, want {want}")),
+                        other => violations.push(format!(
+                            "multi-key merge changed :{label} to {other:?}, want {want}"
+                        )),
                     }
                 }
             }
@@ -2120,7 +2375,10 @@ pub fn run_seed(seed: u64) -> RunReport {
                 let mut rng = Rng::new(seed ^ 0x0F0B);
                 let m = 3 + rng.below(5) as i64;
                 for i in 0..m {
-                    let _ = run_on(&g, &format!("CREATE (a:HA {{i: {i}}})-[:HR]->(:HB {{i: {i}}})"));
+                    let _ = run_on(
+                        &g,
+                        &format!("CREATE (a:HA {{i: {i}}})-[:HR]->(:HB {{i: {i}}})"),
+                    );
                 }
                 let _ = run_on(&g, "CREATE (:Tick)");
                 g.set_degree_table_after(u64::MAX);
@@ -2131,7 +2389,9 @@ pub fn run_seed(seed: u64) -> RunReport {
                 let _ = run_on(&g, "CREATE (:Tick)");
                 let tabled = count_of(&g, "MATCH (a:HA)-[:HR]->(b:HB) RETURN count(*) AS c");
                 if probed != Some(m) || tabled != Some(m) {
-                    violations.push(format!("hop count per-node probes {probed:?} vs tables {tabled:?}, want {m}"));
+                    violations.push(format!(
+                        "hop count per-node probes {probed:?} vs tables {tabled:?}, want {m}"
+                    ));
                 }
             }
 
@@ -2144,7 +2404,10 @@ pub fn run_seed(seed: u64) -> RunReport {
                 let mut rng = Rng::new(seed ^ 0xA11D);
                 let m = 3 + rng.below(5) as i64;
                 for i in 0..m {
-                    let _ = run_on(&g, &format!("CREATE (a:KA {{i: {i}}})-[:KR]->(:KB {{i: {i}}})"));
+                    let _ = run_on(
+                        &g,
+                        &format!("CREATE (a:KA {{i: {i}}})-[:KR]->(:KB {{i: {i}}})"),
+                    );
                 }
                 // Build the table on a first read.
                 let first = count_of(&g, "MATCH (a:KA)-[:KR]->(b:KB) RETURN count(*) AS c");
@@ -2156,7 +2419,10 @@ pub fn run_seed(seed: u64) -> RunReport {
                 // A row-returning anchored read walks per node on the general
                 // path — the reader that asks the stale table with admission
                 // off; a count would be folded by the pipeline instead.
-                let stale = match run_on(&g, "MATCH (a:KA {i: 0})-[:KR]->(b:KB) RETURN b.i ORDER BY b.i") {
+                let stale = match run_on(
+                    &g,
+                    "MATCH (a:KA {i: 0})-[:KR]->(b:KB) RETURN b.i ORDER BY b.i",
+                ) {
                     Ok(r) => Some(r.rows.len() as i64),
                     Err(_) => None,
                 };
@@ -2164,7 +2430,9 @@ pub fn run_seed(seed: u64) -> RunReport {
                 g.set_incremental_caches(true);
                 g.set_single_node_stale_walk(true);
                 if first != Some(m) || stale != Some(2) {
-                    violations.push(format!("kept-off reader answered {stale:?} rows after {first:?}, want 2"));
+                    violations.push(format!(
+                        "kept-off reader answered {stale:?} rows after {first:?}, want 2"
+                    ));
                 }
             }
 
@@ -2174,7 +2442,10 @@ pub fn run_seed(seed: u64) -> RunReport {
             {
                 let store = Store::new();
                 let g = Graph::new(store.clone(), Realm(1), Namespace(1));
-                let _ = run_on(&g, "CREATE (a:OA {i: 1})-[:OR]->(b:OB {i: 1}), (a)-[:OR]->(:OB {i: 2})");
+                let _ = run_on(
+                    &g,
+                    "CREATE (a:OA {i: 1})-[:OR]->(b:OB {i: 1}), (a)-[:OR]->(:OB {i: 2})",
+                );
                 let rid = match run_on(&g, "MATCH (:OA)-[r:OR]->(:OB {i: 2}) RETURN id(r)") {
                     Ok(r) => match r.rows.first().and_then(|row| row.first()) {
                         Some(Value::Int(id)) => Some(*id as u64),
@@ -2187,14 +2458,20 @@ pub fn run_seed(seed: u64) -> RunReport {
                         let _ = store.delete(&g.rel_prefix_for_test(), &id.to_be_bytes());
                         match run_on(&g, "MATCH (a:OA) DETACH DELETE a") {
                             Ok(_) => {}
-                            Err(e) => violations.push(format!("detach over an orphan row refused: {e:?}")),
+                            Err(e) => {
+                                violations.push(format!("detach over an orphan row refused: {e:?}"))
+                            }
                         }
                         match count_of(&g, "MATCH (a:OA) RETURN count(a)") {
                             Some(0) => {}
-                            other => violations.push(format!("detached node still present: {other:?}")),
+                            other => {
+                                violations.push(format!("detached node still present: {other:?}"))
+                            }
                         }
                     }
-                    None => violations.push("orphan scenario could not read the relationship id".into()),
+                    None => {
+                        violations.push("orphan scenario could not read the relationship id".into())
+                    }
                 }
             }
 
@@ -2220,19 +2497,30 @@ pub fn run_seed(seed: u64) -> RunReport {
                         }
                     }
                     for i in 1..12i64 {
-                        let _ = run_on(&g, &format!("MATCH (a:SP {{id: 0}}), (b:SP {{id: {i}}}) CREATE (a)-[:SR]->(b)"));
+                        let _ = run_on(
+                            &g,
+                            &format!(
+                                "MATCH (a:SP {{id: 0}}), (b:SP {{id: {i}}}) CREATE (a)-[:SR]->(b)"
+                            ),
+                        );
                     }
                     store.seal();
                     // Warm: the tables the sidecar will record.
                     let _ = count_of(&g, "MATCH (a:SP {id: 0})-[:SR]->(b) RETURN count(b)");
                     for i in 12..16i64 {
                         let _ = run_on(&g, &format!("CREATE (:SP {{id: {i}}})"));
-                        let _ = run_on(&g, &format!("MATCH (a:SP {{id: 0}}), (b:SP {{id: {i}}}) CREATE (a)-[:SR]->(b)"));
+                        let _ = run_on(
+                            &g,
+                            &format!(
+                                "MATCH (a:SP {{id: 0}}), (b:SP {{id: {i}}}) CREATE (a)-[:SR]->(b)"
+                            ),
+                        );
                     }
                     store.seal();
                     g
                 };
-                let truth = |g: &Graph| count_of(g, "MATCH (a:SP {id: 0})-[:SR]->(b) RETURN count(b)");
+                let truth =
+                    |g: &Graph| count_of(g, "MATCH (a:SP {id: 0})-[:SR]->(b) RETURN count(b)");
                 for arm in ["moved", "newer"] {
                     let sub = dir.join(arm);
                     std::fs::create_dir_all(&sub).expect("scratch arm dir");
@@ -2259,11 +2547,15 @@ pub fn run_seed(seed: u64) -> RunReport {
                     let g1 = Graph::new(store.clone(), Realm(1), Namespace(1));
                     let adopted = g1.adopt_derived_sidecar(&sub);
                     if adopted != 0 {
-                        violations.push(format!("sidecar {arm}: adopted {adopted} structure(s), must refuse"));
+                        violations.push(format!(
+                            "sidecar {arm}: adopted {adopted} structure(s), must refuse"
+                        ));
                     }
                     let now = truth(&g1);
                     if now != want || want.is_none() {
-                        violations.push(format!("sidecar {arm}: answered {now:?} after refusing, want {want:?}"));
+                        violations.push(format!(
+                            "sidecar {arm}: answered {now:?} after refusing, want {want:?}"
+                        ));
                     }
                 }
                 let _ = std::fs::remove_dir_all(&dir);
@@ -2275,7 +2567,10 @@ pub fn run_seed(seed: u64) -> RunReport {
             // uniqueness violation.
             {
                 let g = std::sync::Arc::new(mk());
-                let _ = run_on(&g, "CREATE CONSTRAINT rm_u FOR (n:RM) REQUIRE n.u IS UNIQUE");
+                let _ = run_on(
+                    &g,
+                    "CREATE CONSTRAINT rm_u FOR (n:RM) REQUIRE n.u IS UNIQUE",
+                );
                 let mut rng = Rng::new(seed ^ 0x9ACE);
                 let u = rng.below(1000) as i64;
                 let hook: engram_graph::MergeRaceHook = std::sync::Arc::new(move |g: &Graph| {
@@ -2286,7 +2581,9 @@ pub fn run_seed(seed: u64) -> RunReport {
                 g.set_merge_race_hook_for_test(Some(hook));
                 match run_on(&g, &format!("MERGE (n:RM {{u: {u}}}) RETURN n.u")) {
                     Ok(r) if r.rows == vec![vec![Value::Int(u)]] => {}
-                    other => violations.push(format!("merge did not converge on the racer's node: {other:?}")),
+                    other => violations.push(format!(
+                        "merge did not converge on the racer's node: {other:?}"
+                    )),
                 }
                 match count_of(&g, "MATCH (n:RM) RETURN count(n)") {
                     Some(1) => {}
@@ -2410,9 +2707,12 @@ pub fn run_seed(seed: u64) -> RunReport {
                 ];
                 match v2.feed(&unknown_manifest) {
                     Ok(r) if r == vec![0, 0, 8, 5] => {}
-                    other => violations.push(format!("unknown manifest not passed over: {other:?}")),
+                    other => {
+                        violations.push(format!("unknown manifest not passed over: {other:?}"))
+                    }
                 }
-                let mut bad_pick = BoltServer::new(Graph::new(Store::new(), Realm(1), Namespace(1)));
+                let mut bad_pick =
+                    BoltServer::new(Graph::new(Store::new(), Realm(1), Namespace(1)));
                 let manifest: [u8; 20] = [
                     0x60, 0x60, 0xB0, 0x17, 0x00, 0x00, 0x01, 0xFF, 0x00, 0x08, 0x08, 0x05, 0x00,
                     0x02, 0x04, 0x04, 0x00, 0x00, 0x00, 0x03,
@@ -2433,7 +2733,11 @@ pub fn run_seed(seed: u64) -> RunReport {
                 0x60, 0x60, 0xB0, 0x17, 0x00, 0x00, 0x01, 0xFF, 0x00, 0x08, 0x08, 0x05, 0x00, 0x02,
                 0x04, 0x04, 0x00, 0x00, 0x00, 0x03,
             ];
-            let pick: (u8, u8) = if rng.below(2) == 0 { (6, 0) } else { (5, rng.below(9) as u8) };
+            let pick: (u8, u8) = if rng.below(2) == 0 {
+                (6, 0)
+            } else {
+                (5, rng.below(9) as u8)
+            };
             let msg = |tag: u8, fields: Vec<Pack>| -> Vec<u8> {
                 let mut payload = Vec::new();
                 engram_bolt::packstream::encode_struct(tag, &fields, &mut payload)

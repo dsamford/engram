@@ -35,9 +35,7 @@
 //! arms, over a corpus built to make precedence matter.
 
 use engram_key::{KeyPrefix, Kind, Namespace, Partition, Realm};
-use engram_store::{
-    SPAN_READS_EXCLUDING_WRITERS, SPAN_READS_LATCH_FREE, Store, StoredValue,
-};
+use engram_store::{SPAN_READS_EXCLUDING_WRITERS, SPAN_READS_LATCH_FREE, Store, StoredValue};
 use std::sync::atomic::Ordering;
 
 fn serial() -> std::sync::MutexGuard<'static, ()> {
@@ -66,14 +64,22 @@ fn key(i: u32) -> Vec<u8> {
 /// the shape that shows it.
 fn build(s: &Store) {
     for i in 0..300u32 {
-        s.put(&pfx(), &key(i), StoredValue::Plain(vec![1, (i % 251) as u8]))
-            .expect("put");
+        s.put(
+            &pfx(),
+            &key(i),
+            StoredValue::Plain(vec![1, (i % 251) as u8]),
+        )
+        .expect("put");
     }
     s.seal();
     // Overwrite a third IN THE TAIL: the tail must win over the segment.
     for i in (0..300u32).step_by(3) {
-        s.put(&pfx(), &key(i), StoredValue::Plain(vec![2, (i % 251) as u8]))
-            .expect("overwrite");
+        s.put(
+            &pfx(),
+            &key(i),
+            StoredValue::Plain(vec![2, (i % 251) as u8]),
+        )
+        .expect("overwrite");
     }
     // Delete a quarter IN THE TAIL: a tombstone must shadow the segment's row.
     for i in (0..300u32).step_by(4) {
@@ -150,8 +156,12 @@ fn the_copy_and_the_borrow_answer_identically_on_a_paged_store() {
     // the branch under test and passes for the wrong reason. The first cut of
     // this test did exactly that.
     for i in 0..300u32 {
-        s.put(&pfx(), &key(i), StoredValue::Plain(vec![1, (i % 251) as u8]))
-            .expect("put");
+        s.put(
+            &pfx(),
+            &key(i),
+            StoredValue::Plain(vec![1, (i % 251) as u8]),
+        )
+        .expect("put");
     }
     s.seal();
     let _cache = s.into_paged(dir.path(), 8 << 20).expect("into_paged");

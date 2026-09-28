@@ -28,7 +28,10 @@ use engram_store::Store;
 fn params() -> BTreeMap<String, Value> {
     let mut p = BTreeMap::new();
     p.insert("u".to_string(), Value::Str("user-3".to_string()));
-    p.insert("windowStart".to_string(), Value::Str("2026-08-20".to_string()));
+    p.insert(
+        "windowStart".to_string(),
+        Value::Str("2026-08-20".to_string()),
+    );
     p
 }
 
@@ -77,7 +80,10 @@ fn corpus() -> Graph {
         for k in 0..4usize {
             let p = projs[(ui * 4 + k) % 20];
             let mut m = BTreeMap::new();
-            m.insert("role".to_string(), Value::Str(if k == 0 { "owner" } else { "member" }.to_string()));
+            m.insert(
+                "role".to_string(),
+                Value::Str(if k == 0 { "owner" } else { "member" }.to_string()),
+            );
             if k == 3 {
                 m.insert("state".to_string(), Value::Str("inactive".to_string()));
             }
@@ -87,9 +93,22 @@ fn corpus() -> Graph {
     for i in 0..4000i64 {
         let mut m = BTreeMap::new();
         m.insert("itemId".to_string(), Value::Str(format!("item-{i:04}")));
-        m.insert("updatedAt".to_string(), Value::Str(format!("2026-08-{:02}T{:02}:00:00Z", 1 + (i % 28), i % 24)));
-        m.insert("status".to_string(), Value::Str(if i % 5 == 0 { "done" } else { "open" }.to_string()));
-        m.insert("completedAt".to_string(), if i % 5 == 0 { Value::Str(format!("2026-08-{:02}", 10 + (i % 20))) } else { Value::Null });
+        m.insert(
+            "updatedAt".to_string(),
+            Value::Str(format!("2026-08-{:02}T{:02}:00:00Z", 1 + (i % 28), i % 24)),
+        );
+        m.insert(
+            "status".to_string(),
+            Value::Str(if i % 5 == 0 { "done" } else { "open" }.to_string()),
+        );
+        m.insert(
+            "completedAt".to_string(),
+            if i % 5 == 0 {
+                Value::Str(format!("2026-08-{:02}", 10 + (i % 20)))
+            } else {
+                Value::Null
+            },
+        );
         m.insert("payload".to_string(), Value::Str("x".repeat(400)));
         let w = g.create_node(&["Item".into()], &m).expect("item");
         g.create_rel(w, "BELONGS_TO", projs[(i % 20) as usize], &BTreeMap::new())
@@ -129,26 +148,45 @@ fn the_dashboard_listing_reads_one_property_per_item_not_the_record() {
     // Items of proj-12: i ≡ 12 (mod 20) → 200 items; 40 done (i % 5 == 0 ⇔ i ≡ 0 mod 5;
     // i = 12 + 20k, 12 + 20k ≡ 2 (mod 5) → NONE are done).
     assert_eq!(p12[3], Value::Int(200), "itemCount");
-    assert_eq!(p12[4], Value::Int(200), "openCount (no item of proj-12 is done)");
+    assert_eq!(
+        p12[4],
+        Value::Int(200),
+        "openCount (no item of proj-12 is done)"
+    );
     // Members of proj-12: user-3 (owner, active) only … plus whoever else lands on 12:
     // ui*4+k ≡ 12 (mod 20): (3,0) only → 1.
     assert_eq!(p12[5], Value::Int(1), "memberCount");
     // proj-00: i ≡ 0 (mod 20) → every item i % 5 == 0 → all 200 done.
     let p0 = &by_id["proj-00"];
     assert_eq!(p0[3], Value::Int(200));
-    assert_eq!(p0[4], Value::Int(0), "openCount (every item of proj-00 is done)");
+    assert_eq!(
+        p0[4],
+        Value::Int(0),
+        "openCount (every item of proj-00 is done)"
+    );
     // user-3's projects are (3*4+k) % 20 ∈ {12,13,14,15}: no edge to proj-00.
-    assert_eq!(p0[1], Value::Str("none".into()), "myRole for a project $u is not in");
+    assert_eq!(
+        p0[1],
+        Value::Str("none".into()),
+        "myRole for a project $u is not in"
+    );
     // proj-15 is user-3's INACTIVE membership (k = 3): the role rides on the
     // edge regardless, the active-member count excludes it.
     let p15 = &by_id["proj-15"];
     assert_eq!(p15[1], Value::Str("member".into()));
-    assert_eq!(p15[5], Value::Int(0), "the inactive membership is not counted");
+    assert_eq!(
+        p15[5],
+        Value::Int(0),
+        "the inactive membership is not counted"
+    );
     // The demand: `w` is read for `updatedAt` only, the COUNT {} ends for
     // their labels (and `status` / `state`), the comprehension for
     // `completedAt` / `itemId`. Nothing is read in full: 4,000 fat items ×
     // (1 OPTIONAL + 3 subqueries) would be 16,000 full records.
-    assert!(count_of(&c, BOUND) > 0, "hop ends bound to their demand: {c:?}");
+    assert!(
+        count_of(&c, BOUND) > 0,
+        "hop ends bound to their demand: {c:?}"
+    );
     assert!(count_of(&c, REUSED) > 0, "the bound project reused: {c:?}");
     // The executor reads each PROJECT in full a few times (the seed, the
     // group key); no fat ITEM record ever — 16,000 projections, not 16,000
@@ -163,11 +201,28 @@ fn the_dashboard_listing_reads_one_property_per_item_not_the_record() {
     // `openCount` body reads `status`, a column nothing had cached — it is
     // loaded whole ONCE and that body vectorises too (another 4,000 ends
     // never bound). The OPTIONAL hop's `updatedAt` and the comprehension's
-    // `completedAt` / `itemId` stay projected: 8,000, not 16,000.
-    assert_eq!(count_of(&c, "interp.subquery hop loaded its far end's column whole"), 1, "{c:?}");
+    // `completedAt` / `itemId` stayed projected — 8,000, not 16,000 — until
+    // fix 87: the comprehension's sixty-fourth miss reads its columns whole
+    // and the rest bind from them, so the projected reads are the OPTIONAL
+    // hop's 4,000 and the sixty-four misses.
+    assert_eq!(
+        count_of(&c, "interp.subquery hop loaded its far end's column whole"),
+        1,
+        "{c:?}"
+    );
+    assert!(
+        count_of(
+            &c,
+            "interp.matcher warmed a hop end label's columns after repeated misses"
+        ) >= 1,
+        "{c:?}"
+    );
     let projected = count_of(&c, "graph.projected node materialisations");
-    assert!((8_000..12_000).contains(&projected), "{c:?}");
-    assert!(count_of(&c, "interp.subquery hop evaluated column-at-a-time") >= 40, "{c:?}");
+    assert!((4_000..6_000).contains(&projected), "{c:?}");
+    assert!(
+        count_of(&c, "interp.subquery hop evaluated column-at-a-time") >= 40,
+        "{c:?}"
+    );
     assert!(
         count_of(&c, FULL_RELS) <= 60,
         "only the named MEMBER_OF edges (their props are read), never the 4,000 anonymous BELONGS_TO: {c:?}"
@@ -180,21 +235,46 @@ fn the_dashboard_listing_reads_one_property_per_item_not_the_record() {
 #[test]
 fn a_bare_use_still_comes_in_full() {
     let g = corpus();
-    let full = rows(&g, "MATCH (p:Proj {id: 'proj-07'}) OPTIONAL MATCH (w:Item)-[:BELONGS_TO]->(p) WITH w ORDER BY w.itemId LIMIT 2 RETURN properties(w) AS w");
+    let full = rows(
+        &g,
+        "MATCH (p:Proj {id: 'proj-07'}) OPTIONAL MATCH (w:Item)-[:BELONGS_TO]->(p) WITH w ORDER BY w.itemId LIMIT 2 RETURN properties(w) AS w",
+    );
     assert_eq!(full.len(), 2);
     let Value::Map(m) = &full[0][0] else {
         panic!("properties(w): {:?}", full[0][0]);
     };
     assert_eq!(m.get("itemId"), Some(&Value::Str("item-0007".into())));
-    assert_eq!(m.get("payload").map(|v| matches!(v, Value::Str(s) if s.len() == 400)), Some(true), "the fat payload is there");
+    assert_eq!(
+        m.get("payload")
+            .map(|v| matches!(v, Value::Str(s) if s.len() == 400)),
+        Some(true),
+        "the fat payload is there"
+    );
     // An open item has no completedAt (a null property is absent): four properties.
     assert_eq!(m.len(), 4, "every property: {m:?}");
     assert!(m.get("completedAt").is_none());
     // A property read after a bare carry: full, and correct.
-    let got = rows(&g, "MATCH (p:Proj {id: 'proj-07'}) OPTIONAL MATCH (w:Item)-[:BELONGS_TO]->(p) WITH p, w ORDER BY w.itemId LIMIT 3 RETURN w.itemId AS id, w.status AS s, size(w.payload) AS n");
+    let got = rows(
+        &g,
+        "MATCH (p:Proj {id: 'proj-07'}) OPTIONAL MATCH (w:Item)-[:BELONGS_TO]->(p) WITH p, w ORDER BY w.itemId LIMIT 3 RETURN w.itemId AS id, w.status AS s, size(w.payload) AS n",
+    );
     assert_eq!(got.len(), 3);
-    assert_eq!(got[0], vec![Value::Str("item-0007".into()), Value::Str("open".into()), Value::Int(400)]);
-    assert_eq!(got[1], vec![Value::Str("item-0027".into()), Value::Str("open".into()), Value::Int(400)]);
+    assert_eq!(
+        got[0],
+        vec![
+            Value::Str("item-0007".into()),
+            Value::Str("open".into()),
+            Value::Int(400)
+        ]
+    );
+    assert_eq!(
+        got[1],
+        vec![
+            Value::Str("item-0027".into()),
+            Value::Str("open".into()),
+            Value::Int(400)
+        ]
+    );
 }
 
 /// The demanded properties are exactly what a later clause reads — a WITH
@@ -208,11 +288,18 @@ fn a_property_read_two_clauses_later_is_in_the_demand() {
     assert_eq!(got[0][0], Value::Str("proj-07".into()));
     // proj-07: i ≡ 7 (mod 20) → i % 5 == 2 → none done → 200 open.
     assert_eq!(got[0][1], Value::Int(200));
-    assert_eq!(got[0][2], Value::Str("2026-08-08T07:00:00Z".into()), "item-0007's updatedAt");
+    assert_eq!(
+        got[0][2],
+        Value::Str("2026-08-08T07:00:00Z".into()),
+        "item-0007's updatedAt"
+    );
     // A pattern reusing `w` later is an identity use; the far end's map keys are read.
     let src2 = "MATCH (p:Proj {id: 'proj-07'}) OPTIONAL MATCH (w:Item)-[:BELONGS_TO]->(p) WITH w ORDER BY w.itemId LIMIT 1 MATCH (w)-[:BELONGS_TO]->(q:Proj {color: 'blue'}) RETURN q.id AS q, w.itemId AS w";
     assert_eq!(
         rows(&g, src2),
-        vec![vec![Value::Str("proj-07".into()), Value::Str("item-0007".into())]]
+        vec![vec![
+            Value::Str("proj-07".into()),
+            Value::Str("item-0007".into())
+        ]]
     );
 }

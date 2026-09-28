@@ -107,3 +107,93 @@ fn ic11_semijoin_matches_general_and_interp() {
     );
     assert!(fired(&g, src), "the IC11 shape must take the semijoin");
 }
+
+/// More survivors than the LIMIT, with years colliding across friends: the
+/// semijoin ranks its id rows on the key columns and projects the ten winners
+/// alone. It decoded every friend and company whole before ranking — IC11 at
+/// SF3 read 11,374 nodes in full for its ten rows.
+#[test]
+fn ic11_semijoin_projects_its_winners_alone() {
+    let g = Graph::new(Store::new(), Realm(1), Namespace(1));
+    let p0 = node(&g, "Person", &[("id", i(1000))]);
+    let c0 = node(&g, "Country", &[("name", s("Country0"))]);
+    let mut comps = Vec::new();
+    for k in 0..5 {
+        let c = node(&g, "Company", &[("name", s(&format!("Comp{k}")))]);
+        rel(&g, c, "IS_LOCATED_IN", c0);
+        comps.push(c);
+    }
+    for f in 0..40i64 {
+        let p = node(&g, "Person", &[("id", i(f))]);
+        rel(&g, p0, "KNOWS", p);
+        rel_from(&g, p, comps[(f % 5) as usize], 2000 + (f % 7));
+        rel_from(&g, p, comps[((f + 2) % 5) as usize], 2000 + (f % 3));
+    }
+    let src = "MATCH (:Person {id: 1000})-[:KNOWS*1..2]-(friend:Person) \
+        WITH DISTINCT friend \
+        MATCH (friend)-[w:WORK_AT]->(company:Company)-[:IS_LOCATED_IN]->(:Country {name: 'Country0'}) \
+        WHERE w.workFrom < 2005 \
+        RETURN friend.id AS pid, company.name AS org, w.workFrom AS yr \
+        ORDER BY yr ASC, toInteger(pid) ASC, org DESC LIMIT 10";
+    let (sj, general, interp) = three(&g, src);
+    assert_eq!(sj, general, "ic11 semijoin vs general disagree");
+    assert_eq!(sj, interp, "ic11 semijoin vs interp disagree");
+    assert_eq!(sj.len(), 10, "{sj:?}");
+    g.set_columnar_scans(true);
+    g.set_ic11_semijoin(true);
+    let (_, trace) = engram_observe::with_trace(|| rows(&g, src));
+    let c = trace.counters();
+    let n = |k: &str| c.get(k).copied().unwrap_or(0);
+    assert!(
+        n("interp.pipeline ic11 semijoin ranked its rows before projecting them") > 0,
+        "{c:?}"
+    );
+    assert!(
+        n("graph.nodes materialised in full") <= 2 * 10 + 4,
+        "more than the winners were decoded whole: {c:?}"
+    );
+}
+
+/// The country is the far end of more than companies' `IS_LOCATED_IN`: at SNB
+/// SF10 every message is located in a country, and the semijoin inserted
+/// China's whole in-adjacency into its company set (300 of IC11's 337 ms). The
+/// set now holds members of the pattern's `Company` label, found from the
+/// company side when that side is smaller -- and a WORK_AT onto a node of
+/// another label located in the country is refused, as the pattern says and
+/// as the general path and the interpreter already refused it.
+#[test]
+fn ic11_semijoin_keeps_only_the_companies_of_the_country() {
+    let g = Graph::new(Store::new(), Realm(1), Namespace(1));
+    let p0 = node(&g, "Person", &[("id", i(10))]);
+    let p1 = node(&g, "Person", &[("id", i(1))]);
+    rel(&g, p0, "KNOWS", p1);
+    let c0 = node(&g, "Country", &[("name", s("Country0"))]);
+    let compa = node(&g, "Company", &[("name", s("CompA"))]);
+    rel(&g, compa, "IS_LOCATED_IN", c0);
+    let uni = node(&g, "University", &[("name", s("Uni"))]);
+    rel(&g, uni, "IS_LOCATED_IN", c0);
+    for m in 0..300i64 {
+        let msg = node(&g, "Message", &[("id", i(10_000 + m))]);
+        rel(&g, msg, "IS_LOCATED_IN", c0);
+    }
+    rel_from(&g, p1, compa, 2010);
+    rel_from(&g, p1, uni, 2011); // not a Company: the pattern refuses it
+    let src = "MATCH (:Person {id: 10})-[:KNOWS*1..2]-(friend:Person) \
+        WITH DISTINCT friend \
+        MATCH (friend)-[w:WORK_AT]->(company:Company)-[:IS_LOCATED_IN]->(:Country {name: 'Country0'}) \
+        WHERE w.workFrom < 2015 \
+        RETURN friend.id AS pid, company.name AS org, w.workFrom AS yr \
+        ORDER BY yr ASC, toInteger(pid) ASC, org DESC LIMIT 10";
+    let (sj, general, interp) = three(&g, src);
+    assert_eq!(sj, general, "ic11 semijoin vs general disagree");
+    assert_eq!(sj, interp, "ic11 semijoin vs interp disagree");
+    assert_eq!(sj, vec![vec![i(1), s("CompA"), i(2010)]]);
+    g.set_columnar_scans(true);
+    g.set_ic11_semijoin(true);
+    let (_, trace) = engram_observe::with_trace(|| rows(&g, src));
+    let c = trace.counters();
+    assert!(
+        c.get("interp.pipeline ic11 companies found from the company side").copied().unwrap_or(0) > 0,
+        "one company against 302 located entries: {c:?}"
+    );
+}

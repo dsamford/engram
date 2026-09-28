@@ -60,7 +60,11 @@ fn corpus() -> Graph {
         let mut m = BTreeMap::new();
         m.insert(
             "status".to_string(),
-            Value::Str(if i % 3 == 0 { "pending".into() } else { "done".into() }),
+            Value::Str(if i % 3 == 0 {
+                "pending".into()
+            } else {
+                "done".into()
+            }),
         );
         m.insert("priority".to_string(), Value::Int(i % 7));
         m.insert("proposedAt".to_string(), Value::Int(1_000_000 - i));
@@ -70,13 +74,15 @@ fn corpus() -> Graph {
             let mut am = BTreeMap::new();
             am.insert("id".to_string(), Value::Str(format!("art-{i}-{k}")));
             let a = g.create_node(&["Artifact".into()], &am).expect("artifact");
-            g.create_rel(p, "HAS_ARTIFACT", a, &BTreeMap::new()).expect("has");
+            g.create_rel(p, "HAS_ARTIFACT", a, &BTreeMap::new())
+                .expect("has");
         }
         if i % 2 == 0 {
             let mut rm = BTreeMap::new();
             rm.insert("id".to_string(), Value::Str(format!("repo-{}", i % 11)));
             let r = g.create_node(&["Repo".into()], &rm).expect("repo");
-            g.create_rel(p, "FOR_REPO", r, &BTreeMap::new()).expect("for");
+            g.create_rel(p, "FOR_REPO", r, &BTreeMap::new())
+                .expect("for");
         }
     }
     g
@@ -94,7 +100,10 @@ fn a_direct_property_key_over_a_nullable_var_runs_on_the_optional_pipeline() {
     let want = general(&g, LISTING);
     assert_eq!(want.len(), 25);
     // The fixture exercises the null key: some paged rows have no repo.
-    assert!(want.iter().any(|r| matches!(r[3], Value::Null)), "a null rid is paged: {want:?}");
+    assert!(
+        want.iter().any(|r| matches!(r[3], Value::Null)),
+        "a null rid is paged: {want:?}"
+    );
     let (got, c) = traced(&g, LISTING);
     assert_eq!(got, want);
     assert!(count_of(&c, ADMITTED) > 0, "{c:?}");

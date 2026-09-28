@@ -35,7 +35,13 @@ fn warmed(edges: usize) -> WarmReport {
         g.create_rel(w[0], "KNOWS", w[1], &e).expect("knows");
     }
     for i in 0..edges / 3 {
-        g.create_rel(persons[i], "LIKES", persons[(i * 7 + 3) % persons.len()], &e).expect("likes");
+        g.create_rel(
+            persons[i],
+            "LIKES",
+            persons[(i * 7 + 3) % persons.len()],
+            &e,
+        )
+        .expect("likes");
     }
     g.warm()
 }
@@ -43,9 +49,16 @@ fn warmed(edges: usize) -> WarmReport {
 #[test]
 fn held_bytes_count_every_edge_four_times_plus_the_offsets() {
     let w = warmed(1000);
-    assert!(w.tables >= 6, "untyped + 2 typed per direction expected, got {}", w.tables);
+    assert!(
+        w.tables >= 6,
+        "untyped + 2 typed per direction expected, got {}",
+        w.tables
+    );
     let edges = w.out_edges;
-    assert_eq!(w.in_edges, edges, "the two directions hold different edge counts");
+    assert_eq!(
+        w.in_edges, edges,
+        "the two directions hold different edge counts"
+    );
     // Entries: untyped + typed copies, both directions. Offsets: at least one
     // u32 per table (the closing offset), at most one per node id per table.
     let entries = 4 * edges * ENTRY_BYTES;
@@ -64,7 +77,12 @@ fn allocated_is_at_least_held_and_below_twice_it() {
     // Push growth: capacity in [len, 2·len). Not asserted equal — the
     // difference is real and reported; it is simply not resident.
     let w = warmed(1000);
-    assert!(w.table_capacity_bytes >= w.table_bytes, "allocated {} < held {}", w.table_capacity_bytes, w.table_bytes);
+    assert!(
+        w.table_capacity_bytes >= w.table_bytes,
+        "allocated {} < held {}",
+        w.table_capacity_bytes,
+        w.table_bytes
+    );
     assert!(
         w.table_capacity_bytes < 2 * w.table_bytes,
         "allocated {} B is not below twice the {} B held — that is not push growth",
@@ -77,6 +95,11 @@ fn allocated_is_at_least_held_and_below_twice_it() {
 fn the_report_grows_with_the_corpus_so_it_is_read_not_fixed() {
     let small = warmed(300);
     let large = warmed(3000);
-    assert!(large.table_bytes > 5 * small.table_bytes, "{} vs {}", large.table_bytes, small.table_bytes);
+    assert!(
+        large.table_bytes > 5 * small.table_bytes,
+        "{} vs {}",
+        large.table_bytes,
+        small.table_bytes
+    );
     assert!(large.table_capacity_bytes > large.table_bytes / 2);
 }

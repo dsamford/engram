@@ -1,0 +1,1483 @@
+{
+  "catalogue_version": 1,
+  "what_this_is": "The ONE statement catalogue. Before it, the LSQB battery existed three times — crates/engram-bench/src/bin/lsqb.rs (Cypher), a PostgreSQL runner script (SQL) and an embedded LadybugDB runner (Kuzu/LadybugDB Cypher) — and the stress workload existed once, in Cypher, which is why concurrency was measured on two engines and the join battery on four. Statement TEXT lives here, per dialect; the SEQUENCE, the parameters and the mix live in an emitted plan (see docs/converged-harness.md). A backend renders text from here and binds the plan's parameters; it never invents either.",
+  "provenance": {
+    "lsqb.cypher": "Transcribed from crates/engram-bench/src/bin/lsqb.rs, QUERIES table, string continuations resolved. That table is GONE: lsqb.rs renders from here. The bytes are locked to the ones the pre-cutover binary sent by tests/golden/lsqb-cypher-statements.txt, checked by tests/a_lsqb_statement_lives_once_and_matches_the_baseline.rs.",
+    "lsqb.sql": "the PostgreSQL LSQB runner script, the q1..q9 FROM bodies, verbatim.",
+    "lsqb.cypher_ladybug": "the embedded LadybugDB runner's QUERIES, verbatim (Message -> Post:Comment, NOT (a)-[:T]-(b) -> NOT EXISTS { MATCH ... }).",
+    "stress.cypher": "crates/engram-bench/src/bin/stress.rs render_read/render_write/render_algo/render_churn_*, extracted from their rendered output and locked by tests/golden/stress-op-sequence.txt."
+  },
+  "status_values": {
+    "verified": "this text has been executed against the engine it names and its answer checked against another engine's",
+    "unverified": "transcribed from the schema and the Cypher, never executed. A run that uses it is a first run, not a comparison.",
+    "unsupported": "this dialect cannot express the shape; `reason` says why. Declared, never dropped — the lsqb `unmappable` discipline."
+  },
+  "dialects": {
+    "cypher": {
+      "engines": [
+        "engram",
+        "neo4j"
+      ],
+      "transport": "bolt",
+      "rel_alternation": false
+    },
+    "cypher_ladybug": {
+      "engines": [
+        "ladybug",
+        "kuzu"
+      ],
+      "transport": "embedded-python",
+      "rel_alternation": true,
+      "rel_alternation_note": "LadybugDB/Kuzu store one rel table per (type, src-table, dst-table) pair, so a type spanning several pairs must be written as the alternation of its pair tables. The executor substitutes `[:TYPE]` -> `[:TYPE_Src_Dst|TYPE_Src2_Dst2]` from the pairs.json its own loader wrote. That substitution is a property of the LOADED corpus, not of this catalogue, which is why it is declared here and applied there."
+    },
+    "sql": {
+      "engines": [
+        "postgres"
+      ],
+      "transport": "pgwire",
+      "rel_alternation": false
+    }
+  },
+  "lsqb": {
+    "corpus_note": "Counts are properties of WHATEVER corpus is loaded — snbgen synthetic or converted official Datagen. They are comparable across engines loading the SAME corpus and never against published LSQB results.",
+    "expected_note": "`sf1` and `sf3` are the official Datagen scale factors as loaded on the bench pod. An entry that is absent carries NO expectation; it is not an expectation of zero.",
+    "queries": {
+      "q1": {
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (:Country)<-[:IS_PART_OF]-(:City)<-[:IS_LOCATED_IN]-(:Person)<-[:HAS_MEMBER]-(:Forum)-[:CONTAINER_OF]->(:Post)<-[:REPLY_OF]-(:Comment)-[:HAS_TAG]->(:Tag)-[:HAS_TYPE]->(:TagClass) RETURN count(*) AS count"
+        },
+        "cypher_ladybug": {
+          "status": "verified",
+          "text": "MATCH (:Country)<-[:IS_PART_OF]-(:City)<-[:IS_LOCATED_IN]-(:Person)<-[:HAS_MEMBER]-(:Forum)-[:CONTAINER_OF]->(:Post)<-[:REPLY_OF]-(:Comment)-[:HAS_TAG]->(:Tag)-[:HAS_TYPE]->(:TagClass) RETURN count(*) AS count"
+        },
+        "sql": {
+          "status": "verified",
+          "body": "FROM IS_PART_OF_City_Country cpc JOIN IS_LOCATED_IN_Person_City plc ON plc.dst = cpc.src JOIN HAS_MEMBER_Forum_Person fhm ON fhm.dst = plc.src JOIN CONTAINER_OF_Forum_Post fcp ON fcp.src = fhm.src JOIN REPLY_OF_Comment_Post crp ON crp.dst = fcp.dst JOIN HAS_TAG_Comment_Tag cht ON cht.src = crp.src JOIN HAS_TYPE_Tag_TagClass tht ON tht.src = cht.dst"
+        },
+        "skeleton": {
+          "types": [
+            "CONTAINER_OF",
+            "HAS_MEMBER",
+            "HAS_TAG",
+            "HAS_TYPE",
+            "IS_LOCATED_IN",
+            "IS_PART_OF",
+            "REPLY_OF"
+          ],
+          "optional": 0,
+          "anti": 0,
+          "inequalities": 0
+        },
+        "expected": {
+          "sf1": 179510748,
+          "sf3": 762461366
+        }
+      },
+      "q2": {
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (person1:Person)-[:KNOWS]-(person2:Person), (person1)<-[:HAS_CREATOR]-(comment:Comment)-[:REPLY_OF]->(post:Post)-[:HAS_CREATOR]->(person2) RETURN count(*) AS count"
+        },
+        "cypher_ladybug": {
+          "status": "verified",
+          "text": "MATCH (person1:Person)-[:KNOWS]-(person2:Person), (person1)<-[:HAS_CREATOR]-(comment:Comment)-[:REPLY_OF]->(post:Post)-[:HAS_CREATOR]->(person2) RETURN count(*) AS count"
+        },
+        "sql": {
+          "status": "verified",
+          "body": "FROM knows_sym k JOIN HAS_CREATOR_Comment_Person chc ON chc.dst = k.src JOIN REPLY_OF_Comment_Post crp ON crp.src = chc.src JOIN HAS_CREATOR_Post_Person phc ON phc.src = crp.dst AND phc.dst = k.dst"
+        },
+        "skeleton": {
+          "types": [
+            "HAS_CREATOR",
+            "HAS_CREATOR",
+            "KNOWS",
+            "REPLY_OF"
+          ],
+          "optional": 0,
+          "anti": 0,
+          "inequalities": 0
+        },
+        "expected": {
+          "sf1": 943416
+        }
+      },
+      "q3": {
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (country:Country) MATCH (person1:Person)-[:IS_LOCATED_IN]->(city1:City)-[:IS_PART_OF]->(country) MATCH (person2:Person)-[:IS_LOCATED_IN]->(city2:City)-[:IS_PART_OF]->(country) MATCH (person3:Person)-[:IS_LOCATED_IN]->(city3:City)-[:IS_PART_OF]->(country) MATCH (person1)-[:KNOWS]-(person2)-[:KNOWS]-(person3)-[:KNOWS]-(person1) RETURN count(*) AS count"
+        },
+        "cypher_ladybug": {
+          "status": "verified",
+          "text": "MATCH (country:Country) MATCH (person1:Person)-[:IS_LOCATED_IN]->(city1:City)-[:IS_PART_OF]->(country) MATCH (person2:Person)-[:IS_LOCATED_IN]->(city2:City)-[:IS_PART_OF]->(country) MATCH (person3:Person)-[:IS_LOCATED_IN]->(city3:City)-[:IS_PART_OF]->(country) MATCH (person1)-[:KNOWS]-(person2)-[:KNOWS]-(person3)-[:KNOWS]-(person1) RETURN count(*) AS count"
+        },
+        "sql": {
+          "status": "verified",
+          "body": "FROM IS_LOCATED_IN_Person_City p1 JOIN IS_PART_OF_City_Country c1 ON c1.src = p1.dst JOIN IS_LOCATED_IN_Person_City p2 ON true JOIN IS_PART_OF_City_Country c2 ON c2.src = p2.dst AND c2.dst = c1.dst JOIN IS_LOCATED_IN_Person_City p3 ON true JOIN IS_PART_OF_City_Country c3 ON c3.src = p3.dst AND c3.dst = c1.dst JOIN knows_sym k12 ON k12.src = p1.src AND k12.dst = p2.src JOIN knows_sym k23 ON k23.src = p2.src AND k23.dst = p3.src JOIN knows_sym k31 ON k31.src = p3.src AND k31.dst = p1.src"
+        },
+        "skeleton": {
+          "types": [
+            "IS_LOCATED_IN",
+            "IS_LOCATED_IN",
+            "IS_LOCATED_IN",
+            "IS_PART_OF",
+            "IS_PART_OF",
+            "IS_PART_OF",
+            "KNOWS",
+            "KNOWS",
+            "KNOWS"
+          ],
+          "optional": 0,
+          "anti": 0,
+          "inequalities": 0
+        },
+        "expected": {
+          "sf1": 554754
+        }
+      },
+      "q4": {
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (:Tag)<-[:HAS_TAG]-(message:Message)-[:HAS_CREATOR]->(creator:Person), (message)<-[:LIKES]-(liker:Person), (message)<-[:REPLY_OF]-(comment:Comment) RETURN count(*) AS count"
+        },
+        "cypher_ladybug": {
+          "status": "verified",
+          "text": "MATCH (:Tag)<-[:HAS_TAG]-(message:Post:Comment)-[:HAS_CREATOR]->(creator:Person), (message)<-[:LIKES]-(liker:Person), (message)<-[:REPLY_OF]-(comment:Comment) RETURN count(*) AS count"
+        },
+        "sql": {
+          "status": "verified",
+          "body": "FROM Message_hasTag_Tag mht JOIN Message_hasCreator_Person mhc ON mhc.src = mht.src JOIN Person_likes_Message plm ON plm.dst = mht.src JOIN Comment_replyOf_Message crm ON crm.dst = mht.src"
+        },
+        "skeleton": {
+          "types": [
+            "HAS_CREATOR",
+            "HAS_TAG",
+            "LIKES",
+            "REPLY_OF"
+          ],
+          "optional": 0,
+          "anti": 0,
+          "inequalities": 0
+        },
+        "expected": {
+          "sf1": 16312503
+        }
+      },
+      "q5": {
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (tag1:Tag)<-[:HAS_TAG]-(message:Message)<-[:REPLY_OF]-(comment:Comment)-[:HAS_TAG]->(tag2:Tag) WHERE tag1 <> tag2 RETURN count(*) AS count"
+        },
+        "cypher_ladybug": {
+          "status": "verified",
+          "text": "MATCH (tag1:Tag)<-[:HAS_TAG]-(message:Post:Comment)<-[:REPLY_OF]-(comment:Comment)-[:HAS_TAG]->(tag2:Tag) WHERE tag1 <> tag2 RETURN count(*) AS count"
+        },
+        "sql": {
+          "status": "verified",
+          "body": "FROM Message_hasTag_Tag mt1 JOIN Comment_replyOf_Message crm ON crm.dst = mt1.src JOIN HAS_TAG_Comment_Tag ct2 ON ct2.src = crm.src WHERE mt1.dst <> ct2.dst"
+        },
+        "skeleton": {
+          "types": [
+            "HAS_TAG",
+            "HAS_TAG",
+            "REPLY_OF"
+          ],
+          "optional": 0,
+          "anti": 0,
+          "inequalities": 1
+        },
+        "expected": {
+          "sf1": 12501170
+        }
+      },
+      "q6": {
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (person1:Person)-[:KNOWS]-(person2:Person)-[:KNOWS]-(person3:Person)-[:HAS_INTEREST]->(tag:Tag) WHERE person1 <> person3 RETURN count(*) AS count"
+        },
+        "cypher_ladybug": {
+          "status": "verified",
+          "text": "MATCH (person1:Person)-[:KNOWS]-(person2:Person)-[:KNOWS]-(person3:Person)-[:HAS_INTEREST]->(tag:Tag) WHERE person1 <> person3 RETURN count(*) AS count"
+        },
+        "sql": {
+          "status": "verified",
+          "body": "FROM knows_sym k1 JOIN knows_sym k2 ON k2.src = k1.dst JOIN HAS_INTEREST_Person_Tag pit ON pit.src = k2.dst WHERE k1.src <> k2.dst"
+        },
+        "skeleton": {
+          "types": [
+            "HAS_INTEREST",
+            "KNOWS",
+            "KNOWS"
+          ],
+          "optional": 0,
+          "anti": 0,
+          "inequalities": 1
+        },
+        "expected": {
+          "sf1": 1174390566
+        }
+      },
+      "q7": {
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (:Tag)<-[:HAS_TAG]-(message:Message)-[:HAS_CREATOR]->(creator:Person) OPTIONAL MATCH (message)<-[:LIKES]-(liker:Person) OPTIONAL MATCH (message)<-[:REPLY_OF]-(comment:Comment) RETURN count(*) AS count"
+        },
+        "cypher_ladybug": {
+          "status": "verified",
+          "text": "MATCH (:Tag)<-[:HAS_TAG]-(message:Post:Comment)-[:HAS_CREATOR]->(creator:Person) OPTIONAL MATCH (message)<-[:LIKES]-(liker:Person) OPTIONAL MATCH (message)<-[:REPLY_OF]-(comment:Comment) RETURN count(*) AS count"
+        },
+        "sql": {
+          "status": "verified",
+          "body": "FROM Message_hasTag_Tag mht JOIN Message_hasCreator_Person mhc ON mhc.src = mht.src LEFT JOIN Person_likes_Message plm ON plm.dst = mht.src LEFT JOIN Comment_replyOf_Message crm ON crm.dst = mht.src"
+        },
+        "skeleton": {
+          "types": [
+            "HAS_CREATOR",
+            "HAS_TAG",
+            "LIKES",
+            "REPLY_OF"
+          ],
+          "optional": 2,
+          "anti": 0,
+          "inequalities": 0
+        },
+        "expected": {
+          "sf1": 26097816
+        }
+      },
+      "q8": {
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (tag1:Tag)<-[:HAS_TAG]-(message:Message)<-[:REPLY_OF]-(comment:Comment)-[:HAS_TAG]->(tag2:Tag) WHERE NOT (comment)-[:HAS_TAG]->(tag1) AND tag1 <> tag2 RETURN count(*) AS count"
+        },
+        "cypher_ladybug": {
+          "status": "verified",
+          "text": "MATCH (tag1:Tag)<-[:HAS_TAG]-(message:Post:Comment)<-[:REPLY_OF]-(comment:Comment)-[:HAS_TAG]->(tag2:Tag) WHERE NOT EXISTS { MATCH (comment)-[:HAS_TAG]->(tag1) } AND tag1 <> tag2 RETURN count(*) AS count"
+        },
+        "sql": {
+          "status": "verified",
+          "body": "FROM Message_hasTag_Tag mt1 JOIN Comment_replyOf_Message crm ON crm.dst = mt1.src JOIN HAS_TAG_Comment_Tag ct2 ON ct2.src = crm.src WHERE mt1.dst <> ct2.dst AND NOT EXISTS (SELECT 1 FROM HAS_TAG_Comment_Tag x WHERE x.src = crm.src AND x.dst = mt1.dst)"
+        },
+        "skeleton": {
+          "types": [
+            "HAS_TAG",
+            "HAS_TAG",
+            "HAS_TAG",
+            "REPLY_OF"
+          ],
+          "optional": 0,
+          "anti": 1,
+          "inequalities": 1
+        },
+        "expected": {
+          "sf1": 6241640,
+          "sf3": 19471289
+        }
+      },
+      "q9": {
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (person1:Person)-[:KNOWS]-(person2:Person)-[:KNOWS]-(person3:Person)-[:HAS_INTEREST]->(tag:Tag) WHERE NOT (person1)-[:KNOWS]-(person3) AND person1 <> person3 RETURN count(*) AS count"
+        },
+        "cypher_ladybug": {
+          "status": "verified",
+          "text": "MATCH (person1:Person)-[:KNOWS]-(person2:Person)-[:KNOWS]-(person3:Person)-[:HAS_INTEREST]->(tag:Tag) WHERE NOT EXISTS { MATCH (person1)-[:KNOWS]-(person3) } AND person1 <> person3 RETURN count(*) AS count"
+        },
+        "sql": {
+          "status": "verified",
+          "body": "FROM knows_sym k1 JOIN knows_sym k2 ON k2.src = k1.dst JOIN HAS_INTEREST_Person_Tag pit ON pit.src = k2.dst WHERE k1.src <> k2.dst AND NOT EXISTS (SELECT 1 FROM knows_sym x WHERE x.src = k1.src AND x.dst = k2.dst)"
+        },
+        "skeleton": {
+          "types": [
+            "HAS_INTEREST",
+            "KNOWS",
+            "KNOWS",
+            "KNOWS"
+          ],
+          "optional": 0,
+          "anti": 1,
+          "inequalities": 1
+        },
+        "expected": {
+          "sf1": 1120994930,
+          "sf3": 4739123333
+        }
+      }
+    },
+    "sql_shape": {
+      "count": "SELECT count(*) ${body}",
+      "probe": "SELECT 1 ${body} LIMIT 1",
+      "note": "pg-lsqb.sh's protocol, kept: the probe is the SAME body with the aggregate replaced, so an anti-join's zero is proven with the NOT applied. The Cypher dialects derive their probe the same way, by replacing the `RETURN count(*) AS count` suffix with `RETURN 1 LIMIT 1`."
+    },
+    "table_alias": {
+      "note": "The SQL schema materialises the Message supertype and a symmetric KNOWS, so a table name does not equal a relationship type. This map is what the catalogue-equivalence test uses to compare the SQL's joined tables against the Cypher's relationship types.",
+      "Message_hasTag_Tag": "HAS_TAG",
+      "Message_hasCreator_Person": "HAS_CREATOR",
+      "Person_likes_Message": "LIKES",
+      "Comment_replyOf_Message": "REPLY_OF",
+      "knows_sym": "KNOWS"
+    },
+    "skeleton_note": " is the multiset of relationship-type traversals the query performs, ANTI-JOIN legs included: q8 walks HAS_TAG three times (twice in the pattern, once inside the NOT) and the SQL joins HAS_TAG_Comment_Tag three times for the same reason. Counting only the joined legs would let a dialect drop an anti-join and still match.",
+    "census": {
+      "_note": "An empty corpus answers 0 to every query and would pass vacuously, so a run against one fails before measuring anything. Two statements, not one: a corpus with nodes but no :Person is a corpus loaded from the wrong export, and the whole battery would then answer 0 legitimately.",
+      "cypher": {
+        "status": "verified",
+        "nodes": "MATCH (n) RETURN count(n) AS c",
+        "persons": "MATCH (p:Person) RETURN count(p) AS c"
+      },
+      "cypher_ladybug": {
+        "status": "verified",
+        "nodes": "MATCH (p:Person) RETURN count(p) AS c",
+        "persons": "MATCH (p:Person) RETURN count(p) AS c",
+        "note": "LadybugDB has no all-tables node count in one statement — a node IS its table — so the Person count stands for both. Declared rather than silently skipped: the guard is weaker on this engine, not absent."
+      },
+      "sql": {
+        "status": "unverified",
+        "nodes": "SELECT (SELECT count(*) FROM Person) + (SELECT count(*) FROM Tag) AS c",
+        "persons": "SELECT count(*) AS c FROM Person"
+      }
+    }
+  },
+  "stress": {
+    "census": {
+      "cypher": "MATCH (n) RETURN count(n) AS c",
+      "cypher_ladybug": {
+        "status": "unsupported",
+        "reason": "an all-tables node count has no single-statement form; the executor sums per-table counts from its own loader manifest"
+      },
+      "sql": "SELECT (SELECT count(*) FROM stress) AS c"
+    },
+    "datasets": {
+      "synthetic": {
+        "what": "the harness seeds its own world, so a four-engine concurrency comparison needs no corpus at all",
+        "key_space": "--keys, default 20000",
+        "sql_schema": [
+          "CREATE TABLE IF NOT EXISTS stress (k bigint PRIMARY KEY, b int NOT NULL, pad text NOT NULL, hits bigint)",
+          "CREATE TABLE IF NOT EXISTS link (src bigint NOT NULL, dst bigint NOT NULL)",
+          "CREATE TABLE IF NOT EXISTS slink (src bigint NOT NULL, dst bigint NOT NULL)",
+          "CREATE TABLE IF NOT EXISTS stressw (id bigint NOT NULL, c bigint NOT NULL, s bigint NOT NULL)",
+          "CREATE TABLE IF NOT EXISTS msgnode (id bigint, creation_date bigint, content text, length int, mid bigint, mdate bigint, mtext text, mlen int)",
+          "CREATE TABLE IF NOT EXISTS uniq (u bigint PRIMARY KEY)",
+          "CREATE TABLE IF NOT EXISTS churn_anchor (cid bigint NOT NULL, nonce bigint NOT NULL)",
+          "CREATE TABLE IF NOT EXISTS churn (id bigint NOT NULL, cid bigint NOT NULL, nonce bigint NOT NULL)",
+          "CREATE TABLE IF NOT EXISTS churn_rel (acid bigint NOT NULL, anonce bigint NOT NULL, id bigint NOT NULL, nonce bigint NOT NULL)",
+          "CREATE INDEX IF NOT EXISTS stress_b ON stress (b)",
+          "CREATE INDEX IF NOT EXISTS link_src ON link (src, dst)",
+          "CREATE INDEX IF NOT EXISTS link_dst ON link (dst, src)",
+          "CREATE INDEX IF NOT EXISTS churn_key ON churn (nonce, id)",
+          "CREATE INDEX IF NOT EXISTS churn_anchor_key ON churn_anchor (nonce, cid)"
+        ],
+        "sql_schema_note": "BUILT by the harness, unlike snb's, and the asymmetry is the point: on Bolt the synthetic corpus needs no DDL because the graph is schemaless, so a SQL arm that did not run this would fail its first seed statement with `relation \"stress\" does not exist` and the dataset's promise - that it runs anywhere, including CI, with no corpus at all - would hold on three engines out of four. `IF NOT EXISTS` throughout because the harness runs the whole list on every start; without it a second run dies on the first CREATE. `stressw.id` is deliberately NOT a primary key: the Bolt arm's `CREATE (:StressW {c, s})` admits duplicates, so a PK here would make the same plan replayed twice at one level index refuse EVERY write, and a level that measured refusals would sit in the table beside levels that measured inserts. Level scoping stays checkable on this arm without it - `uniq.u` IS a primary key, and every churn survivor probe is bounded by the level's own id range, so a dropped stride shows up as total churn loss rather than as nothing.",
+        "sql_seed": [
+          "INSERT INTO stress (k, b, pad) SELECT i, i % 16, 'x' FROM generate_series(${lo}, ${hi}) AS i",
+          "INSERT INTO link (src, dst) SELECT a.k, b.k FROM stress a JOIN stress b ON b.k = (a.k * 7 + 1) % ${keys} WHERE a.k >= ${lo} AND a.k <= ${hi}"
+        ],
+        "sql_seed_post": [
+          "ANALYZE stress",
+          "ANALYZE link"
+        ],
+        "sql_seed_post_note": "Run ONCE after the seeding loop, never inside a measured window. A PostgreSQL that has never been ANALYZEd plans against default selectivity guesses, so the first comparison would be against a planner working blind - and autovacuum's own first pass would otherwise land at an unpredictable point inside a level and show up as a mid-run throughput step nobody could attribute. The Cypher arm declares no equivalent because its index fixtures already force the one deferred build it has.",
+        "sql_seed_note": "The Cypher seeder writes the same two populations in 500-row UNWIND batches. The set is identical; the write PATH is not, and no engine's seed time is a measured number in this harness. These are bounded by the SAME [lo, hi] batch window as the Cypher templates because the harness has ONE seeding loop for every dialect. The first version of this entry was set-based over the whole key space and bound `${keys_minus_1}`, which nothing supplies - so the harness issued forty identical whole-population INSERTs, each still carrying the literal characters `${keys_minus_1}`, and PostgreSQL answered `syntax error at or near \"$\"`. Observed 2026-09-09, on the first statement PgBackend ever sent. That is why seed_or_attach now refuses a template that still carries an unbound placeholder instead of letting the engine's parser be the thing that notices.",
+        "cypher_seed": [
+          "UNWIND range(${lo}, ${hi}) AS i CREATE (:Stress {k: i, b: i % 16, pad: 'x'})",
+          "UNWIND range(${lo}, ${hi}) AS i MATCH (a:Stress {k: i}), (b:Stress {k: (i * 7 + 1) % ${keys}}) CREATE (a)-[:LINK]->(b)"
+        ],
+        "cypher_seed_note": "The two populations stress.rs seeds, as UNWIND batches over a [lo, hi] range so seeding is not itself the bottleneck. Batch SIZE is the harness s (500, as stress.rs uses); the SET is what matters and it is identical. No engine s seed time is a measured number in this harness.",
+        "cypher_census": "MATCH (n:Stress) RETURN count(n) AS c",
+        "sql_census": "SELECT count(*) FROM stress",
+        "census_note": "One census per dialect, and the SQL one is not decoration: seed_or_attach reads it to refuse a SECOND seeding pass over a corpus it already built. It used to be skipped on `sql` because only the Cypher form existed, and a skipped guard on this arm means the second run either doubles the population or - `stress.k` being a primary key - refuses every seed statement and stops. Neither is a corpus anybody chose. The guard compares against --keys, so a corpus seeded SMALLER than the run asks for is not skipped: the seed loop starts again from 0, and on SQL the first batch collides with `stress.k` and stops the run at `seed failed at 0`. That is the right answer badly worded, and it is louder than the Cypher arm's, which has no primary key and simply grows a second overlapping population. Point a differently sized run at a fresh database rather than growing one in place."
+      },
+      "snb": {
+        "what": "ATTACH to a server that already holds an LDBC SNB corpus; --keys is probed from it",
+        "sql_schema_status": "BUILT 2026-09-09. docs/bench/pg-snb-load.sh loaded it into `sf1` and `sf3` on the PostgreSQL benchmark server from /datasets/jsonl/sf{1,3}, and docs/bench/pg-snb-verify.sql checked every table against the corpus manifest AND against the tables pg-lsqb.sh loaded from the split-CSV export. Every `snb` SQL entry nevertheless stays `unverified`: each has now been EXECUTED and returns plausible rows, but no answer has been compared with engram's, and `verified` in this catalogue means cross-checked.",
+        "sql_schema_note": "pg-lsqb.sh's relational shape carries ids ONLY (`CREATE TABLE Person (id bigint PRIMARY KEY)`) because LSQB counts subgraphs and never reads a property. Every SNB stress read shape reads properties — firstName, birthday, browserUsed, Tag.name, City.name. This list is the shape that adds them. It is owned by the CORPUS LOADER, not by the harness: seed_or_attach runs `sql_schema` only on the seeding branch, and `snb` attaches, so nothing here is ever executed by a run. docs/bench/pg-snb-schema.sql is the implementation and tests/a_sql_statement_names_only_tables_and_columns_its_schema_declares.rs is what holds the two together — it was that test, not a reading, that found the five `any`-family tables missing below.",
+        "sql_schema": [
+          "CREATE TABLE person (id bigint PRIMARY KEY, first_name text, last_name text, birthday text, location_ip text, browser_used text, hits bigint)",
+          "CREATE TABLE message (id bigint PRIMARY KEY, creation_date bigint, content text, length int, browser_used text, is_comment boolean NOT NULL)",
+          "CREATE TABLE tag (id bigint PRIMARY KEY, name text)",
+          "CREATE TABLE city (id bigint PRIMARY KEY, name text)",
+          "CREATE TABLE knows (src bigint NOT NULL, dst bigint NOT NULL)",
+          "CREATE TABLE has_creator (src bigint NOT NULL, dst bigint NOT NULL)",
+          "CREATE TABLE has_tag (src bigint NOT NULL, dst bigint NOT NULL)",
+          "CREATE TABLE reply_of (src bigint NOT NULL, dst bigint NOT NULL)",
+          "CREATE TABLE is_located_in (src bigint NOT NULL, dst bigint NOT NULL)",
+          "CREATE TABLE stressed (src bigint NOT NULL, dst bigint NOT NULL)",
+          "CREATE TABLE msgnode (id bigint, creation_date bigint, content text, length int, mid bigint, mdate bigint, mtext text, mlen int)",
+          "CREATE TABLE uniq (u bigint PRIMARY KEY)",
+          "CREATE TABLE churn_anchor (cid bigint NOT NULL, nonce bigint NOT NULL)",
+          "CREATE TABLE churn (id bigint NOT NULL, cid bigint NOT NULL, nonce bigint NOT NULL)",
+          "CREATE TABLE churn_rel (acid bigint NOT NULL, anonce bigint NOT NULL, id bigint NOT NULL, nonce bigint NOT NULL)",
+          "CREATE INDEX knows_src ON knows (src, dst)",
+          "CREATE INDEX has_creator_dst ON has_creator (dst, src)",
+          "CREATE INDEX has_tag_src ON has_tag (src, dst)",
+          "CREATE INDEX reply_of_dst ON reply_of (dst, src)",
+          "CREATE INDEX churn_key ON churn (nonce, id)",
+          "CREATE INDEX churn_anchor_key ON churn_anchor (nonce, cid)",
+          "CREATE INDEX churn_rel_key ON churn_rel (nonce, id)"
+        ],
+        "sql_any_family_note": "The last five tables — msgnode, uniq, churn_anchor, churn, churn_rel — were absent from this list until 2026-09-09 and belong here because the write ops that use them (node_only, node_only_fresh_props, unique_create, churn_anchor, churn_create, churn_delete) are declared `any`, meaning they render the SAME text on every corpus. They appear under `synthetic` as well, and the duplication is deliberate: a dataset's sql_schema must be the WHOLE schema a run on that dataset needs, or the check that compares statements against it can only be as complete as the list.",
+        "sql_index_note": "One index per access path an SNB statement actually takes, and no others, because both errors are fatal to a comparison and only one of them looks wrong. Three indexes this list used to carry are gone. `person_name (first_name, last_name)` served only the plat-composite shapes, which are `unsupported` in SQL, and the Cypher fixture group for `snb` does not build a name index either — only `snb-platform` does — so it would have given Postgres a structure engram does not carry. `knows_dst` has no reader: `knows` is stored symmetrically, so the mirror row IS the reverse lookup, and every statement probes it by src. `has_creator_src` has no reader either AND has_creator is written on every node_create, so it was a per-write tax with nothing on the other side. Three are new and matter more: has_tag_src (ic6-friend-tags probes by src), reply_of_dst (is7-replies probes by dst) and churn_rel_key (churn_delete deletes by (nonce, id) on every second churn op, against a table that grows all run). Without those three the statements are sequential scans of multi-million-row tables per operation — not a slower Postgres, a rigged one. Verified by EXPLAIN against sf1 on 2026-09-09: with churn_rel_key dropped the delete plans as `Seq Scan on churn_rel`, and with it as `Index Scan using churn_rel_key`. `is_located_in` is deliberately UNINDEXED: its only reader, agg-by-city, aggregates the whole table.",
+        "sql_planner_note": "NOT a schema problem, recorded here because it will show up as one. With a non-zero max_parallel_workers_per_gather — which PgBackend::connect sets from --thread-cap — the ic6-friend-tags plan costs a parallel aggregate at 28,280 against a serial 34,957 and therefore chooses it, which forces `Parallel Seq Scan on knows` (cost 4,609) in place of `Index Only Scan using knows_src` (cost 50), because a scan under Gather must be parallel-aware. Measured by EXPLAIN against sf1 on 2026-09-09; at max_parallel_workers_per_gather=0 the index is used immediately. It is one shape of nine at weight 5, and Postgres spending the thread budget INSIDE a query where engram spends it across clients is arguably the honest reading of a thread cap. What is not honest is leaving it unsaid: the PostgreSQL benchmark server capped max_parallel_workers at 6 CLUSTER-WIDE, so at 32 clients most Gather nodes find no worker and run the parallel plan in the leader alone — still scanning the whole knows table, now with nothing parallel about it. --thread-cap 0 fixes the plan and also changes the fairness block, which the reporter compares for equality, so it is a decision about both arms rather than an adjustment to one.",
+        "knows_note": "`knows` must be SYMMETRIC (both directions stored), as pg-lsqb.sh's `knows_sym` is, because every `-[:KNOWS]-` in the Cypher is undirected.",
+        "cypher_attach": "MATCH (p:Person) RETURN p.id",
+        "cypher_attach_note": "ATTACH, not seed: the corpus is already there and --keys is PROBED from it rather than trusted. A key space larger than the corpus makes most lookups miss, and a run whose reads mostly return nothing measures the index s negative path and reports it as throughput. The probe returns one ROW per person rather than a count(*) scalar because the row count IS the answer and snbgen emits dense ids 0..persons.",
+        "sql_attach": "SELECT id FROM person"
+      },
+      "snb-platform": {
+        "what": "the SNB corpus read through the platform's own access shapes",
+        "cross_engine": false,
+        "cross_engine_reason": "these seven shapes exist to reproduce ONE production system's access paths on engram against Neo4j, over Bolt. Transcribing them to SQL would produce a comparison nobody asked for and would change what `--dataset snb-platform` means. Declared out of scope rather than half-mapped."
+      }
+    },
+    "read_shapes": {
+      "point-lookup": {
+        "dataset": "synthetic",
+        "params": [
+          "key"
+        ],
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (n:Stress {k: ${key}}) RETURN n.k, n.pad"
+        },
+        "cypher_ladybug": {
+          "status": "unverified",
+          "text": "MATCH (n:Stress {k: ${key}}) RETURN n.k, n.pad"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "SELECT k, pad FROM stress WHERE k = ${key}"
+        }
+      },
+      "one-hop": {
+        "dataset": "synthetic",
+        "params": [
+          "key"
+        ],
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (n:Stress {k: ${key}})-[:LINK]->(m) RETURN m.k LIMIT 25"
+        },
+        "cypher_ladybug": {
+          "status": "unverified",
+          "text": "MATCH (n:Stress {k: ${key}})-[:LINK]->(m:Stress) RETURN m.k LIMIT 25"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "SELECT m.k FROM link l JOIN stress m ON m.k = l.dst WHERE l.src = ${key} LIMIT 25"
+        }
+      },
+      "two-hop": {
+        "dataset": "synthetic",
+        "params": [
+          "key"
+        ],
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (n:Stress {k: ${key}})-[:LINK]->()-[:LINK]->(m) RETURN m.k LIMIT 25"
+        },
+        "cypher_ladybug": {
+          "status": "unverified",
+          "text": "MATCH (n:Stress {k: ${key}})-[:LINK]->(:Stress)-[:LINK]->(m:Stress) RETURN m.k LIMIT 25"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "SELECT m.k FROM link l1 JOIN link l2 ON l2.src = l1.dst JOIN stress m ON m.k = l2.dst WHERE l1.src = ${key} LIMIT 25"
+        }
+      },
+      "var-length": {
+        "dataset": "synthetic",
+        "params": [
+          "key"
+        ],
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (n:Stress {k: ${key}})-[:LINK*1..2]->(m) RETURN count(m) AS c"
+        },
+        "cypher_ladybug": {
+          "status": "unverified",
+          "text": "MATCH (n:Stress {k: ${key}})-[:LINK*1..2]->(m:Stress) RETURN count(m) AS c"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "SELECT count(*) AS c FROM (SELECT l.dst FROM link l WHERE l.src = ${key} UNION ALL SELECT l2.dst FROM link l1 JOIN link l2 ON l2.src = l1.dst AND (l2.src, l2.dst) <> (l1.src, l1.dst) WHERE l1.src = ${key}) t",
+          "note": "The `(l2.src, l2.dst) <> (l1.src, l1.dst)` term is Cypher's relationship-uniqueness rule within one path, written out. `link` carries no edge id, so the pair stands in for one; that is exact here because the seeder writes each (src, dst) once."
+        }
+      },
+      "aggregate": {
+        "dataset": "synthetic",
+        "params": [
+          "b"
+        ],
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (n:Stress) WHERE n.b = ${b} RETURN n.b, count(*) AS c"
+        },
+        "cypher_ladybug": {
+          "status": "unverified",
+          "text": "MATCH (n:Stress) WHERE n.b = ${b} RETURN n.b, count(*) AS c"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "SELECT b, count(*) AS c FROM stress WHERE b = ${b} GROUP BY b"
+        }
+      },
+      "top-k": {
+        "dataset": "synthetic",
+        "params": [],
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (n:Stress) RETURN n.k ORDER BY n.k DESC LIMIT 20"
+        },
+        "cypher_ladybug": {
+          "status": "unverified",
+          "text": "MATCH (n:Stress) RETURN n.k ORDER BY n.k DESC LIMIT 20"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "SELECT k FROM stress ORDER BY k DESC LIMIT 20"
+        }
+      },
+      "scan-filter": {
+        "dataset": "synthetic",
+        "params": [
+          "key"
+        ],
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (n:Stress) WHERE n.k > ${key} RETURN count(n) AS c"
+        },
+        "cypher_ladybug": {
+          "status": "unverified",
+          "text": "MATCH (n:Stress) WHERE n.k > ${key} RETURN count(n) AS c"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "SELECT count(*) AS c FROM stress WHERE k > ${key}"
+        }
+      },
+      "is1-profile": {
+        "dataset": "snb",
+        "params": [
+          "key"
+        ],
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (p:Person {id: ${key}}) RETURN p.firstName, p.lastName, p.birthday, p.locationIP, p.browserUsed"
+        },
+        "cypher_ladybug": {
+          "status": "unverified",
+          "text": "MATCH (p:Person {id: ${key}}) RETURN p.firstName, p.lastName, p.birthday, p.locationIP, p.browserUsed"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "SELECT first_name, last_name, birthday, location_ip, browser_used FROM person WHERE id = ${key}"
+        }
+      },
+      "is3-friends": {
+        "dataset": "snb",
+        "params": [
+          "key"
+        ],
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (p:Person {id: ${key}})-[:KNOWS]-(f:Person) RETURN f.id, f.firstName LIMIT 25"
+        },
+        "cypher_ladybug": {
+          "status": "unverified",
+          "text": "MATCH (p:Person {id: ${key}})-[:KNOWS]-(f:Person) RETURN f.id, f.firstName LIMIT 25"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "SELECT f.id, f.first_name FROM knows k JOIN person f ON f.id = k.dst WHERE k.src = ${key} LIMIT 25"
+        }
+      },
+      "ic-foaf": {
+        "dataset": "snb",
+        "params": [
+          "key"
+        ],
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (p:Person {id: ${key}})-[:KNOWS]-()-[:KNOWS]-(f:Person) RETURN count(DISTINCT f) AS c"
+        },
+        "cypher_ladybug": {
+          "status": "unverified",
+          "text": "MATCH (p:Person {id: ${key}})-[:KNOWS]-(:Person)-[:KNOWS]-(f:Person) RETURN count(DISTINCT f) AS c"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "SELECT count(DISTINCT k2.dst) AS c FROM knows k1 JOIN knows k2 ON k2.src = k1.dst AND (k2.src, k2.dst) <> (k1.dst, k1.src) WHERE k1.src = ${key}"
+        }
+      },
+      "is5-by-creator": {
+        "dataset": "snb",
+        "params": [
+          "key"
+        ],
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (m:Message)-[:HAS_CREATOR]->(p:Person {id: ${key}}) RETURN m.id LIMIT 25"
+        },
+        "cypher_ladybug": {
+          "status": "unverified",
+          "text": "MATCH (m:Post:Comment)-[:HAS_CREATOR]->(p:Person {id: ${key}}) RETURN m.id LIMIT 25"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "SELECT m.id FROM has_creator hc JOIN message m ON m.id = hc.src WHERE hc.dst = ${key} LIMIT 25"
+        }
+      },
+      "is5-anchored": {
+        "dataset": "snb",
+        "params": [
+          "key"
+        ],
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (p:Person {id: ${key}})<-[:HAS_CREATOR]-(m:Message) RETURN m.id LIMIT 25"
+        },
+        "cypher_ladybug": {
+          "status": "unverified",
+          "text": "MATCH (p:Person {id: ${key}})<-[:HAS_CREATOR]-(m:Post:Comment) RETURN m.id LIMIT 25"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "SELECT m.id FROM person p JOIN has_creator hc ON hc.dst = p.id JOIN message m ON m.id = hc.src WHERE p.id = ${key} LIMIT 25"
+        }
+      },
+      "ic6-friend-tags": {
+        "dataset": "snb",
+        "params": [
+          "key"
+        ],
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (p:Person {id: ${key}})-[:KNOWS]-(f:Person)<-[:HAS_CREATOR]-(m:Message) MATCH (m)-[:HAS_TAG]->(t:Tag) RETURN t.name, count(*) AS c ORDER BY c DESC LIMIT 10"
+        },
+        "cypher_ladybug": {
+          "status": "unverified",
+          "text": "MATCH (p:Person {id: ${key}})-[:KNOWS]-(f:Person)<-[:HAS_CREATOR]-(m:Post:Comment) MATCH (m)-[:HAS_TAG]->(t:Tag) RETURN t.name, count(*) AS c ORDER BY c DESC LIMIT 10"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "SELECT t.name, count(*) AS c FROM knows k JOIN has_creator hc ON hc.dst = k.dst JOIN has_tag ht ON ht.src = hc.src JOIN tag t ON t.id = ht.dst WHERE k.src = ${key} GROUP BY t.name ORDER BY c DESC LIMIT 10"
+        }
+      },
+      "knows-var-length": {
+        "dataset": "snb",
+        "params": [
+          "key"
+        ],
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (p:Person {id: ${key}})-[:KNOWS*1..2]-(f:Person) RETURN count(DISTINCT f) AS c"
+        },
+        "cypher_ladybug": {
+          "status": "unverified",
+          "text": "MATCH (p:Person {id: ${key}})-[:KNOWS*1..2]-(f:Person) RETURN count(DISTINCT f) AS c"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "SELECT count(DISTINCT d) AS c FROM (SELECT k.dst AS d FROM knows k WHERE k.src = ${key} UNION ALL SELECT k2.dst AS d FROM knows k1 JOIN knows k2 ON k2.src = k1.dst AND (k2.src, k2.dst) <> (k1.dst, k1.src) WHERE k1.src = ${key}) t"
+        }
+      },
+      "is7-replies": {
+        "dataset": "snb",
+        "params": [
+          "mid"
+        ],
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (m:Message {id: ${mid}})<-[:REPLY_OF]-(c:Comment) RETURN c.id LIMIT 25"
+        },
+        "cypher_ladybug": {
+          "status": "unverified",
+          "text": "MATCH (m:Post:Comment {id: ${mid}})<-[:REPLY_OF]-(c:Comment) RETURN c.id LIMIT 25"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "SELECT c.id FROM reply_of r JOIN message c ON c.id = r.src AND c.is_comment WHERE r.dst = ${mid} LIMIT 25"
+        }
+      },
+      "agg-by-city": {
+        "dataset": "snb",
+        "params": [],
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (p:Person)-[:IS_LOCATED_IN]->(c:City) RETURN c.name, count(p) AS n ORDER BY n DESC LIMIT 10"
+        },
+        "cypher_ladybug": {
+          "status": "unverified",
+          "text": "MATCH (p:Person)-[:IS_LOCATED_IN]->(c:City) RETURN c.name, count(p) AS n ORDER BY n DESC LIMIT 10"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "SELECT c.name, count(*) AS n FROM is_located_in il JOIN city c ON c.id = il.dst GROUP BY c.name ORDER BY n DESC LIMIT 10"
+        }
+      },
+      "plat-composite-count": {
+        "dataset": "snb-platform",
+        "params": [
+          "first",
+          "last"
+        ],
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (p:Person {firstName: '${first}', lastName: '${last}'}) RETURN count(p) AS n"
+        },
+        "cypher_ladybug": {
+          "status": "unsupported",
+          "reason": "snb-platform is a two-engine Bolt comparison by construction — see stress.datasets.snb-platform"
+        },
+        "sql": {
+          "status": "unsupported",
+          "reason": "snb-platform is a two-engine Bolt comparison by construction"
+        }
+      },
+      "plat-composite-list": {
+        "dataset": "snb-platform",
+        "params": [
+          "first",
+          "last"
+        ],
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (p:Person {firstName: '${first}', lastName: '${last}'}) RETURN p.id, p.birthday, p.locationIP"
+        },
+        "cypher_ladybug": {
+          "status": "unsupported",
+          "reason": "snb-platform is a two-engine Bolt comparison by construction"
+        },
+        "sql": {
+          "status": "unsupported",
+          "reason": "snb-platform is a two-engine Bolt comparison by construction"
+        }
+      },
+      "plat-limit-listing": {
+        "dataset": "snb-platform",
+        "params": [],
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (p:Person) RETURN p.id AS id, p.firstName AS name LIMIT 5000"
+        },
+        "cypher_ladybug": {
+          "status": "unsupported",
+          "reason": "snb-platform is a two-engine Bolt comparison by construction"
+        },
+        "sql": {
+          "status": "unsupported",
+          "reason": "snb-platform is a two-engine Bolt comparison by construction"
+        }
+      },
+      "plat-notin-pick": {
+        "dataset": "snb-platform",
+        "params": [
+          "first",
+          "idlist"
+        ],
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (p:Person {firstName: '${first}'}) WHERE p.browserUsed <> 'Safari' AND NOT p.id IN ${idlist} RETURN p.id, p.lastName, p.birthday LIMIT 5"
+        },
+        "cypher_ladybug": {
+          "status": "unsupported",
+          "reason": "snb-platform is a two-engine Bolt comparison by construction"
+        },
+        "sql": {
+          "status": "unsupported",
+          "reason": "snb-platform is a two-engine Bolt comparison by construction"
+        }
+      },
+      "plat-in-list-seek": {
+        "dataset": "snb-platform",
+        "params": [
+          "idlist"
+        ],
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (p:Person) WHERE p.id IN ${idlist} RETURN p.id, p.firstName"
+        },
+        "cypher_ladybug": {
+          "status": "unsupported",
+          "reason": "snb-platform is a two-engine Bolt comparison by construction"
+        },
+        "sql": {
+          "status": "unsupported",
+          "reason": "snb-platform is a two-engine Bolt comparison by construction"
+        }
+      },
+      "plat-hop-group": {
+        "dataset": "snb-platform",
+        "params": [
+          "key"
+        ],
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (p:Person {id: ${key}})-[:KNOWS]-(f:Person)<-[:HAS_CREATOR]-(m:Message) RETURN f.firstName AS name, count(*) AS c ORDER BY c DESC LIMIT 20"
+        },
+        "cypher_ladybug": {
+          "status": "unsupported",
+          "reason": "snb-platform is a two-engine Bolt comparison by construction"
+        },
+        "sql": {
+          "status": "unsupported",
+          "reason": "snb-platform is a two-engine Bolt comparison by construction"
+        }
+      },
+      "plat-optional-count": {
+        "dataset": "snb-platform",
+        "params": [
+          "key"
+        ],
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (p:Person {id: ${key}})-[:KNOWS]-(f:Person) OPTIONAL MATCH (f)<-[:HAS_CREATOR]-(m:Message) WHERE m.browserUsed = 'Chrome' WITH f, count(m) AS n RETURN f.id, n ORDER BY n DESC LIMIT 25"
+        },
+        "cypher_ladybug": {
+          "status": "unsupported",
+          "reason": "snb-platform is a two-engine Bolt comparison by construction"
+        },
+        "sql": {
+          "status": "unsupported",
+          "reason": "snb-platform is a two-engine Bolt comparison by construction"
+        }
+      },
+      "algo-pagerank": {
+        "dataset": "any",
+        "params": [],
+        "cypher": {
+          "status": "verified",
+          "text": "CALL engram.algo.pagerank.stream({nodeLabels: ['Stress'],              relationshipTypes: ['LINK', 'SLINK'], maxIterations: 5})              YIELD score RETURN count(score) AS c"
+        },
+        "cypher_ladybug": {
+          "status": "unsupported",
+          "reason": "engram.algo.* is engram's own procedure namespace; there is no cross-engine algorithm surface to compare against"
+        },
+        "sql": {
+          "status": "unsupported",
+          "reason": "engram.algo.* is engram's own procedure namespace"
+        }
+      },
+      "algo-wcc": {
+        "dataset": "any",
+        "params": [],
+        "cypher": {
+          "status": "verified",
+          "text": "CALL engram.algo.wcc.stream({nodeLabels: ['Stress'],              relationshipTypes: ['LINK', 'SLINK']}) YIELD componentId RETURN count(componentId) AS c"
+        },
+        "cypher_ladybug": {
+          "status": "unsupported",
+          "reason": "engram.algo.* is engram's own procedure namespace"
+        },
+        "sql": {
+          "status": "unsupported",
+          "reason": "engram.algo.* is engram's own procedure namespace"
+        }
+      },
+      "algo-kshortest": {
+        "dataset": "any",
+        "params": [
+          "key",
+          "other"
+        ],
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (a:Stress {k: ${key}}), (b:Stress {k: ${other}})              CALL engram.algo.kshortestpaths.stream({nodeLabels: ['Stress'],              relationshipTypes: ['LINK', 'SLINK'], sourceNode: id(a), targetNode: id(b), k: 3})              YIELD totalCost RETURN count(totalCost) AS c"
+        },
+        "cypher_ladybug": {
+          "status": "unsupported",
+          "reason": "engram.algo.* is engram's own procedure namespace"
+        },
+        "sql": {
+          "status": "unsupported",
+          "reason": "engram.algo.* is engram's own procedure namespace"
+        }
+      },
+      "algo-allshortest": {
+        "dataset": "any",
+        "params": [
+          "key",
+          "other"
+        ],
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH p = allShortestPaths((a:Stress {k: ${key}})-[:LINK*1..4]->             (b:Stress {k: ${other}})) RETURN count(p) AS c"
+        },
+        "cypher_ladybug": {
+          "status": "unsupported",
+          "reason": "engram.algo.* is engram's own procedure namespace"
+        },
+        "sql": {
+          "status": "unsupported",
+          "reason": "engram.algo.* is engram's own procedure namespace"
+        }
+      },
+      "algo-stats": {
+        "dataset": "any",
+        "params": [],
+        "cypher": {
+          "status": "verified",
+          "text": "CALL engram.algo.wcc.stats({nodeLabels: ['Stress'],              relationshipTypes: ['LINK', 'SLINK']}) YIELD nodeCount, relationshipCount              RETURN nodeCount"
+        },
+        "cypher_ladybug": {
+          "status": "unsupported",
+          "reason": "engram.algo.* is engram's own procedure namespace"
+        },
+        "sql": {
+          "status": "unsupported",
+          "reason": "engram.algo.* is engram's own procedure namespace"
+        }
+      },
+      "algo-mutate": {
+        "dataset": "any",
+        "params": [
+          "mk"
+        ],
+        "cypher": {
+          "status": "verified",
+          "text": "CALL engram.algo.degree.mutate({nodeLabels: ['Stress'],              relationshipTypes: ['LINK', 'SLINK'], mutateKey: 'm${mk}'})              YIELD mutateKey RETURN mutateKey"
+        },
+        "cypher_ladybug": {
+          "status": "unsupported",
+          "reason": "engram.algo.* is engram's own procedure namespace"
+        },
+        "sql": {
+          "status": "unsupported",
+          "reason": "engram.algo.* is engram's own procedure namespace"
+        }
+      },
+      "algo-result": {
+        "dataset": "any",
+        "params": [
+          "par"
+        ],
+        "cypher": {
+          "status": "verified",
+          "text": "CALL engram.algo.result.list() YIELD mutateKey, stale              RETURN count(mutateKey) AS c, ${par}"
+        },
+        "cypher_ladybug": {
+          "status": "unsupported",
+          "reason": "engram.algo.* is engram's own procedure namespace"
+        },
+        "sql": {
+          "status": "unsupported",
+          "reason": "engram.algo.* is engram's own procedure namespace"
+        }
+      },
+      "algo-write": {
+        "dataset": "any",
+        "params": [
+          "dg"
+        ],
+        "cypher": {
+          "status": "verified",
+          "text": "CALL engram.algo.degree.write({nodeLabels: ['Stress'],              relationshipTypes: ['LINK', 'SLINK'], writeProperty: 'deg${dg}',              writeBatchSize: 256}) YIELD nodesWritten RETURN nodesWritten"
+        },
+        "cypher_ladybug": {
+          "status": "unsupported",
+          "reason": "engram.algo.* is engram's own procedure namespace"
+        },
+        "sql": {
+          "status": "unsupported",
+          "reason": "engram.algo.* is engram's own procedure namespace"
+        }
+      }
+    },
+    "write_ops": {
+      "_shape": "write_ops.<neutral op>.<dataset family | any>.<dialect>. The op name is the vocabulary the LadybugDB executor implements and carries no dataset — a plan names the corpus once, in its header. `any` is the fallback when the op renders the same whatever the corpus is.",
+      "_level_scope": "The `id` binding (and `u` for unique_create) is what the level stride moves; see plan.rs's LEVEL_STRIDE. `synthetic` node_create binds an `id` its Cypher never interpolates, deliberately: the engines with a primary key need a value that does not collide across levels, and the Bolt arm stays byte-identical to stress.rs by ignoring it.",
+      "hot_update": {
+        "params": [],
+        "synthetic": {
+          "cypher": {
+            "status": "verified",
+            "text": "MATCH (n:Stress {k: 0}) SET n.hits = coalesce(n.hits, 0) + 1"
+          },
+          "cypher_ladybug": {
+            "status": "unverified",
+            "text": "MATCH (n:Stress {k: 0}) SET n.hits = coalesce(n.hits, 0) + 1"
+          },
+          "sql": {
+            "status": "unverified",
+            "text": "UPDATE stress SET hits = coalesce(hits, 0) + 1 WHERE k = 0"
+          }
+        },
+        "snb": {
+          "cypher": {
+            "status": "verified",
+            "text": "MATCH (p:Person {id: 0}) SET p.hits = coalesce(p.hits, 0) + 1"
+          },
+          "cypher_ladybug": {
+            "status": "unverified",
+            "text": "MATCH (p:Person {id: 0}) SET p.hits = coalesce(p.hits, 0) + 1"
+          },
+          "sql": {
+            "status": "unverified",
+            "text": "UPDATE person SET hits = coalesce(hits, 0) + 1 WHERE id = 0"
+          }
+        }
+      },
+      "node_create": {
+        "params": [
+          "id",
+          "cid",
+          "seq",
+          "author",
+          "mdate"
+        ],
+        "synthetic": {
+          "cypher": {
+            "status": "verified",
+            "text": "CREATE (:StressW {c: ${cid}, s: ${seq}})"
+          },
+          "cypher_ladybug": {
+            "status": "unverified",
+            "text": "CREATE (:StressW {id: ${id}, c: ${cid}, s: ${seq}})",
+            "note": "LadybugDB needs a PRIMARY KEY on every node table, so the scoped `id` the Cypher ignores is written here."
+          },
+          "sql": {
+            "status": "unverified",
+            "text": "INSERT INTO stressw (id, c, s) VALUES (${id}, ${cid}, ${seq})"
+          }
+        },
+        "snb": {
+          "cypher": {
+            "status": "verified",
+            "text": "MATCH (p:Person {id: ${author}}) CREATE (m:Message:Comment {id: ${id}, creationDate: ${mdate}, content: 'stress', length: 6})-[:HAS_CREATOR]->(p)"
+          },
+          "cypher_ladybug": {
+            "status": "unverified",
+            "text": "MATCH (p:Person {id: ${author}}) CREATE (m:Comment {id: ${id}, creationDate: ${mdate}, content: 'stress', length: 6})-[:HAS_CREATOR_Comment_Person]->(p)"
+          },
+          "sql": {
+            "status": "unverified",
+            "text": "WITH a AS (SELECT id FROM person WHERE id = ${author}), m AS (INSERT INTO message (id, creation_date, content, length, is_comment) SELECT ${id}, ${mdate}, 'stress', 6, true FROM a RETURNING id) INSERT INTO has_creator (src, dst) SELECT m.id, ${author} FROM m"
+          }
+        }
+      },
+      "node_only": {
+        "params": [
+          "id",
+          "mdate"
+        ],
+        "any": {
+          "cypher": {
+            "status": "verified",
+            "text": "CREATE (m:Message:Comment {id: ${id}, creationDate: ${mdate},                  content: 'stress', length: 6})"
+          },
+          "cypher_ladybug": {
+            "status": "unverified",
+            "text": "CREATE (m:Comment {id: ${id}, creationDate: ${mdate}, content: 'stress', length: 6})"
+          },
+          "sql": {
+            "status": "unverified",
+            "text": "INSERT INTO msgnode (id, creation_date, content, length) VALUES (${id}, ${mdate}, 'stress', 6)"
+          }
+        }
+      },
+      "node_only_fresh_props": {
+        "params": [
+          "id",
+          "mdate"
+        ],
+        "any": {
+          "cypher": {
+            "status": "verified",
+            "text": "CREATE (m:Message:Comment {mid: ${id}, mdate: ${mdate},                  mtext: 'stress', mlen: 6})"
+          },
+          "cypher_ladybug": {
+            "status": "unverified",
+            "text": "CREATE (m:Comment {mid: ${id}, mdate: ${mdate}, mtext: 'stress', mlen: 6})"
+          },
+          "sql": {
+            "status": "unverified",
+            "text": "INSERT INTO msgnode (mid, mdate, mtext, mlen) VALUES (${id}, ${mdate}, 'stress', 6)"
+          }
+        }
+      },
+      "node_only_no_labels": {
+        "params": [
+          "id",
+          "mdate"
+        ],
+        "any": {
+          "cypher": {
+            "status": "verified",
+            "text": "CREATE (m {mid: ${id}, mdate: ${mdate}, mtext: 'stress', mlen: 6})"
+          },
+          "cypher_ladybug": {
+            "status": "unsupported",
+            "reason": "LadybugDB/Kuzu has no unlabelled node — a node IS its table — so the leg this diagnostic isolates (named-label membership churn) does not exist to remove. Their executor refuses the profile rather than substituting something adjacent, and so does this."
+          },
+          "sql": {
+            "status": "unsupported",
+            "reason": "a relational row belongs to exactly one table; there is no unlabelled node whose membership could be removed"
+          }
+        }
+      },
+      "unique_create": {
+        "params": [
+          "u"
+        ],
+        "any": {
+          "cypher": {
+            "status": "verified",
+            "text": "CREATE (:Uniq {u: ${u}})"
+          },
+          "cypher_ladybug": {
+            "status": "unsupported",
+            "reason": "MEASURED HAZARD, not a gap: under `--writes multi` LadybugDB 0.20.2 admits duplicate primary keys AND corrupts the heap (SIGABRT/SIGSEGV at K>=2) on exactly this profile's premise — K clients racing one key. Under `--writes single` it is correct but the level is then a refusal measurement. Their executor refuses the combination; this catalogue declares it rather than emitting text that would produce a number over a corrupted process."
+          },
+          "sql": {
+            "status": "unverified",
+            "text": "INSERT INTO uniq (u) VALUES (${u})"
+          }
+        }
+      },
+      "rel_spread": {
+        "params": [
+          "a",
+          "b"
+        ],
+        "synthetic": {
+          "cypher": {
+            "status": "verified",
+            "text": "MATCH (a:Stress {k: ${a}}), (b:Stress {k: ${b}}) CREATE (a)-[:SLINK]->(b)"
+          },
+          "cypher_ladybug": {
+            "status": "unverified",
+            "text": "MATCH (a:Stress {k: ${a}}), (b:Stress {k: ${b}}) CREATE (a)-[:SLINK]->(b)"
+          },
+          "sql": {
+            "status": "unverified",
+            "text": "INSERT INTO slink (src, dst) SELECT a.k, b.k FROM stress a, stress b WHERE a.k = ${a} AND b.k = ${b}"
+          }
+        },
+        "snb": {
+          "cypher": {
+            "status": "verified",
+            "text": "MATCH (a:Person {id: ${a}}), (b:Person {id: ${b}}) CREATE (a)-[:STRESSED]->(b)"
+          },
+          "cypher_ladybug": {
+            "status": "unverified",
+            "text": "MATCH (a:Person {id: ${a}}), (b:Person {id: ${b}}) CREATE (a)-[:STRESSED]->(b)"
+          },
+          "sql": {
+            "status": "unverified",
+            "text": "INSERT INTO stressed (src, dst) SELECT a.id, b.id FROM person a, person b WHERE a.id = ${a} AND b.id = ${b}"
+          }
+        }
+      },
+      "rel_hub": {
+        "params": [
+          "a",
+          "b"
+        ],
+        "_note": "The same statement as rel_spread; only the bound `b` differs (always 0), so every write serialises through one guard row. A separate op name because the plan must say which phenomenon it is measuring.",
+        "synthetic": {
+          "cypher": {
+            "status": "verified",
+            "text": "MATCH (a:Stress {k: ${a}}), (b:Stress {k: ${b}}) CREATE (a)-[:SLINK]->(b)"
+          },
+          "cypher_ladybug": {
+            "status": "unverified",
+            "text": "MATCH (a:Stress {k: ${a}}), (b:Stress {k: ${b}}) CREATE (a)-[:SLINK]->(b)"
+          },
+          "sql": {
+            "status": "unverified",
+            "text": "INSERT INTO slink (src, dst) SELECT a.k, b.k FROM stress a, stress b WHERE a.k = ${a} AND b.k = ${b}"
+          }
+        },
+        "snb": {
+          "cypher": {
+            "status": "verified",
+            "text": "MATCH (a:Person {id: ${a}}), (b:Person {id: ${b}}) CREATE (a)-[:STRESSED]->(b)"
+          },
+          "cypher_ladybug": {
+            "status": "unverified",
+            "text": "MATCH (a:Person {id: ${a}}), (b:Person {id: ${b}}) CREATE (a)-[:STRESSED]->(b)"
+          },
+          "sql": {
+            "status": "unverified",
+            "text": "INSERT INTO stressed (src, dst) SELECT a.id, b.id FROM person a, person b WHERE a.id = ${a} AND b.id = ${b}"
+          }
+        }
+      },
+      "churn_anchor": {
+        "params": [
+          "cid",
+          "nonce"
+        ],
+        "_note": "Setup, not a plan op: issued once per worker before the level's loop, because a retried CREATE here would mint two anchors and double every later create.",
+        "any": {
+          "cypher": {
+            "status": "verified",
+            "text": "CREATE (:ChurnAnchor {cid: ${cid}, nonce: ${nonce}})"
+          },
+          "cypher_ladybug": {
+            "status": "unverified",
+            "text": "CREATE (:ChurnAnchor {id: ${anchor}, cid: ${cid}, nonce: ${nonce}})"
+          },
+          "sql": {
+            "status": "unverified",
+            "text": "INSERT INTO churn_anchor (cid, nonce) VALUES (${cid}, ${nonce})"
+          }
+        }
+      },
+      "churn_create": {
+        "params": [
+          "id",
+          "cid",
+          "nonce",
+          "anchor"
+        ],
+        "any": {
+          "cypher": {
+            "status": "verified",
+            "text": "MATCH (a:ChurnAnchor {cid: ${cid}, nonce: ${nonce}}) CREATE (a)-[:CHURN]->(:Churn {id: ${id}, cid: ${cid}, nonce: ${nonce}})"
+          },
+          "cypher_ladybug": {
+            "status": "unverified",
+            "text": "MATCH (a:ChurnAnchor {id: ${anchor}}) CREATE (a)-[:CHURN_EDGE]->(:Churn {id: ${id}, cid: ${cid}, nonce: ${nonce}})",
+            "note": "CHURN_EDGE, not CHURN: their executor records that LadybugDB reserves the shorter name."
+          },
+          "sql": {
+            "status": "unverified",
+            "text": "WITH a AS (SELECT cid, nonce FROM churn_anchor WHERE cid = ${cid} AND nonce = ${nonce}), n AS (INSERT INTO churn (id, cid, nonce) SELECT ${id}, ${cid}, ${nonce} FROM a RETURNING id, cid, nonce) INSERT INTO churn_rel (acid, anonce, id, nonce) SELECT ${cid}, ${nonce}, n.id, n.nonce FROM n"
+          }
+        }
+      },
+      "churn_delete": {
+        "params": [
+          "id",
+          "cid",
+          "nonce"
+        ],
+        "any": {
+          "cypher": {
+            "status": "verified",
+            "text": "MATCH (n:Churn {id: ${id}, nonce: ${nonce}}) DETACH DELETE n"
+          },
+          "cypher_ladybug": {
+            "status": "unverified",
+            "text": "MATCH (n:Churn {id: ${id}}) DETACH DELETE n"
+          },
+          "sql": {
+            "status": "unverified",
+            "text": "WITH d AS (DELETE FROM churn_rel WHERE id = ${id} AND nonce = ${nonce}) DELETE FROM churn WHERE id = ${id} AND nonce = ${nonce}",
+            "note": "DETACH is the whole point of the churn profile's delete half: the rel cleanup must be part of the SAME statement, or the SQL arm measures a bare row delete against the Cypher arm's delete-plus-edge-cleanup."
+          }
+        }
+      }
+    },
+    "integrity_probes": {
+      "hot-counter-synthetic": {
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (n:Stress {k: 0}) RETURN coalesce(n.hits, 0)"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "SELECT coalesce(hits, 0) FROM stress WHERE k = 0"
+        }
+      },
+      "hot-counter-snb": {
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (p:Person {id: 0}) RETURN coalesce(p.hits, 0)"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "SELECT coalesce(hits, 0) FROM person WHERE id = 0"
+        }
+      },
+      "uniq-duplicates": {
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (n:Uniq) WITH n.u AS u, count(*) AS c WHERE c > 1 RETURN u"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "SELECT u FROM uniq GROUP BY u HAVING count(*) > 1"
+        }
+      },
+      "uniq-population": {
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (n:Uniq) RETURN n.u"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "SELECT u FROM uniq"
+        }
+      },
+      "rel-endpoints-synthetic": {
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH ()-[r:SLINK]->() WITH count(r) AS bare MATCH (a)-[q:SLINK]->(b) RETURN bare, count(q) AS bound"
+        },
+        "sql": {
+          "status": "unsupported",
+          "reason": "a foreign-key-less edge table cannot hold a dangling edge the way an adjacency structure can, and the ONE-STATEMENT-one-snapshot rule this probe exists for has no relational analogue that is not just `count(*) = count(*)`. The class it guards (W1.1 dangling edges) is an engram/Neo4j failure mode; declaring it inapplicable is honest, asserting `0 = 0` would not be."
+        }
+      },
+      "rel-endpoints-snb": {
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH ()-[r:STRESSED]->() WITH count(r) AS bare MATCH (a)-[q:STRESSED]->(b) RETURN bare, count(q) AS bound"
+        },
+        "sql": {
+          "status": "unsupported",
+          "reason": "see rel-endpoints-synthetic"
+        }
+      },
+      "churn-survivors-total": {
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (n:Churn) WHERE n.nonce = ${nonce} AND n.id >= ${lo} AND n.id < ${hi} RETURN n.id"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "SELECT id FROM churn WHERE nonce = ${nonce} AND id >= ${lo} AND id < ${hi}"
+        }
+      },
+      "churn-survivors-worker": {
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (n:Churn) WHERE n.nonce = ${nonce} AND n.cid = ${cid} AND n.id >= ${lo} AND n.id < ${hi} RETURN n.id"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "SELECT id FROM churn WHERE nonce = ${nonce} AND cid = ${cid} AND id >= ${lo} AND id < ${hi}"
+        }
+      },
+      "churn-duplicates": {
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (n:Churn) WHERE n.nonce = ${nonce} AND n.id >= ${lo} AND n.id < ${hi} WITH n.id AS i, count(*) AS c WHERE c > 1 RETURN i"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "SELECT id FROM churn WHERE nonce = ${nonce} AND id >= ${lo} AND id < ${hi} GROUP BY id HAVING count(*) > 1"
+        }
+      },
+      "churn-anchor-rels": {
+        "_note": "Bounded by the LEVEL's id range, not only by the nonce: anchors are reused across levels (an anchor has no identity of its own to scope), so a probe that counted every rel on this run's anchors would sum every level.",
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (a:ChurnAnchor {nonce: ${nonce}})-[r:CHURN]->(n:Churn) WHERE n.id >= ${lo} AND n.id < ${hi} RETURN id(r)"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "SELECT r.id FROM churn_rel r WHERE r.anonce = ${nonce} AND r.id >= ${lo} AND r.id < ${hi}"
+        }
+      },
+      "churn-rel-bare": {
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH ()-[r:CHURN]->() RETURN id(r)"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "SELECT id FROM churn_rel"
+        }
+      },
+      "churn-rel-bound": {
+        "cypher": {
+          "status": "verified",
+          "text": "MATCH (a)-[r:CHURN]->(b) RETURN id(r)"
+        },
+        "sql": {
+          "status": "unverified",
+          "text": "SELECT r.id FROM churn_rel r JOIN churn_anchor a ON a.cid = r.acid AND a.nonce = r.anonce JOIN churn n ON n.id = r.id AND n.nonce = r.nonce"
+        }
+      }
+    },
+    "fixtures": {
+      "note": "Index DDL and the forced first seek. Creating these is not tuning: an unindexed lookup key turns every point lookup into a full scan, so the fixture would BE the measurement.",
+      "synthetic": {
+        "cypher": {
+          "indexes": [
+            "CREATE INDEX stress_k IF NOT EXISTS FOR (n:Stress) ON (n.k)"
+          ],
+          "probes": []
+        },
+        "sql": {
+          "indexes": [],
+          "probes": [],
+          "note": "`stress.k` is the primary key, so its index is the table definition; there is no deferred build to force."
+        }
+      },
+      "snb": {
+        "cypher": {
+          "indexes": [
+            "CREATE INDEX snb_person_id IF NOT EXISTS FOR (n:Person) ON (n.id)",
+            "CREATE INDEX snb_message_id IF NOT EXISTS FOR (n:Message) ON (n.id)"
+          ],
+          "probes": [
+            "MATCH (p:Person {id: 1}) RETURN p.id",
+            "MATCH (m:Message {id: 1}) RETURN m.id"
+          ]
+        },
+        "sql": {
+          "indexes": [],
+          "probes": [
+            "SELECT id FROM person WHERE id = 1",
+            "SELECT id FROM message WHERE id = 1"
+          ]
+        }
+      },
+      "snb-platform": {
+        "cypher": {
+          "indexes": [
+            "CREATE INDEX snb_person_id IF NOT EXISTS FOR (n:Person) ON (n.id)",
+            "CREATE INDEX snb_message_id IF NOT EXISTS FOR (n:Message) ON (n.id)",
+            "CREATE INDEX snb_person_first IF NOT EXISTS FOR (n:Person) ON (n.firstName)",
+            "CREATE INDEX snb_person_name IF NOT EXISTS FOR (n:Person) ON (n.firstName, n.lastName)"
+          ],
+          "probes": [
+            "MATCH (p:Person {id: 1}) RETURN p.id",
+            "MATCH (m:Message {id: 1}) RETURN m.id",
+            "MATCH (p:Person {firstName: 'Jan'}) RETURN count(p)",
+            "MATCH (p:Person {firstName: 'Jan', lastName: 'Chen'}) RETURN count(p)"
+          ]
+        }
+      },
+      "unique-create": {
+        "cypher": {
+          "setup": [
+            "CREATE CONSTRAINT stress_u IF NOT EXISTS FOR (n:Uniq) REQUIRE n.u IS UNIQUE",
+            "MATCH (n:Uniq) WHERE n.u >= ${lo} AND n.u < ${hi} DETACH DELETE n"
+          ]
+        },
+        "sql": {
+          "setup": [
+            "DELETE FROM uniq WHERE u >= ${lo} AND u < ${hi}"
+          ],
+          "note": "the UNIQUE is the primary key in the schema above, so there is no constraint to create per level."
+        }
+      },
+      "delete-churn": {
+        "_note": "The per-level clean slate, and the ANCHOR half of it is load-bearing. Anchors carry no level identity, so a level that left the previous level s anchors in place would find TWO ChurnAnchor rows for (cid, nonce): the create MATCHes both and one acked statement mints two nodes. Measured here on 2026-09-09 before the sweep deleted them - level 1 reported 100 survivors against an expected 67 and 33 duplicate ids, which is exactly level 0 s survivor count. Deleting this run s anchors orphans the previous level s survivors (they keep their node, lose their rel); that is harmless because every anchor-rel check is bounded to the level s own id range. The Churn delete is bounded by the id RANGE rather than by the nonce, because under a plan one nonce covers the whole sweep.",
+        "cypher": {
+          "setup": [
+            "CREATE INDEX churn_id IF NOT EXISTS FOR (n:Churn) ON (n.id)",
+            "CREATE INDEX churn_anchor_cid IF NOT EXISTS FOR (n:ChurnAnchor) ON (n.cid)",
+            "MATCH (n:Churn) WHERE n.nonce = ${nonce} AND n.id >= ${lo} AND n.id < ${hi} DETACH DELETE n",
+            "MATCH (a:ChurnAnchor) WHERE a.nonce = ${nonce} DETACH DELETE a"
+          ]
+        },
+        "sql": {
+          "setup": [
+            "DELETE FROM churn_rel WHERE nonce = ${nonce} AND id >= ${lo} AND id < ${hi}",
+            "DELETE FROM churn WHERE nonce = ${nonce} AND id >= ${lo} AND id < ${hi}",
+            "DELETE FROM churn_rel WHERE anonce = ${nonce}",
+            "DELETE FROM churn_anchor WHERE nonce = ${nonce}"
+          ],
+          "note": "The third statement is the DETACH half of the fourth. Cypher's `DETACH DELETE a` takes every CHURN rel hanging off the anchor with it; a relational DELETE takes the anchor row alone and leaves the edge rows behind, because `churn_rel` carries no foreign key. What the leftovers do depends on the sweep, which is why this was nearly missed: an ASCENDING sweep re-creates an anchor with the same (cid, nonce) at the next level, so the orphans silently re-bind and every probe passes. A sweep whose next level has FEWER clients does not re-create the higher cids, and the orphans then bind nothing. Measured 2026-09-09 against PostgreSQL 17.11 with this statement removed: `delete-churn 2,1` reported `48 CHURN edge(s) but only 32 bind both endpoints - DANGLING EDGES` at the second level and failed the run; with it, the same sweep passes. A probe that cries wolf on a workload that did nothing wrong is worse than no probe, because it teaches the reader to discount the one time it is right."
+
+        }
+      }
+    }
+  }
+}

@@ -401,12 +401,17 @@ fn a_torn_tail_record_is_discarded_and_the_prefix_survives() {
     }
     // Simulate a crash mid-append: a partial record's bytes reached the file
     // but the write never completed or `fsync`'d. These are torn tail bytes.
+    // They land right after the last record — at the log's LOGICAL end, inside
+    // the zero-filled space the WAL keeps ahead of it — which is where a
+    // crashed append would have put them.
     {
-        use std::io::Write;
+        use std::io::{Seek, SeekFrom, Write};
+        let end = engram_log::Wal::logical_len(tmp.path()).expect("a WAL");
         let mut f = std::fs::OpenOptions::new()
-            .append(true)
+            .write(true)
             .open(tmp.path())
-            .expect("open for append");
+            .expect("open for write");
+        f.seek(SeekFrom::Start(end)).expect("seek to the logical end");
         f.write_all(&[0xAB; 40]).expect("write torn tail");
         f.sync_all().expect("sync torn");
     }

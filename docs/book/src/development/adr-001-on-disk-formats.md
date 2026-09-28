@@ -138,7 +138,7 @@ After 0.1 this rule is frozen with the rest of this document.
 - FC-11 (a range-index entry's payload never migrates into the key) is
   documented on `INDEX_ENTRY` and inherits Decision 3's enforcement; the
   mechanical check lands with the index implementation.
-- 45 tests across the crate; every non-structural property is canaried. One
+- 46 tests across the crate; every non-structural property is canaried. One
   canary was retired by making its property structural: the list-skip
   arithmetic moved to u64, where a u32 count cannot wrap on any target —
   checked arithmetic there was untestable on a 64-bit host, and an untestable

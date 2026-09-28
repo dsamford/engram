@@ -81,8 +81,7 @@ const Q7: &str = "MATCH (:Tag)<-[:HAS_TAG]-(message:Message)-[:HAS_CREATOR]->(cr
 
 /// The control: q7 with only ONE of its optional legs — the shape
 /// `recognise_optional` accepts.
-const Q7_ONE_OPT: &str =
-    "MATCH (:Tag)<-[:HAS_TAG]-(message:Message)-[:HAS_CREATOR]->(creator:Person) \
+const Q7_ONE_OPT: &str = "MATCH (:Tag)<-[:HAS_TAG]-(message:Message)-[:HAS_CREATOR]->(creator:Person) \
      OPTIONAL MATCH (message)<-[:LIKES]-(liker:Person) \
      RETURN count(*) AS n";
 

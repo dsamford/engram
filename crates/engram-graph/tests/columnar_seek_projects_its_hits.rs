@@ -60,7 +60,11 @@ fn corpus() -> Graph {
         let mut m = BTreeMap::new();
         m.insert(
             "nodeType".to_string(),
-            Value::Str(if i % 3 == 0 { "email".into() } else { "note".into() }),
+            Value::Str(if i % 3 == 0 {
+                "email".into()
+            } else {
+                "note".into()
+            }),
         );
         m.insert("userId".to_string(), Value::Str(format!("u{}", 1 + i % 40)));
         m.insert("nodeId".to_string(), Value::Str(format!("node-{i:05}")));
@@ -87,9 +91,19 @@ fn a_projection_over_a_seek_decodes_only_what_it_reads() {
         assert!(!want.is_empty(), "fixture: `{src}`");
         let (got, c) = traced(&g, src);
         assert_eq!(got, want, "`{src}`");
-        assert!(count_of(&c, PROJ_SCANS) > 0, "`{src}` seeks on the columnar projection: {c:?}");
-        assert_eq!(count_of(&c, FULL), 0, "`{src}` decodes no record in full: {c:?}");
-        assert!(count_of(&c, PROJECTED) > 0, "`{src}` decodes its hits projected: {c:?}");
+        assert!(
+            count_of(&c, PROJ_SCANS) > 0,
+            "`{src}` seeks on the columnar projection: {c:?}"
+        );
+        assert_eq!(
+            count_of(&c, FULL),
+            0,
+            "`{src}` decodes no record in full: {c:?}"
+        );
+        assert!(
+            count_of(&c, PROJECTED) > 0,
+            "`{src}` decodes its hits projected: {c:?}"
+        );
     }
 }
 
@@ -103,8 +117,15 @@ fn an_aggregate_over_a_seek_decodes_only_what_it_reads() {
         let want = general(&g, src);
         let (got, c) = traced(&g, src);
         assert_eq!(got, want, "`{src}`");
-        assert!(count_of(&c, AGG_SCANS) > 0, "`{src}` seeks on the columnar aggregate: {c:?}");
-        assert_eq!(count_of(&c, FULL), 0, "`{src}` decodes no record in full: {c:?}");
+        assert!(
+            count_of(&c, AGG_SCANS) > 0,
+            "`{src}` seeks on the columnar aggregate: {c:?}"
+        );
+        assert_eq!(
+            count_of(&c, FULL),
+            0,
+            "`{src}` decodes no record in full: {c:?}"
+        );
     }
 }
 

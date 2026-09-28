@@ -68,7 +68,9 @@ Do not treat the credentials your driver sends as a control. See
 Worth knowing if you are debugging a connection rather than using one.
 
 A Bolt connection opens with a four-byte magic preamble followed by sixteen
-bytes of version proposals. Engram offers two versions:
+bytes of version proposals. Engram offers two entries, written
+major.minor.range — Bolt 6.0, then 5.8 with a range of eight minors below it,
+which covers 5.0 through 5.8:
 
 ```text
 6.0.0    and    5.8.8
@@ -93,7 +95,7 @@ RETURN name, versions, edition
 
 ```text
 name     versions     edition
-Engram   ["0.1.0"]    engram
+Engram   ["0.2.0"]    engram
 ```
 
 The server also announces itself in `HELLO`'s response as
@@ -103,9 +105,6 @@ string, so answering truthfully costs nothing a driver depends on. It is
 overridable (`BoltServer::set_server_agent`) for the case where a client is
 found that does read it, because "no driver reads it" is a claim about drivers
 that have been tested.
-
-> Note the `YIELD … RETURN`. Engram has no standalone `CALL` — see
-> [Cypher support](./cypher-support.md).
 
 ## Routing and namespaces
 
@@ -125,7 +124,7 @@ authentication there is no identity to bind a realm to. See
 |---|---|---|
 | `--max-connections N` | 512 | connections past the cap are not accepted |
 | `--read-timeout-secs N` | 300 | a connection quiet for N seconds is reaped |
-| `--row-budget N` | 20,000,000 | a query materialising more is refused |
+| `--row-budget N` | derived from the process's memory ceiling, printed at startup | a query materialising more than its share is refused |
 
 Each connection costs **two OS threads** — a reader and a writer — which is why
 there is a cap at all.

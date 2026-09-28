@@ -73,7 +73,10 @@ fn the_concurrent_duplicate_phantom_is_now_an_occ_conflict() {
         format!("{:?}", retry.expect_err("duplicate refused on re-run")).contains("already exists"),
     );
     assert_eq!(rows(&g, "MATCH (n:U) RETURN id(n)"), 1);
-    assert_eq!(g.verify_constraint_markers().expect("fsck"), Vec::<String>::new());
+    assert_eq!(
+        g.verify_constraint_markers().expect("fsck"),
+        Vec::<String>::new()
+    );
 }
 
 #[test]
@@ -83,7 +86,8 @@ fn distinct_values_do_not_conflict() {
     let a = buffered(&g, "CREATE (:U {u: 1})");
     let b = buffered(&g, "CREATE (:U {u: 2})");
     g.commit_owned(a).expect("a");
-    g.commit_owned(b).expect("distinct values must not serialise");
+    g.commit_owned(b)
+        .expect("distinct values must not serialise");
 }
 
 #[test]
@@ -112,10 +116,12 @@ fn a_single_statement_duplicate_is_refused_through_the_buffer() {
     let txn = g.open_txn();
     let (txn, r) = g.with_txn(txn, || run_query(&g, &q, BTreeMap::new()));
     g.rollback_owned(txn);
-    assert!(
-        format!("{:?}", r.expect_err("in-statement duplicate")).contains("already exists"),
+    assert!(format!("{:?}", r.expect_err("in-statement duplicate")).contains("already exists"),);
+    assert_eq!(
+        rows(&g, "MATCH (n:U) RETURN id(n)"),
+        0,
+        "nothing survives the refusal"
     );
-    assert_eq!(rows(&g, "MATCH (n:U) RETURN id(n)"), 0, "nothing survives the refusal");
     // The DIRECT path refuses too (no atomicity claim — that is the
     // transactional path's property).
     let e = try_run(&g, "CREATE (:U {u: 9}), (:U {u: 9})").expect_err("direct refusal");
@@ -131,7 +137,10 @@ fn set_moves_the_marker_and_frees_the_old_value() {
     run(&g, "CREATE (:U {u: 1})"); // the old value is free again
     let e = try_run(&g, "CREATE (:U {u: 2})").expect_err("the new value is taken");
     assert!(e.contains("already exists"), "{e}");
-    assert_eq!(g.verify_constraint_markers().expect("fsck"), Vec::<String>::new());
+    assert_eq!(
+        g.verify_constraint_markers().expect("fsck"),
+        Vec::<String>::new()
+    );
 }
 
 #[test]
@@ -143,24 +152,39 @@ fn delete_and_label_removal_free_the_value() {
     run(&g, "CREATE (:U {u: 5})");
     run(&g, "MATCH (n:U {u: 5}) REMOVE n:U");
     run(&g, "CREATE (:U {u: 5})");
-    assert_eq!(g.verify_constraint_markers().expect("fsck"), Vec::<String>::new());
+    assert_eq!(
+        g.verify_constraint_markers().expect("fsck"),
+        Vec::<String>::new()
+    );
 }
 
 #[test]
 fn rel_constraints_take_the_marker_path_too() {
     let g = graph_over(Store::new());
     run(&g, "CREATE (:A {id: 1})-[:R {u: 1}]->(:A {id: 2})");
-    ddl(&g, "CREATE CONSTRAINT ru FOR ()-[r:R]-() REQUIRE r.u IS UNIQUE");
+    ddl(
+        &g,
+        "CREATE CONSTRAINT ru FOR ()-[r:R]-() REQUIRE r.u IS UNIQUE",
+    );
     let e = try_run(
         &g,
         "MATCH (a:A {id: 1}), (b:A {id: 2}) CREATE (a)-[:R {u: 1}]->(b)",
     )
     .expect_err("duplicate rel value");
     assert!(e.contains("already exists"), "{e}");
-    run(&g, "MATCH (a:A {id: 1}), (b:A {id: 2}) CREATE (a)-[:R {u: 2}]->(b)");
+    run(
+        &g,
+        "MATCH (a:A {id: 1}), (b:A {id: 2}) CREATE (a)-[:R {u: 2}]->(b)",
+    );
     run(&g, "MATCH ()-[r:R {u: 1}]->() DELETE r");
-    run(&g, "MATCH (a:A {id: 1}), (b:A {id: 2}) CREATE (a)-[:R {u: 1}]->(b)");
-    assert_eq!(g.verify_constraint_markers().expect("fsck"), Vec::<String>::new());
+    run(
+        &g,
+        "MATCH (a:A {id: 1}), (b:A {id: 2}) CREATE (a)-[:R {u: 1}]->(b)",
+    );
+    assert_eq!(
+        g.verify_constraint_markers().expect("fsck"),
+        Vec::<String>::new()
+    );
 }
 
 #[test]
@@ -168,7 +192,10 @@ fn ddl_on_populated_data_backfills_and_refuses_existing_duplicates() {
     let g = graph_over(Store::new());
     run(&g, "UNWIND range(1, 50) AS i CREATE (:U {u: i})");
     ddl(&g, "CREATE CONSTRAINT u FOR (n:U) REQUIRE n.u IS UNIQUE");
-    assert_eq!(g.verify_constraint_markers().expect("fsck"), Vec::<String>::new());
+    assert_eq!(
+        g.verify_constraint_markers().expect("fsck"),
+        Vec::<String>::new()
+    );
     let e = try_run(&g, "CREATE (:U {u: 25})").expect_err("backfilled value is taken");
     assert!(e.contains("already exists"), "{e}");
 
@@ -192,7 +219,10 @@ fn drop_then_recreate_does_not_inherit_stale_markers() {
     run(&g, "CREATE (:U {u: 1, v: 8})"); // duplicate u is fine now
     let e = try_run(&g, "CREATE (:U {v: 9})").expect_err("v is constrained");
     assert!(e.contains("already exists"), "{e}");
-    assert_eq!(g.verify_constraint_markers().expect("fsck"), Vec::<String>::new());
+    assert_eq!(
+        g.verify_constraint_markers().expect("fsck"),
+        Vec::<String>::new()
+    );
 }
 
 #[test]
@@ -204,9 +234,7 @@ fn ddl_inside_an_open_transaction_is_refused() {
         run_stmt(&g, &q, BTreeMap::new())
     });
     g.rollback_owned(txn);
-    assert!(
-        format!("{:?}", r.expect_err("refused")).contains("cannot run inside"),
-    );
+    assert!(format!("{:?}", r.expect_err("refused")).contains("cannot run inside"),);
 }
 
 #[test]
@@ -227,9 +255,7 @@ fn a_v1_constraint_stays_walk_enforced_until_upgraded() {
         .put(
             &kv,
             b"con:legacy",
-            StoredValue::Plain(
-                br#"{"kind":"unique","label":"U","props":["u"]}"#.to_vec(),
-            ),
+            StoredValue::Plain(br#"{"kind":"unique","label":"U","props":["u"]}"#.to_vec()),
         )
         .expect("forge v1 row");
     // A fresh graph over the store (cold cache) sees the v1 constraint.
@@ -240,7 +266,10 @@ fn a_v1_constraint_stays_walk_enforced_until_upgraded() {
     assert_eq!((upgraded, skipped.len()), (1, 0));
     let e = try_run(&g, "CREATE (:U {u: 5})").expect_err("marker enforcement holds");
     assert!(e.contains("already exists"), "{e}");
-    assert_eq!(g.verify_constraint_markers().expect("fsck"), Vec::<String>::new());
+    assert_eq!(
+        g.verify_constraint_markers().expect("fsck"),
+        Vec::<String>::new()
+    );
 }
 
 #[test]
@@ -250,7 +279,10 @@ fn bulk_exit_rebuilds_the_marker_family() {
     g.set_bulk_ingest(true).expect("bulk on");
     run(&g, "UNWIND range(1, 20) AS i CREATE (:U {u: 100 + i})");
     g.set_bulk_ingest(false).expect("bulk exit rebuild");
-    assert_eq!(g.verify_constraint_markers().expect("fsck"), Vec::<String>::new());
+    assert_eq!(
+        g.verify_constraint_markers().expect("fsck"),
+        Vec::<String>::new()
+    );
     let e = try_run(&g, "CREATE (:U {u: 110})").expect_err("bulk-loaded value is taken");
     assert!(e.contains("already exists"), "{e}");
 }
@@ -268,9 +300,15 @@ fn constrained_writes_answer_identically_direct_and_inside_a_transaction() {
         "CREATE (:U {u: 2})",
     ];
     let direct = graph_over(Store::new());
-    ddl(&direct, "CREATE CONSTRAINT u FOR (n:U) REQUIRE n.u IS UNIQUE");
+    ddl(
+        &direct,
+        "CREATE CONSTRAINT u FOR (n:U) REQUIRE n.u IS UNIQUE",
+    );
     let txn_g = graph_over(Store::new());
-    ddl(&txn_g, "CREATE CONSTRAINT u FOR (n:U) REQUIRE n.u IS UNIQUE");
+    ddl(
+        &txn_g,
+        "CREATE CONSTRAINT u FOR (n:U) REQUIRE n.u IS UNIQUE",
+    );
     for stmt in corpus {
         let a = try_run(&direct, stmt).is_ok();
         let b = {
@@ -299,6 +337,12 @@ fn constrained_writes_answer_identically_direct_and_inside_a_transaction() {
         rows(&txn_g, "MATCH (n:U {u: 3}) RETURN id(n)"),
     ];
     assert_eq!(fa, fb);
-    assert_eq!(direct.verify_constraint_markers().expect("fsck"), Vec::<String>::new());
-    assert_eq!(txn_g.verify_constraint_markers().expect("fsck"), Vec::<String>::new());
+    assert_eq!(
+        direct.verify_constraint_markers().expect("fsck"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        txn_g.verify_constraint_markers().expect("fsck"),
+        Vec::<String>::new()
+    );
 }

@@ -75,6 +75,25 @@ const CHOSE_LATER: &str = "interp.seed chose a later, more selective declared ke
 /// claims (the `EXISTS { MATCH … }` count, once that body lifts to a probe)
 /// seeks the same declared key there instead of on the general path.
 const COLUMNAR_SCOPED: &str = "interp.columnar seek chose a declared scoped index";
+/// Fix 115: where a DECLARED COMPOSITE covers every key of the seek, it
+/// answers the tuple in one probe instead of the per-key probe choosing the
+/// more selective of them. That is the same decision made better — the
+/// candidate set is the exact population of both keys — so it satisfies
+/// every "the declared key was used rather than a label walk" assertion
+/// here. Fix 47's rule — a composite declares its TRAILING keys too — stays
+/// pinned by the single-key shape below, which no composite covers.
+const SEED_COMPOSITE: &str = "interp.seed probed a declared composite";
+const COLUMNAR_COMPOSITE: &str = "interp.columnar seek probed a declared composite";
+const PROBED_SCOPED: &str = "interp.seed probed a declared scoped index";
+
+/// Whether this statement was served by a declared index at all — by the
+/// composite, or by the per-key choice of the more selective declared key.
+fn used_a_declared_index(g: &Graph, src: &str) -> bool {
+    counter(g, src, CHOSE_LATER) > 0
+        || counter(g, src, COLUMNAR_SCOPED) > 0
+        || counter(g, src, SEED_COMPOSITE) > 0
+        || counter(g, src, COLUMNAR_COMPOSITE) > 0
+}
 
 #[derive(Clone, Copy)]
 enum Declared {
@@ -97,11 +116,20 @@ fn corpus(declared: Declared) -> Graph {
     g.set_label_scoped_indexes(true);
     match declared {
         Declared::CompositeAndOwner => {
-            ddl(&g, "CREATE INDEX doc_kind_owner IF NOT EXISTS FOR (n:Doc) ON (n.kind, n.owner)");
-            ddl(&g, "CREATE INDEX doc_owner IF NOT EXISTS FOR (n:Doc) ON (n.owner)");
+            ddl(
+                &g,
+                "CREATE INDEX doc_kind_owner IF NOT EXISTS FOR (n:Doc) ON (n.kind, n.owner)",
+            );
+            ddl(
+                &g,
+                "CREATE INDEX doc_owner IF NOT EXISTS FOR (n:Doc) ON (n.owner)",
+            );
         }
         Declared::CompositeOnly => {
-            ddl(&g, "CREATE INDEX doc_kind_owner IF NOT EXISTS FOR (n:Doc) ON (n.kind, n.owner)");
+            ddl(
+                &g,
+                "CREATE INDEX doc_kind_owner IF NOT EXISTS FOR (n:Doc) ON (n.kind, n.owner)",
+            );
         }
         Declared::None => {}
     }
@@ -158,8 +186,9 @@ fn every_shape_on_the_start_seeks_the_declared_selective_key() {
         let (on, off) = both(&g, src);
         assert_eq!(on, off, "seek vs scan disagree on `{src}`");
         assert!(
-            counter(&g, src, CHOSE_LATER) > 0 || counter(&g, src, COLUMNAR_SCOPED) > 0,
-            "`{src}` must choose the later, declared `owner` key over the first `kind` entry"
+            used_a_declared_index(&g, src),
+            "`{src}` must reach the declared `owner` key — by the composite, or by \
+             choosing the later entry over the first `kind` one — not walk the label"
         );
     }
     // Fixture sanity: u8 owns docs 8 and 358, both 'email', both even (flag),
@@ -226,9 +255,16 @@ fn a_declared_correlated_key_seeks_per_row_instead_of_memoising_the_label() {
     let declared = "UNWIND ['u8', 'u9', 'u10', 'u11'] AS o OPTIONAL MATCH (d:Doc {kind: 'email', owner: o}) RETURN o, count(d) AS c ORDER BY o";
     let (on, off) = both(&g, declared);
     assert_eq!(on, off, "seek vs memo disagree");
-    assert!(counter(&g, declared, DECLINED) > 0, "the declared key must decline the memo");
+    assert!(
+        counter(&g, declared, DECLINED) > 0,
+        "the declared key must decline the memo"
+    );
     assert_eq!(counter(&g, declared, MEMOS), 0, "…and build no memo");
-    assert!(counter(&g, declared, PROBED) >= 4, "…probing the declared index per row");
+    assert!(
+        counter(&g, declared, PROBED) + counter(&g, declared, SEED_COMPOSITE) >= 4,
+        "…probing the declared index — the `(kind, owner)` composite, both keys \
+         being sought — once per row"
+    );
     // u8 → docs 8, 358 (both email); u9 → 9, 359; u10 → 10, 360; u11 → 11, 361.
     assert_eq!(
         on,
@@ -240,11 +276,16 @@ fn a_declared_correlated_key_seeks_per_row_instead_of_memoising_the_label() {
         ]
     );
     // CONTROL: `n` is undeclared — the memo is built once, as before.
-    let undeclared = "UNWIND [8, 9, 10] AS x OPTIONAL MATCH (d:Doc {n: x}) RETURN x, count(d) AS c ORDER BY x";
+    let undeclared =
+        "UNWIND [8, 9, 10] AS x OPTIONAL MATCH (d:Doc {n: x}) RETURN x, count(d) AS c ORDER BY x";
     let (on, off) = both(&g, undeclared);
     assert_eq!(on, off);
     assert_eq!(counter(&g, undeclared, DECLINED), 0);
-    assert_eq!(counter(&g, undeclared, MEMOS), 1, "an undeclared correlated key keeps the memo");
+    assert_eq!(
+        counter(&g, undeclared, MEMOS),
+        1,
+        "an undeclared correlated key keeps the memo"
+    );
 }
 
 /// A composite declares EVERY key it carries (fix 47): Neo4j's composite
@@ -260,10 +301,28 @@ fn with_only_the_composite_declared_its_trailing_key_is_probed_and_rows_agree() 
         let (on, off) = both(&g, src);
         assert_eq!(on, off, "seek vs scan disagree on `{src}`");
         assert!(
-            counter(&g, src, CHOSE_LATER) > 0 || counter(&g, src, COLUMNAR_SCOPED) > 0,
-            "`{src}`: the composite's trailing `owner` key is declared too"
+            used_a_declared_index(&g, src),
+            "`{src}`: the composite answers both keys, and its trailing `owner` key \
+             is declared for the shapes it does not cover"
         );
     }
+    // Fix 47 ITSELF, which fix 115 does not reach: a seek on the trailing
+    // key ALONE has no composite to probe (a composite answers a tuple, and
+    // only one key is bound), so it must still reach `owner` through the
+    // composite's DECLARATION — the scoped per-key probe.
+    let single = "MATCH (d:Doc {owner: $owner}) RETURN d.n AS n ORDER BY n";
+    let (on, off) = both(&g, single);
+    assert_eq!(on, off, "seek vs scan disagree on the single trailing key");
+    assert_eq!(on, vec![vec![Value::Int(8)], vec![Value::Int(358)]]);
+    assert_eq!(
+        counter(&g, single, SEED_COMPOSITE) + counter(&g, single, COLUMNAR_COMPOSITE),
+        0,
+        "one bound key is not a tuple: no composite probe"
+    );
+    assert!(
+        counter(&g, single, PROBED_SCOPED) > 0 || counter(&g, single, COLUMNAR_SCOPED) > 0,
+        "…and the trailing key is still declared through the composite (fix 47)"
+    );
 }
 
 /// CONTROL: nothing declared, nothing chosen, same rows.

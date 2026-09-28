@@ -49,19 +49,32 @@ fn open_wal_seals_the_replayed_history_so_it_is_read_lock_free() {
     {
         let s = Store::open_wal(tmp.path()).expect("open");
         for i in 0..50u32 {
-            s.put(&prefix(), &i.to_be_bytes(), StoredValue::Plain(vec![i as u8]))
-                .expect("put");
+            s.put(
+                &prefix(),
+                &i.to_be_bytes(),
+                StoredValue::Plain(vec![i as u8]),
+            )
+            .expect("put");
         }
     }
     let r = Store::open_wal(tmp.path()).expect("reopen");
-    assert_eq!(r.tail_versions(), 0, "the replayed history must not sit in the tail");
+    assert_eq!(
+        r.tail_versions(),
+        0,
+        "the replayed history must not sit in the tail"
+    );
     assert_eq!(r.segment_count(), 1, "one sealed segment holds it");
     for i in 0..50u32 {
-        assert_eq!(r.get(&prefix(), &i.to_be_bytes()), Some(vec![i as u8]), "key {i}");
+        assert_eq!(
+            r.get(&prefix(), &i.to_be_bytes()),
+            Some(vec![i as u8]),
+            "key {i}"
+        );
     }
     // New writes land in the tail; a seal drains them into a second segment;
     // a compaction merges the two.
-    r.put(&prefix(), b"new", StoredValue::Plain(vec![9])).expect("put");
+    r.put(&prefix(), b"new", StoredValue::Plain(vec![9]))
+        .expect("put");
     assert_eq!(r.tail_versions(), 1);
     assert!(r.seal().is_some());
     assert_eq!(r.tail_versions(), 0);
@@ -84,36 +97,60 @@ fn open_wal_seals_the_replayed_history_so_it_is_read_lock_free() {
 fn compaction_keeps_a_dominant_base_and_a_tombstone_that_shadows_it() {
     let s = Store::new();
     for i in 0..20_000u32 {
-        s.put(&prefix(), &i.to_be_bytes(), StoredValue::Plain(vec![1])).expect("base");
+        s.put(&prefix(), &i.to_be_bytes(), StoredValue::Plain(vec![1]))
+            .expect("base");
     }
     s.seal();
     assert_eq!(s.segment_count(), 1);
     // Young run: an update of a base key, a delete of another, 300 new keys.
-    s.put(&prefix(), &5u32.to_be_bytes(), StoredValue::Plain(vec![2])).expect("update");
+    s.put(&prefix(), &5u32.to_be_bytes(), StoredValue::Plain(vec![2]))
+        .expect("update");
     s.delete(&prefix(), &7u32.to_be_bytes());
     for i in 100_000..100_300u32 {
-        s.put(&prefix(), &i.to_be_bytes(), StoredValue::Plain(vec![3])).expect("young");
+        s.put(&prefix(), &i.to_be_bytes(), StoredValue::Plain(vec![3]))
+            .expect("young");
     }
     s.seal();
     s.seal(); // empty: refused
     assert_eq!(s.segment_count(), 2);
     let (_retired, _dropped) = s.compact();
-    assert_eq!(s.segment_count(), 2, "a 20k base is more than twice a 302-key young run and is kept");
-    assert_eq!(s.get(&prefix(), &5u32.to_be_bytes()), Some(vec![2]), "the update shadows the base");
-    assert_eq!(s.get(&prefix(), &7u32.to_be_bytes()), None, "the tombstone over a base key survived the tiered merge");
-    assert_eq!(s.get(&prefix(), &8u32.to_be_bytes()), Some(vec![1]), "an untouched base key");
+    assert_eq!(
+        s.segment_count(),
+        2,
+        "a 20k base is more than twice a 302-key young run and is kept"
+    );
+    assert_eq!(
+        s.get(&prefix(), &5u32.to_be_bytes()),
+        Some(vec![2]),
+        "the update shadows the base"
+    );
+    assert_eq!(
+        s.get(&prefix(), &7u32.to_be_bytes()),
+        None,
+        "the tombstone over a base key survived the tiered merge"
+    );
+    assert_eq!(
+        s.get(&prefix(), &8u32.to_be_bytes()),
+        Some(vec![1]),
+        "an untouched base key"
+    );
     assert_eq!(s.get(&prefix(), &100_299u32.to_be_bytes()), Some(vec![3]));
     // Grow the young run past the base: a full merge, one segment, and the
     // deleted key is still absent (the tombstone did its job, then retired).
     for i in 200_000..225_000u32 {
-        s.put(&prefix(), &i.to_be_bytes(), StoredValue::Plain(vec![4])).expect("grow");
+        s.put(&prefix(), &i.to_be_bytes(), StoredValue::Plain(vec![4]))
+            .expect("grow");
         if i % 5_000 == 0 {
             s.seal();
         }
     }
     s.seal();
     s.compact();
-    assert_eq!(s.segment_count(), 1, "the young run outgrew the base: everything merged");
+    assert_eq!(
+        s.segment_count(),
+        1,
+        "the young run outgrew the base: everything merged"
+    );
     assert_eq!(s.get(&prefix(), &7u32.to_be_bytes()), None);
     assert_eq!(s.get(&prefix(), &5u32.to_be_bytes()), Some(vec![2]));
     assert_eq!(s.get(&prefix(), &19_999u32.to_be_bytes()), Some(vec![1]));
@@ -146,8 +183,12 @@ fn compaction_runs_online_and_keeps_every_key_under_concurrent_seals() {
             }
         });
         for i in 0..KEYS {
-            s.put(&prefix(), &i.to_be_bytes(), StoredValue::Plain(i.to_le_bytes().to_vec()))
-                .expect("put");
+            s.put(
+                &prefix(),
+                &i.to_be_bytes(),
+                StoredValue::Plain(i.to_le_bytes().to_vec()),
+            )
+            .expect("put");
             if i % 250 == 249 {
                 s.seal();
             }

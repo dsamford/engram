@@ -65,12 +65,20 @@ fn item_props(i: i64) -> BTreeMap<String, Value> {
     let mut m = BTreeMap::new();
     m.insert("id".into(), s(&format!("item-{i}")));
     m.insert("title".into(), s(&format!("Item {i}")));
-    m.insert("nodeType".into(), s(if i % 5 == 0 { "repository" } else { "email" }));
+    m.insert(
+        "nodeType".into(),
+        s(if i % 5 == 0 { "repository" } else { "email" }),
+    );
     m.insert("userId".into(), s(&format!("u{}", (i / 5) % 9)));
     // Unique per item, so `ORDER BY createdAt DESC` is a total order.
     m.insert(
         "createdAt".into(),
-        s(&format!("2026-08-{:02}T00:{:02}:{:02}Z", 1 + (i / 60) % 28, (i / 60) % 60, i % 60)),
+        s(&format!(
+            "2026-08-{:02}T00:{:02}:{:02}Z",
+            1 + (i / 60) % 28,
+            (i / 60) % 60,
+            i % 60
+        )),
     );
     m
 }
@@ -86,14 +94,20 @@ fn corpus() -> (Graph, Vec<BTreeMap<String, Value>>) {
     for u in 0..9i64 {
         let mut m = BTreeMap::new();
         m.insert("id".into(), s(&format!("u{u}")));
-        users.insert(format!("u{u}"), g.create_node(&["User".into()], &m).expect("user"));
+        users.insert(
+            format!("u{u}"),
+            g.create_node(&["User".into()], &m).expect("user"),
+        );
     }
     let mut items = Vec::new();
     for i in 0..600i64 {
         let props = item_props(i);
         let id = g.create_node(&["Item".into()], &props).expect("item");
-        let Some(Value::Str(u)) = props.get("userId") else { unreachable!() };
-        g.create_rel(id, "OWNED_BY", users[u.as_str()], &BTreeMap::new()).expect("owned");
+        let Some(Value::Str(u)) = props.get("userId") else {
+            unreachable!()
+        };
+        g.create_rel(id, "OWNED_BY", users[u.as_str()], &BTreeMap::new())
+            .expect("owned");
         items.push(props);
     }
     (g, items)
@@ -103,14 +117,18 @@ fn corpus() -> (Graph, Vec<BTreeMap<String, Value>>) {
 fn expected(items: &[BTreeMap<String, Value>]) -> Vec<Vec<Value>> {
     let mut mine: Vec<&BTreeMap<String, Value>> = items
         .iter()
-        .filter(|m| m.get("userId") == Some(&s("u1")) && m.get("nodeType") == Some(&s("repository")))
+        .filter(|m| {
+            m.get("userId") == Some(&s("u1")) && m.get("nodeType") == Some(&s("repository"))
+        })
         .collect();
     let created = |m: &BTreeMap<String, Value>| match &m["createdAt"] {
         Value::Str(v) => v.clone(),
         other => panic!("createdAt is a string, not {other:?}"),
     };
     mine.sort_by_key(|m| std::cmp::Reverse(created(m)));
-    mine.into_iter().map(|m| vec![Value::Map(m.clone())]).collect()
+    mine.into_iter()
+        .map(|m| vec![Value::Map(m.clone())])
+        .collect()
 }
 
 const ORIG: &str = "MATCH (n:Item {userId: $userId, nodeType: 'repository'}) \
@@ -150,7 +168,8 @@ fn b_a_where_equality_is_a_residual_as_well() {
     assert_eq!(count_of(&c, RESIDUAL), 1, "{c:?}");
     assert_eq!(count_of(&c, FULL), want.len() as u64, "{c:?}");
 
-    let unordered = "MATCH (n:Item {userId: $userId, nodeType: 'repository'}) RETURN properties(n) AS n";
+    let unordered =
+        "MATCH (n:Item {userId: $userId, nodeType: 'repository'}) RETURN properties(n) AS n";
     let mut want_any = eager(&g, unordered);
     let (mut got, c) = traced(&g, unordered);
     want_any.sort_by_key(|r| format!("{r:?}"));

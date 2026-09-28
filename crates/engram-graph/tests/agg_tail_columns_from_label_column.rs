@@ -24,7 +24,7 @@ fn params() -> BTreeMap<String, Value> {
     p.insert("s".to_string(), Value::Str("pending".to_string()));
     p.insert(
         "modes".to_string(),
-        Value::List(vec![Value::Str("push".into()), Value::Str("onboarding".into())]),
+        Value::List((vec![Value::Str("push".into()), Value::Str("onboarding".into())]).into()),
     );
     p.insert("limit".to_string(), Value::Int(25));
     p
@@ -66,14 +66,21 @@ fn paged_corpus() -> (Graph, std::path::PathBuf) {
     let g = Graph::new(Store::new(), Realm(1), Namespace(1));
     let filler = |g: &Graph, i: i64| {
         let mut f = BTreeMap::new();
-        f.insert("other".to_string(), Value::Str(format!("filler-{i}-{}", "x".repeat(40))));
+        f.insert(
+            "other".to_string(),
+            Value::Str(format!("filler-{i}-{}", "x".repeat(40))),
+        );
         g.create_node(&["Filler".into()], &f).expect("filler");
     };
     for i in 0..600i64 {
         let mut m = BTreeMap::new();
         m.insert(
             "status".to_string(),
-            Value::Str(if i % 3 == 0 { "pending".into() } else { "done".into() }),
+            Value::Str(if i % 3 == 0 {
+                "pending".into()
+            } else {
+                "done".into()
+            }),
         );
         m.insert("priority".to_string(), Value::Int(i % 7));
         m.insert("proposedAt".to_string(), Value::Int(1_000_000 - i));
@@ -84,14 +91,16 @@ fn paged_corpus() -> (Graph, std::path::PathBuf) {
             let mut am = BTreeMap::new();
             am.insert("id".to_string(), Value::Str(format!("art-{i}-{k}")));
             let a = g.create_node(&["Artifact".into()], &am).expect("artifact");
-            g.create_rel(p, "HAS_ARTIFACT", a, &BTreeMap::new()).expect("has");
+            g.create_rel(p, "HAS_ARTIFACT", a, &BTreeMap::new())
+                .expect("has");
             filler(&g, 10_000 + i * 3 + k);
         }
         if i % 2 == 0 {
             let mut rm = BTreeMap::new();
             rm.insert("id".to_string(), Value::Str(format!("repo-{}", i % 11)));
             let r = g.create_node(&["Repo".into()], &rm).expect("repo");
-            g.create_rel(p, "FOR_REPO", r, &BTreeMap::new()).expect("for");
+            g.create_rel(p, "FOR_REPO", r, &BTreeMap::new())
+                .expect("for");
             filler(&g, 20_000 + i);
         }
     }
@@ -100,14 +109,21 @@ fn paged_corpus() -> (Graph, std::path::PathBuf) {
         let mut m = BTreeMap::new();
         m.insert(
             "provider".to_string(),
-            Value::Str(if i % 4 == 0 { "github".into() } else { "lore".into() }),
+            Value::Str(if i % 4 == 0 {
+                "github".into()
+            } else {
+                "lore".into()
+            }),
         );
         if i % 3 == 0 {
             m.insert("syncMode".to_string(), Value::Str("push".into()));
         }
         m.insert("orgId".to_string(), Value::Str(format!("org-{}", i % 7)));
         m.insert("externalId".to_string(), Value::Str(format!("ext-{i:04}")));
-        m.insert("repoId".to_string(), Value::Str(format!("repo-{:04}", (i * 37) % 140)));
+        m.insert(
+            "repoId".to_string(),
+            Value::Str(format!("repo-{:04}", (i * 37) % 140)),
+        );
         repos.push(
             g.create_node(&["MRepo".into(), "ManagedRepo".into()], &m)
                 .expect("mrepo"),

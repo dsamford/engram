@@ -31,7 +31,10 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
 
 fn scratch(tag: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("engram-tombstone-trigger-{}-{tag}", std::process::id()));
+    p.push(format!(
+        "engram-tombstone-trigger-{}-{tag}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&p);
     std::fs::create_dir_all(&p).expect("scratch dir");
     p
@@ -63,7 +66,8 @@ fn serve_with(dir: &std::path::Path, cfg: ServerConfig) -> u16 {
 /// Create then delete, so the sealed set fills with tombstones.
 fn churn(c: &mut Client, rounds: u64) {
     for i in 0..rounds {
-        c.run(&format!("CREATE (:Churned {{k: {i}}})")).expect("create");
+        c.run(&format!("CREATE (:Churned {{k: {i}}})"))
+            .expect("create");
         c.run(&format!("MATCH (n:Churned {{k: {i}}}) DELETE n"))
             .expect("delete");
     }

@@ -34,13 +34,24 @@ fn g() -> Graph {
     let a3 = node("A", &[("name", "a3")]);
     let b1 = node(
         "B",
-        &[("title", "t1"), ("status", "live"), ("body", "a long body nobody reads")],
+        &[
+            ("title", "t1"),
+            ("status", "live"),
+            ("body", "a long body nobody reads"),
+        ],
     );
     let b2 = node(
         "B",
-        &[("title", "t2"), ("status", "live"), ("body", "another long body")],
+        &[
+            ("title", "t2"),
+            ("status", "live"),
+            ("body", "another long body"),
+        ],
     );
-    let b3 = node("B", &[("title", "t3"), ("status", "stale"), ("body", "stale body")]);
+    let b3 = node(
+        "B",
+        &[("title", "t3"), ("status", "stale"), ("body", "stale body")],
+    );
     for (a, b) in [(a1, b1), (a2, b1), (a3, b1), (a1, b2), (a2, b3)] {
         g.create_rel(a, "R", b, &BTreeMap::new()).expect("rel");
     }
@@ -65,7 +76,11 @@ fn traced(g: &Graph, src: &str) -> (u64, u64, Vec<Vec<Value>>) {
     // These shapes must be on the STREAMING path for the claim to be about
     // the stage planner at all — a bare one-hop group-by takes the columnar
     // aggregate, which has its own materialisation rules.
-    let mut fired: Vec<String> = trace.sometimes_hit().iter().map(|s| s.to_string()).collect();
+    let mut fired: Vec<String> = trace
+        .sometimes_hit()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     fired.sort();
     assert!(
         trace
@@ -103,7 +118,10 @@ fn the_story_shape_reads_two_properties_and_decodes_no_node_in_full() {
         vec![vec![s("t1"), Value::Int(3)], vec![s("t2"), Value::Int(1)]],
         "rows"
     );
-    assert!(narrowed >= 1, "the WITH must have demanded only the later-read properties");
+    assert!(
+        narrowed >= 1,
+        "the WITH must have demanded only the later-read properties"
+    );
     assert_eq!(mats, 0, "no grouped node may be decoded in full: {mats}");
 }
 
@@ -130,7 +148,10 @@ fn an_optional_match_endpoint_after_the_with_is_an_identity_use() {
             vec![s("t2"), s("live"), Value::Int(1)],
         ]
     );
-    assert!(narrowed >= 1, "the endpoint use must not widen the demand to the full node");
+    assert!(
+        narrowed >= 1,
+        "the endpoint use must not widen the demand to the full node"
+    );
     assert_eq!(mats, 0, "no B may be decoded in full: {mats}");
     // An endpoint that RESTATES a props map on the carried name is a
     // whole-entity use and keeps the full node — the narrowing must not fire.
@@ -139,8 +160,14 @@ fn an_optional_match_endpoint_after_the_with_is_an_identity_use() {
          OPTIONAL MATCH (b {status: 'live'})<-[:R]-(a:A) \
          RETURN b.title AS title, count(a) AS fans ORDER BY title";
     let (narrowed, _, out) = traced(&g, restated);
-    assert_eq!(out, vec![vec![s("t1"), Value::Int(3)], vec![s("t2"), Value::Int(1)]]);
-    assert_eq!(narrowed, 0, "a restated map on the endpoint is a whole-entity use");
+    assert_eq!(
+        out,
+        vec![vec![s("t1"), Value::Int(3)], vec![s("t2"), Value::Int(1)]]
+    );
+    assert_eq!(
+        narrowed, 0,
+        "a restated map on the endpoint is a whole-entity use"
+    );
 }
 
 /// `RETURN count(s)` after the WITH is a presence-level use (the same rule
@@ -156,7 +183,10 @@ fn a_later_count_of_the_node_is_presence_only() {
          RETURN count(b) AS c",
     );
     assert_eq!(out, vec![vec![Value::Int(2)]]);
-    assert!(narrowed >= 1, "count(b) reads no property and needs no full node");
+    assert!(
+        narrowed >= 1,
+        "count(b) reads no property and needs no full node"
+    );
     assert_eq!(mats, 0);
 }
 
@@ -196,7 +226,10 @@ fn an_alias_is_narrowed_under_its_new_name() {
             vec![s("t3"), s("stale"), Value::Int(1)],
         ]
     );
-    assert!(narrowed >= 1, "the alias is the name the later clauses read");
+    assert!(
+        narrowed >= 1,
+        "the alias is the name the later clauses read"
+    );
     assert_eq!(mats, 0);
 }
 
@@ -215,8 +248,16 @@ fn a_bare_later_use_keeps_the_full_node() {
     let Value::Node { props, .. } = &out[0][0] else {
         panic!("a node");
     };
-    assert_eq!(props.get("body").map(|v| v == &s("a long body nobody reads")), Some(true));
-    assert_eq!(narrowed, 0, "a bare RETURN of the node is a whole-entity use");
+    assert_eq!(
+        props
+            .get("body")
+            .map(|v| v == &s("a long body nobody reads")),
+        Some(true)
+    );
+    assert_eq!(
+        narrowed, 0,
+        "a bare RETURN of the node is a whole-entity use"
+    );
     assert!(mats >= 1);
 }
 
@@ -241,6 +282,9 @@ fn a_pattern_reusing_the_name_as_a_bare_endpoint_still_narrows() {
             vec![s("t3"), Value::Int(1)],
         ]
     );
-    assert!(narrowed >= 1, "a bare endpoint reuse reads nothing of the node");
+    assert!(
+        narrowed >= 1,
+        "a bare endpoint reuse reads nothing of the node"
+    );
     assert_eq!(mats, 0, "no B may be decoded in full: {mats}");
 }

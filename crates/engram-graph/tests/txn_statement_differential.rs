@@ -94,7 +94,10 @@ fn every_write_statement_answers_identically_direct_and_inside_a_transaction() {
     for (i, stmt) in CORPUS.iter().enumerate() {
         let ra = direct(&a, stmt);
         let rb = in_txn(&b, stmt);
-        assert_eq!(ra, rb, "statement {i} answered differently inside a transaction:\n{stmt}");
+        assert_eq!(
+            ra, rb,
+            "statement {i} answered differently inside a transaction:\n{stmt}"
+        );
         assert_eq!(
             fingerprint(&a),
             fingerprint(&b),

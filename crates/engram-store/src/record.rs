@@ -205,6 +205,81 @@ impl Record {
     }
 }
 
+/// A BORROWED walk over an encoded record: `(id, tagged value)` slices in
+/// record order, no copy. [`Record::decode`] copies every value into a map
+/// before a caller can look at one; a full node decode, which only turns
+/// each value into its own type, walks the buffer once instead (12.7 µs of
+/// a 32-property record's decode on the record-decode bench was two maps
+/// and ~96 allocations). The structural checks are `decode`'s: a truncated
+/// buffer or an unskippable value is an `Err` item, trailing bytes are
+/// [`RecordWalk::finish`]'s error, and a duplicate id is the consumer's to
+/// reject — its own map sees the second insert.
+pub struct RecordWalk<'a> {
+    buf: &'a [u8],
+    at: usize,
+    left: usize,
+    failed: bool,
+}
+
+impl<'a> RecordWalk<'a> {
+    /// Start the walk: the property count from the header.
+    pub fn new(buf: &'a [u8]) -> Result<Self, RecordError> {
+        let count = u32::from_le_bytes(
+            buf.get(0..4)
+                .ok_or(RecordError::Truncated { at: 0 })?
+                .try_into()
+                .expect("4 bytes"),
+        ) as usize;
+        Ok(Self {
+            buf,
+            at: 4,
+            left: count,
+            failed: false,
+        })
+    }
+
+    /// How many properties the header still promises.
+    pub fn remaining(&self) -> usize {
+        self.left
+    }
+
+    /// After the last item: the count and the content must agree exactly
+    /// as [`Record::decode`] demands (trailing bytes are a `Truncated`).
+    pub fn finish(&self) -> Result<(), RecordError> {
+        if self.failed || self.left != 0 || self.at != self.buf.len() {
+            return Err(RecordError::Truncated { at: self.at });
+        }
+        Ok(())
+    }
+}
+
+impl<'a> Iterator for RecordWalk<'a> {
+    type Item = Result<(PropertyId, &'a [u8]), RecordError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.left == 0 || self.failed {
+            return None;
+        }
+        let at = self.at;
+        let Some(id_bytes) = self.buf.get(at..at + 4) else {
+            self.failed = true;
+            return Some(Err(RecordError::Truncated { at }));
+        };
+        let id = u32::from_le_bytes(id_bytes.try_into().expect("4 bytes"));
+        let value_at = at + 4;
+        let Some(len) = skip_value(&self.buf[value_at..]) else {
+            self.failed = true;
+            return Some(Err(RecordError::UnskippableValue {
+                property: PropertyId(id),
+                at: value_at,
+            }));
+        };
+        self.at = value_at + len;
+        self.left -= 1;
+        Some(Ok((PropertyId(id), &self.buf[value_at..value_at + len])))
+    }
+}
+
 /// Read ONE property from an encoded record without decoding the rest.
 ///
 /// The skip rule's payoff: a point read of one property walks tag bytes and
@@ -222,6 +297,106 @@ pub fn get_property(buf: &[u8], id: PropertyId) -> Option<Vec<u8>> {
         at += len;
     }
     None
+}
+
+#[cfg(test)]
+mod walk_tests {
+    use super::{PropertyId, Record, RecordError, RecordWalk};
+
+    fn int64(v: i64) -> Vec<u8> {
+        let mut out = vec![0x03];
+        out.extend_from_slice(&v.to_le_bytes());
+        out
+    }
+    fn string(s: &str) -> Vec<u8> {
+        let mut out = vec![0x05];
+        out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        out.extend_from_slice(s.as_bytes());
+        out
+    }
+    fn wide() -> Record {
+        let mut r = Record::new();
+        for id in 0..40u32 {
+            let v = if id % 7 == 0 {
+                int64(id as i64)
+            } else {
+                string(&"x".repeat(1 + (id as usize % 13)))
+            };
+            r.set(PropertyId(id), v);
+        }
+        r
+    }
+
+    /// Fix 98: the walk yields exactly `decode`'s properties, in record
+    /// order, as borrowed slices — and `finish` accepts the whole buffer.
+    #[test]
+    fn the_walk_yields_decodes_properties_in_order() {
+        let r = wide();
+        let buf = r.encode();
+        let mut walk = RecordWalk::new(&buf).expect("header");
+        assert_eq!(walk.remaining(), 40);
+        let mut got = Vec::new();
+        for item in &mut walk {
+            let (id, v) = item.expect("item");
+            got.push((id, v.to_vec()));
+        }
+        walk.finish().expect("exact");
+        let want: Vec<(PropertyId, Vec<u8>)> = Record::decode(&buf)
+            .expect("decode")
+            .iter()
+            .map(|(id, v)| (id, v.to_vec()))
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    /// The buffers `decode` rejects: truncated inside a header, an
+    /// unskippable value, trailing bytes after the count.
+    #[test]
+    fn the_walk_reports_what_decode_rejects() {
+        let buf = wide().encode();
+        // Truncated: cut inside the third property's header (property 0 is
+        // 4 + 9 bytes, property 1 is 4 + 7 — a two-character string).
+        let cut = &buf[..4 + 13 + 11 + 2];
+        let mut walk = RecordWalk::new(cut).expect("header");
+        let mut items = 0;
+        let mut err = None;
+        for item in &mut walk {
+            match item {
+                Ok(_) => items += 1,
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        assert_eq!(items, 2);
+        assert!(
+            matches!(err, Some(RecordError::Truncated { .. })),
+            "{err:?}"
+        );
+        assert!(walk.finish().is_err());
+        assert!(Record::decode(cut).is_err());
+        // Trailing bytes: the count says 40, the buffer holds one more.
+        let mut long = buf.clone();
+        long.extend_from_slice(&int64(7));
+        let mut walk = RecordWalk::new(&long).expect("header");
+        assert_eq!((&mut walk).filter(|i| i.is_ok()).count(), 40);
+        assert!(matches!(walk.finish(), Err(RecordError::Truncated { .. })));
+        assert!(Record::decode(&long).is_err());
+        // Unskippable: the second property's string claims a length past
+        // the buffer (its header is at 17, its tag at 21, its length at 22).
+        let mut bad = buf.clone();
+        bad[22..26].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut walk = RecordWalk::new(&bad).expect("header");
+        assert!(walk.next().expect("first").is_ok());
+        assert!(matches!(
+            walk.next(),
+            Some(Err(RecordError::UnskippableValue { .. }))
+        ));
+        assert!(walk.next().is_none());
+        assert!(walk.finish().is_err());
+        assert!(Record::decode(&bad).is_err());
+    }
 }
 
 #[cfg(test)]
@@ -263,9 +438,19 @@ mod projected_tests {
         let r = wide();
         let bytes = r.encode();
         let full = Record::decode(&bytes).expect("full");
-        for want in [vec![], vec![3u32], vec![0, 39], vec![5, 6, 7, 99], (0..40).collect::<Vec<_>>()] {
+        for want in [
+            vec![],
+            vec![3u32],
+            vec![0, 39],
+            vec![5, 6, 7, 99],
+            (0..40).collect::<Vec<_>>(),
+        ] {
             let p = Record::decode_projected(&bytes, &want).expect("projected");
-            assert_eq!(p.len(), want.iter().filter(|w| **w < 40).count(), "count for {want:?}");
+            assert_eq!(
+                p.len(),
+                want.iter().filter(|w| **w < 40).count(),
+                "count for {want:?}"
+            );
             for (pid, tagged) in p.iter() {
                 assert!(want.contains(&pid.0), "unwanted {pid:?} came back");
                 assert_eq!(Some(tagged), full.get(pid), "bytes of {pid:?}");
@@ -283,14 +468,18 @@ mod projected_tests {
         // header is "truncated" — the projected read must agree either way.
         let same = |buf: &[u8], want: &[u32]| {
             let full = Record::decode(buf).expect_err("the full decode must refuse");
-            let proj = Record::decode_projected(buf, want).expect_err("the projected decode must refuse");
+            let proj =
+                Record::decode_projected(buf, want).expect_err("the projected decode must refuse");
             assert_eq!(full, proj, "refusals differ for want={want:?}");
             full
         };
         // Truncated inside the last value, and inside a header.
         same(&bytes[..bytes.len() - 5], &[3]);
         same(&bytes[..bytes.len() - 5], &[39]);
-        assert!(matches!(same(&bytes[..6], &[0]), RecordError::Truncated { .. }));
+        assert!(matches!(
+            same(&bytes[..6], &[0]),
+            RecordError::Truncated { .. }
+        ));
         // Trailing bytes.
         let mut long = bytes.clone();
         long.push(0);
@@ -303,8 +492,17 @@ mod projected_tests {
         let entry = enc[4..].to_vec();
         enc.extend_from_slice(&entry);
         enc[0..4].copy_from_slice(&2u32.to_le_bytes());
-        assert!(matches!(Record::decode(&enc), Err(RecordError::DuplicateProperty(_))));
-        assert!(matches!(Record::decode_projected(&enc, &[1]), Err(RecordError::DuplicateProperty(_))));
-        assert!(matches!(Record::decode_projected(&enc, &[9]), Err(RecordError::DuplicateProperty(_))));
+        assert!(matches!(
+            Record::decode(&enc),
+            Err(RecordError::DuplicateProperty(_))
+        ));
+        assert!(matches!(
+            Record::decode_projected(&enc, &[1]),
+            Err(RecordError::DuplicateProperty(_))
+        ));
+        assert!(matches!(
+            Record::decode_projected(&enc, &[9]),
+            Err(RecordError::DuplicateProperty(_))
+        ));
     }
 }

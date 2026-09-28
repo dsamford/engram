@@ -83,8 +83,10 @@ fn properties_lost(addr: &str) -> usize {
     let last = PER - 1;
     (0..CLIENTS)
         .filter(|ci| {
-            c.run(&format!("MATCH (n:Hot {{k: 0}}) WHERE n.p{ci} = {last} RETURN n"))
-                .expect("read")
+            c.run(&format!(
+                "MATCH (n:Hot {{k: 0}}) WHERE n.p{ci} = {last} RETURN n"
+            ))
+            .expect("read")
                 != 1
         })
         .count()
@@ -171,7 +173,8 @@ fn increments(addr: &str) -> (u64, u64) {
 fn concurrent_autocommit_increments_of_one_node_all_land() {
     let (acked, hits) = increments(&start(WORKERS));
     assert_eq!(
-        hits, acked,
+        hits,
+        acked,
         "{acked} increments were acknowledged but the node holds {hits}: \
          {} update(s) LOST to a concurrent read-modify-write",
         acked - hits

@@ -1,5 +1,8 @@
 # Build output
 /target
+# Alternate target directories (`--target-dir etarget-*`) and scratch space.
+/etarget-*/
+/tmp/
 **/*.rs.bk
 *.pdb
 
@@ -25,6 +28,7 @@
 # Benchmark binaries built for the measurement host, kept beside their results.
 /portbench-v*
 /measurements/pod/*-new
+/measurements/pod/*/*-new
 /measurements/pod/engram-server-v*
 /measurements/pod/*-v[0-9]*
 

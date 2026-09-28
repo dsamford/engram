@@ -132,7 +132,11 @@ fn a_paged_bare_carry_runs_on_the_stage_and_hydrates_its_page() {
         assert_eq!(r[1], Value::Int(project(i)));
     }
     assert!(count_of(&c, STAGES) >= 1, "the stage claimed it: {c:?}");
-    assert_eq!(count_of(&c, HYDRATED), 10, "one hydration per survivor: {c:?}");
+    assert_eq!(
+        count_of(&c, HYDRATED),
+        10,
+        "one hydration per survivor: {c:?}"
+    );
     assert!(count_of(&c, FULL) <= 10 + 4, "{c:?}");
     assert_eq!(ints(&general(&g, PAGED_HOP)), want, "general path");
 }

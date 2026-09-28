@@ -37,7 +37,7 @@ fn params() -> BTreeMap<String, Value> {
     let mut params = BTreeMap::new();
     params.insert(
         "ids".to_string(),
-        Value::List(vec![Value::Str("b".into()), Value::Str("c".into())]),
+        Value::List((vec![Value::Str("b".into()), Value::Str("c".into())]).into()),
     );
     params
 }

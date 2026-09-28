@@ -56,12 +56,22 @@ fn corpus() -> Graph {
         }
         let mut m = BTreeMap::new();
         m.insert("articleId".to_string(), Value::Str(format!("ka-{i:03}")));
-        m.insert("abuseStatus".to_string(), Value::Str(statuses[(i % 4) as usize].into()));
+        m.insert(
+            "abuseStatus".to_string(),
+            Value::Str(statuses[(i % 4) as usize].into()),
+        );
         m.insert(
             "abuseStatusUpdatedAt".to_string(),
             Value::Str(format!("2026-08-{:02}T00:00:00Z", 1 + (i % 28))),
         );
-        m.insert("kind".to_string(), Value::Str(if i % 3 == 0 { "guide".into() } else { "note".into() }));
+        m.insert(
+            "kind".to_string(),
+            Value::Str(if i % 3 == 0 {
+                "guide".into()
+            } else {
+                "note".into()
+            }),
+        );
         g.create_node(&labels, &m).expect("article");
         for k in 0..40i64 {
             let mut f = BTreeMap::new();

@@ -12,8 +12,9 @@ serving path calls them**:
 
 Verified rather than assumed: `engram_crypto::`, `engram_objstore::`,
 `engram_blob::` and `engram_exec::` appear **nowhere** in `engram-graph`,
-`engram-server` or `engram-bolt`. Only `engram-sim` and their own tests
-reference them.
+`engram-server` or `engram-bolt`. What does reference them is `engram-sim`,
+their own tests, and each other: `engram-blob` and `engram-objstore` both seal
+through `engram-crypto`, which is the design described below.
 
 **Do not read their presence as a shipped feature.** This page exists so that
 nobody does.

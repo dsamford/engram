@@ -67,7 +67,10 @@ fn corpus(declare: bool, per_prefix: usize) -> Graph {
     let g = Graph::new(Store::new(), Realm(1), Namespace(1));
     g.set_label_scoped_indexes(true);
     if declare {
-        ddl(&g, "CREATE INDEX ev_id IF NOT EXISTS FOR (n:Ev) ON (n.eventId)");
+        ddl(
+            &g,
+            "CREATE INDEX ev_id IF NOT EXISTS FOR (n:Ev) ON (n.eventId)",
+        );
     }
     for i in 0..4000i64 {
         let mut m = BTreeMap::new();
@@ -81,7 +84,10 @@ fn corpus(declare: bool, per_prefix: usize) -> Graph {
             }),
         );
         if i % 7 != 0 {
-            m.insert("startAt".to_string(), Value::Str(format!("2026-08-{:02}", 1 + i % 28)));
+            m.insert(
+                "startAt".to_string(),
+                Value::Str(format!("2026-08-{:02}", 1 + i % 28)),
+            );
         }
         m.insert("sev".to_string(), Value::Float((i % 10) as f64 / 10.0));
         g.create_node(&["Ev".into()], &m).expect("ev");
@@ -89,11 +95,10 @@ fn corpus(declare: bool, per_prefix: usize) -> Graph {
     g
 }
 
-const COUNT: &str =
-    "MATCH (e:Ev) WHERE e.eventId STARTS WITH 'edgar-8k-' AND e.startAt IS NOT NULL AND e.startAt >= $since RETURN count(e) AS n";
-const COUNT_PARAM: &str = "MATCH (e:Ev) WHERE e.eventId STARTS WITH $pre AND e.sev >= 0.5 RETURN count(e) AS n";
-const PROJECT: &str =
-    "MATCH (e:Ev) WHERE e.eventId STARTS WITH 'edgar-8k-00' RETURN e.eventId AS id ORDER BY id LIMIT 5";
+const COUNT: &str = "MATCH (e:Ev) WHERE e.eventId STARTS WITH 'edgar-8k-' AND e.startAt IS NOT NULL AND e.startAt >= $since RETURN count(e) AS n";
+const COUNT_PARAM: &str =
+    "MATCH (e:Ev) WHERE e.eventId STARTS WITH $pre AND e.sev >= 0.5 RETURN count(e) AS n";
+const PROJECT: &str = "MATCH (e:Ev) WHERE e.eventId STARTS WITH 'edgar-8k-00' RETURN e.eventId AS id ORDER BY id LIMIT 5";
 
 #[test]
 fn a_declared_key_seeks_the_prefix_and_agrees() {
@@ -101,7 +106,10 @@ fn a_declared_key_seeks_the_prefix_and_agrees() {
     for src in [COUNT, COUNT_PARAM, PROJECT] {
         let (on, off) = both(&g, src);
         assert_eq!(on, off, "seek vs walk disagree on `{src}`");
-        assert!(counter(&g, src, PREFIX) > 0, "`{src}` must probe the declared prefix");
+        assert!(
+            counter(&g, src, PREFIX) > 0,
+            "`{src}` must probe the declared prefix"
+        );
         assert!(counter(&g, src, PROBES) > 0);
     }
     // Fixture sanity: i % 4 == 0, i % 7 != 0, day >= 20 → i % 28 >= 19.
@@ -119,7 +127,11 @@ fn a_prefix_wider_than_the_per_id_cap_is_walked_over_the_seek() {
     // Half the label does not halve it: the walk seek must DECLINE here…
     let (on, off) = both(&g, COUNT_PARAM);
     assert_eq!(on, off);
-    assert_eq!(counter(&g, COUNT_PARAM, WALKED), 0, "half the label is no reduction");
+    assert_eq!(
+        counter(&g, COUNT_PARAM, WALKED),
+        0,
+        "half the label is no reduction"
+    );
     // …and a third of it is taken.
     let g = corpus(true, 3); // 1,334 prefixed: past the per-id cap? no (< 2,048): it is per-id sought
     let (on, off) = both(&g, COUNT_PARAM);
@@ -129,12 +141,19 @@ fn a_prefix_wider_than_the_per_id_cap_is_walked_over_the_seek() {
     // shrink the label's cap by ADDING nodes: 6,000 nodes at 40% = 2,400 > 2,048.
     let g = Graph::new(Store::new(), Realm(1), Namespace(1));
     g.set_label_scoped_indexes(true);
-    ddl(&g, "CREATE INDEX ev_id IF NOT EXISTS FOR (n:Ev) ON (n.eventId)");
+    ddl(
+        &g,
+        "CREATE INDEX ev_id IF NOT EXISTS FOR (n:Ev) ON (n.eventId)",
+    );
     for i in 0..6000i64 {
         let mut m = BTreeMap::new();
         m.insert(
             "eventId".to_string(),
-            Value::Str(if i % 5 < 2 { format!("edgar-8k-{i:06}") } else { format!("other-{i:06}") }),
+            Value::Str(if i % 5 < 2 {
+                format!("edgar-8k-{i:06}")
+            } else {
+                format!("other-{i:06}")
+            }),
         );
         m.insert("sev".to_string(), Value::Float((i % 10) as f64 / 10.0));
         g.create_node(&["Ev".into()], &m).expect("ev");
@@ -156,7 +175,9 @@ fn a_prefix_wider_than_the_per_id_cap_is_walked_over_the_seek() {
     assert_eq!(on, off);
     assert_eq!(
         on,
-        vec![vec![Value::Int((0..6000i64).filter(|i| i % 5 < 2 && i % 10 >= 5).count() as i64)]]
+        vec![vec![Value::Int(
+            (0..6000i64).filter(|i| i % 5 < 2 && i % 10 >= 5).count() as i64
+        )]]
     );
 }
 
@@ -173,7 +194,10 @@ fn an_undeclared_key_is_not_prefix_probed_but_the_operator_vectorises() {
     let src = "MATCH (e:Ev) WHERE e.eventId STARTS WITH 'edgar-8k-' AND e.eventId ENDS WITH '0' AND NOT e.eventId CONTAINS '9' RETURN count(e) AS n";
     let first = rows(&g, src); // keeps the column
     assert_eq!(rows(&g, src), first);
-    assert!(counter(&g, src, VECTORISED) > 0, "STARTS/ENDS WITH and CONTAINS vectorise");
+    assert!(
+        counter(&g, src, VECTORISED) > 0,
+        "STARTS/ENDS WITH and CONTAINS vectorise"
+    );
     assert_eq!(
         first,
         vec![vec![Value::Int(

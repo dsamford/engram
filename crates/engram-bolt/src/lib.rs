@@ -5,9 +5,14 @@
 pub mod client;
 pub mod packstream;
 pub mod server;
+pub mod serving;
 
 pub use packstream::{Decoder, Pack, PackError, decode_value, encode_value};
-pub use server::{BoltServer, GraphResolver, MAX_MESSAGE_BYTES, TRACE_MARKER, WireError};
+pub use serving::{SERVING_KEY, ServingHint};
+pub use server::{
+    BoltServer, GraphResolver, MAX_MESSAGE_BYTES, TRACE_MARKER, WireError, set_resident_cache_probe,
+    set_wall_clock_probe,
+};
 
 /// Production-visible counters (the `engram_log::FSYNCS` pattern): plain
 /// global atomics, because the `counted!` trace is thread-local and only
@@ -19,6 +24,15 @@ pub mod counters {
 
     /// Autocommit statements re-run after an OCC conflict (one per re-run).
     pub static AUTOCOMMIT_RERUNS: AtomicU64 = AtomicU64::new(0);
+    /// Statements that carried the trace marker and were traced, because the
+    /// operator permits it. Process-wide rather than a `counted!` alone, since
+    /// a traced statement runs inside its own trace and a caller's trace
+    /// cannot see what was recorded around it.
+    pub static TRACE_MARKER_HONOURED: AtomicU64 = AtomicU64::new(0);
+    /// Statements that carried the trace marker and were NOT traced, because
+    /// the operator did not permit it — the number that tells an operator who
+    /// expected a trace why the log has none (security plan §2.13).
+    pub static TRACE_MARKER_IGNORED: AtomicU64 = AtomicU64::new(0);
     /// Successful autocommit WRITE statements bucketed by the attempt that
     /// won: `[1, 2, 3–4, 5–8, 9+]`. The distribution, not just a total —
     /// a healthy hot key wins at 1–2; a retry storm lives in the top bucket.
@@ -122,13 +136,20 @@ impl Subsystem for BoltWire {
             .sometimes("bolt.ignored a message while failed")
             .sometimes("bolt.explicit transaction opened")
             .sometimes("bolt.rolled back a transaction")
+            .sometimes("bolt.logoff rolled back an open transaction")
             .sometimes("bolt.sent a failure")
+            .counter("bolt.trace marker honoured")
+            .counter("bolt.trace marker ignored: tracing not permitted")
             .counter("bolt.sessions negotiated")
             .counter("bolt.sessions negotiated through the manifest")
             .counter("bolt.manifest offered")
             .counter("bolt.statements run")
             .counter("bolt.statements that grew the resident set")
             .counter("bolt.records streamed")
+            .counter("bolt.record re-chunked past one chunk")
+            // The client's, not the server's: a zero-length chunk read while
+            // no message has begun is a peer's keep-alive, not a message.
+            .counter("bolt.client skipped a keep-alive NOOP chunk")
             .gate(
                 Gate::new(
                     "the manifest is answered with the whole offer, and only an offered pick negotiates",
@@ -151,6 +172,18 @@ impl Subsystem for BoltWire {
                 Gate::new(
                     "the failure protocol IGNOREs until RESET",
                     Canary::new("keep answering after a failure and assert the post-failure RUN is not IGNORED"),
+                ),
+            )
+            .gate(
+                Gate::new(
+                    "LOGOFF leaves nothing of the previous principal on the connection",
+                    Canary::new("keep the streams and the transaction across LOGOFF and assert the next LOGON pulls the previous principal's rows and commits its buffered write"),
+                ),
+            )
+            .gate(
+                Gate::new(
+                    "the per-statement trace marker is honoured only when the operator permits it",
+                    Canary::new("honour the marker regardless of the permission and assert an unpermitted server counts it honoured"),
                 ),
             )
             .gate(

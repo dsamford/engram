@@ -74,7 +74,9 @@ fn stmt(g: &Graph, src: &str) {
     let txn = g.open_txn();
     let (txn, r) = g.with_txn(txn, || run_query(g, &q, BTreeMap::new()));
     match r {
-        Ok(_) => g.commit_owned(txn).unwrap_or_else(|e| panic!("commit {src}: {e:?}")),
+        Ok(_) => g
+            .commit_owned(txn)
+            .unwrap_or_else(|e| panic!("commit {src}: {e:?}")),
         Err(e) => {
             g.rollback_owned(txn);
             panic!("run {src}: {e:?}");
@@ -136,10 +138,7 @@ fn build(g: &Graph, s: &Store) {
     // an established flag from an assumed one. The hub already has :R edges to
     // high peers; a :S edge back to a LOW peer sorts after them by type and
     // before them by peer, so the untyped O table's hub row is non-monotone.
-    stmt(
-        g,
-        "MATCH (a:P {id: 0}), (b:P {id: 1}) CREATE (a)-[:S]->(b)",
-    );
+    stmt(g, "MATCH (a:P {id: 0}), (b:P {id: 1}) CREATE (a)-[:S]->(b)");
     s.seal();
     // Deletes: tombstones for the merge to drop, and holes in the membership.
     for i in [3i64, 7, 11] {
@@ -318,7 +317,10 @@ fn an_emitted_csr_is_byte_identical_to_a_built_one() {
             on.offsets, off.offsets,
             "[{n_on}] offsets must be byte-identical, not merely equivalent"
         );
-        assert_eq!(on.entries, off.entries, "[{n_on}] entries must be byte-identical");
+        assert_eq!(
+            on.entries, off.entries,
+            "[{n_on}] entries must be byte-identical"
+        );
         assert_eq!(
             on.sorted_by_peer, off.sorted_by_peer,
             "[{n_on}] the sorted claim is what a binary search over a row \

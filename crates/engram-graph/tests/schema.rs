@@ -264,7 +264,10 @@ fn unknown_procedures_still_refuse_by_name() {
     // `db.labels` was the specimen until R-5 implemented it (see
     // tests/introspection_procedures.rs); the property — unsupported
     // procedures refuse and the refusal NAMES the procedure — is unchanged.
-    match try_run(&g, "CALL db.schema.visualization() YIELD nodes RETURN nodes") {
+    match try_run(
+        &g,
+        "CALL db.schema.visualization() YIELD nodes RETURN nodes",
+    ) {
         Err(RunError::Unsupported(w)) => assert!(w.contains("db.schema.visualization")),
         other => panic!("expected the named refusal, got {other:?}"),
     }

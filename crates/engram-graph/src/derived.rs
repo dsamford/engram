@@ -8,7 +8,10 @@
 //!
 //! # The defect this module exists to end
 //!
-//! Six times in one day the same defect was found in six different caches:
+//! Six times in one day the same defect was found in six different caches,
+//! and three times since — in a test that was watching for it, in a lever
+//! nothing could reach, and in a benchmark too short to see the event it was
+//! run to measure:
 //!
 //! 1. **Validity keyed on the wrong clock.** A cache compared its build clock
 //!    to the store's GLOBAL commit clock, which every write advances — so a
@@ -25,6 +28,102 @@
 //!    and lose a row — a correctness fault, reachable.
 //!
 //! Every one was fixed as a special case, and the next cache had it again.
+//!
+//! There is a fourth, and it is the one this list did not warn about: **a
+//! SCOPED structure has more than one source, and its currency test must read
+//! them all.** A trigram index built over a label's members, keyed on the
+//! indexed property's epoch, was judged current after `SET n:File` — the node
+//! joined the label, no property was written, and every text predicate
+//! silently omitted the row. The guard existed, was checked, and measured the
+//! wrong quantity, which is worse than a missing guard because a missing guard
+//! gets noticed. A structure derived from N sources needs the newest of N
+//! epochs, and a change to a source the log cannot express forces a rebuild
+//! rather than a catch-up.
+//!
+//! And a fifth, which is the same defect wearing different clothes: **an
+//! estimate that is safe where it feeds a BUDGET is not safe where it meets a
+//! THRESHOLD.** A cheap upper bound consumed as `min(cost, share)` costs at
+//! worst a smaller slice; the same bound compared against a ceiling FLIPS the
+//! decision, and a repair that was always taken becomes a decline. Which
+//! consumers a number has is a grep, not a memory — and the reverse holds too:
+//! moving a decision onto a cheap estimate is sound exactly when its consumer
+//! is a comparison rather than a ceiling.
+//!
+//! Every one of these is the same sentence: THE GUARD EXISTED, WAS CHECKED,
+//! AND MEASURED THE WRONG QUANTITY. That is worse than a missing guard,
+//! because a missing guard gets noticed.
+//!
+//! And a sixth, which is that sentence turned on the TESTS rather than on the
+//! guards: **a differential is evidence only once the path it compares has
+//! been shown to run, and its inputs to tell the two arms apart.** The
+//! algorithm layer's width-invariance test compared PageRank at seven widths
+//! and was green while `ScopedExec::for_each` was never called at all — the
+//! morsel arithmetic varied, the execution did not — and stayed green under a
+//! deliberately broken merge, because the corpus was regular enough that the
+//! answer was uniform and a permutation of it was itself. Green is not the
+//! property. Ask what the test would have to see to fail, then arrange for it
+//! to see it: assert the seam was crossed (from the TEST's side — a `counted!`
+//! inside a worker records onto that thread and is dropped), and assert the
+//! inputs discriminate, before believing what the comparison proves.
+//! `docs/book/src/architecture/graph-algorithms.md` works the case.
+//!
+//! There is a sharper form of that, found the hard way in the ordering test:
+//! **a PROXY metric can be silently invalidated by a change to the very
+//! mechanism it proxies for.** `order_by_peak_not_by_next_step` priced a plan
+//! by `graph.adjacency tables reused`, which tracked plan work only because
+//! every fold close probed the table once per row. The hoisted close reads one
+//! bound row per BINDING, so thousands of probes became one lookup and the
+//! counter — still counting exactly what it always counted — stopped standing
+//! for the quantity under test. The test went red about its subject while
+//! being wrong about its evidence.
+//!
+//! Note how this differs from the fourth and fifth defects: there a guard
+//! measured the wrong quantity from the start. Here the metric was right when
+//! written and was retired by a change elsewhere, silently, with no site to
+//! grep. The defence is to prefer a metric the mechanism under test CANNOT
+//! move — the fold's walk count is invariant under the hoist, because the
+//! hoist changes what a walk costs and never how many there are — and, when a
+//! differential flips after an unrelated change, to ask whether the measure
+//! still means what it meant before assuming the subject regressed.
+//!
+//! And a seventh, about the OVERLAY rather than the currency test, which is
+//! here because the FIX was wrong and the measurement said so: **before
+//! enlarging a structure to make a rare operation rarer, check what the
+//! frequent operation pays for the size.**
+//!
+//! The trigram index folds its overlay into a new base past a threshold, and
+//! that threshold is a constant inherited from the range index whose UNITS did
+//! not survive the copy — a range write contributes one overlay entry, a
+//! trigram write contributes one per distinct trigram, about a hundred. So the
+//! fold arrived a hundred times too often and each arrival rebuilt the base on
+//! a reader's thread: a 236 ms spike against a 0.9 ms median.
+//!
+//! The textbook repair is to fold at a FRACTION of the base, so O(base) work
+//! buys O(base) insertions. On a 500-pair benchmark it looked like a 63x win
+//! on the maximum. Over 5,000 pairs it measured a **5.5x median regression and
+//! 2.6x the wall time**, and was reverted. Two reasons, both invisible in the
+//! short run: a catch-up begins `self.clone()`, so the overlay is DEEP-COPIED
+//! on every stale read and a larger overlay charges the frequent operation to
+//! spare the rare one; and the large thresholds did not make the fold cheap,
+//! they meant no fold occurred within the run at all. The spike was postponed,
+//! not amortised, and would land larger.
+//!
+//! Two rules, then. Amortisation arguments assume the enlarged structure is
+//! free to carry; where it is copied per read, the assumption fails and the
+//! arithmetic inverts. And **a benchmark shorter than the period of the event
+//! it is measuring reports the event's absence as its cure** — the 500-pair
+//! run was not weak evidence for the fraction, it was evidence for the
+//! opposite, read backwards.
+//!
+//! What did fix it was making the fold CHEAP rather than RARE — merge the two
+//! already-ordered inputs instead of re-sorting their concatenation, and share
+//! a document's key across its entries behind an `Arc` so rebuilding the base
+//! is a refcount bump per entry rather than a heap allocation. Maximum 239 ms
+//! to 60-84 ms, and the median and the throughput improved TOO, which is the
+//! signature of removing work rather than moving it. When a change helps one
+//! metric and hurts another, that is the shape of a trade; when it helps all
+//! of them, something was simply being wasted.
+//!
 //! This module is the general case. A derived structure is:
 //!
 //! - **a [`ChangeLog`]** of its source — append-only, stamped with the commit
@@ -42,8 +141,10 @@
 //!   so N workers that miss at once on the same structure do one rebuild,
 //!   not N, and a build of one structure never holds up a builder of another.
 //! - a snapshot that applies a delta in **O(delta)**, not O(base) — a shared
-//!   immutable base plus a small overlay, folded on a threshold
-//!   ([`MembersView`] is the reference implementation for id sets).
+//!   immutable base plus a SMALL overlay, folded on a threshold sized by what
+//!   the overlay costs to carry rather than by what the fold costs to run
+//!   (the seventh defect above; [`MembersView`] is the reference
+//!   implementation for id sets).
 //!
 //! # The reader protocol
 //!
@@ -302,14 +403,50 @@ impl<E> ChangeLog<E> {
         self.epoch
     }
 
+    /// Widen the cap to `cap` — never narrow it.
+    ///
+    /// Fix 88b. A log is worth keeping while it is cheaper than the rebuild
+    /// it prevents, so a consumer that would rebuild from N records asks for
+    /// a cap proportional to N (`Graph::widen_prop_log`). With the default
+    /// cap alone, fix 88 bounded WHO pays at the cap but not how much: on the
+    /// SF1 sweep the `Message.id` index sat idle through two write-only
+    /// levels (~118k id-writes in 40 s), fell below the halved log's floor,
+    /// and its next probe rebuilt from 3,055,775 records — 3.5 s on the
+    /// first read of the level that followed, a single stalled second that
+    /// failed it. At 1/8 of the index's rows the same stretch is a catch-up.
+    pub(crate) fn widen_to(&mut self, cap: usize) {
+        if cap > self.cap {
+            self.cap = cap;
+            counted!("derived.change log widened");
+        }
+    }
+
+    /// The cap in force.
+    pub(crate) fn cap(&self) -> usize {
+        self.cap
+    }
+
     /// Record one change stamped `ts`. Returns `true` when the log was
     /// POISONED by it — see below — so the caller can retract the snapshots
     /// the entry would otherwise have been lost to.
     ///
-    /// Past `cap` pending entries the log gives up on catch-up for anything
-    /// older than now — bounded memory — and says so with the floor rather
-    /// than by silently dropping the oldest entries, which would turn a
-    /// catch-up into a snapshot missing rows.
+    /// Past `cap` pending entries the OLDEST HALF is dropped and the floor
+    /// rises to the last dropped stamp — bounded memory, said with the
+    /// floor: a snapshot stamped inside the kept half still catches up, one
+    /// older than it rebuilds, and nothing is dropped silently (a snapshot
+    /// below the floor is refused by `covers`, never handed a delta with a
+    /// hole in it).
+    ///
+    /// Fix 88. This used to clear the WHOLE log and set the floor to the
+    /// epoch, which stranded every snapshot — including the one a reader
+    /// had caught up a millisecond earlier. On the SF1 write-heavy sweep the
+    /// `id` log (shared by `Person.id` and `Message.id`, and pinned by
+    /// whichever sibling is not being probed — see `prune_prop_log`)
+    /// overflowed every ~9 s at ~1,700 id-writes/s, and each overflow sent
+    /// the NEXT `Message.id` reader through all 3,055,775 Message records
+    /// (4.4–5.7 s) with every other reader behind its build guard: the whole
+    /// server at 0 ops/s for three seconds, three times a level, on a
+    /// structure that was current when the log overflowed.
     ///
     /// A stamp at or below `pruned_to` is a change that a published snapshot
     /// was stamped past without holding: under the write fence this cannot
@@ -333,14 +470,19 @@ impl<E> ChangeLog<E> {
         }
         if poisoned {
             counted!("derived.change log poisoned by a stamp below a published snapshot");
+            engram_store::CHANGE_LOGS_POISONED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.entries.clear();
             self.floor = self.floor.max(self.epoch);
             return true;
         }
         if self.entries.len() > self.cap {
             counted!("derived.change log overflowed");
-            self.entries.clear();
-            self.floor = self.epoch;
+            // The oldest half, never everything (see above). `max(1)` keeps a
+            // zero-cap log honest: it drops the one entry it holds.
+            let drop = (self.entries.len() / 2).max(1);
+            let last_dropped = self.entries[drop - 1].0;
+            self.entries.drain(..drop);
+            self.floor = self.floor.max(last_dropped);
         }
         false
     }
@@ -371,6 +513,18 @@ impl<E> ChangeLog<E> {
     pub(crate) fn since(&self, at: u64) -> impl Iterator<Item = &(u64, E)> {
         let start = self.entries.partition_point(|(ts, _)| *ts <= at);
         self.entries.range(start..)
+    }
+
+    /// How many entries [`since`] would yield, WITHOUT yielding them.
+    ///
+    /// The same `partition_point` the iterator uses, and then arithmetic: O(log
+    /// n) against `since(at).count()`'s O(delta). It exists because pricing a
+    /// repair needs the size of the delta and nothing else, and walking the
+    /// delta to learn its size is the whole cost the price was meant to avoid
+    /// paying — under the very lock writers take to record into.
+    pub(crate) fn count_since(&self, at: u64) -> usize {
+        let start = self.entries.partition_point(|(ts, _)| *ts <= at);
+        self.entries.len() - start
     }
 
     /// Drop entries at or below `at` — legal only once a snapshot stamped
@@ -518,6 +672,40 @@ impl<T> Slot<T> {
         won
     }
 
+    /// Replace the published snapshot `original` with `snap` at the SAME
+    /// stamp — a fold in place: the same rows in a different layout. A
+    /// compare-and-swap on the snapshot's IDENTITY, not its stamp: a stamp
+    /// does not identify content once a retract (the fail-closed response to
+    /// a poisoned log) and a rebuild have put a different table at the same
+    /// stamp, and a swap on the stamp alone would reinstate the rows the
+    /// retract threw away. Refused when the slot holds anything but
+    /// `original` — moved on, retracted, rebuilt, or already refolded. Fix
+    /// 83's maintenance pass uses it to fold a CURRENT table whose overlay a
+    /// reader's repair left past the threshold — nothing else would.
+    pub(crate) fn publish_refold(
+        &self,
+        original: &Arc<Snapshot<T>>,
+        snap: Arc<Snapshot<T>>,
+    ) -> bool {
+        let mut won = false;
+        self.inner.rcu(|cur| match cur {
+            Some(c) if Arc::ptr_eq(c, original) => {
+                won = true;
+                Some(Arc::clone(&snap))
+            }
+            _ => {
+                won = false;
+                cur.clone()
+            }
+        });
+        if won {
+            counted!("derived.snapshot refolded in place");
+        } else {
+            counted!("derived.snapshot refold lost to a newer one");
+        }
+        won
+    }
+
     /// RETRACT the published snapshot, whatever its stamp: the next reader
     /// finds nothing and builds from the store. The fail-closed response to
     /// a poisoned change log (see [`ChangeLog::record`]) — the one snapshot
@@ -601,7 +789,9 @@ impl BaseBits {
         }
         let span = hi - lo + 1;
         let words = span.div_ceil(64);
-        if words.saturating_mul(8) > (base.len() as u64).saturating_mul(MEMBERS_BITS_MAX_BYTES_PER_ID) {
+        if words.saturating_mul(8)
+            > (base.len() as u64).saturating_mul(MEMBERS_BITS_MAX_BYTES_PER_ID)
+        {
             return None;
         }
         let mut w = vec![0u64; usize::try_from(words).ok()?];
@@ -609,7 +799,10 @@ impl BaseBits {
             let off = id - lo;
             w[usize::try_from(off >> 6).expect("span fits, checked above")] |= 1u64 << (off & 63);
         }
-        Some(BaseBits { lo, words: w.into_boxed_slice() })
+        Some(BaseBits {
+            lo,
+            words: w.into_boxed_slice(),
+        })
     }
 
     /// Is `id` present? One bounds check and one probe.
@@ -620,7 +813,9 @@ impl BaseBits {
         let Ok(w) = usize::try_from(off >> 6) else {
             return false;
         };
-        self.words.get(w).is_some_and(|x| (x >> (off & 63)) & 1 == 1)
+        self.words
+            .get(w)
+            .is_some_and(|x| (x >> (off & 63)) & 1 == 1)
     }
 }
 
@@ -716,8 +911,7 @@ impl MembersView {
             let built = BaseBits::build(&self.base);
             if built.is_some() {
                 counted!("derived.members base bitmap built");
-                crate::counters::MEMBERS_BITMAPS
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::counters::MEMBERS_BITMAPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             } else {
                 counted!("derived.members base declined a bitmap");
             }
@@ -813,7 +1007,11 @@ impl MembersView {
 
     /// [`MembersView::apply`] with the fold chosen by the caller — the lever
     /// the graph exposes so a test can prove the two arms agree.
-    pub fn apply_with(&self, changes: impl IntoIterator<Item = (u64, bool)>, batch: bool) -> MembersView {
+    pub fn apply_with(
+        &self,
+        changes: impl IntoIterator<Item = (u64, bool)>,
+        batch: bool,
+    ) -> MembersView {
         if batch {
             self.apply_batched(changes)
         } else {
@@ -936,10 +1134,17 @@ mod tests {
         }
         assert_eq!(l.epoch(), 50);
         let got: Vec<u64> = l.since(20).map(|(_, e)| *e).collect();
-        assert_eq!(got, vec![3, 4, 5], "since(20) must be exactly the entries stamped after 20");
+        assert_eq!(
+            got,
+            vec![3, 4, 5],
+            "since(20) must be exactly the entries stamped after 20"
+        );
         assert!(l.covers(0));
         l.prune_below(30);
-        assert!(!l.covers(20), "a snapshot older than the prune point cannot catch up");
+        assert!(
+            !l.covers(20),
+            "a snapshot older than the prune point cannot catch up"
+        );
         assert!(l.covers(30));
         let got: Vec<u64> = l.since(30).map(|(_, e)| *e).collect();
         assert_eq!(got, vec![4, 5]);
@@ -951,7 +1156,11 @@ mod tests {
         l.record(10, "a");
         l.record(5, "b"); // observed the clock before a concurrent writer
         let got: Vec<&str> = l.since(9).map(|(_, e)| *e).collect();
-        assert_eq!(got, vec!["a", "b"], "the late entry must still be seen by a reader at 9");
+        assert_eq!(
+            got,
+            vec!["a", "b"],
+            "the late entry must still be seen by a reader at 9"
+        );
     }
 
     #[test]
@@ -960,8 +1169,21 @@ mod tests {
         for ts in 1..=4u64 {
             l.record(ts, ts);
         }
-        assert_eq!(l.len(), 0, "past the cap the entries are dropped");
-        assert!(!l.covers(0), "and a snapshot from before the overflow must rebuild");
+        assert_eq!(
+            l.len(),
+            2,
+            "past the cap the OLDEST HALF is dropped (fix 88), never everything"
+        );
+        assert!(
+            !l.covers(1),
+            "a snapshot from before the dropped half must rebuild"
+        );
+        assert!(
+            l.covers(2),
+            "a snapshot at the last dropped stamp still catches up: everything after it is kept"
+        );
+        let got: Vec<u64> = l.since(2).map(|(_, e)| *e).collect();
+        assert_eq!(got, vec![3, 4]);
         assert!(l.covers(4));
         let mut t: ChangeLog<u64> = ChangeLog::new(3);
         t.record(1, 1);
@@ -970,17 +1192,80 @@ mod tests {
         assert!(!t.covers(6));
     }
 
+    /// A refold replaces the EXACT snapshot it was given, never merely one at
+    /// the same stamp: a retract (the fail-closed response to a poisoned log)
+    /// followed by a rebuild puts a different table at the same stamp, and a
+    /// swap on the stamp alone would have reinstated the rows the retract
+    /// threw away.
+    #[test]
+    fn slot_refold_replaces_only_the_snapshot_it_was_given() {
+        let s: Slot<&str> = Slot::default();
+        assert!(s.publish(5, Arc::new("five")));
+        let x = s.load().expect("snap");
+        let folded = Arc::new(Snapshot {
+            at: 5,
+            value: Arc::new("five, folded"),
+        });
+        assert!(
+            s.publish_refold(&x, folded),
+            "the snapshot that was folded must refold"
+        );
+        assert_eq!(*s.load().expect("snap").value, "five, folded");
+        assert!(
+            !s.publish_refold(
+                &x,
+                Arc::new(Snapshot {
+                    at: 5,
+                    value: Arc::new("five, folded twice"),
+                })
+            ),
+            "a refold of a snapshot the slot no longer holds must be refused"
+        );
+        s.retract();
+        assert!(s.publish(5, Arc::new("five, rebuilt")));
+        assert!(
+            !s.publish_refold(
+                &x,
+                Arc::new(Snapshot {
+                    at: 5,
+                    value: Arc::new("five, folded stale"),
+                })
+            ),
+            "a rebuild at the same stamp must not be displaced by a fold of what the retract removed"
+        );
+        assert_eq!(*s.load().expect("snap").value, "five, rebuilt");
+        let y = s.load().expect("snap");
+        assert!(s.publish(6, Arc::new("six")));
+        assert!(
+            !s.publish_refold(
+                &y,
+                Arc::new(Snapshot {
+                    at: 5,
+                    value: Arc::new("five, folded late"),
+                })
+            ),
+            "a newer stamp is never displaced"
+        );
+        assert_eq!(*s.load().expect("snap").value, "six");
+    }
+
     #[test]
     fn slot_publish_is_monotone() {
         let s: Slot<&str> = Slot::default();
         assert!(s.publish(5, Arc::new("five")));
-        assert!(!s.publish(3, Arc::new("three")), "an older build must not overwrite");
+        assert!(
+            !s.publish(3, Arc::new("three")),
+            "an older build must not overwrite"
+        );
         assert_eq!(*s.load().expect("snap").value, "five");
         assert!(s.publish(6, Arc::new("six")));
         assert_eq!(*s.load().expect("snap").value, "six");
         s.retract();
         assert!(s.load().is_none(), "a retracted slot holds nothing");
-        assert!(s.publish(2, Arc::new("two")), "after a retract any stamp publishes");
+        assert!(
+            s.publish(2, Arc::new("two")),
+            "after a retract any stamp publishes"
+        );
     }
 
     /// A stamp at or below what a PUBLISHED snapshot pruned behind poisons
@@ -994,7 +1279,10 @@ mod tests {
         assert!(!l.record(10, "a"));
         l.prune_below(10); // a snapshot at 10 was published
         assert!(!l.record(12, "b"));
-        assert!(l.record(9, "late"), "a stamp below the published snapshot must poison");
+        assert!(
+            l.record(9, "late"),
+            "a stamp below the published snapshot must poison"
+        );
         assert_eq!(l.len(), 0, "the entries are dropped");
         assert_eq!(l.epoch(), 12);
         assert!(!l.covers(11), "everything below the epoch must rebuild");
@@ -1004,8 +1292,79 @@ mod tests {
         for ts in 1..=3u64 {
             assert!(!o.record(ts, ts));
         }
-        assert!(!o.covers(2), "overflowed");
-        assert!(!o.record(2, 9), "a late stamp below an overflow floor is folded, not poison");
+        assert!(
+            !o.covers(0),
+            "overflowed: the oldest entry (stamp 1) is gone"
+        );
+        assert!(o.covers(1), "and the floor is the last DROPPED stamp");
+        assert!(
+            !o.record(1, 9),
+            "a late stamp below an overflow floor is folded, not poison"
+        );
+    }
+
+    /// Fix 88, at the mechanism: a log that overflows keeps its newest half,
+    /// so a snapshot that was current a moment before the overflow catches
+    /// up over exactly the entries it lacks, while one from before the
+    /// dropped half is refused. The memory bound is unchanged: the log
+    /// never holds more than `cap` entries after a record.
+    #[test]
+    fn an_overflow_keeps_the_newest_half_so_a_current_snapshot_still_catches_up() {
+        let cap = 8;
+        let mut l: ChangeLog<u64> = ChangeLog::new(cap);
+        for ts in 1..=cap as u64 {
+            l.record(ts, ts);
+        }
+        assert_eq!(l.len(), cap, "at the cap nothing is dropped");
+        // A reader caught up at stamp 7 (a published snapshot prunes behind
+        // itself in production; here the snapshot simply IS at 7).
+        let at = 7u64;
+        l.record(9, 9); // the ninth entry: overflow
+        assert_eq!(l.len(), 5, "the oldest four of nine go: {}", l.len());
+        assert!(
+            l.covers(at),
+            "a snapshot one entry behind the overflow is still covered"
+        );
+        let got: Vec<u64> = l.since(at).map(|(_, e)| *e).collect();
+        assert_eq!(got, vec![8, 9], "and catches up over exactly what it lacks");
+        assert!(
+            !l.covers(3),
+            "a snapshot from before the dropped half rebuilds"
+        );
+        assert!(
+            l.covers(4),
+            "the floor is the last dropped stamp, inclusive"
+        );
+        // Keep writing: the bound holds and the floor keeps pace.
+        for ts in 10..=100u64 {
+            l.record(ts, ts);
+            assert!(l.len() <= cap, "the cap is a bound on memory: {}", l.len());
+        }
+        assert!(l.covers(100));
+        assert!(!l.covers(50));
+    }
+
+    /// Fix 88b: a widened cap is a bigger window, never a smaller one, and
+    /// it takes effect on the next record.
+    #[test]
+    fn a_widened_cap_keeps_more_and_never_narrows() {
+        let mut l: ChangeLog<u64> = ChangeLog::new(4);
+        for ts in 1..=4u64 {
+            l.record(ts, ts);
+        }
+        l.widen_to(16);
+        assert_eq!(l.cap(), 16);
+        l.widen_to(8);
+        assert_eq!(l.cap(), 16, "a narrower request is ignored");
+        for ts in 5..=16u64 {
+            l.record(ts, ts);
+        }
+        assert_eq!(l.len(), 16, "sixteen entries fit under the widened cap");
+        assert!(l.covers(0), "nothing was dropped");
+        l.record(17, 17);
+        assert_eq!(l.len(), 9, "the seventeenth drops the oldest eight");
+        assert!(l.covers(8));
+        assert!(!l.covers(7));
     }
 
     /// Two slots' build guards are independent: holding one does not block
@@ -1015,7 +1374,10 @@ mod tests {
         let a: Slot<u8> = Slot::default();
         let b: Slot<u8> = Slot::default();
         let _held = a.enter_build();
-        assert!(a.build.0.try_lock().is_err(), "the same slot's guard is held");
+        assert!(
+            a.build.0.try_lock().is_err(),
+            "the same slot's guard is held"
+        );
         assert!(b.build.0.try_lock().is_ok(), "another slot's guard is free");
     }
 
@@ -1024,14 +1386,24 @@ mod tests {
         let base: Vec<u64> = (0..1000).map(|i| i * 2).collect(); // evens
         let v = MembersView::from_base(Arc::new(base.clone()));
         // add some odds, remove some evens, re-add a removed even
-        let v = v.apply(vec![(1, true), (3, true), (4, false), (6, false), (4, true), (1999, true)]);
+        let v = v.apply(vec![
+            (1, true),
+            (3, true),
+            (4, false),
+            (6, false),
+            (4, true),
+            (1999, true),
+        ]);
         let mut expect: std::collections::BTreeSet<u64> = base.into_iter().collect();
         expect.insert(1);
         expect.insert(3);
         expect.remove(&6);
         expect.insert(1999);
         assert_eq!(v.len(), expect.len());
-        assert_eq!(v.iter().collect::<Vec<_>>(), expect.iter().copied().collect::<Vec<_>>());
+        assert_eq!(
+            v.iter().collect::<Vec<_>>(),
+            expect.iter().copied().collect::<Vec<_>>()
+        );
         for id in 0..2001u64 {
             assert_eq!(v.contains(id), expect.contains(&id), "id {id}");
         }
@@ -1054,7 +1426,12 @@ mod tests {
         // over a span of 24,576, which is 3 bytes an id.
         let base: Vec<u64> = (0..8_192u64).map(|i| 1_000 + i * 3).collect();
         let v = MembersView::from_base(Arc::new(base.clone()));
-        let v = v.apply(vec![(7, true), (1_003, false), (999_999, true), (1_006, false)]);
+        let v = v.apply(vec![
+            (7, true),
+            (1_003, false),
+            (999_999, true),
+            (1_006, false),
+        ]);
 
         // THE CANARY: prove the bitmap is built and used, not silently declined.
         // One probe past the threshold is enough; `base_bits` records the
@@ -1071,7 +1448,18 @@ mod tests {
         for id in 24_000..26_000u64 {
             assert_eq!(v.contains_with(id, 1), v.contains(id), "span edge id {id}");
         }
-        for id in [0, 7, 999, 1_000, 1_003, 1_006, 25_573, 25_574, 999_999, u64::MAX] {
+        for id in [
+            0,
+            7,
+            999,
+            1_000,
+            1_003,
+            1_006,
+            25_573,
+            25_574,
+            999_999,
+            u64::MAX,
+        ] {
             assert_eq!(v.contains_with(id, 1), v.contains(id), "boundary id {id}");
         }
         // And against a plain set, so neither arm is the oracle for the other.
@@ -1081,13 +1469,16 @@ mod tests {
         expect.remove(&1_003);
         expect.remove(&1_006);
         for id in 0..3_000u64 {
-            assert_eq!(v.contains_with(id, 1), expect.contains(&id), "vs set, id {id}");
+            assert_eq!(
+                v.contains_with(id, 1),
+                expect.contains(&id),
+                "vs set, id {id}"
+            );
         }
 
         // A base too sparse for the memory bound DECLINES, and still answers.
-        let sparse = MembersView::from_base(Arc::new(
-            (0..8_192u64).map(|i| i * 64).collect::<Vec<_>>(),
-        ));
+        let sparse =
+            MembersView::from_base(Arc::new((0..8_192u64).map(|i| i * 64).collect::<Vec<_>>()));
         assert!(sparse.contains_with(64, 1));
         assert!(
             matches!(sparse.base_bits.get(), Some(None)),
@@ -1098,7 +1489,10 @@ mod tests {
         // Below the probe threshold nothing is built at all.
         let cold = MembersView::from_base(Arc::new((0..8_192u64).collect::<Vec<_>>()));
         assert!(cold.contains_with(5, 1_000_000));
-        assert!(cold.base_bits.get().is_none(), "a barely-probed base pays no build");
+        assert!(
+            cold.base_bits.get().is_none(),
+            "a barely-probed base pays no build"
+        );
     }
 
     /// The batched fold must reach exactly the state the serial fold reaches,
@@ -1119,15 +1513,24 @@ mod tests {
         let base: Vec<u64> = (0..5_000u64).map(|i| i * 3).collect();
         let start = MembersView::from_base(Arc::new(base));
         // An existing overlay, itself built serially.
-        let seed: Vec<(u64, bool)> = (0..300).map(|_| (next() % 20_000, next() % 2 == 0)).collect();
+        let seed: Vec<(u64, bool)> = (0..300)
+            .map(|_| (next() % 20_000, next() % 2 == 0))
+            .collect();
         let start = start.apply_serial(seed);
         assert!(start.has_overlay());
         for k in [1usize, 2, 17, 1_000, 6_000] {
-            let changes: Vec<(u64, bool)> = (0..k).map(|_| (next() % 20_000, next() % 3 != 0)).collect();
+            let changes: Vec<(u64, bool)> =
+                (0..k).map(|_| (next() % 20_000, next() % 3 != 0)).collect();
             let serial = start.apply_serial(changes.clone());
             let batched = start.apply_batched(changes);
-            assert_eq!(*serial.added, *batched.added, "k={k}: added overlays differ");
-            assert_eq!(*serial.removed, *batched.removed, "k={k}: removed overlays differ");
+            assert_eq!(
+                *serial.added, *batched.added,
+                "k={k}: added overlays differ"
+            );
+            assert_eq!(
+                *serial.removed, *batched.removed,
+                "k={k}: removed overlays differ"
+            );
             assert_eq!(serial.len(), batched.len(), "k={k}");
             assert_eq!(
                 serial.iter().collect::<Vec<_>>(),
@@ -1141,9 +1544,14 @@ mod tests {
     #[test]
     fn members_view_folds_past_the_threshold() {
         let v = MembersView::from_base(Arc::new(vec![0]));
-        let big: Vec<(u64, bool)> = (1..=(MEMBERS_FOLD_AT as u64 + 1)).map(|i| (i, true)).collect();
+        let big: Vec<(u64, bool)> = (1..=(MEMBERS_FOLD_AT as u64 + 1))
+            .map(|i| (i, true))
+            .collect();
         let v = v.apply(big);
-        assert!(!v.has_overlay(), "past the threshold the overlay must fold into a new base");
+        assert!(
+            !v.has_overlay(),
+            "past the threshold the overlay must fold into a new base"
+        );
         assert_eq!(v.len(), MEMBERS_FOLD_AT + 2);
         assert!(v.contains(MEMBERS_FOLD_AT as u64 + 1));
     }

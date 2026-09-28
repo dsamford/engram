@@ -25,7 +25,8 @@ use engram_cypher::ast::{BinOp, Expr};
 use engram_cypher::bindings::VarMap;
 use engram_cypher::eval::{Scope, eval_with, is_aggregate_fn};
 use engram_cypher::stmt::{
-    Clause, NodePattern, OrderItem, PathPattern, Pattern, Projection, RelDir, SingleQuery,
+    Clause, NodePattern, OrderItem, PathPattern, Pattern, ProjItem, Projection, RelDir,
+    SingleQuery,
 };
 use engram_cypher::{Truth, Value};
 use engram_observe::{counted, sometimes};
@@ -35,6 +36,7 @@ use crate::interp::{
     cmp_order_keys, column_name, conjunct_count, contains_opaque, eval_count, free_vars_of,
     prop_eq_candidates, seek_candidates,
 };
+use crate::pipeline::subquery_end_gather_enabled;
 use crate::{ColumnFamily, Dir, Graph, PropColumn};
 
 /// One item of the aggregating projection, in the rewritten grammar.
@@ -130,6 +132,18 @@ impl Reads {
             tag: tag.to_string(),
             ..Reads::default()
         }
+    }
+
+    /// Nothing is read of the variable: no property value or presence, no
+    /// label test, probe or degree, neither its id nor its type.
+    fn reads_nothing(&self) -> bool {
+        self.props.is_empty()
+            && self.presence.is_empty()
+            && self.labels.is_empty()
+            && self.probes.is_empty()
+            && self.degrees.is_empty()
+            && !self.id_read
+            && !self.type_read
     }
 }
 
@@ -241,7 +255,10 @@ impl Reads {
         end_filter: Option<&Expr>,
     ) -> String {
         if let Some(p) = self.probes.iter().find(|p| {
-            p.dir == dir && p.types == types && p.labels == labels && p.end_filter.as_ref() == end_filter
+            p.dir == dir
+                && p.types == types
+                && p.labels == labels
+                && p.end_filter.as_ref() == end_filter
         }) {
             return p.local.clone();
         }
@@ -283,6 +300,7 @@ struct Plan {
     /// Every `var.prop STARTS WITH x` (x variable-free) the WHERE carries —
     /// a PREFIX a declared index seeks as a range (`columnar_seek_ids`).
     prefixes: Vec<(String, Expr)>,
+    texts: Vec<(String, engram_cypher::BinOp, String)>,
     /// Every `var.prop < / <= / > / >= x` (x variable-free) the WHERE
     /// carries — a RANGE a declared index seeks (fix 47).
     ranges: Vec<(String, engram_cypher::BinOp, Expr)>,
@@ -303,14 +321,11 @@ fn covered_count_applies(plan: &Plan) -> bool {
     let r = &plan.reads;
     // The predicate's rewrite registered the keys it compares as column
     // reads; covered means those ARE the seek keys, and nothing else is read.
-    let only_seek_keys = r
-        .props
-        .iter()
-        .all(|p| {
-            plan.seeks.iter().any(|(k, _)| k == p)
-                || plan.prefixes.iter().any(|(k, _)| k == p)
-                || plan.ranges.iter().any(|(k, _, _)| k == p)
-        });
+    let only_seek_keys = r.props.iter().all(|p| {
+        plan.seeks.iter().any(|(k, _)| k == p)
+            || plan.prefixes.iter().any(|(k, _)| k == p)
+            || plan.ranges.iter().any(|(k, _, _)| k == p)
+    });
     if !(only_seek_keys
         && r.labels.is_empty()
         && r.probes.is_empty()
@@ -380,7 +395,10 @@ fn aligned_columns(
         // `Graph::prop_column_aligned`): a presence column of Nulls.
         if graph.prop_token_peek(&p).is_none() {
             counted!("graph.property column absent everywhere");
-            presence.push((local_for_prop(&reads.tag, &p), vec![Value::Null; members.len()]));
+            presence.push((
+                local_for_prop(&reads.tag, &p),
+                vec![Value::Null; members.len()],
+            ));
             continue;
         }
         let PropColumn::Presence(ids) = graph.prop_column(label, &p, true)? else {
@@ -421,6 +439,67 @@ fn aligned_columns(
 /// columns ran column-at-a-time in a third of the time per member.
 const PRED_CHUNK: usize = 4096;
 
+/// Fix 82: whether a scan of `n` members visits its chunks from BOTH ends
+/// — a CAPPED scan (a bare LIMIT, no ORDER BY) of more than one chunk.
+/// Ids are minted in creation order, so a label's newest members sit at
+/// the end of id order, and the listings that cap without ordering are
+/// recency-filtered (`lastUpdatedAt > $cutoff`, `status <> 'stale'`): the
+/// forward scan met its fifth NewsStory match after the whole label (8 ms
+/// on the mirror — every chunk evaluated, the limit reached in the last)
+/// where Neo4j's scan of the storyId index meets matches spread at random
+/// through UUID order in under 2. A bare LIMIT wants ANY k matches; the k
+/// found come back in id order. The column-at-a-time scan and the
+/// per-member walk share the order, so a statement answers the same k
+/// rows cold (the walk that assembles the columns) and warm.
+///
+/// Fix 122: and only with a PREDICATE. Both-ends exists to meet a selective
+/// filter sooner when the matches sit at the end of id order; with no filter
+/// every member matches, the first chunk already answers the whole limit, and
+/// reordering the chunks buys nothing while costing locality. The bare
+/// listing `MATCH (p:Person) RETURN p.id, p.firstName LIMIT 5000` took this
+/// path for no reason.
+fn scan_from_both_ends(n: usize, cap: Option<usize>, has_pred: bool) -> bool {
+    has_pred && cap.is_some() && n.div_ceil(PRED_CHUNK) > 1
+}
+
+/// The chunks of a scan of `n` members in visiting order: forward, or from
+/// both ends — the last chunk first, then the first, then the second-last…
+fn scan_chunk_order(n: usize, cap: Option<usize>, has_pred: bool) -> Vec<usize> {
+    let chunks = n.div_ceil(PRED_CHUNK);
+    if !scan_from_both_ends(n, cap, has_pred) {
+        return (0..chunks).collect();
+    }
+    counted!("interp.columnar projection scanned its chunks from both ends for the limit");
+    let mut order = Vec::with_capacity(chunks);
+    let (mut a, mut b) = (0usize, chunks);
+    while a < b {
+        b -= 1;
+        order.push(b);
+        if a < b {
+            order.push(a);
+            a += 1;
+        }
+    }
+    order
+}
+
+/// Put projected rows (their id trailing, `project_row`) and their order
+/// keys into id order — the per-member walk's answer after a scan from
+/// both ends, as the column-at-a-time scan answers it.
+fn sort_rows_by_trailing_id(rows: &mut Vec<Vec<Value>>, keys: &mut Vec<Vec<Value>>) {
+    let mut perm: Vec<usize> = (0..rows.len()).collect();
+    perm.sort_by_key(|&i| match rows[i].last() {
+        Some(Value::Int(id)) => *id,
+        _ => i64::MAX,
+    });
+    let mut r: Vec<Option<Vec<Value>>> = std::mem::take(rows).into_iter().map(Some).collect();
+    let mut k: Vec<Option<Vec<Value>>> = std::mem::take(keys).into_iter().map(Some).collect();
+    for &i in &perm {
+        rows.push(r[i].take().expect("row"));
+        keys.push(k[i].take().expect("key"));
+    }
+}
+
 fn survivors_over_cached_columns(
     graph: &Graph,
     label: &str,
@@ -432,9 +511,11 @@ fn survivors_over_cached_columns(
 ) -> Option<Vec<usize>> {
     let cols = aligned_columns(graph, label, reads, members)?;
     let n = members.len();
+    let from_both_ends = scan_from_both_ends(n, cap, true);
     let mut hits: Vec<usize> = Vec::new();
-    let mut lo = 0usize;
-    while lo < n {
+    let mut done = false;
+    for c in scan_chunk_order(n, cap, true) {
+        let lo = c * PRED_CHUNK;
         let hi = n.min(lo + PRED_CHUNK);
         let view = cols.view(lo, hi);
         let truth = crate::vectorized::eval_column(pred, "", hi - lo, &view, scope)?;
@@ -443,14 +524,20 @@ fn survivors_over_cached_columns(
                 Some(Truth::True) => {
                     hits.push(lo + i);
                     if cap.is_some_and(|c| hits.len() >= c) {
-                        return Some(hits);
+                        done = true;
+                        break;
                     }
                 }
                 Some(_) => {}
                 None => return None,
             }
         }
-        lo = hi;
+        if done {
+            break;
+        }
+    }
+    if from_both_ends {
+        hits.sort_unstable();
     }
     Some(hits)
 }
@@ -488,7 +575,7 @@ pub(crate) fn count_hop_ends_vectorised(
         return Ok(None);
     }
     let path = &pattern.paths[0];
-    if path.shortest || path.var.is_some() || path.hops.len() != 1 {
+    if path.shortest.is_some() || path.var.is_some() || path.hops.len() != 1 {
         return Ok(None);
     }
     let (rel, end) = &path.hops[0];
@@ -513,12 +600,24 @@ pub(crate) fn count_hop_ends_vectorised(
             && !n.var.as_ref().is_some_and(|v| row.contains_key(v))
     };
     let (from, far, dir) = match (bound_node(&path.start), bound_node(end)) {
-        (Some(a), None) if bare(&path.start) && unbound_far(end) => {
-            (a, end, if rel.dir == RelDir::Out { Dir::Out } else { Dir::In })
-        }
-        (None, Some(b)) if bare(end) && unbound_far(&path.start) => {
-            (b, &path.start, if rel.dir == RelDir::Out { Dir::In } else { Dir::Out })
-        }
+        (Some(a), None) if bare(&path.start) && unbound_far(end) => (
+            a,
+            end,
+            if rel.dir == RelDir::Out {
+                Dir::Out
+            } else {
+                Dir::In
+            },
+        ),
+        (None, Some(b)) if bare(end) && unbound_far(&path.start) => (
+            b,
+            &path.start,
+            if rel.dir == RelDir::Out {
+                Dir::In
+            } else {
+                Dir::Out
+            },
+        ),
         _ => return Ok(None),
     };
     let Some(tokens) = graph.type_tokens_peek(&rel.types) else {
@@ -536,7 +635,10 @@ pub(crate) fn count_hop_ends_vectorised(
             let Some(fv) = far.var.as_deref() else {
                 return Ok(None);
             };
-            if label.is_none() || contains_opaque(w) || !reads_only(w, std::slice::from_ref(&fv.to_string())) {
+            if label.is_none()
+                || contains_opaque(w)
+                || !reads_only(w, std::slice::from_ref(&fv.to_string()))
+            {
                 return Ok(None);
             }
             let mut reads = Reads::default();
@@ -567,18 +669,81 @@ pub(crate) fn count_hop_ends_vectorised(
     // mirror after fix 70. One whole-label read is ~15k gets once; every
     // later body over that label is column-at-a-time. A label past the
     // bound, or a load that declines, still hands the body to the matcher.
+    //
+    // Fix 121: the ENDS are collected first, because what they cost to read is
+    // the whole question. Before this, the column loop ran first and a label
+    // past the whole-read ceiling simply declined — permanently, since the two
+    // sites that would mint the column refuse on the same constant (fix 118).
+    // The fallback was one projected record read per end: 113,065 of them for
+    // a query returning twenty-five rows, 137 ms against Neo4j's 28.
+    //
+    // Knowing the ends first turns the ceiling from a cliff into a choice.
+    // The label may be 3,055,774 nodes, but this hop touches a few thousand,
+    // and gathering exactly those is bounded by the FAN-OUT rather than by the
+    // label. The bare constant remains the right guard for the two `interp.rs`
+    // warm sites, which mint a WHOLE column and genuinely scale with the label.
+    let mut ids: Vec<u64> = Vec::new();
+    graph.adjacent_slim_for_each(from, dir, &tokens, |e| ids.push(e.peer));
+    if let Some(l) = label {
+        let members = graph.members(Some(l))?;
+        ids.retain(|id| graph.members_contains(&members, *id));
+    }
     let mut columns: Vec<GatheredColumn> = Vec::new();
     if let Some(l) = label {
-        let mut wanted: Vec<(String, bool)> = reads.props.iter().map(|p| (p.clone(), false)).collect();
+        let mut wanted: Vec<(String, bool)> =
+            reads.props.iter().map(|p| (p.clone(), false)).collect();
         wanted.extend(reads.presence_only().into_iter().map(|p| (p, true)));
         for (p, presence) in wanted {
             let col = match graph.prop_column(l, &p, false) {
                 Some(PropColumn::Values(col)) => col,
                 _ => {
-                    if graph.count_label_nodes(l) > WHOLE_LABEL_READ_MAX {
-                        return Ok(None);
+                    if graph.count_label_nodes(l) > graph.whole_label_read_max() {
+                        // Fix 118's counter. This decline WAS permanent: the
+                        // column is absent, the label is over the ceiling, and
+                        // the two sites that would mint it refuse on the same
+                        // constant. Measured 213 ms then 265 ms over two
+                        // passes of the same eight seeds, with no learning.
+                        counted!("interp.subquery hop declined: label over the whole-read ceiling");
+                        // Fix 121: gather just this hop's ends instead. The
+                        // cost is |ends|, not |label|, so the comparison that
+                        // matters is between them — a fan-out approaching the
+                        // label's size gains nothing and keeps the old path.
+                        // `LEAN_COLUMN_BATCH` is the floor: below it, today's
+                        // projected reads are already cheap and a gather would
+                        // only add a sort.
+                        if !subquery_end_gather_enabled()
+                            || ids.len() < crate::interp::LEAN_COLUMN_BATCH
+                            || (ids.len() as u64).saturating_mul(2) >= graph.count_label_nodes(l)
+                        {
+                            return Ok(None);
+                        }
+                        let mut want: Vec<u64> = ids.clone();
+                        want.sort_unstable();
+                        want.dedup();
+                        let Ok(mut gathered) = graph.column_entries_gather_many(
+                            ColumnFamily::Nodes,
+                            std::slice::from_ref(&p),
+                            &want,
+                        ) else {
+                            return Ok(None);
+                        };
+                        let Some(mut col) = gathered.pop() else {
+                            return Ok(None);
+                        };
+                        // The lookup below is a binary search, so the gather
+                        // has to arrive sorted by id whatever order it came in.
+                        col.sort_unstable_by_key(|(i, _)| *i);
+                        counted!("interp.subquery hop gathered only its own ends");
+                        columns.push((
+                            local_for_prop(&reads.tag, &p),
+                            std::sync::Arc::new(col),
+                            presence,
+                        ));
+                        continue;
                     }
-                    let Some(mut loaded) = label_value_columns(graph, l, std::slice::from_ref(&p), params)? else {
+                    let Some(mut loaded) =
+                        label_value_columns(graph, l, std::slice::from_ref(&p), params)?
+                    else {
                         return Ok(None);
                     };
                     let Some(col) = loaded.pop() else {
@@ -590,12 +755,6 @@ pub(crate) fn count_hop_ends_vectorised(
             };
             columns.push((local_for_prop(&reads.tag, &p), col, presence));
         }
-    }
-    let mut ids: Vec<u64> = Vec::new();
-    graph.adjacent_slim_for_each(from, dir, &tokens, |e| ids.push(e.peer));
-    if let Some(l) = label {
-        let members = graph.members(Some(l))?;
-        ids.retain(|id| graph.members_contains(&members, *id));
     }
     let Some(rw) = rw else {
         counted!("interp.subquery hop evaluated column-at-a-time");
@@ -695,6 +854,130 @@ fn count_over_cached_columns(
     Ok(Some(count))
 }
 
+/// Fix 108: ANY aggregate over ONE label whose predicate, grouping keys and
+/// aggregate arguments read only CACHED columns, folded COLUMN-AT-A-TIME:
+/// the predicate over the aligned columns as vectors, every key and
+/// argument evaluated as a column too, and the survivors gathered per
+/// position into the fold in member order — the walk's — so the groups'
+/// first-seen order is the walk's and every value is the vectoriser's own
+/// (which mirrors `eval_with` per element). The count-star form had this
+/// (`count_over_cached_columns`); a grouped `count(a)` over the same cached
+/// columns still bound a scope and walked its predicate and key per member:
+/// the production NewsArticle classification `MATCH (a:NewsArticle) WHERE
+/// a.classifiedAt IS NOT NULL AND a.pubDate >= $c AND (a.abuseStatus IS
+/// NULL OR …) AND a.contentType IS NOT NULL RETURN a.contentType AS key,
+/// count(a)` evaluated 165k expressions over its 67k survivors — 111 ms on
+/// the mirror where its count took 22. `Ok(false)` when a column is not
+/// cached (the walk assembles and keeps it), a key or argument is a form
+/// `eval_column` declines, or the predicate answers a non-boolean (the walk
+/// raises it) — the walk answers, as before.
+fn fold_over_cached_columns<'p>(
+    graph: &Graph,
+    label: &str,
+    plan: &'p Plan,
+    scope: &Scope<'_>,
+    fold: &mut Fold<'p>,
+) -> Result<bool, RunError> {
+    let members = graph
+        .members_all(std::slice::from_ref(&label.to_string()))
+        .map_err(RunError::Graph)?
+        .to_arc_vec();
+    let Some(cols) = aligned_columns(graph, label, &plan.reads, &members) else {
+        return Ok(false);
+    };
+    let n = members.len();
+    // `id(var)` (fix 46's local): the member's own id, never a record read.
+    let id_col: Vec<Value> = if plan.reads.id_read {
+        members.iter().map(|&id| Value::Int(id as i64)).collect()
+    } else {
+        Vec::new()
+    };
+    // A label wider than the aggregate's batch is folded in member BATCHES —
+    // each batch's view, predicate, keys and arguments alone are held — as
+    // the walk batches; the fold accumulates across them in member order.
+    let batch = if graph.columnar_agg_batch_enabled() && n > graph.columnar_agg_batch_size() {
+        graph.columnar_agg_batch_size().max(1)
+    } else {
+        n.max(1)
+    };
+    // Folded into a fresh fold and handed over whole: a decline in a later
+    // batch (a non-boolean predicate value, a form the vectoriser refuses
+    // on that batch's values) leaves the caller's fold untouched.
+    let mut local = Fold::new(&plan.items);
+    let mut lo = 0usize;
+    while lo < n {
+        let hi = (lo + batch).min(n);
+        let len = hi - lo;
+        let mut view = cols.view(lo, hi);
+        if plan.reads.id_read {
+            view.insert(local_for_id(&plan.reads.tag), &id_col[lo..hi]);
+        }
+        let survivors: Vec<usize> = match &plan.pred {
+            None => (0..len).collect(),
+            Some(pred) => {
+                let Some(truth) = crate::vectorized::eval_column(pred, "", len, &view, scope)
+                else {
+                    return Ok(false);
+                };
+                let mut s = Vec::new();
+                for (i, v) in truth.iter().enumerate() {
+                    match v.truth() {
+                        Some(Truth::True) => s.push(i),
+                        Some(_) => {}
+                        None => return Ok(false),
+                    }
+                }
+                s
+            }
+        };
+        if !survivors.is_empty() {
+            let mut keys: Vec<crate::vectorized::Col<'_>> = Vec::new();
+            let mut args: Vec<Option<crate::vectorized::Col<'_>>> = Vec::new();
+            for it in &plan.items {
+                match it {
+                    Item::Key(e) => {
+                        let Some(c) = crate::vectorized::eval_column(e, "", len, &view, scope)
+                        else {
+                            return Ok(false);
+                        };
+                        keys.push(c);
+                    }
+                    Item::Agg(_, None) => args.push(None),
+                    Item::Agg(_, Some(a)) => {
+                        let Some(c) = crate::vectorized::eval_column(a, "", len, &view, scope)
+                        else {
+                            return Ok(false);
+                        };
+                        args.push(Some(c));
+                    }
+                }
+            }
+            for &i in &survivors {
+                let key: Vec<Value> = keys.iter().map(|k| k[i].clone()).collect();
+                local.push_values(
+                    graph,
+                    key,
+                    args.iter().map(|a| a.as_ref().map(|c| c[i].clone())),
+                )?;
+            }
+        }
+        lo = hi;
+    }
+    // The counters the walk reports for the same reads: each value column
+    // served from the property-column cache, an id bound without a record.
+    for _ in &cols.values {
+        counted!("interp.columnar column read served from the property-column cache");
+    }
+    if plan.reads.id_read {
+        counted!("interp.columnar id bound from the walk");
+    }
+    if batch < n {
+        counted!("interp.columnar aggregate batched");
+    }
+    *fold = local;
+    Ok(true)
+}
+
 /// The number of `label`'s members satisfying EVERY seek equality, from the
 /// DECLARED scoped indexes alone — `None` unless every equality is on a key
 /// with an index declared for this label, every value is a STRING (an
@@ -722,12 +1005,42 @@ fn covered_count(
     {
         return Ok(None);
     }
+    // Fix 95: a label with no live node counts zero — no index built or
+    // read for it (`MATCH (p:Part {orgId: $orgId}) RETURN count(p)` built
+    // and queried the scoped index for a label that has never held a node).
+    if graph.count_label_nodes(label) == 0 {
+        counted!("interp.seed answered empty from a label with no member");
+        return Ok(Some(0));
+    }
     let labels = [label.to_string()];
     let mut acc: Option<Vec<u64>> = None;
+    // Fix 115: a DECLARED COMPOSITE whose keys are exactly the seeks (one
+    // string each, nothing else to intersect) is ONE probe — the tuple's
+    // exact range — where the per-key probes below extract each key's whole
+    // match set to intersect them: `{userId: $u, nodeType: 'contact'}`
+    // gathered the user's every node and every contact in the store to
+    // answer 391 (0.6 ms in the engine against Neo4j's whole 0.7).
+    if ranges.is_empty() && prefixes.is_empty() {
+        if let Some((covered, ids)) = composite_seek(graph, &labels, seeks, None, scope)? {
+            if covered.len() == seeks.len() {
+                counted!("interp.columnar covered count sought a composite");
+                let members = graph.members_all(&labels).map_err(RunError::Graph)?;
+                let n = ids
+                    .iter()
+                    .filter(|id| graph.members_contains(&members, **id))
+                    .count() as u64;
+                counted!("interp.columnar covered count");
+                return Ok(Some(n));
+            }
+        }
+    }
     // A RANGE (`prop > x`, …) on a declared key is a range of the same index
     // (fix 47) — exact for string keys; a non-string bound declines.
     for (prop, op, e) in ranges {
-        let Some(scoped) = graph.declared_scope_for(&labels, prop).map_err(RunError::Graph)? else {
+        let Some(scoped) = graph
+            .declared_scope_for(&labels, prop)
+            .map_err(RunError::Graph)?
+        else {
             return Ok(None);
         };
         let v = eval_with(e, scope, None).map_err(RunError::Eval)?;
@@ -751,7 +1064,10 @@ fn covered_count(
     // count(g)` walked 3.9k sought ids re-reading the key it had just
     // sought (7 ms against Neo4j's 1.4); the range's size is the answer.
     for (prop, e) in prefixes {
-        let Some(scoped) = graph.declared_scope_for(&labels, prop).map_err(RunError::Graph)? else {
+        let Some(scoped) = graph
+            .declared_scope_for(&labels, prop)
+            .map_err(RunError::Graph)?
+        else {
             return Ok(None);
         };
         let Value::Str(prefix) = eval_with(e, scope, None).map_err(RunError::Eval)? else {
@@ -770,7 +1086,10 @@ fn covered_count(
         });
     }
     for (prop, values) in seeks {
-        let Some(scoped) = graph.declared_scope_for(&labels, prop).map_err(RunError::Graph)? else {
+        let Some(scoped) = graph
+            .declared_scope_for(&labels, prop)
+            .map_err(RunError::Graph)?
+        else {
             return Ok(None);
         };
         let mut ids: Vec<u64> = Vec::new();
@@ -804,6 +1123,62 @@ fn covered_count(
         .count() as u64;
     counted!("interp.columnar covered count");
     Ok(Some(n))
+}
+
+/// What a composite probe answered: the seek positions the composite's keys
+/// covered, and the ids carrying that tuple.
+type CompositeHit = (Vec<usize>, Vec<u64>);
+
+/// Fix 115: the seeks' single-valued keys probed as ONE tuple against the
+/// declared composite index they cover — `(the seek positions the
+/// composite answered, ids)`, or `None` when no declared composite fits
+/// them, a value is not a string, or the match set is over `cap`. The ids
+/// are a candidate set: exact for the covered keys, a superset for the
+/// caller's whole predicate.
+fn composite_seek(
+    graph: &Graph,
+    labels: &[String],
+    seeks: &[(String, Vec<Expr>)],
+    cap: Option<usize>,
+    scope: &Scope,
+) -> Result<Option<CompositeHit>, RunError> {
+    if seeks.len() < 2 {
+        return Ok(None);
+    }
+    let single: Vec<&str> = seeks
+        .iter()
+        .filter(|(_, values)| values.len() == 1)
+        .map(|(k, _)| k.as_str())
+        .collect();
+    let Some((label, props)) = graph
+        .declared_composite_for(labels, &single)
+        .map_err(RunError::Graph)?
+    else {
+        return Ok(None);
+    };
+    let mut covered = Vec::with_capacity(props.len());
+    let mut values = Vec::with_capacity(props.len());
+    for p in &props {
+        let Some(i) = seeks
+            .iter()
+            .position(|(k, values)| k == p && values.len() == 1)
+        else {
+            return Ok(None);
+        };
+        let v = eval_with(&seeks[i].1[0], scope, None).map_err(RunError::Eval)?;
+        if !matches!(v, Value::Str(_)) {
+            return Ok(None);
+        }
+        covered.push(i);
+        values.push(v);
+    }
+    let Some(ids) = graph
+        .index_probe_composite(&label, &props, &values, cap)
+        .map_err(RunError::Graph)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((covered, ids)))
 }
 
 /// The intersection of two ASCENDING id vectors, ascending.
@@ -858,19 +1233,49 @@ const SEEK_WALK_CAP: usize = 8 * crate::PROPERTY_SEEK_MAX_PROBE;
 /// A walk wins on halving the label.
 const SEEK_WALK_SELECTIVITY: u64 = 2;
 
+/// The four kinds of seekable conjunct a clause can offer, gathered.
+///
+/// One struct rather than four parameters because they always travel together
+/// and are always derived from the same WHERE — and because a fifth kind would
+/// otherwise mean touching every call site again, which is how the trigram
+/// group arrived.
+struct SeekCandidates<'a> {
+    /// `prop = x` / `prop IN [...]`.
+    seeks: &'a [(String, Vec<Expr>)],
+    /// `prop STARTS WITH x`.
+    prefixes: &'a [(String, Expr)],
+    /// `prop > x`, and the rest of the comparisons.
+    ranges: &'a [(String, engram_cypher::BinOp, Expr)],
+    /// `prop =~ / CONTAINS / STARTS WITH / ENDS WITH 'literal'` conjuncts,
+    /// raw. The condition is derived in the loop, after the declared-index
+    /// lookup, so an undeclared property costs no analysis at all.
+    texts: &'a [(String, engram_cypher::BinOp, String)],
+}
+
+impl SeekCandidates<'_> {
+    /// Nothing to seek on.
+    fn is_empty(&self) -> bool {
+        self.seeks.is_empty()
+            && self.prefixes.is_empty()
+            && self.ranges.is_empty()
+            && self.texts.is_empty()
+    }
+}
+
 fn columnar_seek_ids(
     graph: &Graph,
     labels: &[String],
-    seeks: &[(String, Vec<Expr>)],
-    prefixes: &[(String, Expr)],
-    ranges: &[(String, engram_cypher::BinOp, Expr)],
+    cands: &SeekCandidates<'_>,
     use_: SeekUse,
     scope: &Scope,
 ) -> Result<Option<Vec<u64>>, RunError> {
-    if (seeks.is_empty() && prefixes.is_empty() && ranges.is_empty())
-        || labels.is_empty()
-        || !graph.property_seek_enabled()
-    {
+    let SeekCandidates {
+        seeks,
+        prefixes,
+        ranges,
+        texts,
+    } = *cands;
+    if cands.is_empty() || labels.is_empty() || !graph.property_seek_enabled() {
         return Ok(None);
     }
     // Prefix and range candidates seek DECLARED keys only (an equality may
@@ -880,13 +1285,22 @@ fn columnar_seek_ids(
     // whole-store pass charged to a two-node label's budgeted read
     // (`population_scan_interleaved_bare_on_a_paged_store_stops_fetching_at_the_budget`).
     if seeks.is_empty() {
-        let mut declared = false;
+        let mut declared = texts
+            .iter()
+            .any(|(p, _, _)| graph.declared_trigram_for(labels, p).is_some());
         for prop in prefixes
             .iter()
             .map(|(p, _)| p)
             .chain(ranges.iter().map(|(p, _, _)| p))
         {
-            if graph.declared_scope_for(labels, prop).map_err(RunError::Graph)?.is_some() {
+            if declared {
+                break;
+            }
+            if graph
+                .declared_scope_for(labels, prop)
+                .map_err(RunError::Graph)?
+                .is_some()
+            {
                 declared = true;
                 break;
             }
@@ -899,8 +1313,19 @@ fn columnar_seek_ids(
     if !graph.property_seek_worth_probing(floor_label) {
         return Ok(None);
     }
+    // Fix 95: a label with no live node seeks nothing — see
+    // `best_declared_seek`, the general path's rule. Behind the size test
+    // above on purpose: the count is a maintained statistic the seek
+    // consults anyway, never a cold-store rebuild for a two-node label.
+    if labels.iter().any(|l| graph.count_label_nodes(l) == 0) {
+        counted!("interp.seed answered empty from a label with no member");
+        return Ok(Some(Vec::new()));
+    }
     let (cap_n, selectivity) = match use_ {
-        SeekUse::PerId => (crate::PROPERTY_SEEK_MAX_PROBE, crate::PROPERTY_SEEK_SELECTIVITY),
+        SeekUse::PerId => (
+            crate::PROPERTY_SEEK_MAX_PROBE,
+            crate::PROPERTY_SEEK_SELECTIVITY,
+        ),
         SeekUse::Walk => (SEEK_WALK_CAP, SEEK_WALK_SELECTIVITY),
     };
     let cap = Some(cap_n);
@@ -909,7 +1334,10 @@ fn columnar_seek_ids(
     // prefix is a range over the index the operator declared; nothing is
     // built for an undeclared one.
     for (prop, e) in prefixes {
-        let Some(l) = graph.declared_scope_for(labels, prop).map_err(RunError::Graph)? else {
+        let Some(l) = graph
+            .declared_scope_for(labels, prop)
+            .map_err(RunError::Graph)?
+        else {
             continue;
         };
         let Value::Str(prefix) = eval_with(e, scope, None).map_err(RunError::Eval)? else {
@@ -932,7 +1360,10 @@ fn columnar_seek_ids(
     // the mirror's `(status, lastUpdatedAt)` index; Neo4j seeks the same
     // index in 2 ms.
     for (prop, op, e) in ranges {
-        let Some(l) = graph.declared_scope_for(labels, prop).map_err(RunError::Graph)? else {
+        let Some(l) = graph
+            .declared_scope_for(labels, prop)
+            .map_err(RunError::Graph)?
+        else {
             continue;
         };
         let v = eval_with(e, scope, None).map_err(RunError::Eval)?;
@@ -946,12 +1377,48 @@ fn columnar_seek_ids(
             }
         }
     }
+    // TEXT candidates (`=~`, `CONTAINS`, `STARTS WITH`, `ENDS WITH`) on a
+    // DECLARED trigram index. The answer is a CANDIDATE set that the walk's
+    // own predicate re-checks, exactly as a prefix or range candidate is —
+    // which is why this competes on `ids.len()` alongside them rather than
+    // short-circuiting. A range index answers a prefix better than trigrams
+    // do, and when one is declared it simply wins here on its merits.
+    for (prop, op, text) in texts {
+        let Some(l) = graph.declared_trigram_for(labels, prop) else {
+            continue;
+        };
+        // Derived HERE, not in the recogniser: a pattern parse and a tree
+        // analysis are wasted work on a property nobody indexed.
+        let Some(q) = crate::interp::text_query_for(*op, text) else {
+            continue;
+        };
+        // The cap here is the LABEL'S, not the caller's: see `text_seek_cap`.
+        let text_cap =
+            Some(cap.map_or(graph.text_seek_cap(&l), |c| c.min(graph.text_seek_cap(&l))));
+        if let Some(ids) = graph.trigram_probe_scoped(prop, &q, text_cap, &l) {
+            counted!("interp.columnar seek probed a declared trigram index");
+            if best.as_ref().is_none_or(|(b, _)| ids.len() < b.len()) {
+                best = Some((ids, true));
+            }
+        }
+    }
+    // Fix 115: the declared COMPOSITE the seeks cover, probed as one tuple —
+    // the exact population of those keys, where a single key's index names
+    // every node carrying that one value.
+    if let Some((_, ids)) = composite_seek(graph, labels, seeks, cap, scope)? {
+        counted!("interp.columnar seek probed a declared composite");
+        if best.as_ref().is_none_or(|(b, _)| ids.len() < b.len()) {
+            best = Some((ids, true));
+        }
+    }
     for (i, (prop, values)) in seeks.iter().enumerate() {
         // The declared index on a label the pattern requires whose FIRST
         // property is this key — a composite is ordered by it, so an equality
         // on it is the prefix the index answers. One rule for every seek site:
         // `Graph::declared_scope_for`.
-        let scoped_to = graph.declared_scope_for(labels, prop).map_err(RunError::Graph)?;
+        let scoped_to = graph
+            .declared_scope_for(labels, prop)
+            .map_err(RunError::Graph)?;
         let scoped_to = scoped_to.as_deref();
         if scoped_to.is_none() && i > 0 {
             // Undeclared and not the first conjunct: probing it would build a
@@ -1011,7 +1478,7 @@ fn local_for_label(tag: &str, l: &str) -> String {
 /// An unlabelled far end with a map is refused: the map would have to be
 /// resolved over every node in the graph.
 fn probe_shape(path: &PathPattern, var: &str) -> Option<ProbeShape> {
-    if path.shortest || path.var.is_some() || path.hops.len() != 1 {
+    if path.shortest.is_some() || path.var.is_some() || path.hops.len() != 1 {
         return None;
     }
     if path.start.var.as_deref() != Some(var)
@@ -1380,7 +1847,7 @@ fn recognise_source(match_clause: &Clause) -> Option<(String, Kind, Source, Opti
         return None;
     }
     let path = &pattern.paths[0];
-    if path.var.is_some() || path.shortest {
+    if path.var.is_some() || path.shortest.is_some() {
         return None;
     }
     let anon = |n: &NodePattern| n.var.is_none() && n.labels.is_empty() && n.props.is_none();
@@ -1507,6 +1974,7 @@ fn recognise(q: &SingleQuery) -> Option<Plan> {
     }
     let seeks = prop_eq_candidates(full_where.as_ref(), &var);
     let prefixes = crate::interp::prop_prefix_candidates(full_where.as_ref(), &var);
+    let texts = crate::interp::prop_text_candidates(full_where.as_ref(), &var);
     let ranges = crate::interp::prop_range_candidates(full_where.as_ref(), &var);
     // Covered: every conjunct is a seek equality, a prefix or a range — the
     // count is then the size of the probes' intersection (`covered_count`).
@@ -1532,6 +2000,7 @@ fn recognise(q: &SingleQuery) -> Option<Plan> {
     {
         return None;
     }
+    let agg_proj = &star_distinct_counts(agg_proj, &var);
     let (items, columns) = aggregating_items(agg_proj, &var, kind, &mut reads)?;
     let order = order_over(agg_proj, &columns)?;
     let final_ = match final_proj {
@@ -1554,6 +2023,7 @@ fn recognise(q: &SingleQuery) -> Option<Plan> {
         order,
         seeks,
         prefixes,
+        texts,
         ranges,
         covered,
         skip: agg_proj.skip.clone(),
@@ -1732,6 +2202,15 @@ struct Walk {
     members: std::sync::Arc<Vec<u64>>,
     rel_types: Vec<u32>,
     type_names: BTreeMap<u32, Value>,
+    /// NOT shared with the property-column cache, deliberately. Fix 122
+    /// tried: `keep_prop_column` takes `columns[j].clone()`, a second full
+    /// copy of every column of a whole-label read, and sharing an `Arc` with
+    /// the cache looks like a free removal of it. It is not. `Walk::bind`
+    /// MOVES each value out with `std::mem::replace(&mut col[*cur].1,
+    /// Value::Null)` rather than cloning it, so a shared column would be
+    /// hollowed out under the cache — and `Arc::make_mut` would only restore
+    /// the clone lazily, per column, while adding a per-value clone to every
+    /// bind. One column copy at keep time is the cheaper half of that trade.
     columns: Vec<Vec<(u64, Value)>>,
     cursors: Vec<usize>,
     /// Presence-only columns: (property, ids carrying it, cursor).
@@ -1795,7 +2274,9 @@ fn restrict_ids(ids: &[u64], lo: u64, hi: Option<u64>) -> Vec<u64> {
 /// exactly what it reads.
 fn restrict_entries_to(col: &[(u64, Value)], ids: &[u64]) -> Vec<(u64, Value)> {
     let mut out = Vec::with_capacity(ids.len());
-    let mut ci = 0usize;
+    // from the first member's entry, not the column's start: a share cut from
+    // the middle of a label (`parallel_stage_fold`) walked all before it
+    let mut ci = ids.first().map_or(0, |&f| col.partition_point(|(id, _)| *id < f));
     for &id in ids {
         while ci < col.len() && col[ci].0 < id {
             ci += 1;
@@ -1827,15 +2308,16 @@ fn take_entries_to(col: &mut [(u64, Value)], ids: &[u64]) -> Vec<(u64, Value)> {
 
 /// Fix 78: a population at least this share of its label (1/N) is read as
 /// the whole label so the columns are kept.
-const WHOLE_LABEL_SHARE: u64 = 8;
+pub(crate) const WHOLE_LABEL_SHARE: u64 = 8;
 /// ...and only for a label up to this many members: reading a bigger label
 /// whole for a fraction of it is a gamble the population read need not take.
-const WHOLE_LABEL_READ_MAX: u64 = 262_144;
+pub(crate) const WHOLE_LABEL_READ_MAX: u64 = 262_144;
 
 /// [`restrict_entries_to`] for a presence column (ids only).
 fn restrict_ids_to(present: &[u64], ids: &[u64]) -> Vec<u64> {
     let mut out = Vec::with_capacity(ids.len().min(present.len()));
-    let mut ci = 0usize;
+    // from the first member's entry (see `restrict_entries_to`)
+    let mut ci = ids.first().map_or(0, |&f| present.partition_point(|id| *id < f));
     for &id in ids {
         while ci < present.len() && present[ci] < id {
             ci += 1;
@@ -1931,7 +2413,13 @@ fn resolve_probe_ends(
             .iter()
             .map(|(k, v)| (k.clone(), vec![v.clone()]))
             .collect();
-        let over = match columnar_seek_ids(graph, &p.labels, &seeks, &[], &[], SeekUse::PerId, &scope)? {
+        let cands = SeekCandidates {
+            seeks: &seeks,
+            prefixes: &[],
+            ranges: &[],
+            texts: &[],
+        };
+        let over = match columnar_seek_ids(graph, &p.labels, &cands, SeekUse::PerId, &scope)? {
             Some(ids) => {
                 let members = graph.members_all(&p.labels).map_err(RunError::Graph)?;
                 counted!("interp.columnar probe sought its far end");
@@ -1943,8 +2431,7 @@ fn resolve_probe_ends(
             }
             None => None,
         };
-        let Some(ids) = filter_ids_in(graph, &p.labels, PROBE_END_VAR, &pred, params, over)?
-        else {
+        let Some(ids) = filter_ids_in(graph, &p.labels, PROBE_END_VAR, &pred, params, over)? else {
             return Ok(None);
         };
         out.push(Some(ids));
@@ -1998,15 +2485,23 @@ fn load_walk_budgeted(
             let label = labels[0].as_str();
             let total = graph.count_label_nodes(label);
             let uncached = reads.props.iter().any(|p| {
-                !matches!(graph.prop_column(label, p, false), Some(PropColumn::Values(_)))
+                !matches!(
+                    graph.prop_column(label, p, false),
+                    Some(PropColumn::Values(_))
+                )
             }) || reads.presence_only().iter().any(|p| {
-                !matches!(graph.prop_column(label, p, true), Some(PropColumn::Presence(_)))
+                !matches!(
+                    graph.prop_column(label, p, true),
+                    Some(PropColumn::Presence(_))
+                )
             });
             if uncached
-                && total <= WHOLE_LABEL_READ_MAX
+                && total <= graph.whole_label_read_max()
                 && (over_ids.len() as u64).saturating_mul(WHOLE_LABEL_SHARE) >= total
             {
-                if let Some(mut walk) = load_walk_budgeted(graph, source, reads, None, None, params)? {
+                if let Some(mut walk) =
+                    load_walk_budgeted(graph, source, reads, None, None, params)?
+                {
                     counted!("interp.columnar population read its label whole to keep the columns");
                     for col in walk.columns.iter_mut() {
                         *col = take_entries_to(col, over_ids);
@@ -2039,12 +2534,18 @@ fn load_walk_budgeted(
                 ColumnFamily::Nodes,
             ),
             Source::Nodes { any_of, .. } if !any_of.is_empty() => (
-                graph.members_any(any_of).map_err(RunError::Graph)?.to_arc_vec(),
+                graph
+                    .members_any(any_of)
+                    .map_err(RunError::Graph)?
+                    .to_arc_vec(),
                 Vec::new(),
                 ColumnFamily::Nodes,
             ),
             Source::Nodes { labels, .. } => (
-                graph.members_all(labels).map_err(RunError::Graph)?.to_arc_vec(),
+                graph
+                    .members_all(labels)
+                    .map_err(RunError::Graph)?
+                    .to_arc_vec(),
                 Vec::new(),
                 ColumnFamily::Nodes,
             ),
@@ -2078,7 +2579,6 @@ fn load_walk_budgeted(
     // walk that would have fit is skipped for a gather of |members| point
     // reads — the direction that costs a few microseconds, not a scan.
     let span = hi.unwrap_or(lo).saturating_sub(lo) as usize;
-    let sparse_label = span > budget.saturating_mul(8);
     // The PROPERTY-COLUMN CACHE (`Graph::prop_column`): a single-label node
     // population reads a column the last walk over that label assembled,
     // restricted to this population's id range, instead of assembling it
@@ -2117,6 +2617,16 @@ fn load_walk_budgeted(
         && over.is_none()
         && (!multi_label
             || cache_label.is_some_and(|l| graph.count_label_nodes(l) == members.len() as u64));
+    // Fix 106: a walk that is NOT kept — an unlabelled population, or a
+    // labelled one read over a supplied subset — is skipped as soon as the
+    // span is wider than the budget: the walk visits every row of the span
+    // and declines past the budget, so on a dense store it can only
+    // decline, after the visits, and the gather then runs anyway (the
+    // seeded MENTIONS aggregate's unlabelled ends walked twice and gathered
+    // once per property: 909 ms on the hop-listing bench against the
+    // labelled spelling's 139). A whole-label walk keeps the eight-budget
+    // rule: served, it is KEPT as the label's column for every later read.
+    let sparse_label = span > budget.saturating_mul(if whole_label { 8 } else { 1 });
     let mut columns: Vec<Vec<(u64, Value)>> = Vec::with_capacity(reads.props.len());
     let mut declined: Vec<usize> = Vec::new();
     let mut from_cache: Vec<bool> = vec![false; reads.props.len()];
@@ -2139,7 +2649,13 @@ fn load_walk_budgeted(
             }
         }
         if sparse_label {
-            counted!("interp.columnar column read skipped the span walk for a sparse label");
+            if whole_label {
+                counted!("interp.columnar column read skipped the span walk for a sparse label");
+            } else {
+                counted!(
+                    "interp.columnar column read skipped the span walk for a sparse population"
+                );
+            }
             declined.push(j);
             columns.push(Vec::new());
             continue;
@@ -2219,7 +2735,13 @@ fn load_walk_budgeted(
         // full: the production NewsArticle enrichment count grew the
         // resident set by 6.75 GB per execution for a `count(a)`.
         let ids: Vec<u64> = if sparse_label {
-            counted!("interp.columnar column read skipped the span walk for a sparse label");
+            if whole_label {
+                counted!("interp.columnar column read skipped the span walk for a sparse label");
+            } else {
+                counted!(
+                    "interp.columnar column read skipped the span walk for a sparse population"
+                );
+            }
             graph
                 .column_presence_gather(family, &p, members.as_slice())
                 .map_err(RunError::Graph)?
@@ -2263,7 +2785,10 @@ fn load_walk_budgeted(
     for l in &reads.labels {
         label_members.push((
             l.clone(),
-            graph.members(Some(l)).map_err(RunError::Graph)?.to_arc_vec(),
+            graph
+                .members(Some(l))
+                .map_err(RunError::Graph)?
+                .to_arc_vec(),
             0,
         ));
     }
@@ -2314,7 +2839,9 @@ fn load_walk_budgeted(
     // range, a writing transaction or an absent table keep the per-member
     // probe; a type never minted has no edges.
     let mut probe_hits: Vec<Option<Vec<bool>>> = Vec::with_capacity(reads.probes.len());
-    let in_table_range = members.last().is_none_or(|&m| m <= crate::DEGREE_TABLE_MAX_ID);
+    let in_table_range = members
+        .last()
+        .is_none_or(|&m| m <= crate::DEGREE_TABLE_MAX_ID);
     for (pi, p) in reads.probes.iter().enumerate() {
         let tag = match p.dir {
             Dir::Out => b'O',
@@ -2467,6 +2994,26 @@ impl Walk {
 
     /// Bind member `mi` (id `id`) into `scope`: the columns (absent →
     /// Null), the label booleans, the probes, `type(r)`.
+    /// Fix 109: place every sequential cursor at the first entry of id `id`
+    /// or above — for a walk whose members are visited in CHUNKS out of id
+    /// order (fix 82's both-ends order for a bare LIMIT). `bind`'s cursors
+    /// only advance, so a later chunk of LOWER ids found them already past
+    /// its entries and bound Null: the production `MATCH (a:NewsArticle)
+    /// RETURN a.articleId AS id LIMIT 5000` — two chunks, the last visited
+    /// first — answered 4,096 rows of `id: null`. Within a chunk the ids
+    /// ascend and chunks never overlap, so a value is still taken once.
+    fn seek_cursors(&mut self, id: u64) {
+        for (ci, col) in self.columns.iter().enumerate() {
+            self.cursors[ci] = col.partition_point(|(cid, _)| *cid < id);
+        }
+        for (_, ids, cur) in self.presence.iter_mut() {
+            *cur = ids.partition_point(|&cid| cid < id);
+        }
+        for (_, members, cur) in self.label_members.iter_mut() {
+            *cur = members.partition_point(|&cid| cid < id);
+        }
+    }
+
     fn bind(
         &mut self,
         graph: &Graph,
@@ -2588,13 +3135,21 @@ pub(crate) fn try_columnar_aggregate(
     if plan.covered && covered_count_applies(&plan) {
         if let Source::Nodes { labels, any_of } = &plan.source {
             if any_of.is_empty() && labels.len() == 1 {
-                if let Some(n) =
-                    covered_count(graph, &labels[0], &plan.seeks, &plan.prefixes, &plan.ranges, &scope)?
-                {
+                if let Some(n) = covered_count(
+                    graph,
+                    &labels[0],
+                    &plan.seeks,
+                    &plan.prefixes,
+                    &plan.ranges,
+                    &scope,
+                )? {
                     sought = true;
                     counted!("interp.statements run");
                     counted!("interp.columnar aggregate scans");
-                    sometimes!("interp.columnar aggregate counted an index intersection", true);
+                    sometimes!(
+                        "interp.columnar aggregate counted an index intersection",
+                        true
+                    );
                     for _ in 0..n {
                         fold.push(graph, &scope)?;
                     }
@@ -2605,15 +3160,14 @@ pub(crate) fn try_columnar_aggregate(
     if !sought && plan.reads.probes.is_empty() && plan.reads.degrees.is_empty() {
         if let Source::Nodes { labels, any_of } = &plan.source {
             if any_of.is_empty() {
-                if let Some(ids) = columnar_seek_ids(
-                    graph,
-                    labels,
-                    &plan.seeks,
-                    &plan.prefixes,
-                    &plan.ranges,
-                    SeekUse::PerId,
-                    &scope,
-                )? {
+                let cands = SeekCandidates {
+                    seeks: &plan.seeks,
+                    prefixes: &plan.prefixes,
+                    ranges: &plan.ranges,
+                    texts: &plan.texts,
+                };
+                if let Some(ids) = columnar_seek_ids(graph, labels, &cands, SeekUse::PerId, &scope)?
+                {
                     sought = true;
                     counted!("interp.statements run");
                     counted!("interp.columnar aggregate scans");
@@ -2672,15 +3226,13 @@ pub(crate) fn try_columnar_aggregate(
     if !sought {
         if let Source::Nodes { labels, any_of } = &plan.source {
             if any_of.is_empty() {
-                walk_seek = columnar_seek_ids(
-                    graph,
-                    labels,
-                    &plan.seeks,
-                    &plan.prefixes,
-                    &plan.ranges,
-                    SeekUse::Walk,
-                    &scope,
-                )?;
+                let cands = SeekCandidates {
+                    seeks: &plan.seeks,
+                    prefixes: &plan.prefixes,
+                    ranges: &plan.ranges,
+                    texts: &plan.texts,
+                };
+                walk_seek = columnar_seek_ids(graph, labels, &cands, SeekUse::Walk, &scope)?;
                 if let (Some(ids), Some(l)) = (&walk_seek, labels.first()) {
                     prefer_walk = (ids.len() as u64).saturating_mul(8) < graph.count_label_nodes(l);
                 }
@@ -2708,6 +3260,28 @@ pub(crate) fn try_columnar_aggregate(
                         fold.push(graph, &scope)?;
                     }
                 }
+            }
+        }
+    }
+    // Fix 108: any other aggregate over ONE label with every column CACHED —
+    // grouped, DISTINCT, a non-star argument — folded over the columns as
+    // vectors, no per-member scope (`fold_over_cached_columns`).
+    if !sought
+        && !prefer_walk
+        && plan.reads.probes.is_empty()
+        && plan.reads.degrees.is_empty()
+        && plan.reads.labels.is_empty()
+        && !plan.reads.type_read
+    {
+        if let Source::Nodes { labels, any_of } = &plan.source {
+            if labels.len() == 1
+                && any_of.is_empty()
+                && fold_over_cached_columns(graph, &labels[0], &plan, &scope, &mut fold)?
+            {
+                sought = true;
+                counted!("interp.statements run");
+                counted!("interp.columnar aggregate scans");
+                counted!("interp.columnar aggregate folded over cached columns");
             }
         }
     }
@@ -2761,7 +3335,9 @@ pub(crate) fn try_columnar_aggregate(
                 if any_of.is_empty() {
                     if let Some(ids) = walk_seek.take() {
                         if prefer_walk {
-                            counted!("interp.columnar aggregate walked a selective seek instead of vectorising");
+                            counted!(
+                                "interp.columnar aggregate walked a selective seek instead of vectorising"
+                            );
                         }
                         let members = graph.members_all(labels).map_err(RunError::Graph)?;
                         let over: Vec<u64> = ids
@@ -2835,7 +3411,8 @@ pub(crate) fn try_columnar_aggregate(
             let members = members.to_arc_vec();
             for batch in members.chunks(bsize) {
                 let over = std::sync::Arc::new(batch.to_vec());
-                let Some(mut walk) = load_walk_over(graph, &plan.source, &plan.reads, Some(over), params)?
+                let Some(mut walk) =
+                    load_walk_over(graph, &plan.source, &plan.reads, Some(over), params)?
                 else {
                     return Ok(None);
                 };
@@ -2889,6 +3466,9 @@ struct Fold<'p> {
     group_index: BTreeMap<Vec<u8>, usize>,
     groups: Vec<(Vec<Value>, Vec<SiteAcc>)>,
     nonce: u64,
+    /// A share's PARTIAL fold (`parallel_stage_fold`): its sums and averages
+    /// keep their float addends in arrival order (`SiteAcc::defer_floats`).
+    partial: bool,
 }
 
 /// What the fold projects at the end.
@@ -2923,31 +3503,90 @@ impl<'p> Fold<'p> {
             group_index: BTreeMap::new(),
             groups: Vec::new(),
             nonce: 0,
+            partial: false,
         }
     }
 
-    /// Fold one bound row (its locals already in `scope`).
-    fn push(&mut self, graph: &Graph, scope: &Scope<'_>) -> Result<(), RunError> {
+    /// The group the bound row belongs to — its key evaluated, the group
+    /// made on first sight.
+    fn group_of(&mut self, graph: &Graph, scope: &Scope<'_>) -> Result<usize, RunError> {
         let mut key = Vec::with_capacity(self.key_exprs.len());
         for k in &self.key_exprs {
             key.push(eval_with(k, scope, None).map_err(RunError::Eval)?);
         }
+        self.group_for(graph, key)
+    }
+
+    /// Fold one row from PRE-EVALUATED key values and site arguments (fix
+    /// 108): the group by its key, each site pushed its argument — `None`
+    /// for a star site — exactly as `push` folds a bound row.
+    fn push_values(
+        &mut self,
+        graph: &Graph,
+        key: Vec<Value>,
+        args: impl Iterator<Item = Option<Value>>,
+    ) -> Result<(), RunError> {
+        let gi = self.group_for(graph, key)?;
+        let accs = &mut self.groups[gi].1;
+        for (acc, v) in accs.iter_mut().zip(args) {
+            acc.push(v)?;
+        }
+        Ok(())
+    }
+
+    /// The group an evaluated key belongs to, made on first sight.
+    fn group_for(&mut self, graph: &Graph, key: Vec<Value>) -> Result<usize, RunError> {
         let ser = agg_key_of(&key, &mut self.nonce);
-        let gi = match self.group_index.get(&ser) {
+        Ok(match self.group_index.get(&ser) {
             Some(&i) => i,
             None => {
-                self.groups.push((
-                    key,
-                    self.sites
-                        .iter()
-                        .map(|(s, _)| SiteAcc::for_site(s))
-                        .collect(),
-                ));
+                let mut accs: Vec<SiteAcc> =
+                    self.sites.iter().map(|(s, _)| SiteAcc::for_site(s)).collect();
+                if self.partial {
+                    accs.iter_mut().for_each(SiteAcc::defer_floats);
+                }
+                self.groups.push((key, accs));
                 self.group_index.insert(ser, self.groups.len() - 1);
                 budget_check(graph, self.groups.len())?;
                 self.groups.len() - 1
             }
-        };
+        })
+    }
+
+    /// Merge a LATER share's partial into this one (`parallel_stage_fold`):
+    /// what folding its rows after this one's would have made. Its groups
+    /// follow in its own first-seen order; a group both saw merges its
+    /// accumulators ([`SiteAcc::merge_in_order`]); NaN keys never meet, as
+    /// they never do in one fold (each partial numbers its own apart).
+    /// `Ok(false)` when an accumulator cannot merge exactly — the caller
+    /// then folds on its own thread.
+    fn merge_later(&mut self, graph: &Graph, later: Fold<'p>) -> Result<bool, RunError> {
+        let mut sers: Vec<Vec<u8>> = vec![Vec::new(); later.groups.len()];
+        for (ser, i) in later.group_index {
+            sers[i] = ser;
+        }
+        for ((key, accs), ser) in later.groups.into_iter().zip(sers) {
+            match self.group_index.get(&ser) {
+                Some(&gi) => {
+                    for (acc, part) in self.groups[gi].1.iter_mut().zip(accs) {
+                        if !acc.merge_in_order(part)? {
+                            return Ok(false);
+                        }
+                    }
+                }
+                None => {
+                    self.groups.push((key, accs));
+                    self.group_index.insert(ser, self.groups.len() - 1);
+                    budget_check(graph, self.groups.len())?;
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Fold one bound row (its locals already in `scope`).
+    fn push(&mut self, graph: &Graph, scope: &Scope<'_>) -> Result<(), RunError> {
+        let gi = self.group_of(graph, scope)?;
         let accs = &mut self.groups[gi].1;
         for ((site, arg), acc) in self.sites.iter().zip(accs.iter_mut()) {
             let v = if site.star {
@@ -2957,6 +3596,37 @@ impl<'p> Fold<'p> {
                 Some(eval_with(a, scope, None).map_err(RunError::Eval)?)
             };
             acc.push(v)?;
+        }
+        Ok(())
+    }
+
+    /// Fold `n` rows alike in one push (fix 81): the key evaluated once, a
+    /// star count advanced by `n`, any other site pushed `n` times. The
+    /// seeded hop walk folds a seed's whole degree, or a far end's edge
+    /// count, this way.
+    fn push_n(&mut self, graph: &Graph, scope: &Scope<'_>, n: u64) -> Result<(), RunError> {
+        if n == 0 {
+            return Ok(());
+        }
+        let gi = self.group_of(graph, scope)?;
+        let accs = &mut self.groups[gi].1;
+        for ((site, arg), acc) in self.sites.iter().zip(accs.iter_mut()) {
+            if site.star {
+                match acc {
+                    SiteAcc::CountStar(c) => *c += n as i64,
+                    _ => {
+                        for _ in 0..n {
+                            acc.push(None)?;
+                        }
+                    }
+                }
+            } else {
+                let a = arg.expect("non-star site has an argument");
+                let v = eval_with(a, scope, None).map_err(RunError::Eval)?;
+                for _ in 0..n {
+                    acc.push(Some(v.clone()))?;
+                }
+            }
         }
         Ok(())
     }
@@ -3083,6 +3753,11 @@ struct ProjPlan {
     seeks: Vec<(String, Vec<Expr>)>,
     /// `var.prop STARTS WITH x` candidates — see `Plan::prefixes`.
     prefixes: Vec<(String, Expr)>,
+    /// `var.prop =~ / CONTAINS / STARTS WITH / ENDS WITH 'literal'` conjuncts,
+    /// recorded RAW. The trigram condition is derived later, in the seek, and
+    /// only once a declared index is known to exist — see
+    /// `crate::interp::text_query_for`.
+    texts: Vec<(String, engram_cypher::BinOp, String)>,
     /// `var.prop < / <= / > / >= x` candidates — see `Plan::ranges`.
     ranges: Vec<(String, engram_cypher::BinOp, Expr)>,
     skip: Option<Expr>,
@@ -3105,6 +3780,7 @@ fn recognise_projection(q: &SingleQuery) -> Option<ProjPlan> {
     }
     let seeks = prop_eq_candidates(full_where.as_ref(), &var);
     let prefixes = crate::interp::prop_prefix_candidates(full_where.as_ref(), &var);
+    let texts = crate::interp::prop_text_candidates(full_where.as_ref(), &var);
     let ranges = crate::interp::prop_range_candidates(full_where.as_ref(), &var);
     let mut pred_reads = Reads::default();
     let mut reads = Reads::default();
@@ -3229,6 +3905,7 @@ fn recognise_projection(q: &SingleQuery) -> Option<ProjPlan> {
         two_phase,
         seeks,
         prefixes,
+        texts,
         ranges,
         skip: proj.skip.clone(),
         limit: proj.limit.clone(),
@@ -3276,6 +3953,147 @@ fn bind_from_projected(reads: &Reads, scope: &mut Scope<'_>, node: Option<&Value
 
 /// Evaluate the items (and the key vector when the order is not by
 /// column) for one bound survivor, pushing the row with its id trailing.
+/// Fix 94: the walk column a `RETURN DISTINCT n.p` (one item, no ORDER
+/// BY) projects — `Some(column index)` — or `None` for any other shape.
+/// `MATCH (n:UserDataNode {nodeType: 'email'}) WHERE n.userId IS NOT NULL
+/// RETURN DISTINCT n.userId AS userId` bound, evaluated, boxed into a row
+/// and canonically re-keyed every one of 18,373 survivors to keep two
+/// values (12.4 ms against Neo4j's 6.9 on the mirror); the column holds
+/// the values already, in the survivors' order.
+fn distinct_column_item(plan: &ProjPlan, walk: &Walk) -> Option<usize> {
+    if !plan.distinct || !plan.order.is_empty() || plan.items.len() != 1 {
+        return None;
+    }
+    let ProjItemPlan::Expr(Expr::Var(local)) = &plan.items[0] else {
+        return None;
+    };
+    if walk.columns.len() != plan.reads.props.len() {
+        return None;
+    }
+    plan.reads
+        .props
+        .iter()
+        .position(|p| local_for_prop(&plan.reads.tag, p) == *local)
+}
+
+/// Fix 126: every projected item is a plain COLUMN LOCAL, so the answer is
+/// the walk's columns transposed and nothing else — no `Scope`, no per-member
+/// `bind`, no expression evaluation per item.
+///
+/// `MATCH (p:Person) RETURN p.id AS id, p.firstName AS name LIMIT 5000` spent
+/// its whole per-member loop clearing a scope, binding two locals into it, and
+/// evaluating two `Expr::Var` lookups back out — five thousand times, to move
+/// two values it already had in hand.
+///
+/// Declines on anything that needs the scope: a bare `n`, DISTINCT, an ORDER
+/// BY whose keys are not already the projected columns, a type or id read, a
+/// probe, a degree, a presence or label test, or an expression that is not a
+/// bare column local. Also declines when two items name the SAME column,
+/// because the emit TAKES each value out of the column exactly as `bind` does
+/// and the second reader would see the `Null` left behind.
+fn all_column_items(plan: &ProjPlan, walk: &Walk) -> Option<Vec<usize>> {
+    if plan.distinct || !plan.order.is_empty() || plan.items.is_empty() {
+        return None;
+    }
+    if plan.reads.type_read || plan.reads.id_read {
+        return None;
+    }
+    if !walk.presence.is_empty() || !walk.label_members.is_empty() || !walk.degrees.is_empty() {
+        return None;
+    }
+    if walk.columns.len() != plan.reads.props.len() {
+        return None;
+    }
+    let mut cis: Vec<usize> = Vec::with_capacity(plan.items.len());
+    for it in &plan.items {
+        let ProjItemPlan::Expr(Expr::Var(local)) = it else {
+            return None;
+        };
+        let ci = plan
+            .reads
+            .props
+            .iter()
+            .position(|p| local_for_prop(&plan.reads.tag, p) == *local)?;
+        if cis.contains(&ci) {
+            return None; // the same column twice: the second read would be Null
+        }
+        cis.push(ci);
+    }
+    Some(cis)
+}
+
+/// Fix 126's emit: one row per id, each column's value taken at its own
+/// cursor, then the trailing id `project_row` appends. Byte-for-byte the rows
+/// the per-member loop built.
+fn emit_column_rows(
+    walk: &mut Walk,
+    cis: &[usize],
+    ids: impl Iterator<Item = u64>,
+    rows: &mut Vec<Vec<Value>>,
+    keys: &mut Vec<Vec<Value>>,
+) {
+    for id in ids {
+        let mut out = Vec::with_capacity(cis.len() + 1);
+        for &ci in cis {
+            let col = &mut walk.columns[ci];
+            let cur = &mut walk.cursors[ci];
+            while *cur < col.len() && col[*cur].0 < id {
+                *cur += 1;
+            }
+            // TAKEN, not cloned — the same trade `Walk::bind` makes, and the
+            // reason `all_column_items` refuses to serve one column twice.
+            out.push(if *cur < col.len() && col[*cur].0 == id {
+                std::mem::replace(&mut col[*cur].1, Value::Null)
+            } else {
+                Value::Null
+            });
+        }
+        out.push(Value::Int(id as i64));
+        rows.push(out);
+        keys.push(Vec::new());
+    }
+}
+
+/// Fix 94: the distinct values of the walk's column `ci` over its members,
+/// first occurrence first, each as the row the per-member loop would have
+/// built (the value, then the trailing id placeholder) with an empty order
+/// key. A member with no entry reads Null; every Null is one value, as
+/// DISTINCT has it; a string dedups by its text, anything else by the same
+/// canonical key the row-wise dedup uses.
+fn dedup_one_column(
+    walk: &Walk,
+    ci: usize,
+    ids: impl Iterator<Item = u64>,
+    rows: &mut Vec<Vec<Value>>,
+    keys: &mut Vec<Vec<Value>>,
+) {
+    let col = &walk.columns[ci];
+    let mut cur = walk.cursors[ci];
+    let mut seen_str: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    let mut seen_other: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
+    let mut seen_null = false;
+    let mut nonce = 0u64;
+    for id in ids {
+        while cur < col.len() && col[cur].0 < id {
+            cur += 1;
+        }
+        let v = if cur < col.len() && col[cur].0 == id {
+            &col[cur].1
+        } else {
+            &Value::Null
+        };
+        let fresh = match v {
+            Value::Null => !std::mem::replace(&mut seen_null, true),
+            Value::Str(s) => seen_str.insert(s.as_str()),
+            other => seen_other.insert(agg_key_of(std::slice::from_ref(other), &mut nonce)),
+        };
+        if fresh {
+            rows.push(vec![v.clone(), Value::Int(id as i64)]);
+            keys.push(Vec::new());
+        }
+    }
+}
+
 fn project_row(
     plan: &ProjPlan,
     scope: &mut Scope<'_>,
@@ -3376,15 +4194,14 @@ pub(crate) fn try_columnar_projection(
     if plan.reads.probes.is_empty() && plan.reads.degrees.is_empty() {
         if let Source::Nodes { labels, any_of } = &plan.source {
             if any_of.is_empty() {
-                if let Some(ids) = columnar_seek_ids(
-                    graph,
-                    labels,
-                    &plan.seeks,
-                    &plan.prefixes,
-                    &plan.ranges,
-                    SeekUse::PerId,
-                    &scope,
-                )? {
+                let cands = SeekCandidates {
+                    seeks: &plan.seeks,
+                    prefixes: &plan.prefixes,
+                    ranges: &plan.ranges,
+                    texts: &plan.texts,
+                };
+                if let Some(ids) = columnar_seek_ids(graph, labels, &cands, SeekUse::PerId, &scope)?
+                {
                     sought = true;
                     counted!("interp.statements run");
                     counted!("interp.columnar projection scans");
@@ -3405,7 +4222,29 @@ pub(crate) fn try_columnar_projection(
                         .chain(plan.reads.presence.iter())
                         .cloned()
                         .collect();
-                    for id in ids {
+                    // Fix 114: a bare LIMIT over a SOUGHT population visits
+                    // the ids NEWEST FIRST — fix 82's rule for the label
+                    // scan, which this path lacked. Ids are minted in
+                    // creation order and the listings that cap without
+                    // ordering are recency-filtered, so the k survivors sit
+                    // at the END of id order: the production story pick
+                    // (`s.primaryTopic = $t AND s.status <> 'stale' AND
+                    // s.lastUpdatedAt > $cutoff … LIMIT 5`) read 1,324
+                    // sought stories ascending to find five recent ones
+                    // (9 ms on the mirror, Neo4j 1.1). The k found come
+                    // back in id order, as the label scan's do.
+                    let newest_first = early_cap.is_some() && ids.len() > 1;
+                    if newest_first {
+                        counted!(
+                            "interp.columnar projection sought ids visited newest first for the limit"
+                        );
+                    }
+                    let order: Vec<u64> = if newest_first {
+                        ids.into_iter().rev().collect()
+                    } else {
+                        ids
+                    };
+                    for id in order {
                         let node = graph.node_projected(id, &want).map_err(RunError::Graph)?;
                         let Some(Value::Node { labels: nl, .. }) = &node else {
                             continue;
@@ -3425,8 +4264,12 @@ pub(crate) fn try_columnar_projection(
                         project_row(&plan, &mut scope, id, &mut rows, &mut keys)?;
                         budget_check(graph, rows.len())?;
                         if early_cap.is_some_and(|c| rows.len() >= c) {
+                            counted!("interp.columnar projection stopped at the limit");
                             break;
                         }
+                    }
+                    if newest_first {
+                        sort_rows_by_trailing_id(&mut rows, &mut keys);
                     }
                 }
             }
@@ -3442,7 +4285,11 @@ pub(crate) fn try_columnar_projection(
         // items and binds the survivors alone. A column not yet cached, or
         // a predicate the vectoriser declines, keeps the per-member walk
         // (which assembles and keeps the columns for the next statement).
-        let phase1_reads = if two_phase { &plan.pred_reads } else { &plan.reads };
+        let phase1_reads = if two_phase {
+            &plan.pred_reads
+        } else {
+            &plan.reads
+        };
         let vector_label: Option<&str> = match (&plan.pred, &plan.source) {
             (Some(_), Source::Nodes { labels, any_of })
                 if labels.len() == 1
@@ -3495,14 +4342,59 @@ pub(crate) fn try_columnar_projection(
                 // walk (and the column it would assemble and keep) is cut
                 // to them. `MATCH (s:Story) RETURN s.storyId LIMIT 3` read
                 // the whole label's column for three rows.
-                let capped: Option<std::sync::Arc<Vec<u64>>> = match (early_cap, &plan.pred, &plan.source) {
+                // Fix 112: when the label's columns are NOT yet kept and the
+                // whole label would fit the property-column cache, the walk
+                // is NOT cut: it reads the label whole ONCE — the walk keeps
+                // only whole-label columns — and stops at the limit in id
+                // order, so this execution answers the first `cap` members
+                // exactly as the cut walk did and every later one reads the
+                // cache. The production `MATCH (a:NewsArticle) RETURN
+                // a.articleId AS id, a.title AS title LIMIT 5000` gathered
+                // 5,000 fat records on every execution (54 ms on the mirror,
+                // Neo4j 18.5) because a cut walk kept nothing. A label past
+                // the budget, or a read of anything but plain properties,
+                // keeps the cut.
+                // A SMALL limit keeps the cut (fix 52's own case: `LIMIT 3`
+                // must not read a whole label for three rows), and so does a
+                // label wide enough that its one whole walk would stall the
+                // first caller for seconds.
+                const WIDEN_MIN_LIMIT: usize = 256;
+                const WIDEN_MAX_LABEL: usize = 262_144;
+                let mut widened = false;
+                let capped: Option<std::sync::Arc<Vec<u64>>> = match (
+                    early_cap,
+                    &plan.pred,
+                    &plan.source,
+                ) {
                     (Some(cap), None, Source::Nodes { labels, any_of })
                         if labels.len() == 1 && any_of.is_empty() =>
                     {
                         let members = graph.members_all(labels).map_err(RunError::Graph)?;
-                        let ids: Vec<u64> = members.iter().take(cap).collect();
-                        counted!("interp.columnar projection walk cut at the plain limit");
-                        Some(std::sync::Arc::new(ids))
+                        let keep_whole = !plan.reads.props.is_empty()
+                            && plan.reads.probes.is_empty()
+                            && plan.reads.degrees.is_empty()
+                            && plan.reads.labels.is_empty()
+                            && !plan.reads.type_read
+                            && cap >= WIDEN_MIN_LIMIT
+                            && members.len() > cap
+                            && members.len() <= WIDEN_MAX_LABEL
+                            && members.len().saturating_mul(64) <= graph.prop_column_budget()
+                            && !graph.prop_columns_current(
+                                &labels[0],
+                                &plan.reads.props,
+                                &plan.reads.presence_only(),
+                            );
+                        if keep_whole {
+                            counted!(
+                                "interp.columnar projection walked its label whole to keep the columns for its limit"
+                            );
+                            widened = true;
+                            None
+                        } else {
+                            let ids: Vec<u64> = members.iter().take(cap).collect();
+                            counted!("interp.columnar projection walk cut at the plain limit");
+                            Some(std::sync::Arc::new(ids))
+                        }
                     }
                     _ => None,
                 };
@@ -3515,8 +4407,7 @@ pub(crate) fn try_columnar_projection(
                 // Single phase over a label: the predicate column-at-a-time
                 // over the walk's own members, the items bound from the walk
                 // for the survivors alone.
-                let vector_hits: Option<Vec<usize>> = match (two_phase, vector_label, &plan.pred)
-                {
+                let vector_hits: Option<Vec<usize>> = match (two_phase, vector_label, &plan.pred) {
                     (false, Some(label), Some(pred)) => survivors_over_cached_columns(
                         graph,
                         label,
@@ -3530,43 +4421,126 @@ pub(crate) fn try_columnar_projection(
                 };
                 if let Some(hits) = vector_hits {
                     counted!("interp.columnar projection predicate evaluated column-at-a-time");
-                    for mi in hits {
-                        let id = pwalk.members[mi];
-                        scope.locals.clear();
-                        pwalk.bind(graph, &plan.reads, &mut scope, mi, id)?;
-                        single_phase_rows.push((id, mi));
-                        project_row(&plan, &mut scope, id, &mut rows, &mut keys)?;
+                    if let Some(ci) = distinct_column_item(&plan, &pwalk) {
+                        // Fix 94: `RETURN DISTINCT n.p` dedups the column over
+                        // the survivors (no bare item, so no late row).
+                        dedup_one_column(
+                            &pwalk,
+                            ci,
+                            hits.iter().map(|&mi| pwalk.members[mi]),
+                            &mut rows,
+                            &mut keys,
+                        );
+                        counted!("interp.columnar projection deduplicated its one column");
                         budget_check(graph, rows.len())?;
+                    } else {
+                        for mi in hits {
+                            let id = pwalk.members[mi];
+                            scope.locals.clear();
+                            pwalk.bind(graph, &plan.reads, &mut scope, mi, id)?;
+                            single_phase_rows.push((id, mi));
+                            project_row(&plan, &mut scope, id, &mut rows, &mut keys)?;
+                            budget_check(graph, rows.len())?;
+                        }
                     }
                     if early_cap.is_some_and(|c| rows.len() >= c) {
                         counted!("interp.columnar projection stopped at the limit");
                     }
                 } else {
-                    for mi in 0..pwalk.members.len() {
-                        let id = pwalk.members[mi];
-                        scope.locals.clear();
-                        pwalk.bind(graph, phase1_reads, &mut scope, mi, id)?;
-                        if let Some(pred) = &plan.pred {
-                            let v = eval_with(pred, &scope, None).map_err(RunError::Eval)?;
-                            if !truth_of(v)? {
-                                continue;
-                            }
-                        }
-                        if two_phase {
-                            survivors.push(id);
-                            if early_cap.is_some_and(|c| survivors.len() >= c) {
+                    // The per-member walk visits the chunks in the same
+                    // order as the column-at-a-time scan (fix 82), so a
+                    // capped statement answers the same k rows cold and warm.
+                    let n = pwalk.members.len();
+                    // Fix 112: a walk widened to keep its columns visits its
+                    // chunks FORWARD and stops at the limit — the first `cap`
+                    // members in id order, the cut walk's own rows.
+                    let has_pred = plan.pred.is_some();
+                    let both_ends = !widened && scan_from_both_ends(n, early_cap, has_pred);
+                    let order: Vec<usize> = if widened {
+                        (0..n.div_ceil(PRED_CHUNK)).collect()
+                    } else {
+                        scan_chunk_order(n, early_cap, has_pred)
+                    };
+                    // Fix 126: a capped, predicate-less, single-phase, FORWARD
+                    // walk whose every item is a bare column local is just its
+                    // columns transposed — take the first `cap` members in id
+                    // order and read one value per column. This is the branch
+                    // `plat-limit-listing` takes; the plain-walk site below is
+                    // the uncapped twin.
+                    //
+                    // Guarded on all four, each load-bearing: a predicate needs
+                    // the scope to evaluate against, a two-phase plan defers its
+                    // items to phase 2, a both-ends order visits chunks out of id
+                    // order (so the cursors would have to be re-seeked per
+                    // chunk), and a bare item is already refused by the
+                    // recogniser.
+                    let mut emitted_by_columns = false;
+                    if !two_phase && plan.pred.is_none() && !both_ends {
+                        if let Some(cis) = all_column_items(&plan, &pwalk) {
+                            let take = early_cap.unwrap_or(n).min(n);
+                            let members = std::sync::Arc::clone(&pwalk.members);
+                            emit_column_rows(
+                                &mut pwalk,
+                                &cis,
+                                members[..take].iter().copied(),
+                                &mut rows,
+                                &mut keys,
+                            );
+                            counted!(
+                                "interp.columnar projection emitted its rows from the columns"
+                            );
+                            if early_cap.is_some_and(|c| rows.len() >= c) {
                                 counted!("interp.columnar projection stopped at the limit");
-                                break;
                             }
-                            continue;
+                            budget_check(graph, rows.len())?;
+                            emitted_by_columns = true;
                         }
-                        single_phase_rows.push((id, mi));
-                        project_row(&plan, &mut scope, id, &mut rows, &mut keys)?;
-                        budget_check(graph, rows.len())?;
-                        if early_cap.is_some_and(|c| rows.len() >= c) {
-                            counted!("interp.columnar projection stopped at the limit");
+                    }
+                    let mut done = emitted_by_columns;
+                    for c in order {
+                        if done {
                             break;
                         }
+                        // Fix 109: a chunk visited out of id order places
+                        // the bind cursors at its first member first.
+                        if both_ends {
+                            pwalk.seek_cursors(pwalk.members[c * PRED_CHUNK]);
+                        }
+                        for mi in c * PRED_CHUNK..n.min((c + 1) * PRED_CHUNK) {
+                            let id = pwalk.members[mi];
+                            scope.locals.clear();
+                            pwalk.bind(graph, phase1_reads, &mut scope, mi, id)?;
+                            if let Some(pred) = &plan.pred {
+                                let v = eval_with(pred, &scope, None).map_err(RunError::Eval)?;
+                                if !truth_of(v)? {
+                                    continue;
+                                }
+                            }
+                            if two_phase {
+                                survivors.push(id);
+                                if early_cap.is_some_and(|c| survivors.len() >= c) {
+                                    counted!("interp.columnar projection stopped at the limit");
+                                    done = true;
+                                    break;
+                                }
+                                continue;
+                            }
+                            single_phase_rows.push((id, mi));
+                            project_row(&plan, &mut scope, id, &mut rows, &mut keys)?;
+                            budget_check(graph, rows.len())?;
+                            if early_cap.is_some_and(|c| rows.len() >= c) {
+                                counted!("interp.columnar projection stopped at the limit");
+                                done = true;
+                                break;
+                            }
+                        }
+                        if done {
+                            break;
+                        }
+                    }
+                    if both_ends {
+                        survivors.sort_unstable();
+                        sort_rows_by_trailing_id(&mut rows, &mut keys);
                     }
                 }
                 let population = pwalk.members.len();
@@ -3607,12 +4581,37 @@ pub(crate) fn try_columnar_projection(
                     counted!("interp.columnar projection scans");
                     sometimes!("interp.columnar projection scan ran", true);
                     note_walk_events(&plan.source, &plan.reads, &walk);
-                    for mi in 0..walk.members.len() {
-                        let id = walk.members[mi];
-                        scope.locals.clear();
-                        walk.bind(graph, &plan.reads, &mut scope, mi, id)?;
-                        project_row(&plan, &mut scope, id, &mut rows, &mut keys)?;
+                    if let Some(ci) = distinct_column_item(&plan, &walk) {
+                        // Fix 94: `RETURN DISTINCT n.p` dedups the column.
+                        dedup_one_column(
+                            &walk,
+                            ci,
+                            walk.members.iter().copied(),
+                            &mut rows,
+                            &mut keys,
+                        );
+                        counted!("interp.columnar projection deduplicated its one column");
                         budget_check(graph, rows.len())?;
+                    } else if let Some(cis) = all_column_items(&plan, &walk) {
+                        // Fix 126: the rows ARE the columns, transposed.
+                        let members = std::sync::Arc::clone(&walk.members);
+                        emit_column_rows(
+                            &mut walk,
+                            &cis,
+                            members.iter().copied(),
+                            &mut rows,
+                            &mut keys,
+                        );
+                        counted!("interp.columnar projection emitted its rows from the columns");
+                        budget_check(graph, rows.len())?;
+                    } else {
+                        for mi in 0..walk.members.len() {
+                            let id = walk.members[mi];
+                            scope.locals.clear();
+                            walk.bind(graph, &plan.reads, &mut scope, mi, id)?;
+                            project_row(&plan, &mut scope, id, &mut rows, &mut keys)?;
+                            budget_check(graph, rows.len())?;
+                        }
                     }
                 }
                 None => {
@@ -3871,7 +4870,14 @@ fn filter_ids_mode(
             // on the paged mirror (a population walk is never kept).
             let sole_conjunct = crate::interp::conjunct_count(pred) == 1
                 && seeks.len() + prefixes.len() + ranges.len() == 1;
-            match columnar_seek_ids(graph, labels, &seeks, &prefixes, &ranges, SeekUse::Walk, &scope)? {
+            let texts = crate::interp::prop_text_candidates(Some(pred), var);
+            let cands = SeekCandidates {
+                seeks: &seeks,
+                prefixes: &prefixes,
+                ranges: &ranges,
+                texts: &texts,
+            };
+            match columnar_seek_ids(graph, labels, &cands, SeekUse::Walk, &scope)? {
                 Some(ids) => {
                     let members = graph.members_all(labels).map_err(RunError::Graph)?;
                     counted!("interp.seed column filter walked over a seek");
@@ -3909,7 +4915,10 @@ fn filter_ids_mode(
         && reads.degrees.is_empty()
         && !reads.type_read
     {
-        let members = graph.members_all(labels).map_err(RunError::Graph)?.to_arc_vec();
+        let members = graph
+            .members_all(labels)
+            .map_err(RunError::Graph)?
+            .to_arc_vec();
         if let Some(hits) =
             survivors_over_cached_columns(graph, &labels[0], &rw, &reads, &members, None, &scope)
         {
@@ -3980,6 +4989,12 @@ enum Breaker {
     Fold {
         items: Vec<Item>,
         order: Vec<(usize, bool)>,
+        /// An item with an aggregate NESTED in it (`sum(m.length) /
+        /// toFloat(count(m))`): the fold's own columns — keys, top-level
+        /// aggregates and each lifted aggregate under a hidden name — and
+        /// the projection over them that yields the breaker's columns,
+        /// ordered and paged there (see `split_nested_aggregates`).
+        fin: Option<Box<(Vec<String>, Final)>>,
     },
 }
 
@@ -3993,6 +5008,11 @@ struct StagePlan {
     source: Source,
     pred: Option<Expr>,
     reads: Reads,
+    /// What the predicate ALONE reads. `reads` also holds the chain's and
+    /// the breaker's, and a label an item tests (`m:Comment AS isComment`)
+    /// kept the predicate from being judged column-at-a-time, although the
+    /// predicate itself read no label.
+    pred_reads: Reads,
     chain: Vec<ChainStep>,
     /// The breaker's columns, and how it consumes the rows.
     columns: Vec<String>,
@@ -4013,11 +5033,19 @@ fn recognise_stage(
     prefix: &[Clause],
     breaker: &Clause,
     rest_after: &[Clause],
+    // The names the stage's ONE input row carries in (`try_columnar_stage`
+    // binds them as the walk's variables): readable wherever an alias is.
+    carried: &[String],
 ) -> Option<StagePlan> {
     let [m @ Clause::Match { .. }, withs @ ..] = prefix else {
         return None;
     };
     let (var, kind, source, full_where) = recognise_source(m)?;
+    // A carried name the pattern re-uses is a BOUND node, not a scan of its
+    // label: the general path matches it.
+    if carried.contains(&var) {
+        return None;
+    }
     // See `recognise_projection`: an identity equality stays the general
     // path's one-get seek (`MATCH (n) WHERE id(n) = $id …` would otherwise
     // walk every node of the store).
@@ -4029,6 +5057,12 @@ fn recognise_stage(
         None => None,
         Some(w) => Some(rewrite(w, &var, kind, &mut reads)?),
     };
+    // The predicate is rewritten first into `reads` as well, so both name
+    // every local alike.
+    let mut pred_reads = Reads::default();
+    if let Some(w) = &full_where {
+        rewrite(w, &var, kind, &mut pred_reads)?;
+    }
     // A surviving graph-dependent subquery has no hooks in this stage:
     // `rewrite` passes an EXISTS/COUNT whose pattern STARTS from another
     // variable through untouched, and the chain evaluated it hook-less —
@@ -4046,7 +5080,7 @@ fn recognise_stage(
     // The scanned variable is in scope until a WITH drops it: a WITH
     // rebinds the scope to its items, an UNWIND adds to it. Reading it
     // after a WITH that dropped it is what the general path refuses.
-    let mut aliases: Vec<String> = Vec::new();
+    let mut aliases: Vec<String> = carried.to_vec();
     let mut chain = Vec::with_capacity(withs.len());
     let mut var_in_scope = true;
     for c in withs {
@@ -4055,7 +5089,9 @@ fn recognise_stage(
             if var_in_scope {
                 allowed.push(var.clone());
             }
-            if !reads_only(expr, &allowed) || *alias == var {
+            // Re-declaring a name in scope (an alias, a carried name) is the
+            // general path's to refuse.
+            if !reads_only(expr, &allowed) || *alias == var || aliases.contains(alias) {
                 return None;
             }
             let list = rewrite(expr, &var, kind, &mut reads)?;
@@ -4173,6 +5209,18 @@ fn recognise_stage(
     if !bare.is_empty() && !var_in_scope {
         return None; // carrying what an earlier WITH dropped
     }
+    // A bare carry under ANOTHER name (`WITH n AS m ORDER BY m.x`) declines:
+    // the ORDER BY reads the alias, and `rewrite` maps reads of the scanned
+    // variable only, so `m.x` read the null placeholder and the top-k sorted
+    // nulls — `MATCH (m:Message) WITH m AS mm ORDER BY mm.n DESC LIMIT 3
+    // RETURN mm.sq` hydrated the first three members by id instead of the
+    // three largest (found 2026-09-24). The general path answers it.
+    if bare
+        .iter()
+        .any(|&i| proj.items[i].alias.as_deref().is_some_and(|a| a != var))
+    {
+        return None;
+    }
     // A bare carry is a TOP-K's: a plain limit over the carry is the seed's
     // to cut (fix 52 reads only its first members), and this stage would
     // walk the whole label's columns to page it.
@@ -4202,9 +5250,37 @@ fn recognise_stage(
     let (columns, breaker) = if aggregating {
         // `count(v)` over the variable is `count(*)`; over an alias it is
         // a real count of non-null values (aggregating_items keeps it).
-        let (items, columns) = aggregating_items(proj, &var, kind, &mut reads)?;
-        let order = order_over(proj, &columns)?;
-        (columns, Breaker::Fold { items, order })
+        // Fix 86: so is `count(DISTINCT v)` — a member is one row here.
+        let proj = &star_distinct_counts(proj, &var);
+        match split_nested_aggregates(proj)? {
+            None => {
+                let (items, columns) = aggregating_items(proj, &var, kind, &mut reads)?;
+                let order = order_over(proj, &columns)?;
+                (
+                    columns,
+                    Breaker::Fold {
+                        items,
+                        order,
+                        fin: None,
+                    },
+                )
+            }
+            Some((inner, fin)) => {
+                // The lifted aggregates too: `count(DISTINCT v)` nested in an
+                // item counts members as a top-level one does.
+                let inner = star_distinct_counts(&inner, &var);
+                let (items, inner_columns) = aggregating_items(&inner, &var, kind, &mut reads)?;
+                counted!("interp.columnar stage lifted an aggregate nested in a breaker item");
+                (
+                    fin.columns.clone(),
+                    Breaker::Fold {
+                        items,
+                        order: Vec::new(),
+                        fin: Some(Box::new((inner_columns, fin))),
+                    },
+                )
+            }
+        }
     } else {
         let mut items = Vec::with_capacity(proj.items.len());
         let mut columns = Vec::with_capacity(proj.items.len());
@@ -4291,6 +5367,7 @@ fn recognise_stage(
         source,
         pred,
         reads,
+        pred_reads,
         chain,
         columns,
         breaker,
@@ -4312,6 +5389,201 @@ fn contains_aggregate_call(e: &Expr) -> bool {
         }
     });
     found
+}
+
+/// The hidden fold column an aggregate lifted out of a breaker item folds
+/// into — NUL-prefixed, so no name a statement binds can collide with it.
+fn hidden_aggregate(i: usize) -> String {
+    format!("\u{0}agg{i}")
+}
+
+/// `e` with every aggregate call in it replaced by its hidden fold column
+/// (`hidden_aggregate`), each distinct call lifted into `lifted` once —
+/// `None` for an expression shape this walk does not cover, or an
+/// aggregate over an aggregate (which the general path refuses by name).
+fn lift_aggregates(e: &Expr, lifted: &mut Vec<Expr>) -> Option<Expr> {
+    if let Expr::Call {
+        name, args, star, ..
+    } = e
+    {
+        if *star || is_aggregate_fn(name) {
+            if args.iter().any(contains_aggregate_call) {
+                return None;
+            }
+            let i = match lifted.iter().position(|x| x == e) {
+                Some(i) => i,
+                None => {
+                    lifted.push(e.clone());
+                    lifted.len() - 1
+                }
+            };
+            return Some(Expr::Var(hidden_aggregate(i)));
+        }
+    }
+    let l = |x: &Expr, lifted: &mut Vec<Expr>| lift_aggregates(x, lifted).map(Box::new);
+    Some(match e {
+        Expr::Var(_)
+        | Expr::Param(_)
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Str(_)
+        | Expr::Bool(_)
+        | Expr::Null => e.clone(),
+        Expr::Prop(b, k) => Expr::Prop(l(b, lifted)?, k.clone()),
+        Expr::Not(a) => Expr::Not(l(a, lifted)?),
+        Expr::Neg(a) => Expr::Neg(l(a, lifted)?),
+        Expr::And(a, b) => Expr::And(l(a, lifted)?, l(b, lifted)?),
+        Expr::Or(a, b) => Expr::Or(l(a, lifted)?, l(b, lifted)?),
+        Expr::Xor(a, b) => Expr::Xor(l(a, lifted)?, l(b, lifted)?),
+        Expr::Bin(op, a, b) => Expr::Bin(*op, l(a, lifted)?, l(b, lifted)?),
+        Expr::In(a, b) => Expr::In(l(a, lifted)?, l(b, lifted)?),
+        Expr::Index(a, b) => Expr::Index(l(a, lifted)?, l(b, lifted)?),
+        Expr::IsNull { of, negated } => Expr::IsNull {
+            of: l(of, lifted)?,
+            negated: *negated,
+        },
+        Expr::List(items) => Expr::List(
+            items
+                .iter()
+                .map(|x| lift_aggregates(x, lifted))
+                .collect::<Option<_>>()?,
+        ),
+        Expr::Map(pairs) => Expr::Map(
+            pairs
+                .iter()
+                .map(|(k, v)| Some((k.clone(), lift_aggregates(v, lifted)?)))
+                .collect::<Option<_>>()?,
+        ),
+        Expr::Case {
+            subject,
+            arms,
+            otherwise,
+        } => Expr::Case {
+            subject: match subject {
+                Some(s) => Some(l(s, lifted)?),
+                None => None,
+            },
+            arms: arms
+                .iter()
+                .map(|(w, t)| Some((lift_aggregates(w, lifted)?, lift_aggregates(t, lifted)?)))
+                .collect::<Option<_>>()?,
+            otherwise: match otherwise {
+                Some(o) => Some(l(o, lifted)?),
+                None => None,
+            },
+        },
+        Expr::Call {
+            name,
+            distinct,
+            args,
+            star,
+        } => Expr::Call {
+            name: name.clone(),
+            distinct: *distinct,
+            args: args
+                .iter()
+                .map(|x| lift_aggregates(x, lifted))
+                .collect::<Option<_>>()?,
+            star: *star,
+        },
+        _ => return None,
+    })
+}
+
+/// An aggregating breaker whose items NEST an aggregate in an expression —
+/// SNB BI bi1's `sum(message.length) / toFloat(count(message)) AS
+/// averageMessageLength` — split into the fold the stage runs and the
+/// projection over it that yields the breaker's own columns: the fold keeps
+/// each key and top-level aggregate under its column name and folds each
+/// nested aggregate into a hidden column; the projection computes every
+/// item from those and carries the breaker's ORDER BY / SKIP / LIMIT.
+/// `Some(None)` when no item nests one — the fold IS the breaker, as
+/// before. `None` declines: a shape the lift does not cover, or a projected
+/// expression or ORDER BY reading anything but the fold's columns (a group
+/// key re-spelt rather than named, a variable, a subquery).
+///
+/// Until this held, one such item sent bi1's whole stage to the general
+/// path, which decoded each of its 2.1M messages in full at SF3 to fold
+/// three properties of them.
+fn split_nested_aggregates(proj: &Projection) -> Option<Option<(Projection, Final)>> {
+    let top_level =
+        |e: &Expr| matches!(e, Expr::Call { name, star, .. } if *star || is_aggregate_fn(name));
+    if !proj
+        .items
+        .iter()
+        .any(|it| !top_level(&it.expr) && contains_aggregate_call(&it.expr))
+    {
+        return Some(None);
+    }
+    if proj.star || proj.distinct {
+        return None;
+    }
+    let columns: Vec<String> = proj
+        .items
+        .iter()
+        .enumerate()
+        .map(|(i, it)| {
+            it.alias
+                .clone()
+                .or_else(|| it.text.clone())
+                .unwrap_or_else(|| column_name(&it.expr, i))
+        })
+        .collect();
+    let mut inner: Vec<ProjItem> = Vec::new();
+    let mut fin_items: Vec<Expr> = Vec::with_capacity(proj.items.len());
+    let mut lifted: Vec<Expr> = Vec::new();
+    for (it, col) in proj.items.iter().zip(&columns) {
+        if top_level(&it.expr) || !contains_aggregate_call(&it.expr) {
+            // A key or a top-level aggregate: folded under its own name.
+            inner.push(ProjItem::synthetic(it.expr.clone(), Some(col.clone())));
+            fin_items.push(Expr::Var(col.clone()));
+        } else {
+            fin_items.push(lift_aggregates(&it.expr, &mut lifted)?);
+        }
+    }
+    let mut order = Vec::with_capacity(proj.order.len());
+    for o in &proj.order {
+        order.push(OrderItem {
+            expr: lift_aggregates(&o.expr, &mut lifted)?,
+            desc: o.desc,
+        });
+    }
+    let fold_columns: Vec<String> = inner
+        .iter()
+        .filter_map(|it| it.alias.clone())
+        .chain((0..lifted.len()).map(hidden_aggregate))
+        .collect();
+    for (i, agg) in lifted.into_iter().enumerate() {
+        inner.push(ProjItem::synthetic(agg, Some(hidden_aggregate(i))));
+    }
+    // The projection is evaluated over the fold's columns alone (and, for
+    // ORDER BY, its own), hook-less.
+    let mut allowed = fold_columns;
+    allowed.extend(columns.iter().cloned());
+    if fin_items
+        .iter()
+        .chain(order.iter().map(|o| &o.expr))
+        .any(|e| !reads_only(e, &allowed) || contains_opaque(e))
+    {
+        return None;
+    }
+    Some(Some((
+        Projection {
+            distinct: false,
+            star: false,
+            items: inner,
+            order: Vec::new(),
+            skip: None,
+            limit: None,
+        },
+        Final {
+            items: fin_items,
+            columns,
+            order,
+            skip: proj.skip.clone(),
+            limit: proj.limit.clone(),
+        },
+    )))
 }
 
 /// Visit every sub-expression (pre-order), shallowly over the variants the
@@ -4394,7 +5666,7 @@ fn walk_chain(
             match v {
                 Value::Null => Ok(()),
                 Value::List(items) => {
-                    for it in items {
+                    for it in (items).iter().cloned() {
                         scope.bind(alias, it);
                         walk_chain(rest, scope, sink)?;
                     }
@@ -4424,12 +5696,76 @@ pub(crate) fn try_columnar_stage(
         sometimes!("interp.columnar paths switched off", true);
         return Ok(None);
     }
-    if input.len() != 1 || !input[0].is_empty() {
-        return Ok(None); // a stage head only: nothing carried in
+    if input.len() != 1 {
+        return Ok(None); // ONE input row: a stage head, or a statement's constants
     }
-    let Some(plan) = recognise_stage(prefix, breaker, rest_after) else {
+    // ONE input row carrying values — a total an earlier stage counted, as
+    // in SNB BI bi1's `WITH count(message) AS totalMessageCountInt WITH
+    // toFloat(totalMessageCountInt) AS totalMessageCount MATCH (message:
+    // Message) …` — is the walk's variables, and the plain WITHs leading the
+    // prefix are evaluated over it ONCE. Until this held, a stage carrying
+    // anything in went to the general path whole: bi1 decoded each of its
+    // 2.1M messages in full at SF3 to fold three properties of them.
+    let lead = prefix
+        .iter()
+        .take_while(|c| matches!(c, Clause::With { .. }))
+        .count();
+    let mut carried_names: Vec<String> = input[0].keys().cloned().collect();
+    for c in &prefix[..lead] {
+        let Clause::With { proj, where_ } = c else {
+            unreachable!("counted as a WITH above")
+        };
+        // A filter (a row the WITH may drop), a star, or anything a breaker
+        // would carry is the general path's.
+        if where_.is_some()
+            || proj.star
+            || proj.distinct
+            || !proj.order.is_empty()
+            || proj.skip.is_some()
+            || proj.limit.is_some()
+            || proj.items.iter().any(|it| contains_aggregate_call(&it.expr))
+        {
+            return Ok(None);
+        }
+        carried_names = proj
+            .items
+            .iter()
+            .enumerate()
+            .map(|(i, it)| {
+                it.alias
+                    .clone()
+                    .or_else(|| it.text.clone())
+                    .unwrap_or_else(|| column_name(&it.expr, i))
+            })
+            .collect();
+    }
+    let Some(plan) = recognise_stage(&prefix[lead..], breaker, rest_after, &carried_names) else {
         return Ok(None);
     };
+    let mut carried: Row = input[0].clone();
+    for c in &prefix[..lead] {
+        let Clause::With { proj, .. } = c else {
+            unreachable!("counted as a WITH above")
+        };
+        let mut next = Row::new();
+        for (i, it) in proj.items.iter().enumerate() {
+            let name = it
+                .alias
+                .clone()
+                .or_else(|| it.text.clone())
+                .unwrap_or_else(|| column_name(&it.expr, i));
+            let v = crate::interp::eval_expr(graph, &it.expr, &carried, params)?;
+            next.insert(name, v);
+        }
+        carried = next;
+    }
+    if !carried.is_empty() {
+        counted!("interp.columnar stage carried its input row in as variables");
+    }
+    // The stage's other half of the scope rule: the prefix after the leading
+    // WITHs starts at a MATCH that `recognise_stage` walks, so a name it did
+    // not carry is not there to read — `reads_only` refused it.
+    let prefix = &prefix[lead..];
     // Fix 57's graph-dependent half: a bare carry rides the stage only
     // where its start is NOT selectively seekable. The general path's seed
     // — the same candidates, the same probe — reads a sought minority alone
@@ -4439,8 +5775,15 @@ pub(crate) fn try_columnar_stage(
     // inbox page of a user who owns 38k of the 38.6k emails is the stage's;
     // a 500-email user's is the seek's.
     if !plan.bare.is_empty() {
-        if let [Clause::Match { pattern, where_, .. }, ..] = prefix {
-            if let (Source::Nodes { labels, .. }, [path]) = (&plan.source, pattern.paths.as_slice()) {
+        if let [
+            Clause::Match {
+                pattern, where_, ..
+            },
+            ..,
+        ] = prefix
+        {
+            if let (Source::Nodes { labels, .. }, [path]) = (&plan.source, pattern.paths.as_slice())
+            {
                 let label = labels.first().map(String::as_str);
                 if graph.property_seek_worth_probing(label) {
                     let seed = Row::new();
@@ -4465,116 +5808,23 @@ pub(crate) fn try_columnar_stage(
             }
         }
     }
-    let Some(mut walk) = load_walk(graph, &plan.source, &plan.reads, params)? else {
-        return Ok(None);
-    };
-    counted!("interp.statements run");
-    counted!("interp.columnar stages");
-    sometimes!("interp.columnar stage produced a WITH chain", true);
-    note_walk_events(&plan.source, &plan.reads, &walk);
-    let empty_vars = VarMap::new();
-    let mut scope = Scope::over(params, &empty_vars, graph.wall_ms(), graph.zone_provider());
-    let truth_of = |v: Value| -> Result<bool, RunError> {
-        match v.truth() {
-            Some(Truth::True) => Ok(true),
-            Some(_) => Ok(false),
-            None => Err(RunError::Semantic(format!(
-                "WHERE takes a boolean, got {}",
-                v.type_name()
-            ))),
+    // SNB BI bi1's fold on the workers (`parallel_stage_fold`); else the one
+    // walk on this thread.
+    let on_workers = match &plan.breaker {
+        Breaker::Fold { items, order, fin } => {
+            parallel_stage_fold(graph, &plan, items, order, fin, &carried, params)?
         }
+        Breaker::Project { .. } => None,
     };
-    // The breaker's rows, before the post-WHERE.
-    let rows: Vec<Vec<Value>> = match &plan.breaker {
-        Breaker::Project {
-            items,
-            order,
-            by_column,
-        } => {
-            let by_column = by_column.as_ref().filter(|b| !b.is_empty());
-            let mut rows: Vec<Vec<Value>> = Vec::new();
-            let mut keys: Vec<Vec<Value>> = Vec::new();
-            for mi in 0..walk.members.len() {
-                let id = walk.members[mi];
-                scope.locals.clear();
-                walk.bind(graph, &plan.reads, &mut scope, mi, id)?;
-                if let Some(pred) = &plan.pred {
-                    let v = eval_with(pred, &scope, None).map_err(RunError::Eval)?;
-                    if !truth_of(v)? {
-                        continue;
-                    }
-                }
-                walk_chain(&plan.chain, &mut scope, &mut |sc| {
-                    let mut out = Vec::with_capacity(items.len());
-                    for e in items {
-                        out.push(eval_with(e, sc, None).map_err(RunError::Eval)?);
-                    }
-                    let mut k = Vec::new();
-                    if by_column.is_none() && !order.is_empty() {
-                        for (c, v) in plan.columns.iter().zip(&out) {
-                            sc.bind(c, v.clone());
-                        }
-                        k.reserve(order.len());
-                        for o in order {
-                            k.push(eval_with(&o.expr, sc, None).map_err(RunError::Eval)?);
-                        }
-                    }
-                    // Fix 57: the member id rides as a trailing column, past
-                    // every real column, for the survivors' hydration.
-                    if !plan.bare.is_empty() {
-                        out.push(Value::Int(id as i64));
-                    }
-                    rows.push(out);
-                    keys.push(k);
-                    budget_check(graph, rows.len())
-                })?;
-            }
-            match by_column {
-                Some(by_col) => order_and_page_by_column(
-                    graph,
-                    params,
-                    rows,
-                    by_col,
-                    plan.skip.as_ref(),
-                    plan.limit.as_ref(),
-                )?,
-                None => order_and_page(
-                    graph,
-                    params,
-                    rows,
-                    order,
-                    keys,
-                    plan.skip.as_ref(),
-                    plan.limit.as_ref(),
-                )?,
-            }
-        }
-        Breaker::Fold { items, order } => {
-            sometimes!("interp.columnar stage folded an aggregating breaker", true);
-            let mut fold = Fold::new(items);
-            for mi in 0..walk.members.len() {
-                let id = walk.members[mi];
-                scope.locals.clear();
-                walk.bind(graph, &plan.reads, &mut scope, mi, id)?;
-                if let Some(pred) = &plan.pred {
-                    let v = eval_with(pred, &scope, None).map_err(RunError::Eval)?;
-                    if !truth_of(v)? {
-                        continue;
-                    }
-                }
-                walk_chain(&plan.chain, &mut scope, &mut |sc| fold.push(graph, sc))?;
-            }
-            let spec = FoldSpec {
-                items,
-                columns: &plan.columns,
-                order,
-                skip: plan.skip.as_ref(),
-                limit: plan.limit.as_ref(),
-                final_: None,
-            };
-            fold.finish(graph, params, &spec, &mut scope)?.rows
-        }
+    let rows: Vec<Vec<Value>> = match on_workers {
+        Some(rows) => rows,
+        None => match serial_stage_rows(graph, &plan, &carried, params)? {
+            Some(rows) => rows,
+            None => return Ok(None),
+        },
     };
+    let mut scope = Scope::over(params, &carried, graph.wall_ms(), graph.zone_provider());
+    let truth_of = stage_truth;
     // Fix 57: the survivors alone are materialised into the bare slots —
     // the trailing id column comes off first.
     let rows = if plan.bare.is_empty() {
@@ -4590,8 +5840,12 @@ pub(crate) fn try_columnar_stage(
         // WITHs under its aliases; a bare use it cannot see through — a
         // whole-node read, a `labels()` call, a star projection, a writing
         // clause — keeps the full record.
+        //
+        // A node the statement's RETURN outputs is output WHOLE: there is no
+        // continuation to read it, and `carry_demand` over none answered the
+        // empty set — a node carrying its labels and no property.
         let mut projected: Option<std::collections::BTreeSet<String>> =
-            Some(Default::default());
+            (!matches!(breaker, Clause::Return { .. })).then(Default::default);
         for &bi in &plan.bare {
             match carry_demand(rest_after, &plan.columns[bi]) {
                 Some(set) => {
@@ -4609,8 +5863,12 @@ pub(crate) fn try_columnar_stage(
             };
             let node = match &projected {
                 Some(set) => {
-                    counted!("interp.columnar stage hydrated a survivor projected to its continuation");
-                    graph.node_projected(id as u64, set).map_err(RunError::Graph)?
+                    counted!(
+                        "interp.columnar stage hydrated a survivor projected to its continuation"
+                    );
+                    graph
+                        .node_projected(id as u64, set)
+                        .map_err(RunError::Graph)?
                 }
                 None => graph.node(id as u64).map_err(RunError::Graph)?,
             };
@@ -4700,6 +5958,379 @@ pub(crate) fn try_columnar_stage(
     Ok(Some((out_rows, 0)))
 }
 
+/// A WHERE's answer as a keep/drop: `true` for True, `false` for False or
+/// null, and the error the general path raises for anything else.
+fn stage_truth(v: Value) -> Result<bool, RunError> {
+    match v.truth() {
+        Some(Truth::True) => Ok(true),
+        Some(_) => Ok(false),
+        None => Err(RunError::Semantic(format!(
+            "WHERE takes a boolean, got {}",
+            v.type_name()
+        ))),
+    }
+}
+
+/// An aggregating breaker's fold spec. A split breaker
+/// (`split_nested_aggregates`): the fold's own columns, unordered and
+/// unpaged, and the projection over them orders and pages the breaker's.
+fn stage_fold_spec<'s>(
+    plan: &'s StagePlan,
+    items: &'s [Item],
+    order: &'s [(usize, bool)],
+    fin: &'s Option<Box<(Vec<String>, Final)>>,
+) -> FoldSpec<'s> {
+    match fin {
+        None => FoldSpec {
+            items,
+            columns: &plan.columns,
+            order,
+            skip: plan.skip.as_ref(),
+            limit: plan.limit.as_ref(),
+            final_: None,
+        },
+        Some(split) => FoldSpec {
+            items,
+            columns: &split.0,
+            order: &[],
+            skip: None,
+            limit: None,
+            final_: Some(&split.1),
+        },
+    }
+}
+
+/// The stage's rows before the post-WHERE, from ONE walk on this thread:
+/// the label's columns (assembled and kept, when not yet cached), the
+/// predicate column-at-a-time where it can be, and each survivor bound and
+/// carried through the chain into the breaker. `None` when the walk
+/// declines (the general path answers).
+fn serial_stage_rows(
+    graph: &Graph,
+    plan: &StagePlan,
+    carried: &Row,
+    params: &BTreeMap<String, Value>,
+) -> Result<Option<Vec<Vec<Value>>>, RunError> {
+    let Some(mut walk) = load_walk(graph, &plan.source, &plan.reads, params)? else {
+        return Ok(None);
+    };
+    counted!("interp.statements run");
+    counted!("interp.columnar stages");
+    sometimes!("interp.columnar stage produced a WITH chain", true);
+    note_walk_events(&plan.source, &plan.reads, &walk);
+    let mut scope = Scope::over(params, carried, graph.wall_ms(), graph.zone_provider());
+    let truth_of = stage_truth;
+    // Fix 84: a ONE-label stage whose predicate reads only value / presence
+    // columns is judged COLUMN-AT-A-TIME over the walk's own members
+    // (`survivors_over_cached_columns`, the projection scan's evaluator
+    // since fix 40 and the seed filter's since fix 67): no scope bound and
+    // no expression walked for a member the predicate drops. The inbox page
+    // (`MATCH (n:UserDataNode {nodeType: 'email', userId: $userId}) WHERE
+    // n.classified = true AND (n.abuseStatus IS NULL OR …) WITH n ORDER BY
+    // n.createdAt DESC SKIP … LIMIT 1000 …`) bound and evaluated every one
+    // of the user's 18k emails per page — 92k expressions, 154 ms on the
+    // mirror against Neo4j's 107. A column not yet cached (the walk that
+    // assembles it keeps it for the next statement), a predicate the
+    // vectoriser declines, or a non-boolean answer keeps the per-member
+    // walk, which raises for the row.
+    let vector_hits: Option<Vec<usize>> = match (&plan.source, &plan.pred) {
+        (Source::Nodes { labels, any_of }, Some(pred))
+            if labels.len() == 1
+                && any_of.is_empty()
+                && plan.pred_reads.labels.is_empty()
+                && plan.pred_reads.probes.is_empty()
+                && plan.pred_reads.degrees.is_empty()
+                && !plan.pred_reads.type_read =>
+        {
+            survivors_over_cached_columns(
+                graph,
+                &labels[0],
+                pred,
+                &plan.pred_reads,
+                &walk.members,
+                None,
+                &scope,
+            )
+        }
+        _ => None,
+    };
+    if vector_hits.is_some() {
+        counted!("interp.columnar stage predicate evaluated column-at-a-time");
+    }
+    let positions: Vec<usize> = match &vector_hits {
+        Some(hits) => hits.clone(),
+        None => (0..walk.members.len()).collect(),
+    };
+    let pred_per_row: Option<&Expr> = if vector_hits.is_some() {
+        None
+    } else {
+        plan.pred.as_ref()
+    };
+    // The breaker's rows, before the post-WHERE.
+    let rows: Vec<Vec<Value>> = match &plan.breaker {
+        Breaker::Project {
+            items,
+            order,
+            by_column,
+        } => {
+            let by_column = by_column.as_ref().filter(|b| !b.is_empty());
+            let mut rows: Vec<Vec<Value>> = Vec::new();
+            let mut keys: Vec<Vec<Value>> = Vec::new();
+            for &mi in &positions {
+                let id = walk.members[mi];
+                scope.locals.clear();
+                walk.bind(graph, &plan.reads, &mut scope, mi, id)?;
+                if let Some(pred) = pred_per_row {
+                    let v = eval_with(pred, &scope, None).map_err(RunError::Eval)?;
+                    if !truth_of(v)? {
+                        continue;
+                    }
+                }
+                walk_chain(&plan.chain, &mut scope, &mut |sc| {
+                    let mut out = Vec::with_capacity(items.len());
+                    for e in items {
+                        out.push(eval_with(e, sc, None).map_err(RunError::Eval)?);
+                    }
+                    let mut k = Vec::new();
+                    if by_column.is_none() && !order.is_empty() {
+                        for (c, v) in plan.columns.iter().zip(&out) {
+                            sc.bind(c, v.clone());
+                        }
+                        k.reserve(order.len());
+                        for o in order {
+                            k.push(eval_with(&o.expr, sc, None).map_err(RunError::Eval)?);
+                        }
+                    }
+                    // Fix 57: the member id rides as a trailing column, past
+                    // every real column, for the survivors' hydration.
+                    if !plan.bare.is_empty() {
+                        out.push(Value::Int(id as i64));
+                    }
+                    rows.push(out);
+                    keys.push(k);
+                    budget_check(graph, rows.len())
+                })?;
+            }
+            match by_column {
+                Some(by_col) => order_and_page_by_column(
+                    graph,
+                    params,
+                    rows,
+                    by_col,
+                    plan.skip.as_ref(),
+                    plan.limit.as_ref(),
+                )?,
+                None => order_and_page(
+                    graph,
+                    params,
+                    rows,
+                    order,
+                    keys,
+                    plan.skip.as_ref(),
+                    plan.limit.as_ref(),
+                )?,
+            }
+        }
+        Breaker::Fold { items, order, fin } => {
+            sometimes!("interp.columnar stage folded an aggregating breaker", true);
+            let mut fold = Fold::new(items);
+            for &mi in &positions {
+                let id = walk.members[mi];
+                scope.locals.clear();
+                walk.bind(graph, &plan.reads, &mut scope, mi, id)?;
+                if let Some(pred) = pred_per_row {
+                    let v = eval_with(pred, &scope, None).map_err(RunError::Eval)?;
+                    if !truth_of(v)? {
+                        continue;
+                    }
+                }
+                walk_chain(&plan.chain, &mut scope, &mut |sc| fold.push(graph, sc))?;
+            }
+            let spec = stage_fold_spec(plan, items, order, fin);
+            fold.finish(graph, params, &spec, &mut scope)?.rows
+        }
+    };
+    Ok(Some(rows))
+}
+
+/// SNB BI bi1's stage — `MATCH (message:Message) WHERE message.creationDate <
+/// $datetime AND message.content IS NOT NULL WITH … count(message), sum(
+/// message.length) …` — folded on the WORKERS. At SF3 its survivors are
+/// millions of the 9M messages, each bound from the cached columns, carried
+/// through the chain and pushed into ONE fold on one thread: 4.0 s against
+/// Neo4j's 2.8.
+///
+/// The predicate is judged column-at-a-time over the whole label, exactly as
+/// the serial walk judges it (the cache's aligned columns are aligned to the
+/// label's whole membership and nothing else — `Graph::prop_column_aligned`).
+/// The survivors are then cut into one contiguous share per worker; each
+/// worker walks its share from the cached columns (`load_walk_over` takes
+/// only the share's entries) into its own partial fold, and the partials
+/// merge in share order ([`Fold::merge_later`]). Every group is then first
+/// seen where the serial fold first sees it, and every accumulator merges to
+/// the value the serial fold computes: a sum's or an average's float addends
+/// are kept in arrival order and added in the serial order at the finish. Or
+/// the merge says it cannot (an integer total the serial order takes past
+/// i64), and the stage folds on this thread instead. So does any share that fails
+/// to fold, whatever the reason: the serial fold raises the error in its own
+/// order, and a share cannot know what the rows before it would have done.
+///
+/// `None` declines: one worker; a transaction; a scanned node carried bare;
+/// a source other than one label; a probe, degree or `type()` read (answered
+/// per population at load); a DISTINCT (no exact merge here); a column
+/// not yet cached (the serial walk assembles and keeps it); too few
+/// survivors to share; or a commit landing while the shares fold.
+fn parallel_stage_fold<'p>(
+    graph: &Graph,
+    plan: &'p StagePlan,
+    items: &'p [Item],
+    order: &'p [(usize, bool)],
+    fin: &'p Option<Box<(Vec<String>, Final)>>,
+    carried: &Row,
+    params: &BTreeMap<String, Value>,
+) -> Result<Option<Vec<Vec<Value>>>, RunError> {
+    let Some(exec) = graph.exec().filter(|e| e.width() > 1) else {
+        return Ok(None);
+    };
+    if graph.in_txn() || !plan.bare.is_empty() {
+        return Ok(None);
+    }
+    let Source::Nodes { labels, any_of } = &plan.source else {
+        return Ok(None);
+    };
+    let [label] = labels.as_slice() else {
+        return Ok(None);
+    };
+    if !any_of.is_empty()
+        || !plan.reads.probes.is_empty()
+        || !plan.reads.degrees.is_empty()
+        || plan.reads.type_read
+        || !items.iter().all(|it| match it {
+            Item::Agg(site, _) => SiteAcc::merges_in_order(site),
+            Item::Key(_) => true,
+        })
+        || !graph.prop_columns_current(label, &plan.reads.props, &plan.reads.presence_only())
+    {
+        return Ok(None);
+    }
+    let stamp = graph.column_stamp();
+    let members = graph
+        .members_all(labels)
+        .map_err(RunError::Graph)?
+        .to_arc_vec();
+    let scope = Scope::over(params, carried, graph.wall_ms(), graph.zone_provider());
+    let hits = match &plan.pred {
+        Some(pred)
+            if plan.pred_reads.labels.is_empty()
+                && plan.pred_reads.probes.is_empty()
+                && plan.pred_reads.degrees.is_empty()
+                && !plan.pred_reads.type_read =>
+        {
+            survivors_over_cached_columns(
+                graph,
+                label,
+                pred,
+                &plan.pred_reads,
+                &members,
+                None,
+                &scope,
+            )
+        }
+        _ => None,
+    };
+    let pred_per_row: Option<&Expr> = if hits.is_some() {
+        None
+    } else {
+        plan.pred.as_ref()
+    };
+    let survivors: Vec<u64>;
+    let population: &[u64] = match &hits {
+        Some(hits) => {
+            survivors = hits.iter().map(|&mi| members[mi]).collect();
+            &survivors
+        }
+        None => &members,
+    };
+    let width = exec.width();
+    if population.len() < graph.parallel_min_rows().saturating_mul(width) {
+        return Ok(None);
+    }
+    let per = population.len().div_ceil(width).max(1);
+    let shares: Vec<&[u64]> = population.chunks(per).collect();
+    type Share<'f> = std::sync::Mutex<Option<Result<Option<Fold<'f>>, RunError>>>;
+    let slots: Vec<Share<'p>> = shares.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    exec.for_each(shares.len(), &|k| {
+        let run = || -> Result<Option<Fold<'p>>, RunError> {
+            let over = std::sync::Arc::new(shares[k].to_vec());
+            let Some(mut walk) =
+                load_walk_over(graph, &plan.source, &plan.reads, Some(over), params)?
+            else {
+                return Ok(None);
+            };
+            // the label memberships' cursors start at the share, not at 0
+            if let Some(&first) = walk.members.first() {
+                walk.seek_cursors(first);
+            }
+            let mut scope = Scope::over(params, carried, graph.wall_ms(), graph.zone_provider());
+            let mut fold = Fold::new(items);
+            fold.partial = true;
+            // NaN keys never equal: each partial numbers its own apart
+            fold.nonce = (k as u64 + 1) << 40;
+            for mi in 0..walk.members.len() {
+                let id = walk.members[mi];
+                scope.locals.clear();
+                walk.bind(graph, &plan.reads, &mut scope, mi, id)?;
+                if let Some(pred) = pred_per_row {
+                    let v = eval_with(pred, &scope, None).map_err(RunError::Eval)?;
+                    if !stage_truth(v)? {
+                        continue;
+                    }
+                }
+                walk_chain(&plan.chain, &mut scope, &mut |sc| fold.push(graph, sc))?;
+            }
+            Ok(Some(fold))
+        };
+        let out = run();
+        *slots[k].lock().unwrap_or_else(|e| e.into_inner()) = Some(out);
+    });
+    let mut merged: Option<Fold<'p>> = None;
+    for slot in slots {
+        let Some(Ok(Some(part))) = slot.into_inner().unwrap_or_else(|e| e.into_inner()) else {
+            counted!("interp.columnar stage fold on the workers declined: a share did not fold");
+            return Ok(None);
+        };
+        match merged.as_mut() {
+            None => merged = Some(part),
+            Some(m) => {
+                if !m.merge_later(graph, part)? {
+                    counted!(
+                        "interp.columnar stage fold on the workers declined: a sum the serial order would not reproduce"
+                    );
+                    return Ok(None);
+                }
+            }
+        }
+    }
+    if graph.column_stamp() != stamp {
+        counted!("interp.columnar stage fold on the workers declined: a commit landed while it ran");
+        return Ok(None);
+    }
+    let Some(fold) = merged else {
+        return Ok(None);
+    };
+    counted!("interp.statements run");
+    counted!("interp.columnar stages");
+    sometimes!("interp.columnar stage produced a WITH chain", true);
+    sometimes!("interp.columnar stage folded an aggregating breaker", true);
+    counted!("interp.columnar stage folded its survivors on the workers");
+    if hits.is_some() {
+        counted!("interp.columnar stage predicate evaluated column-at-a-time");
+    }
+    let mut scope = Scope::over(params, carried, graph.wall_ms(), graph.zone_provider());
+    let spec = stage_fold_spec(plan, items, order, fin);
+    Ok(Some(fold.finish(graph, params, &spec, &mut scope)?.rows))
+}
+
 /// A fused aggregating WITH: the fold's items and columns, and its ORDER
 /// BY over its own columns.
 type ContinuationPlan = (Vec<Item>, Vec<String>, Vec<(usize, bool)>);
@@ -4725,10 +6356,7 @@ fn continuation_plan(next: &Projection, aliases: &[String]) -> Option<Continuati
     // errored "COUNT {} requires a graph context" here. Decline to the
     // streaming aggregate, which has hooks — as `recognise_stage` does for
     // the breaker's own items.
-    if next
-        .items
-        .iter()
-        .any(|it| contains_opaque(&it.expr))
+    if next.items.iter().any(|it| contains_opaque(&it.expr))
         || next.order.iter().any(|o| contains_opaque(&o.expr))
     {
         return None;
@@ -4762,13 +6390,101 @@ struct HopPlan {
     /// rewrite) — the seek candidates a sought start drives the walk from.
     a_seeks: Vec<(String, Vec<Expr>)>,
     r_reads: Reads,
+    /// Fix 81: the WHERE's conjuncts that read the START alone (its inline
+    /// map's equalities, `a.k IS NULL OR a.k IN […]`) — the seeded walk
+    /// evaluates them ONCE per seed, before it reads the seed's adjacency.
+    a_pred: Option<Expr>,
+    /// The rest of the WHERE, per row.
     pred: Option<Expr>,
+    /// Whether the items and `pred` read the FAR end alone (or nothing):
+    /// the seeded walk then folds once per distinct far end, weighted by
+    /// its edge count, instead of once per edge.
+    far_only: bool,
     items: Vec<Item>,
     columns: Vec<String>,
     order: Vec<(usize, bool)>,
     skip: Option<Expr>,
     limit: Option<Expr>,
     final_: Option<Final>,
+}
+
+/// The conjuncts AND-ed back together, in order — `None` for none.
+fn and_all(cs: Vec<Expr>) -> Option<Expr> {
+    cs.into_iter()
+        .reduce(|acc, c| Expr::And(Box::new(acc), Box::new(c)))
+}
+
+/// `rewrite` over an optional expression: `Some(None)` for none, `None`
+/// when the rewrite declines.
+fn rewrite_opt(e: Option<&Expr>, var: &str, kind: Kind, reads: &mut Reads) -> Option<Option<Expr>> {
+    match e {
+        None => Some(None),
+        Some(x) => rewrite(x, var, kind, reads).map(Some),
+    }
+}
+
+/// Whether the row bound in `scope` passes an optional predicate: absent
+/// or True passes, False and Null drop, a non-boolean is the WHERE error.
+fn row_passes(pred: &Option<Expr>, scope: &Scope<'_>) -> Result<bool, RunError> {
+    let Some(p) = pred else {
+        return Ok(true);
+    };
+    let v = eval_with(p, scope, None).map_err(RunError::Eval)?;
+    match v.truth() {
+        Some(Truth::True) => Ok(true),
+        Some(_) => Ok(false),
+        None => Err(RunError::Semantic(format!(
+            "WHERE takes a boolean, got {}",
+            v.type_name()
+        ))),
+    }
+}
+
+/// Fix 86: `count(DISTINCT v)` over the ONE variable a single-source scan
+/// binds is `count(*)`: every member is exactly one row, so the distinct
+/// set is the members themselves. Until this, the bare `v` inside the
+/// aggregate declined the rewrite (`rewrite` has no local for a whole
+/// node) and the statement fell to the general path, which materialised
+/// every survivor and kept a serialised id per row: the NewsArticle
+/// classification aggregate (`… RETURN a.contentType AS key,
+/// count(DISTINCT a) AS n` over 66k survivors) ran 305 ms on the mirror
+/// against 128 for the same statement spelt `count(a)` and Neo4j's 225.
+/// Only a single-variable scan may do this — a hop's start repeats across
+/// its edges (`star_counts` leaves DISTINCT alone there). ORDER BY items
+/// naming the call are rewritten alike, so `order_over` still finds them.
+fn star_distinct_counts(proj: &Projection, var: &str) -> Projection {
+    let mut p = proj.clone();
+    let mut rewritten = false;
+    let mut star_it = |e: &mut Expr| {
+        if let Expr::Call {
+            name,
+            distinct,
+            args,
+            star,
+        } = e
+        {
+            if name == "count"
+                && *distinct
+                && !*star
+                && matches!(args.as_slice(), [Expr::Var(v)] if v == var)
+            {
+                args.clear();
+                *star = true;
+                *distinct = false;
+                rewritten = true;
+            }
+        }
+    };
+    for it in &mut p.items {
+        star_it(&mut it.expr);
+    }
+    for o in &mut p.order {
+        star_it(&mut o.expr);
+    }
+    if rewritten {
+        counted!("interp.columnar count distinct of the scanned variable counted its members");
+    }
+    p
 }
 
 /// `count(v)` for any variable the hop binds is `count(*)`: none is ever
@@ -4834,7 +6550,7 @@ fn recognise_hop(q: &SingleQuery) -> Option<HopPlan> {
         return None;
     }
     let path = &pattern.paths[0];
-    if path.var.is_some() || path.shortest {
+    if path.var.is_some() || path.shortest.is_some() {
         return None;
     }
     let [(rel, end)] = path.hops.as_slice() else {
@@ -4920,30 +6636,46 @@ fn recognise_hop(q: &SingleQuery) -> Option<HopPlan> {
         reads: Reads::tagged("b."),
     };
     let mut r_reads = Reads::tagged("r.");
+    // Fix 81: the WHERE's conjuncts that read the start alone are the
+    // start's predicate; the rest stays per row. Both go through the same
+    // three passes and are evaluated in sequence, so a row passes exactly
+    // when the whole WHERE would (AND is associative under nulls).
+    let (a_only, rest): (Option<Expr>, Option<Expr>) = match (&full_where, &a_var) {
+        (Some(w), Some(av)) => {
+            let mut cs = Vec::new();
+            crate::interp::conjuncts_of(w, &mut cs);
+            let (a_only, rest): (Vec<Expr>, Vec<Expr>) = cs
+                .into_iter()
+                .partition(|c| reads_only(c, std::slice::from_ref(av)));
+            (and_all(a_only), and_all(rest))
+        }
+        (w, _) => (None, w.clone()),
+    };
+    let b_only: Vec<String> = b_var.iter().cloned().collect();
+    let far_only = agg_proj
+        .items
+        .iter()
+        .all(|it| reads_only(&it.expr, &b_only))
+        && rest.as_ref().is_none_or(|r| reads_only(r, &b_only));
     // The passes: the node ends first (labels and probes are node reads),
     // the relationship last.
-    let mut pred = full_where;
+    let mut a_pred = a_only;
+    let mut pred = rest;
     if let Some(v) = &a_var {
-        pred = match pred {
-            None => None,
-            Some(w) => Some(rewrite(&w, v, Kind::Node, &mut a.reads)?),
-        };
+        a_pred = rewrite_opt(a_pred.as_ref(), v, Kind::Node, &mut a.reads)?;
+        pred = rewrite_opt(pred.as_ref(), v, Kind::Node, &mut a.reads)?;
     }
     if let Some(v) = &b_var {
-        pred = match pred {
-            None => None,
-            Some(w) => Some(rewrite(&w, v, Kind::Node, &mut b.reads)?),
-        };
+        a_pred = rewrite_opt(a_pred.as_ref(), v, Kind::Node, &mut b.reads)?;
+        pred = rewrite_opt(pred.as_ref(), v, Kind::Node, &mut b.reads)?;
     }
     if let Some(v) = &r_var {
-        pred = match pred {
-            None => None,
-            Some(w) => Some(rewrite(&w, v, Kind::Rel, &mut r_reads)?),
-        };
+        a_pred = rewrite_opt(a_pred.as_ref(), v, Kind::Rel, &mut r_reads)?;
+        pred = rewrite_opt(pred.as_ref(), v, Kind::Rel, &mut r_reads)?;
     }
     // See `recognise`: any subquery none of the hop's vars could lift into a
     // probe has no hooks in this columnar scan — decline to the interp path.
-    if pred.as_ref().is_some_and(contains_opaque) {
+    if a_pred.as_ref().is_some_and(contains_opaque) || pred.as_ref().is_some_and(contains_opaque) {
         return None;
     }
     let proj = star_counts(agg_proj, &all_vars);
@@ -4982,7 +6714,9 @@ fn recognise_hop(q: &SingleQuery) -> Option<HopPlan> {
         b,
         a_seeks,
         r_reads,
+        a_pred,
         pred,
+        far_only,
         items,
         columns,
         order,
@@ -5116,9 +6850,9 @@ fn carry_demand(clauses: &[Clause], var: &str) -> Option<std::collections::BTree
     Some(props)
 }
 
-/// Fix 58: the hop's population driven from a SOUGHT start — `(src, dst)`
-/// pairs in storage order, read from the start's typed adjacency — or
-/// `None` for the whole-type walk. The start drives the walk when its
+/// Fix 58: the SEEDS of a hop driven from a sought start — the ids its
+/// declared-key equality selects, with the hop's type tokens — or `None`
+/// for the whole-type walk. The start drives the walk when its
 /// declared-key equality (inline map or WHERE) selects fewer than half its
 /// label's members within that bound (`best_declared_seek` under the
 /// general path's own candidate rule: the first candidate may be unscoped,
@@ -5129,20 +6863,12 @@ fn carry_demand(clauses: &[Clause], var: &str) -> Option<std::collections::BTree
 /// presence, probe or degree of it — since the adjacency carries no
 /// relationship record and the seeded population has no relationship
 /// order to bind columns in.
-fn hop_seeded_ends(
+fn hop_seeded_seeds(
     graph: &Graph,
     plan: &HopPlan,
     params: &BTreeMap<String, Value>,
-) -> Result<Option<Vec<(u64, u64)>>, RunError> {
-    let r = &plan.r_reads;
-    if r.type_read
-        || r.id_read
-        || !r.props.is_empty()
-        || !r.presence.is_empty()
-        || !r.probes.is_empty()
-        || !r.degrees.is_empty()
-        || !r.labels.is_empty()
-    {
+) -> Result<Option<HopSeeds>, RunError> {
+    if !plan.r_reads.reads_nothing() {
         return Ok(None);
     }
     if graph.in_txn_with_writes() {
@@ -5154,13 +6880,221 @@ fn hop_seeded_ends(
     if tokens.is_empty() {
         return Ok(None);
     }
-    let tokens = Some(tokens);
     let Some(sought) = hop_end_seek(graph, &plan.a.labels, &plan.a_seeks, params)? else {
         return Ok(None);
     };
+    Ok(Some(HopSeeds {
+        ids: sought,
+        tokens: Some(tokens),
+    }))
+}
+
+/// A sought start's seeds (sorted, distinct, members of its label) and
+/// the hop's type tokens.
+struct HopSeeds {
+    ids: Vec<u64>,
+    tokens: Option<Vec<u32>>,
+}
+
+/// Fix 81: the seeded walk. Fix 58 expanded every seed's adjacency into
+/// `(src, dst)` pairs and ran the per-row loop over them, so the start-only
+/// WHERE was evaluated once per EDGE (83k evaluations of one user's
+/// abuse-status test over her 18.7k emails), a bare `count(*)` bound and
+/// folded every edge, and a far-end group key was evaluated per edge
+/// though it is a function of the end (250k expressions, 310 ms, against
+/// Neo4j's 156). Now each seed is bound once and the start's predicate
+/// keeps or drops it BEFORE its adjacency is read; a fold that reads
+/// nothing of the far end sums each survivor's degree (member peers only,
+/// when the far end is labelled); a fold whose keys and residual predicate
+/// read the far end alone counts edges per distinct far end and folds each
+/// end once, weighted; anything else walks the survivors' edges as before.
+/// Groups are made in the order their first row would have arrived, so an
+/// unordered result is byte-identical to the per-edge fold's.
+fn run_seeded_hop_aggregate(
+    graph: &Graph,
+    plan: &HopPlan,
+    params: &BTreeMap<String, Value>,
+    seeds: HopSeeds,
+) -> Result<Option<QueryResult>, RunError> {
+    counted!("interp.columnar hop scan seeded from a sought end");
+    let HopSeeds {
+        ids: sought,
+        tokens,
+    } = seeds;
     let dir = if plan.out { Dir::Out } else { Dir::In };
+    let mut fold = Fold::new(&plan.items);
+    let empty_vars = VarMap::new();
+    let mut scope = Scope::over(params, &empty_vars, graph.wall_ms(), graph.zone_provider());
+    let spec = FoldSpec {
+        items: &plan.items,
+        columns: &plan.columns,
+        order: &plan.order,
+        skip: plan.skip.as_ref(),
+        limit: plan.limit.as_ref(),
+        final_: plan.final_.as_ref(),
+    };
+    // A seek that selects nobody answers from the empty fold before any
+    // column is loaded: an empty supplied population still sized its walk
+    // by the end label's rows and gathered the whole label (12k gets for
+    // an unknown user).
+    if sought.is_empty() {
+        counted!("interp.statements run");
+        counted!("interp.columnar aggregate scans");
+        counted!("interp.columnar hop aggregate scans");
+        sometimes!("interp.columnar hop scan ran", true);
+        return fold.finish(graph, params, &spec, &mut scope).map(Some);
+    }
+    let a_members = if plan.a.labels.is_empty() {
+        None
+    } else {
+        Some(graph.members_all(&plan.a.labels).map_err(RunError::Graph)?)
+    };
+    let b_members = if plan.b.labels.is_empty() {
+        None
+    } else {
+        Some(graph.members_all(&plan.b.labels).map_err(RunError::Graph)?)
+    };
+    // The start's columns over the seeds (fix 58: served through its
+    // label's property-column cache, restricted to the seeds).
+    let a_source = Source::Nodes {
+        labels: plan.a.labels.clone(),
+        any_of: Vec::new(),
+    };
+    let a_rows = a_members
+        .as_ref()
+        .map(|m| m.len())
+        .unwrap_or(0)
+        .max(sought.len());
+    let sought: std::sync::Arc<Vec<u64>> = std::sync::Arc::new(sought);
+    let Some(a_walk) = load_walk_budgeted(
+        graph,
+        &a_source,
+        &plan.a.reads,
+        Some(std::sync::Arc::clone(&sought)),
+        Some(a_rows),
+        params,
+    )?
+    else {
+        counted!("interp.columnar hop scan declined an end column");
+        return Ok(None);
+    };
+    counted!("interp.statements run");
+    counted!("interp.columnar aggregate scans");
+    counted!("interp.columnar hop aggregate scans");
+    sometimes!("interp.columnar hop scan ran", true);
+    if a_members.is_some() || b_members.is_some() {
+        sometimes!("interp.columnar hop scan filtered an end by label", true);
+    }
+    // The start's predicate, once per seed.
+    let survivors: Vec<u64> = match &plan.a_pred {
+        None => sought.to_vec(),
+        Some(_) => {
+            let mut keep = Vec::with_capacity(sought.len());
+            for &id in sought.iter() {
+                scope.locals.clear();
+                a_walk.bind_random(graph, &plan.a.reads, &mut scope, id)?;
+                if row_passes(&plan.a_pred, &scope)? {
+                    keep.push(id);
+                }
+            }
+            counted!("interp.columnar seeded hop filtered its seeds by the start's predicate");
+            keep
+        }
+    };
+    let all_star = fold.sites.iter().all(|(s, _)| s.star);
+    let has_keys = !fold.key_exprs.is_empty();
+    if all_star && plan.pred.is_none() && plan.b.reads.reads_nothing() {
+        // Every row of a seed is alike: its degree is its count.
+        for &id in &survivors {
+            let n = match &b_members {
+                None => graph.count_adjacent_memo(id, dir, &tokens),
+                Some(m) => {
+                    let mut n = 0u64;
+                    graph.adjacent_slim_for_each(id, dir, &tokens, |e| {
+                        if graph.members_contains(m, e.peer) {
+                            n += 1;
+                        }
+                    });
+                    n
+                }
+            };
+            if n == 0 {
+                continue;
+            }
+            scope.locals.clear();
+            if has_keys {
+                a_walk.bind_random(graph, &plan.a.reads, &mut scope, id)?;
+            }
+            fold.push_n(graph, &scope, n)?;
+        }
+        counted!("interp.columnar seeded hop summed degrees per seed");
+        return fold.finish(graph, params, &spec, &mut scope).map(Some);
+    }
+    let b_source = Source::Nodes {
+        labels: plan.b.labels.clone(),
+        any_of: Vec::new(),
+    };
+    if all_star && plan.far_only {
+        // The key is a function of the far end: count edges per distinct
+        // end, then bind and fold each end once, weighted, in the order
+        // the ends first appeared.
+        let mut peers: Vec<u64> = Vec::new();
+        for &id in &survivors {
+            graph.adjacent_slim_for_each(id, dir, &tokens, |e| peers.push(e.peer));
+        }
+        let mut distinct = peers.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        if let Some(m) = &b_members {
+            distinct.retain(|&p| graph.members_contains(m, p));
+        }
+        if distinct.is_empty() {
+            return fold.finish(graph, params, &spec, &mut scope).map(Some);
+        }
+        let mut count = vec![0u64; distinct.len()];
+        let mut seen = vec![false; distinct.len()];
+        let mut order: Vec<usize> = Vec::with_capacity(distinct.len());
+        for p in &peers {
+            if let Ok(pos) = distinct.binary_search(p) {
+                count[pos] += 1;
+                if !seen[pos] {
+                    seen[pos] = true;
+                    order.push(pos);
+                }
+            }
+        }
+        let b_ids = std::sync::Arc::new(distinct);
+        let b_rows = b_members
+            .as_ref()
+            .map(|m| m.len())
+            .unwrap_or(0)
+            .max(b_ids.len());
+        let Some(b_walk) = load_walk_budgeted(
+            graph,
+            &b_source,
+            &plan.b.reads,
+            Some(std::sync::Arc::clone(&b_ids)),
+            Some(b_rows),
+            params,
+        )?
+        else {
+            counted!("interp.columnar hop scan declined an end column");
+            return Ok(None);
+        };
+        for &pos in &order {
+            scope.locals.clear();
+            b_walk.bind_random(graph, &plan.b.reads, &mut scope, b_ids[pos])?;
+            if !row_passes(&plan.pred, &scope)? {
+                continue;
+            }
+            fold.push_n(graph, &scope, count[pos])?;
+        }
+        counted!("interp.columnar seeded hop folded per distinct far end");
+        return fold.finish(graph, params, &spec, &mut scope).map(Some);
+    }
+    // The general shape: the survivors' edges, one row each.
     let mut ends: Vec<(u64, u64)> = Vec::new();
-    for &id in &sought {
+    for &id in &survivors {
         graph.adjacent_slim_for_each(id, dir, &tokens, |e| {
             ends.push(match dir {
                 Dir::Out => (id, e.peer),
@@ -5168,8 +7102,43 @@ fn hop_seeded_ends(
             });
         });
     }
-    counted!("interp.columnar hop scan seeded from a sought end");
-    Ok(Some(ends))
+    if ends.is_empty() {
+        return fold.finish(graph, params, &spec, &mut scope).map(Some);
+    }
+    let b_ids = distinct_ends(&ends, !plan.out);
+    let b_rows = b_members
+        .as_ref()
+        .map(|m| m.len())
+        .unwrap_or(0)
+        .max(b_ids.len());
+    let Some(b_walk) = load_walk_budgeted(
+        graph,
+        &b_source,
+        &plan.b.reads,
+        Some(b_ids),
+        Some(b_rows),
+        params,
+    )?
+    else {
+        counted!("interp.columnar hop scan declined an end column");
+        return Ok(None);
+    };
+    for &(src, dst) in &ends {
+        let (a_id, b_id) = if plan.out { (src, dst) } else { (dst, src) };
+        if let Some(m) = &b_members {
+            if !graph.members_contains(m, b_id) {
+                continue;
+            }
+        }
+        scope.locals.clear();
+        a_walk.bind_random(graph, &plan.a.reads, &mut scope, a_id)?;
+        b_walk.bind_random(graph, &plan.b.reads, &mut scope, b_id)?;
+        if !row_passes(&plan.pred, &scope)? {
+            continue;
+        }
+        fold.push(graph, &scope)?;
+    }
+    fold.finish(graph, params, &spec, &mut scope).map(Some)
 }
 
 /// The ids a hop end's declared-key equality selects, when they are fewer
@@ -5268,50 +7237,23 @@ pub(crate) fn try_columnar_hop_aggregate(
     // MENTIONS and gathered 38k emails' columns for a user who owns twenty
     // (2.5 s against Neo4j's 2 ms; 2.7 s vs 150 for the user who owns 18k).
     // When an end's declared-key equality selects under half its label,
-    // the population is that end's typed adjacency — (src, dst) in storage
-    // order, no relationship record read — and the end columns are loaded
-    // over the ends it actually reaches.
-    let seeded_ends = hop_seeded_ends(graph, &plan, params)?;
-    let seeded = seeded_ends.is_some();
-    let ends: std::sync::Arc<Vec<(u64, u64)>> = match seeded_ends {
-        Some(v) => std::sync::Arc::new(v),
-        None => {
-            let Some((rel_ids, rel_toks, ends)) =
-                graph.rel_members(&plan.types).map_err(RunError::Graph)?
-            else {
-                sometimes!(
-                    "interp.columnar rel scan declined by the entry budget",
-                    true
-                );
-                return Ok(None);
-            };
-            let _ = (&rel_ids, &rel_toks);
-            ends
-        }
-    };
-    // A seeded population with no edge at all answers from an empty fold —
-    // a user who owns nothing, an entity nothing mentions — before any end
-    // column is loaded: an empty supplied population still sized its walk
-    // by the end label's rows and gathered the whole label (12k gets for an
-    // unknown user).
-    if seeded && ends.is_empty() {
-        counted!("interp.statements run");
-        counted!("interp.columnar aggregate scans");
-        counted!("interp.columnar hop aggregate scans");
-        sometimes!("interp.columnar hop scan ran", true);
-        let fold = Fold::new(&plan.items);
-        let empty_vars = VarMap::new();
-        let mut scope = Scope::over(params, &empty_vars, graph.wall_ms(), graph.zone_provider());
-        let spec = FoldSpec {
-            items: &plan.items,
-            columns: &plan.columns,
-            order: &plan.order,
-            skip: plan.skip.as_ref(),
-            limit: plan.limit.as_ref(),
-            final_: plan.final_.as_ref(),
-        };
-        return fold.finish(graph, params, &spec, &mut scope).map(Some);
+    // the population is that end's typed adjacency — no relationship
+    // record read — and the end columns are loaded over the ends it
+    // actually reaches (`run_seeded_hop_aggregate`, fix 81: folded per
+    // seed or per distinct far end where the fold allows).
+    if let Some(seeds) = hop_seeded_seeds(graph, &plan, params)? {
+        return run_seeded_hop_aggregate(graph, &plan, params, seeds);
     }
+    let Some((rel_ids, rel_toks, ends)) =
+        graph.rel_members(&plan.types).map_err(RunError::Graph)?
+    else {
+        sometimes!(
+            "interp.columnar rel scan declined by the entry budget",
+            true
+        );
+        return Ok(None);
+    };
+    let _ = (&rel_ids, &rel_toks);
     // End memberships (label filters) and columns.
     let a_ids = distinct_ends(&ends, plan.out);
     let b_ids = distinct_ends(&ends, !plan.out);
@@ -5383,19 +7325,12 @@ pub(crate) fn try_columnar_hop_aggregate(
         counted!("interp.columnar hop scan declined an end column");
         return Ok(None);
     };
-    // The relationship walk (its columns in relationship order) belongs to
-    // the whole-type population; a seeded population reads nothing of the
-    // relationship (`hop_seeded_ends` requires it).
-    let mut r_walk: Option<Walk> = if seeded {
-        None
-    } else {
-        let rel_source = Source::Rels {
-            types: plan.types.clone(),
-        };
-        let Some(w) = load_walk(graph, &rel_source, &plan.r_reads, params)? else {
-            return Ok(None);
-        };
-        Some(w)
+    // The relationship walk: its columns in relationship order.
+    let rel_source = Source::Rels {
+        types: plan.types.clone(),
+    };
+    let Some(mut r_walk) = load_walk(graph, &rel_source, &plan.r_reads, params)? else {
+        return Ok(None);
     };
     counted!("interp.statements run");
     counted!("interp.columnar aggregate scans");
@@ -5421,24 +7356,12 @@ pub(crate) fn try_columnar_hop_aggregate(
             }
         }
         scope.locals.clear();
-        if let Some(rw) = r_walk.as_mut() {
-            let rel_id = rw.members[ri];
-            rw.bind(graph, &plan.r_reads, &mut scope, ri, rel_id)?;
-        }
+        let rel_id = r_walk.members[ri];
+        r_walk.bind(graph, &plan.r_reads, &mut scope, ri, rel_id)?;
         a_walk.bind_random(graph, &plan.a.reads, &mut scope, a_id)?;
         b_walk.bind_random(graph, &plan.b.reads, &mut scope, b_id)?;
-        if let Some(pred) = &plan.pred {
-            let v = eval_with(pred, &scope, None).map_err(RunError::Eval)?;
-            match v.truth() {
-                Some(Truth::True) => {}
-                Some(_) => continue,
-                None => {
-                    return Err(RunError::Semantic(format!(
-                        "WHERE takes a boolean, got {}",
-                        v.type_name()
-                    )));
-                }
-            }
+        if !row_passes(&plan.a_pred, &scope)? || !row_passes(&plan.pred, &scope)? {
+            continue;
         }
         fold.push(graph, &scope)?;
     }

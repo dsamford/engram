@@ -70,17 +70,32 @@ fn corpus() -> Graph {
         }
         let n = g.create_node(&["UserDataNode".into()], &m).expect("email");
         if i % 3 == 0 {
-            g.create_rel(n, "MENTIONS_INTEREST", interests[(i / 3 % 10) as usize], &BTreeMap::new())
-                .expect("mention");
+            g.create_rel(
+                n,
+                "MENTIONS_INTEREST",
+                interests[(i / 3 % 10) as usize],
+                &BTreeMap::new(),
+            )
+            .expect("mention");
         }
         if i % 5 == 0 {
-            g.create_rel(n, "MENTIONS_INTEREST", topics[(i / 5 % 5) as usize], &BTreeMap::new())
-                .expect("topic mention");
+            g.create_rel(
+                n,
+                "MENTIONS_INTEREST",
+                topics[(i / 5 % 5) as usize],
+                &BTreeMap::new(),
+            )
+            .expect("topic mention");
         }
     }
     for k in 0..9usize {
-        g.create_rel(interests[k], "MENTIONS_INTEREST", interests[k + 1], &BTreeMap::new())
-            .expect("chain");
+        g.create_rel(
+            interests[k],
+            "MENTIONS_INTEREST",
+            interests[k + 1],
+            &BTreeMap::new(),
+        )
+        .expect("chain");
     }
     g
 }

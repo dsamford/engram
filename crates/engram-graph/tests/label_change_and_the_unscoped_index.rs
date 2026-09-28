@@ -25,14 +25,17 @@
 //! included, because both of its runs were wrong identically.
 //!
 //! 2,000 nodes is the point of this fixture, not incidental to it.
-use std::collections::BTreeMap;
 use engram_graph::Graph;
 use engram_key::{Namespace, Realm};
 use engram_store::Store;
+use std::collections::BTreeMap;
 
 fn run(g: &Graph, src: &str) -> usize {
     let q = engram_cypher::parse_statement(src).expect("parse");
-    engram_graph::run_query(g, &q, BTreeMap::new()).expect("run").rows.len()
+    engram_graph::run_query(g, &q, BTreeMap::new())
+        .expect("run")
+        .rows
+        .len()
 }
 
 #[test]
@@ -46,11 +49,18 @@ fn remove_label_must_not_evict_from_the_partition_wide_index() {
             .expect("node");
     }
     g.shared_store().seal();
-    assert_eq!(run(&g, "MATCH (p:Person {id: 7}) RETURN p.id"), 1, "warm: id=7 seeks");
+    assert_eq!(
+        run(&g, "MATCH (p:Person {id: 7}) RETURN p.id"),
+        1,
+        "warm: id=7 seeks"
+    );
 
     run(&g, "MATCH (p:Person {id: 7}) REMOVE p:Employee");
 
-    let still_there = run(&g, "MATCH (p:Person) WHERE p.id > 6 AND p.id < 9 RETURN p.id");
+    let still_there = run(
+        &g,
+        "MATCH (p:Person) WHERE p.id > 6 AND p.id < 9 RETURN p.id",
+    );
     let by_seek = run(&g, "MATCH (p:Person {id: 7}) RETURN p.id");
     let control = run(&g, "MATCH (p:Person {id: 8}) RETURN p.id");
     eprintln!("[verify] range->{still_there} rows, seek(id=7)->{by_seek}, seek(id=8)->{control}");

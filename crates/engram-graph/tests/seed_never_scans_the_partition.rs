@@ -55,9 +55,26 @@ fn corpus() -> Graph {
             let mut w = BTreeMap::new();
             let n = i / 8;
             w.insert("id".to_string(), Value::Str(format!("wi-{n:05}")));
-            w.insert("status".to_string(), Value::Str(if n % 7 == 0 { "done".into() } else { "open".into() }));
-            w.insert("updatedAt".to_string(), Value::Str(format!("2026-08-{:02}T{:02}:00:00Z", 1 + (n % 28), n % 24)));
-            w.insert("assigneeId".to_string(), Value::Str(if n % 5 == 0 { "viewer-1".into() } else { format!("u{}", n % 5) }));
+            w.insert(
+                "status".to_string(),
+                Value::Str(if n % 7 == 0 {
+                    "done".into()
+                } else {
+                    "open".into()
+                }),
+            );
+            w.insert(
+                "updatedAt".to_string(),
+                Value::Str(format!("2026-08-{:02}T{:02}:00:00Z", 1 + (n % 28), n % 24)),
+            );
+            w.insert(
+                "assigneeId".to_string(),
+                Value::Str(if n % 5 == 0 {
+                    "viewer-1".into()
+                } else {
+                    format!("u{}", n % 5)
+                }),
+            );
             w.insert("userId".to_string(), Value::Str(format!("u{}", n % 9)));
             w.insert("content".to_string(), Value::Str(body.clone()));
             g.create_node(&["KMWorkItem".into()], &w).expect("item");
@@ -80,7 +97,10 @@ fn a_property_demanded_seed_binds_from_the_labels_columns() {
     let (got, c) = traced(&g, LISTING);
     assert_eq!(got, want);
     assert_eq!(
-        count_of(&c, "interp.stage bound a whole-node output lean for the top-k"),
+        count_of(
+            &c,
+            "interp.stage bound a whole-node output lean for the top-k"
+        ),
         1,
         "fix 56 binds the carry lean: {c:?}"
     );
@@ -90,14 +110,27 @@ fn a_property_demanded_seed_binds_from_the_labels_columns() {
     );
     // Only the survivors are decoded in full; nothing reads the 40,000
     // filler records (a point read per member at most).
-    assert_eq!(count_of(&c, "graph.nodes materialised in full"), 50, "{c:?}");
-    assert!(count_of(&c, "store.gets") <= 5_100, "reads bounded by the label: {c:?}");
+    assert_eq!(
+        count_of(&c, "graph.nodes materialised in full"),
+        50,
+        "{c:?}"
+    );
+    assert!(
+        count_of(&c, "store.gets") <= 5_100,
+        "reads bounded by the label: {c:?}"
+    );
     // The columns are KEPT: the second run reads no record before the top-k.
     let (again, c) = traced(&g, LISTING);
     assert_eq!(again, want);
     assert!(
-        count_of(&c, "interp.columnar column read served from the property-column cache") > 0,
+        count_of(
+            &c,
+            "interp.columnar column read served from the property-column cache"
+        ) > 0,
         "{c:?}"
     );
-    assert!(count_of(&c, "store.gets") <= 60, "second run: the survivors alone: {c:?}");
+    assert!(
+        count_of(&c, "store.gets") <= 60,
+        "second run: the survivors alone: {c:?}"
+    );
 }

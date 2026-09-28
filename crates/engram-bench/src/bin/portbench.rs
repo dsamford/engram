@@ -265,7 +265,8 @@ fn main() {
             .and_then(|raw| json::from_json(&raw).ok())
             .map(|v| match v {
                 Value::List(items) => items
-                    .into_iter()
+                    .iter()
+                    .cloned()
                     .filter_map(|st| match st {
                         Value::Map(m) => Some((
                             format!("{}:{}", get_str(&m, "file"), get_str(&m, "line")),
@@ -414,7 +415,7 @@ fn main() {
     let total_stmts = stmts.len();
     let mut stmt_no = 0usize;
     let mut fresh_done = 0usize;
-    for st in &stmts {
+    for st in stmts.iter() {
         let Value::Map(st) = st else { continue };
         let text = get_str(st, "text");
         let key = format!("{}:{}", get_str(st, "file"), get_str(st, "line"));
@@ -483,9 +484,9 @@ fn main() {
                         .iter()
                         .map(|r| {
                             let v = match r {
-                                Value::List(cols) => {
-                                    Value::List(cols.iter().map(canon_incumbent).collect())
-                                }
+                                Value::List(cols) => Value::List(
+                                    cols.iter().map(canon_incumbent).collect::<Vec<_>>().into(),
+                                ),
                                 other => canon_incumbent(other),
                             };
                             (json::to_json(&v), v)
@@ -495,7 +496,9 @@ fn main() {
                         .rows
                         .iter()
                         .map(|row| {
-                            let v = Value::List(row.iter().map(canon_engram).collect());
+                            let v = Value::List(
+                                row.iter().map(canon_engram).collect::<Vec<_>>().into(),
+                            );
                             (json::to_json(&v), v)
                         })
                         .collect();
@@ -576,7 +579,13 @@ fn main() {
         );
         rep.insert(
             "samples_ns".into(),
-            Value::List(samples.into_iter().map(Value::Int).collect()),
+            Value::List(
+                samples
+                    .into_iter()
+                    .map(Value::Int)
+                    .collect::<Vec<_>>()
+                    .into(),
+            ),
         );
         append_result(&mut jsonl, &mut results, rep);
     }
@@ -626,7 +635,7 @@ fn main() {
     doc.insert("not_comparable".to_string(), Value::Int(skipped_cmp as i64));
     doc.insert("parse_errors".to_string(), Value::Int(parse_errors as i64));
     doc.insert("run_errors".to_string(), Value::Int(run_errors as i64));
-    doc.insert("results".to_string(), Value::List(results));
+    doc.insert("results".to_string(), Value::List((results).into()));
     std::fs::write(&out_path, json::to_json(&Value::Map(doc))).expect("write report");
     eprintln!("[port] report written to {out_path}");
 }

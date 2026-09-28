@@ -20,6 +20,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod algo;
 pub(crate) mod batch;
 pub mod cardinality;
 pub(crate) mod constraint_key;
@@ -28,8 +29,9 @@ pub(crate) mod derived_sidecar;
 pub mod hnsw;
 pub mod interp;
 pub(crate) mod merge_derived;
-pub(crate) mod precision;
 pub mod pipeline;
+pub(crate) mod precision;
+pub(crate) mod procbind;
 pub mod schema;
 pub mod scoped_exec;
 pub mod shadow;
@@ -46,6 +48,90 @@ pub use merge_derived::compact_paged_emitting;
 /// operator reads a delta across a window.
 pub mod counters {
     use std::sync::atomic::AtomicU64;
+
+    /// Rows a LABEL-SCOPED range-index catch-up rejected as another label's.
+    ///
+    /// Reads 0 on a build where the filter is absent — which it was, removed on
+    /// the claim that `PropLogs` was keyed `(label, property)` when it is keyed
+    /// by property token alone. A fix here is invisible to most ANSWERS (a
+    /// later filter rejects the foreign row anyway), so this counter is what
+    /// says the isolation is actually being enforced.
+    pub static SCOPED_INDEX_FOREIGN_ROW_REJECTED: AtomicU64 = AtomicU64::new(0);
+
+    /// Per-LABEL membership views built during BOOT WARM-UP.
+    ///
+    /// Warming built only the untyped `members(None)` aggregate, so the first
+    /// query per label built that label's view on a client's thread. Reads 0 on
+    /// a build where warming covers only the aggregate.
+    pub static WARM_LABEL_MEMBERSHIPS: AtomicU64 = AtomicU64::new(0);
+
+    /// PROPERTY COLUMNS rebuilt during BOOT WARM-UP from the persisted working
+    /// set.
+    ///
+    /// Warming built memberships, adjacency and declared indexes — all derived
+    /// TOPOLOGY — and no property data, so the first query to filter on a
+    /// `(label, prop)` pair built its column on the querying thread. Measured
+    /// on SNB BI at SF3: a first query took 108 s where the NEXT one, doing
+    /// strictly more work, took 40 s. Reads 0 on a build where warming covers
+    /// topology only, or where no working set has been persisted yet.
+    pub static WARM_PROP_COLUMNS: AtomicU64 = AtomicU64::new(0);
+
+    /// COUNT STORES rebuilt during BOOT WARM-UP.
+    ///
+    /// A graph opened over data it did not write defers its count store to the
+    /// first read, and every planned statement reads it. So the first query
+    /// after a restart paid for three store-wide key walks on the client's
+    /// thread — measured on SNB BI at SF3 as 61 s for `MATCH (t:TagClass)
+    /// RETURN count(t)`, a 71-node answer, while `RETURN 1` took 0 s and the
+    /// same query afterwards took 0 s. Reads 0 on a store the process wrote
+    /// itself, whose counts are maintained from the first write.
+    pub static WARM_STATS: AtomicU64 = AtomicU64::new(0);
+
+    /// Declared range indexes built during BOOT WARM-UP.
+    ///
+    /// Warming built memberships and adjacency and nothing else, so the first
+    /// seek against a declared index paid for building it on the querying
+    /// thread — 249.7 s for `Person.id` at SF10. Reads 0 on a build where
+    /// warming does not cover indexes, which is what this replaces.
+    pub static WARM_INDEXES_BUILT: AtomicU64 = AtomicU64::new(0);
+
+    /// COMPOSITE indexes built during BOOT WARM-UP.
+    ///
+    /// A declared multi-property index was warmed as its single-key parts and
+    /// never as the composite the planner actually seeks (fix 115's
+    /// structure), so the first two-key seek built it on the client's thread.
+    /// Reads 0 on a build where warming covers only single-key indexes.
+    pub static WARM_COMPOSITE_INDEXES: AtomicU64 = AtomicU64::new(0);
+
+    /// TRIGRAM indexes built during BOOT WARM-UP.
+    ///
+    /// Declared trigram indexes were covered by no warm pass at all: the first
+    /// `CONTAINS` predicate per (label, property) built one. Reads 0 on a
+    /// build where warming does not cover them.
+    pub static WARM_TRIGRAM_INDEXES: AtomicU64 = AtomicU64::new(0);
+
+    /// FULLTEXT (term) indexes built during BOOT WARM-UP.
+    ///
+    /// Same omission as the trigram one, for the same reason: the catalogue
+    /// was never enumerated at boot, so the first `db.index.fulltext.*` call
+    /// paid the build. Reads 0 where warming does not cover them.
+    pub static WARM_TERM_INDEXES: AtomicU64 = AtomicU64::new(0);
+
+    /// Adjacency DIRECTIONS the boot warm-up kept from the derived sidecar
+    /// instead of rebuilding (0, 1 or 2 per warm). Reads 0 on a boot whose
+    /// sidecar was refused or stale — which is what makes a slow restart
+    /// attributable from the counters alone.
+    pub static WARM_ADOPTED_DIRECTIONS: AtomicU64 = AtomicU64::new(0);
+
+    /// Adjacency buckets abandoned at BOOT WARM-UP for exceeding the entry
+    /// budget — almost always the UNTYPED bucket, which holds every type.
+    ///
+    /// Before, one such bucket declined the entire pass and the server booted
+    /// with NO warm tables at all, so every query paid its own lazy first
+    /// build. This counts what is dropped so that "warmed" never silently means
+    /// "warmed nothing": a large value with a healthy table count is the
+    /// intended outcome, and equal values would mean nothing was kept.
+    pub static WARM_BUCKET_OVER_BUDGET: AtomicU64 = AtomicU64::new(0);
 
     /// Overlay rows CARRIED by adjacency repairs — see `repaired_adj_table`.
     ///
@@ -146,6 +232,12 @@ pub mod counters {
 
     /// Single-node reads that DECLINED a stale adjacency table and walked
     /// their own span instead of repairing the whole change set on the query
+    /// Repairs performed BECAUSE the walk they replaced was bigger. The reader
+    /// ceiling declines a large repair; this counts the times declining would have
+    /// cost MORE than repairing, which is the SF10 write-path defect.
+    pub static ADJ_REPAIR_BEAT_THE_WALK: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
     /// thread. See `Graph::set_single_node_stale_walk`.
     pub static ADJ_STALE_DECLINED_TO_WALK: AtomicU64 = AtomicU64::new(0);
 
@@ -201,6 +293,15 @@ pub struct RefreshReport {
     /// and the one-rebuild budget was spent, or caught up but the fenced
     /// publish lost to the slot's current stamp (a writer in flight there).
     pub members_deferred: usize,
+    /// Fix 82's instrument: wall milliseconds the pass spent in the adjacency
+    /// family, and in the membership family. A pass's report used to say WHAT
+    /// it did and its log line how long the whole took; which family the time
+    /// went to had to be inferred from the counts, and the budget curve's 5 s
+    /// passes were attributed to `members rebuilt=1` by exactly that
+    /// inference. Now the line carries both.
+    pub adjacency_ms: u64,
+    /// See `adjacency_ms`.
+    pub members_ms: u64,
 }
 
 impl RefreshReport {
@@ -209,7 +310,10 @@ impl RefreshReport {
     /// not count; it used to, and the server logged "refreshed" for passes
     /// that changed nothing.
     pub fn any(&self) -> bool {
-        self.adjacency_repaired + self.adjacency_rebuilt + self.members_caught_up + self.members_rebuilt
+        self.adjacency_repaired
+            + self.adjacency_rebuilt
+            + self.members_caught_up
+            + self.members_rebuilt
             > 0
     }
 
@@ -222,12 +326,14 @@ impl RefreshReport {
         self.members_caught_up += r.members_caught_up;
         self.members_rebuilt += r.members_rebuilt;
         self.members_deferred += r.members_deferred;
+        self.adjacency_ms += r.adjacency_ms;
+        self.members_ms += r.members_ms;
     }
 
     /// The non-zero fields, named — `adjacency repaired=3 members caught up=2`
     /// — so a log line says what changed rather than printing seven zeros.
     pub fn describe(&self) -> String {
-        let parts: Vec<String> = [
+        let mut parts: Vec<String> = [
             ("adjacency repaired", self.adjacency_repaired),
             ("adjacency rebuilt", self.adjacency_rebuilt),
             ("adjacency declined", self.adjacency_declined),
@@ -241,15 +347,24 @@ impl RefreshReport {
         .map(|(k, n)| format!("{k}={n}"))
         .collect();
         if parts.is_empty() {
-            "nothing stale".to_string()
-        } else {
-            parts.join(" ")
+            return "nothing stale".to_string();
         }
+        // The per-family clock rides at the END, so a line still reads
+        // `adjacency repaired=3 members caught up=2 adjacency_ms=1850
+        // members_ms=12` and a report grouped by its counts strips one
+        // trailing pair.
+        if self.adjacency_ms > 0 || self.members_ms > 0 {
+            parts.push(format!(
+                "adjacency_ms={} members_ms={}",
+                self.adjacency_ms, self.members_ms
+            ));
+        }
+        parts.join(" ")
     }
 }
-pub use schema::{ConstraintDef, IndexDef, VectorArm, VectorPlan};
 pub use derived::MembersView;
 use derived::{ChangeLog, Slot, Snapshot, slot_in};
+pub use schema::{ConstraintDef, IndexDef, VectorArm, VectorPlan};
 pub use scoped_exec::{ScopedExec, SerialExec};
 pub use shadow::{ShadowVerdict, shadow_compare};
 
@@ -258,7 +373,7 @@ use std::collections::BTreeMap;
 use engram_cypher::Value;
 use engram_key::{KeyPrefix, Kind, Namespace, Partition, Realm};
 use engram_observe::{Canary, Gate, Registration, Subsystem, counted, crash_point, sometimes};
-use engram_store::{PropertyId, Record, Store, StoredValue, record::get_property};
+use engram_store::{PropertyId, Record, RecordWalk, Store, StoredValue, record::get_property};
 
 /// A cached ANN build: the index AND the gather snapshot it was built from,
 /// so a warm query touches no node records at all. The bench harness found
@@ -349,6 +464,86 @@ const DEGREE_TABLE_AFTER: u64 = 1024;
 /// Above this node id the table is declined (a Vec<u32> per id).
 const DEGREE_TABLE_MAX_ID: u64 = 1 << 28;
 
+/// Adjacency visits served by a CSR table, and visits that fell through to the
+/// DIRECT PREFIX WALK, split by reason.
+///
+/// WHY. At SF10 a `balanced` run at 32 clients produces NO quotable throughput —
+/// a single operation held the whole measurement window four times over (79.4 s,
+/// 120.3 s, 123.7 s, 125.3 s) — while `balanced-disjoint`, the same write volume
+/// and concurrency on a relationship type no read traverses, sustains 5,121 ops/s
+/// with zero stalls. The difference is entirely whether writes touch the types
+/// the reads walk, and it costs 4.21x at BOTH SF3 and SF10.
+///
+/// The control moves TWO variables at once, so it cannot say which of these
+/// fires:
+///   * `overlaid` — this transaction buffered adjacency rows for this node/side,
+///     so the committed table cannot answer (scales with WRITERS);
+///   * no current table for `epoch` — a write to the type advanced
+///     `adj_type_epoch`, staling the table for EVERY node, after which every
+///     reader pays until repair completes (scales with READERS).
+///
+/// A write-rate sweep already favours the second: 5% writes was WORSE than 50%
+/// (p50 99,258 ms vs 0.66 ms), which a writer-scaled mechanism cannot explain.
+/// These counters settle it directly rather than by inference.
+///
+/// Process-global rather than the thread-local `counted!`, because the workload
+/// that exhibits this is many clients at once — precisely what a per-thread trace
+/// cannot see from a running server.
+pub static ADJ_SERVED_BY_TABLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Fell through to the prefix walk, for any reason. See [`ADJ_SERVED_BY_TABLE`].
+pub static ADJ_FELL_TO_WALK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Fell through because this transaction had buffered rows for the node/side —
+/// the WRITER-scaled candidate.
+pub static ADJ_WALK_OVERLAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Fell through with no overlay and an admissible id: no table current for the
+/// epoch — the READER-scaled candidate, and the one the write-rate sweep favours.
+pub static ADJ_WALK_NO_CURRENT_TABLE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Fell through because the node id exceeded [`DEGREE_TABLE_MAX_ID`]. ALREADY
+/// EXCLUDED by measurement (SF10 has 29,987,846 nodes against a 268,435,456
+/// ceiling); counted so the exclusion stays true rather than remembered.
+pub static ADJ_WALK_ID_CEILING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Served visits this thread has not yet added to [`ADJ_SERVED_BY_TABLE`].
+///
+/// BATCHED, because the denominator is counted on EVERY adjacency visit a table
+/// serves — the hottest read in the engine — and a `fetch_add` there is one
+/// cache line that every worker writes on every hop: the pattern `ProbeGate`
+/// was changed to stop. SNB BI bi15's weighting join served ~19M visits for
+/// 1/20 of SF3's pairs, split across 40 workers. A thread adds its share every
+/// `ADJ_SERVED_FLUSH` visits and when it exits, so the figure the server prints
+/// each tick lags by at most that many visits per live thread.
+struct AdjServedPending(std::cell::Cell<u64>);
+
+impl Drop for AdjServedPending {
+    fn drop(&mut self) {
+        ADJ_SERVED_BY_TABLE.fetch_add(self.0.get(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+thread_local! {
+    static ADJ_SERVED_PENDING: AdjServedPending =
+        const { AdjServedPending(std::cell::Cell::new(0)) };
+}
+
+const ADJ_SERVED_FLUSH: u64 = 4_096;
+
+fn note_adj_served() {
+    let batched = ADJ_SERVED_PENDING.try_with(|p| {
+        let n = p.0.get() + 1;
+        if n >= ADJ_SERVED_FLUSH {
+            ADJ_SERVED_BY_TABLE.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            p.0.set(0);
+        } else {
+            p.0.set(n);
+        }
+    });
+    if batched.is_err() {
+        // this thread's storage is already torn down: count directly
+        ADJ_SERVED_BY_TABLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Which record family a column read walks.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ColumnFamily {
@@ -393,6 +588,14 @@ pub struct Stats {
     pub by_label: BTreeMap<u32, u64>,
     /// Live relationships per type token.
     pub by_type: BTreeMap<u32, u64>,
+    /// Fix 90: live SELF-LOOP relationships (`src == dst`) per type token.
+    /// The count fold's symmetry breaking is exact only for a pattern whose
+    /// symmetric vars are pairwise adjacent through types that carry NO
+    /// self-loop (a self-loop is the one way two of them can bind the same
+    /// node), and this is what answers that in O(1) at execution — from the
+    /// committed counts plus the transaction's own delta, never from a
+    /// cached plan (`Graph::type_self_loops`).
+    pub self_loops_by_type: BTreeMap<u32, u64>,
 }
 
 fn bump(m: &mut BTreeMap<u32, u64>, k: u32, delta: i64) {
@@ -566,7 +769,10 @@ impl RowIndexBuilder {
         if self.current == Some(node) {
             return *self.starts.last().expect("a current row has a start") as usize;
         }
-        debug_assert!(self.last.is_none_or(|l| node > l), "rows must arrive in id order");
+        debug_assert!(
+            self.last.is_none_or(|l| node > l),
+            "rows must arrive in id order"
+        );
         let w = (node / 64) as usize;
         if self.bits.len() <= w {
             self.bits.resize(w + 1, 0);
@@ -675,10 +881,18 @@ mod row_index_tests {
         let idx = RowIndex::from_dense(dense);
         assert_eq!(idx.nodes(), dense.len().saturating_sub(1));
         for n in 0..dense.len() + 70 {
-            assert_eq!(idx.row(n as u64), dense_row(dense, n), "node {n} of {dense:?}");
+            assert_eq!(
+                idx.row(n as u64),
+                dense_row(dense, n),
+                "node {n} of {dense:?}"
+            );
         }
         let back = idx.to_dense();
-        let want: Vec<u32> = if dense.is_empty() { vec![0] } else { dense.to_vec() };
+        let want: Vec<u32> = if dense.is_empty() {
+            vec![0]
+        } else {
+            dense.to_vec()
+        };
         assert_eq!(back, want, "round trip of {dense:?}");
     }
 
@@ -715,15 +929,23 @@ mod row_index_tests {
         // Refusals: a short word vector, a start count off by one, a decreasing
         // start, a bit past `nodes`.
         assert!(RowIndex::from_parts(nodes, vec![], starts.to_vec()).is_none());
-        assert!(RowIndex::from_parts(nodes, bits.to_vec(), starts[..starts.len() - 1].to_vec()).is_none());
+        assert!(
+            RowIndex::from_parts(nodes, bits.to_vec(), starts[..starts.len() - 1].to_vec())
+                .is_none()
+        );
         let mut bad = starts.to_vec();
         bad.swap(0, 1);
-        assert!(RowIndex::from_parts(nodes, bits.to_vec(), bad).is_none() || starts[0] == starts[1]);
+        assert!(
+            RowIndex::from_parts(nodes, bits.to_vec(), bad).is_none() || starts[0] == starts[1]
+        );
         assert!(RowIndex::from_parts(3, vec![1u64 << 5], vec![0, 1]).is_none());
         // The empty table.
         let e = RowIndex::from_dense(&[0]);
         let (n, b, s) = e.parts();
-        assert_eq!(RowIndex::from_parts(n, b.to_vec(), s.to_vec()).expect("empty"), e);
+        assert_eq!(
+            RowIndex::from_parts(n, b.to_vec(), s.to_vec()).expect("empty"),
+            e
+        );
     }
 
     /// The builder produces exactly what `from_dense` produces for the same
@@ -735,7 +957,11 @@ mod row_index_tests {
             vec![0, 0],
             vec![0, 2, 2, 3],
             vec![0, 0, 0, 4, 4, 4, 4],
-            vec![0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3],
+            vec![
+                0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3,
+            ],
         ] {
             let mut b = RowIndexBuilder::new();
             let mut total = 0usize;
@@ -756,7 +982,11 @@ mod row_index_tests {
             while trimmed.len() > 1 && trimmed[trimmed.len() - 1] == trimmed[trimmed.len() - 2] {
                 trimmed.pop();
             }
-            assert_eq!(built, RowIndex::from_dense(&trimmed), "builder vs from_dense on {dense:?}");
+            assert_eq!(
+                built,
+                RowIndex::from_dense(&trimmed),
+                "builder vs from_dense on {dense:?}"
+            );
             for n in 0..dense.len() {
                 assert_eq!(
                     built.row(n as u64).map(|r| (r.start, r.end)),
@@ -772,7 +1002,9 @@ mod row_index_tests {
         // A small deterministic LCG: the shapes must be reproducible.
         let mut seed = 0x9E37_79B9_7F4A_7C15u64;
         let mut next = || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (seed >> 33) as u32
         };
         for _ in 0..200 {
@@ -996,6 +1228,35 @@ struct PropColumnEntry {
     /// The commit clock when the column was read: current while nothing
     /// has been committed since (`Store::now_ts` is bumped by every write).
     at: u64,
+    /// Fix 124: the LABEL and PROPERTY epochs when the column was read.
+    ///
+    /// `at` alone made every column stale on ANY commit anywhere, so the
+    /// read-heavy mix retired `(Person, firstName)` on writes that created
+    /// Messages and touched neither. This is the protocol every other derived
+    /// structure already uses — `members_at_token` tests `label_epoch`,
+    /// `ensure_range_index_scoped` tests `prop_epoch` — and the property
+    /// column cache is the one that never got it.
+    ///
+    /// `None` where the epoch cannot be trusted to move: a property with no
+    /// change log has `prop_epoch` fixed at 0 for ever, so keying on it would
+    /// mean NEVER invalidating. Those entries keep the `at` test.
+    epochs: Option<(u64, u64)>,
+    /// Fix 93 (strategy O4): the LABEL epoch when the column was read, kept
+    /// for the `epochs: None` entries too.
+    ///
+    /// Fix 124 gave currency only to properties that HAVE a change log, and a
+    /// log exists only once an index is built over the property. An unindexed
+    /// property therefore fell all the way back to the commit clock, under
+    /// which any write anywhere retires the column — the coarse behaviour O4
+    /// exists to remove.
+    ///
+    /// The label half of that currency is free and always available:
+    /// `label_epoch` is bumped by BOTH write paths (the direct one and the
+    /// commit replay), so testing it covers every membership change without
+    /// any new bookkeeping. Only the PROPERTY half needs the re-stamp, and
+    /// only for these entries. Recorded unconditionally — it is one `u64` and
+    /// a strictly ADDITIONAL check, so it is sound with the re-stamp off.
+    label_at: u64,
     col: PropColumn,
     /// The value column ALIGNED to the label's members (position i = member
     /// i's value, Null where absent) — built on the first column-at-a-time
@@ -1038,6 +1299,29 @@ impl PropColumnCache {
         }
     }
 }
+
+/// Relationship property VALUES already read, per property token, for the
+/// relationship ids statements asked for — the relationship twin of the
+/// whole-label column cache ([`Graph::prop_column`]), keyed by what was ASKED
+/// rather than by a type, because a type's relationship ids cannot be listed
+/// without walking every node's adjacency.
+///
+/// SNB Interactive IC5 filters every friend's `HAS_MEMBER` edge on
+/// `membership.joinDate`: at SF3 that is ~4.7M relationship records read per
+/// statement, one store read each, for a date — 13.7 s against Neo4j's 7.2.
+/// The values do not change between statements unless something commits.
+/// Its byte budget is the property-column cache's (`Graph::prop_column_budget`).
+struct RelPropMemo {
+    /// The commit clock when the entries were read. Every entry is current
+    /// while nothing has committed since; the first read after ANY commit
+    /// drops them all — the coarse rule, and the one that needs no change log.
+    at: u64,
+    /// property token -> `(rel id, value)` sorted by id, `Null` where the
+    /// relationship does not carry the property (it was read, and is absent).
+    cols: BTreeMap<u32, std::sync::Arc<Vec<(u64, Value)>>>,
+    bytes: usize,
+}
+
 
 /// An estimate of a value's heap footprint beside its 32-byte enum slot —
 /// the string bytes that dominate a column of titles or ids.
@@ -1141,6 +1425,40 @@ enum AdjOutcome {
     Deferred,
 }
 
+/// What a caller of `adj_table_snapshot_reporting` may SPEND on one table.
+///
+/// A reader spends whatever the table needs: it wants an answer and there is
+/// nobody behind it. The maintenance refresh does not — it runs on a thread
+/// that competes with every reader and every writer for the same cores, and a
+/// pass that takes an unbounded step is indistinguishable, from a client, from
+/// the stall it exists to prevent. `write-only @ 1` ran at ~1,600 ops/s for
+/// nineteen seconds of a twenty-second level and at exactly 0 for the
+/// twentieth, and the server's log named the second: one derived refresh,
+/// 9,935 ms, `adjacency repaired=1`.
+#[derive(Debug, Clone, Copy)]
+struct RefreshBudget {
+    /// May this caller pay for a full-span rebuild? (25 s for an untyped
+    /// table at SF1 paged — see `refresh_stale_derived`'s "off the read
+    /// path".)
+    rebuild: bool,
+    /// The most rows ONE repair may re-read, or `None` for the whole delta.
+    ///
+    /// A bounded repair catches the table up to an intermediate stamp rather
+    /// than to the current epoch; the table stays stale for the remainder and
+    /// the next pass takes the next slice. See `adj_repair_change_set`.
+    repair_rows: Option<usize>,
+}
+
+impl RefreshBudget {
+    /// What every reader passes: rebuild if you must, repair the whole delta.
+    fn reader() -> Self {
+        RefreshBudget {
+            rebuild: true,
+            repair_rows: None,
+        }
+    }
+}
+
 /// What resolving a membership snapshot did — the membership analogue of
 /// [`AdjOutcome`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1225,7 +1543,6 @@ const ADJ_TABLE_CACHE_MAX: usize = 512;
 /// rescanned the whole 17.26M-row `[I]` span (25 s on paged storage).
 const ADJ_REPAIR_MAX: usize = 4_096;
 
-
 /// The fixed cost of re-reading ONE node's row, in rebuild-row units — what
 /// the cost gate charges per changed node on top of the changed rows
 /// themselves. A per-node prefix scan sets up a k-way merge (64 tail-shard
@@ -1248,6 +1565,20 @@ const ADJ_REPAIR_MAX: usize = 4_096;
 /// the untyped span: an all-persons burst then charged the whole typed table
 /// as work and never repaired (SF1: built=1 repaired=0 on every arm).
 const ADJ_REPAIR_SCAN_ROWS: usize = 32;
+
+/// What repairing a change set costs, in rows re-read: the changed rows
+/// themselves (`entries`, exact from the log) plus a fixed per-node scan
+/// setup.
+///
+/// ONE formula, three callers — the maintenance pass's budget meter
+/// (`adj_repair_cost_rows`), the repair-vs-rebuild gate (`repaired_adj_table`)
+/// and the truncation that keeps a pass's repair inside its budget. They were
+/// three copies of the same expression, and the doc on `adj_repair_cost_rows`
+/// already names the hazard: a budget that meters a quantity nobody pays is a
+/// defect rather than a conservative approximation.
+fn repair_cost_rows(entries: usize, nodes: usize) -> usize {
+    entries.saturating_add(nodes.saturating_mul(ADJ_REPAIR_SCAN_ROWS))
+}
 
 /// The absolute ceiling on a repair's changed-node set, whatever the cost
 /// model says — a MEMORY bound (the set is collected before the rows are
@@ -1286,6 +1617,28 @@ const END_SET_MEMO_MAX: usize = 64;
 /// Per-label membership snapshots keyed by the commit epoch they were
 /// read at — see `Graph::members`.
 type MembersCache = BTreeMap<u32, std::sync::Arc<Slot<MembersView>>>;
+
+/// A label's membership as [`Graph::members_ref`] hands it out: the published
+/// snapshot borrowed through its arc-swap guard, or an owned view where no
+/// snapshot could be borrowed.
+pub(crate) enum MembersRef {
+    /// Always `Some` — built only from a snapshot that passed the hit rule.
+    Borrowed(arc_swap::Guard<Option<std::sync::Arc<Snapshot<MembersView>>>>),
+    Owned(MembersView),
+}
+
+impl MembersRef {
+    pub(crate) fn view(&self) -> &MembersView {
+        match self {
+            MembersRef::Borrowed(g) => match g.as_ref() {
+                Some(snap) => snap.value.as_ref(),
+                None => unreachable!("a borrowed membership is built from a snapshot"),
+            },
+            MembersRef::Owned(v) => v,
+        }
+    }
+}
+
 /// Range indexes by property token, one monotone slot each.
 /// Range indexes, keyed on `(label token, property token)` packed into a u64.
 ///
@@ -1297,12 +1650,56 @@ type MembersCache = BTreeMap<u32, std::sync::Arc<Slot<MembersView>>>;
 /// in memory for the life of the process.
 type RangeCache = BTreeMap<u64, std::sync::Arc<Slot<engram_store::RangeIndex>>>;
 
+/// Trigram indexes, keyed exactly as the range cache is.
+///
+/// A far smaller cap than the range cache's: a trigram index holds one entry
+/// per three-character window of every value, so it is an order of magnitude
+/// larger per row than a range index over the same property. Sixteen live
+/// structures is already a lot of memory to be holding on the strength of a
+/// probe nobody has repeated.
+type TrigramCache = BTreeMap<u64, std::sync::Arc<Slot<engram_store::trigram::TrigramIndex>>>;
+
+/// The declared trigram indexes as `(label, property)` pairs, shared.
+type TrigramCatalogue = std::sync::Arc<Vec<(String, String)>>;
+
 /// The cache key for a label-scoped index, or an unscoped one.
 ///
 /// `u32::MAX` in the high half means "no label" — the partition-wide index,
 /// which is still what an undeclared probe gets.
 fn range_key(label_token: Option<u32>, prop_token: u32) -> u64 {
     ((label_token.unwrap_or(u32::MAX) as u64) << 32) | prop_token as u64
+}
+/// Composite indexes — one per declared `(label, prop, prop, …)` — keyed
+/// by the label's token followed by the props' tokens in declaration order.
+/// See [`Graph::ensure_composite_index`].
+type CompositeCache = BTreeMap<Vec<u32>, std::sync::Arc<Slot<engram_store::RangeIndex>>>;
+/// One component index of a composite, as `body -> the key that body carries`
+/// — what the join reads. Keyed by body (id bytes), so ordered and
+/// deterministic like every other derived structure here.
+type ComponentKeys<'a> = BTreeMap<&'a [u8], &'a engram_store::IndexKey>;
+
+/// The bytes a COMPOSITE index orders a tuple of STRING values by: each
+/// component escaped (`0x00` → `0x00 0xFF`) and terminated by `0x00 0x00`,
+/// concatenated. Byte order over the whole is lexicographic order over the
+/// tuple, and no encoding is a proper prefix of another (a terminator never
+/// occurs inside an escaped component) — so an equality on every key is
+/// ONE exact probe of the index, and an equality on the leading keys is
+/// one contiguous range of it. Only strings are encoded: a tuple with a
+/// non-string component is left out of the index, and a probe carrying one
+/// declines to the per-key path, which orders numbers itself.
+fn composite_key_bytes(parts: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(parts.iter().map(|p| p.len() + 2).sum());
+    for part in parts {
+        for &b in part.iter() {
+            out.push(b);
+            if b == 0 {
+                out.push(0xFF);
+            }
+        }
+        out.push(0);
+        out.push(0);
+    }
+    out
 }
 /// A transaction's buffered rows under one key prefix, in key order:
 /// `(full body, put?)` — `false` is a buffered delete. Values deliberately
@@ -1315,11 +1712,42 @@ type PendingIndexEntry = (Vec<u8>, Option<engram_store::IndexKey>);
 /// Per-property change logs: each entry is a row body and the index key it
 /// now carries (`None` = it left the index). See `Graph::note_prop_change`.
 type PropLogs = BTreeMap<u32, ChangeLog<(Vec<u8>, Option<engram_store::IndexKey>)>>;
-/// Per-creator messages sorted `(creationDate DESC, id ASC)` — the date-ordered
-/// index behind IC2's k-way merge. Each entry is `(creationDate, message.id,
-/// message node id)`: the first two are the ORDER BY keys (so the merge never
-/// touches the store to rank), the third is the node for late projection.
-pub(crate) type CreatorMsgs = BTreeMap<u64, Vec<(i64, i64, u64)>>;
+/// Per-creator messages sorted `(date DESC, id ASC)` — the date-ordered index
+/// behind IC2's k-way merge and IC3's date window. Each entry is `(date key,
+/// message.id, message node id)`: the first two are the ORDER BY keys (so the
+/// merge never touches the store to rank), the third is the node for late
+/// projection.
+///
+/// The date is the property's INDEX KEY, ordered within its class. It was an
+/// `i64` holding an integer or a DATE's days, and every other value was
+/// skipped: on the typed corpus, where `creationDate` is a DATETIME, IC2's and
+/// IC3's bounds declined on every run — IC9's typed-date story again.
+pub(crate) struct CreatorMsgs {
+    pub(crate) by_creator: BTreeMap<u64, Vec<(engram_store::IndexKey, i64, u64)>>,
+    /// Some message's date is a FLOAT: an integer bound compares with it
+    /// numerically, across a class boundary this order does not interleave.
+    pub(crate) floats: bool,
+    /// The message labels it was built over, and whether EVERY relationship
+    /// of its creator types starts at one of those messages. Then it holds
+    /// every message any query over these types could reach, and answers a
+    /// query over other labels too, filtered to them (`answers`).
+    pub(crate) labels: Vec<String>,
+    pub(crate) covers_every_source: bool,
+}
+
+impl CreatorMsgs {
+    /// Whether this index holds every message a query over `labels` can
+    /// reach: it was built over a subset of those labels (every node the
+    /// query admits is one of its members), or over every source of its
+    /// creator types.
+    pub(crate) fn answers(&self, labels: &[String]) -> bool {
+        self.covers_every_source || self.labels.iter().all(|l| labels.contains(l))
+    }
+}
+
+/// What one [`CreatorMsgs`] was built over: the message labels, the date
+/// property and the creator relationship types.
+pub(crate) type CreatorMsgsKey = (Vec<String>, String, Vec<String>);
 
 /// The ids a vector index has yet to fold into its cached HNSW/vectors,
 /// accumulated by the write path since the index was last built or caught
@@ -1379,6 +1807,24 @@ const VECTOR_DELTA_CAP: usize = 4096;
 const LABEL_LOG_CAP: usize = 65_536;
 /// Index entries carry a body and a key; smaller.
 const PROP_LOG_CAP: usize = 16_384;
+/// Fix 88b: a property log is widened to one entry per this many rows of
+/// the largest index it serves (`prop_log_cap_for`), so that an index left
+/// idle under a write stream catches up rather than rebuilds. An entry is
+/// ~100 bytes; a rebuild is one store get (~1.4 µs paged) per row of the
+/// label plus the index's own memory, so a log of a tenth of the index is
+/// cheap insurance. `PROP_LOG_CAP` stays the floor.
+const PROP_LOG_ENTRIES_PER_INDEX_ROW: usize = 8;
+/// …and the ceiling — ~50 MB of entries for one property on a 9M-row
+/// index (SF3's `id`); SF1's 3.06M rows earn 381,971.
+const PROP_LOG_CAP_MAX: usize = 524_288;
+
+/// The property log cap an index of `rows` entries earns — see
+/// [`PROP_LOG_ENTRIES_PER_INDEX_ROW`]. Never below `PROP_LOG_CAP`, never
+/// above `PROP_LOG_CAP_MAX`.
+#[doc(hidden)]
+pub fn prop_log_cap_for(rows: usize) -> usize {
+    (rows / PROP_LOG_ENTRIES_PER_INDEX_ROW).clamp(PROP_LOG_CAP, PROP_LOG_CAP_MAX)
+}
 
 /// Ids a BULK load reserves per counter write. Bulk trades durability for
 /// ingest rate by contract, so it can afford a large range: a crash abandons
@@ -1406,6 +1852,24 @@ const ADJ_LOG_CAP: usize = 262_144;
 /// view use. An overlay is a `BTreeMap` consulted on every `slice`, so it is
 /// kept small; a fold is O(entries), amortised over `ADJ_OVERLAY_FOLD` repairs.
 const ADJ_OVERLAY_FOLD: usize = 4_096;
+
+/// Fix 83's BOUND: how many multiples of `adj_overlay_fold` a READER's repair
+/// may leave unfolded before it folds after all.
+///
+/// A reader past the fold threshold leaves the fold to the maintenance pass
+/// (`set_deferred_reader_fold`), and the pass repairs a stale table within
+/// about a second — WHEN there is a pass, and when its publish wins. Neither
+/// is guaranteed: `--no-derived-refresh` and a bare `Graph` run no pass at
+/// all, a pass whose fold takes longer than the readers' repairs keeps losing
+/// the publish to a newer stamp, and a table that goes quiet after a burst is
+/// current and never repaired again. Without a bound the overlay grew toward
+/// the table's node count in every one of those regimes, and each reader
+/// repair's `overlay.clone()` grew with it — linear work per read, quadratic
+/// over the run. Past the ceiling the reader folds, as it did before fix 83,
+/// so the overlay a table carries is at most the ceiling plus one repair's
+/// change set in every regime. `--adj-overlay-fold 0` makes the ceiling 0,
+/// which restores that arm's documented meaning: every repair folds.
+const ADJ_DEFERRED_FOLD_CEILING: usize = 16;
 /// Base probes after which a membership base is answered from a presence
 /// BITMAP rather than a binary search.
 ///
@@ -1444,6 +1908,24 @@ const MEMBERS_BITMAP_AFTER: usize = 4_096;
 /// 8,192 rows is ~256 changed nodes at `ADJ_REPAIR_SCAN_ROWS` (32) — well above
 /// a lightly-written table between passes and well below a mixed profile's.
 const ADJ_READER_REPAIR_MAX_ROWS: usize = 8_192;
+
+/// EXPERIMENT (2026-09-12): the ceiling above, but sized so a mixed profile
+/// REPAIRS instead of walking.
+///
+/// 8,192 was chosen "well below a mixed profile's" change rate — so under the
+/// workload this campaign measures it ALWAYS declines, and the decline is cached
+/// per snapshot, so every reader behind it walks too. At SF10 one query then
+/// performs ~1,000 prefix scans and takes 194-316 s, while SF3 — whose repairs
+/// keep up — walks ZERO times in 203.8M visits.
+///
+/// The repair is amortised across every reader until the next write; the walk is
+/// paid per visit. Comparing a one-time repair against a single walk is the wrong
+/// comparison, and `ADJ_LOG_CAP` is the natural ceiling: repair whenever the
+/// change log can answer at all, because the alternative is a store-wide scan.
+///
+/// Read through `reader_repair_max_rows()` so this is one A/B away from being
+/// reverted if it costs SF3 anything.
+const ADJ_READER_REPAIR_MAX_ROWS_AMORTISED: usize = ADJ_LOG_CAP;
 /// How far the cheap per-node staleness scan walks before giving up and
 /// handing the question to the priced path. Bounds what a read pays to learn
 /// "my node did not move", which is the answer most reads get.
@@ -1454,6 +1936,24 @@ const ADJ_STALENESS_SCAN_MAX: usize = 4_096;
 /// maps they replaced carried.
 const MEMBERS_CACHE_MAX: usize = 1_024;
 const RANGE_CACHE_MAX: usize = 256;
+
+/// How many trigram index slots to keep. See [`TrigramCache`] for why this is
+/// so much smaller than the range cache's.
+const TRIGRAM_CACHE_MAX: usize = 16;
+
+/// How many term indexes to hold. Fewer than the trigram cache's: a term index
+/// carries per-document lengths and corpus totals as well as its postings.
+const TERM_CACHE_MAX: usize = 8;
+
+/// Term indexes, one slot per fulltext index name.
+type TermCache = BTreeMap<String, std::sync::Arc<Slot<engram_store::term::TermIndex>>>;
+
+/// One document gathered by the fulltext fallback scan: the node, its
+/// per-field term frequencies at each query position, its per-field lengths,
+/// and its id for the tie-break.
+type ScannedDoc = (Value, Vec<Vec<u32>>, Vec<u32>, u64);
+/// One slot per DECLARED composite index; a catalogue has a handful.
+const COMPOSITE_CACHE_MAX: usize = 64;
 
 /// A property-equality seek fires only when the label has at least this many
 /// nodes - below it the column scan is already sub-millisecond and building a
@@ -1677,6 +2177,65 @@ pub struct Graph {
     /// the A/B differential. Opt-in, so the default convention here is the
     /// reverse of the fast-path levers above.
     parallel_expand: BoolCell,
+    /// Morsel-parallel graph algorithms — `false` (the DEFAULT) runs every
+    /// fixpoint on the calling thread, so the determinism digest and the
+    /// benchmarks are unchanged. Opt-in on the same convention as
+    /// `parallel_expand`, and armed by the server in the same block.
+    ///
+    /// A SEPARATE cell rather than a reuse of `parallel_expand`, because the
+    /// two mechanisms have nothing in common but a thread pool: expand splits
+    /// driving ROWS and reads the store from its workers, an algorithm splits
+    /// an output VERTEX range over an already-materialised CSR and touches no
+    /// store at all. One lever could not say which had been measured, and a
+    /// differential that cannot isolate its arm is not a differential.
+    algo_parallel: BoolCell,
+    /// The vertex count below which a fixpoint runs serially however wide the
+    /// installed executor is. Default **65,536**, and SETTABLE for the same
+    /// reason `parallel_min_rows` is: behaviour at a threshold has to be
+    /// testable without building a corpus at the threshold.
+    ///
+    /// # What `algowidth` actually measured, including the disappointing part
+    ///
+    /// The first figure here was 4,096, reasoned from the shape of the work —
+    /// `O(V+E)` multiply-adds over a materialised CSR, no store access, no
+    /// allocation inside the morsel — rather than measured. Width 4 against
+    /// the serial lane, medians over two runs:
+    ///
+    /// ```text
+    ///   vertices   1,024   4,096   16,384   65,536   200,000   500,000
+    ///   speedup     0.36x   0.82x    1.05x    1.09x     1.03x     0.97x
+    /// ```
+    ///
+    /// **The split does not reliably pay at any size measured**, and the
+    /// run-to-run variance (711 ms and 843 ms for the same 200,000-vertex run
+    /// at width 4) is larger than the effect. PageRank pulling over a CSR is
+    /// bandwidth-bound, and threads do not add bandwidth; the per-iteration
+    /// serial remainder — the morsel-order merge and the width-independent
+    /// convergence fold, both O(V) — then caps what is left by Amdahl.
+    ///
+    /// The lane is kept because it is correct, gated and default-off, and
+    /// because a compute-bound kernel added later inherits it. The floor is
+    /// set where the loss stops rather than where a gain starts, which is the
+    /// honest reading of that row. It is NOT a figure to quote as a speed-up.
+    algo_min_vertices: UsizeCell,
+    /// The four algorithm ceilings and the result cache's byte budget, as
+    /// SETTABLE cells rather than constants.
+    ///
+    /// Every refusal names the lever that would raise the ceiling it hit —
+    /// `ENGRAM_ALGO_NODE_CEILING` and its siblings. Those names shipped in
+    /// user-facing error text while nothing anywhere read them: an operator
+    /// following the message exactly would set the variable, see no change,
+    /// and have no way to tell that the advice was fiction. A lever named in
+    /// an error message is a promise, and this is the other half of it.
+    algo_node_ceiling: U64Cell,
+    /// See [`Graph::algo_node_ceiling`].
+    algo_edge_ceiling: U64Cell,
+    /// See [`Graph::algo_node_ceiling`].
+    algo_byte_ceiling: U64Cell,
+    /// See [`Graph::algo_node_ceiling`].
+    algo_work_ceiling: U64Cell,
+    /// See [`Graph::algo_node_ceiling`].
+    algo_cache_bytes: UsizeCell,
     /// IC3's date-windowed HAS_CREATOR last stage — seek each friend's in-window
     /// messages from the date-ordered `creator_msgs` index instead of reading
     /// every message's date. `false` runs the ordinary batched expansion.
@@ -1693,11 +2252,18 @@ pub struct Graph {
     /// visited set (each node reached once) instead of DFS path enumeration.
     /// `false` forces the enumerating path — the A/B lever for the differential.
     frontier_expand: BoolCell,
+    rel_predicate_pushdown: BoolCell,
+    expand_truncation: BoolCell,
     property_seek: BoolCell,
     /// Fix 72: whether a `count(<chain var>)` over the chain a MATCH binds
     /// folds into its projection as `sum(COUNT { <chain> })`. Default on;
     /// off keeps the clause, for the differential test.
     chain_count_fold: BoolCell,
+    /// Whether a read-only statement the streaming pipeline refuses as a whole
+    /// streams its prefix up to the last `WITH` before the clause it cannot
+    /// run. Default on; off runs every clause on the materialising loop, for
+    /// the differential test.
+    prefix_streaming: BoolCell,
     /// Fix 76: a subquery body (a pattern comprehension, an EXISTS / COUNT
     /// pattern body) is seeded with every bound NODE trimmed to what the
     /// body reads of it, instead of a whole copy of the outer row. Default
@@ -1741,6 +2307,28 @@ pub struct Graph {
     /// readers finding the same stale table do one repair between them instead
     /// of N. Default OFF — measured a regression; see `set_single_flight_repair`.
     single_flight_repair: BoolCell,
+    /// Whether the maintenance pass TRUNCATES the one repair its row budget
+    /// cannot afford, instead of taking the whole delta. Default on; see
+    /// `set_bounded_derived_repair`.
+    bounded_derived_repair: BoolCell,
+    /// See `Graph::reader_repair_max_rows`.
+    amortised_reader_repair: BoolCell,
+    /// Whether a membership catch-up the label's log covers runs REGARDLESS
+    /// of the pass's row budget (fix 82). Default on; see
+    /// `set_members_unmetered_catch_up`.
+    members_unmetered_catch_up: BoolCell,
+    /// Whether a READER's repair leaves the overlay fold to the maintenance
+    /// pass (fix 83). Default on; see `set_deferred_reader_fold`.
+    deferred_reader_fold: BoolCell,
+    /// Whether a repair is PRICED from the change logs' lengths rather than by
+    /// walking their contents. Default **true** — see
+    /// [`Graph::adj_repair_cost_rows`], which carries the argument for why the
+    /// two agree wherever the answer can differ.
+    ///
+    /// Off is the arm that walks: the whole untruncated delta, a `BTreeSet` of
+    /// every changed node built and dropped, once per stale table, under the
+    /// lock a writer takes to record.
+    cheap_repair_pricing: BoolCell,
     /// Whether a single-node reader may be served from a STALE table when the
     /// change set does not touch its node. Default on; see
     /// `set_lazy_stale_serve`.
@@ -1821,8 +2409,7 @@ pub struct Graph {
     /// The constraint list, cached against the schema epoch — see
     /// `Graph::constraints_snapshot`. Per Graph INSTANCE (the server shares
     /// one per coordinate); the epoch read validates it on every use.
-    constraint_cache:
-        SyncRefCell<Option<(u64, std::sync::Arc<Vec<schema::LoadedConstraint>>)>>,
+    constraint_cache: SyncRefCell<Option<(u64, std::sync::Arc<Vec<schema::LoadedConstraint>>)>>,
     /// The DECLARED range indexes (`CREATE INDEX ... FOR (n:L) ON (n.p)`),
     /// cached against the same schema epoch — see
     /// `Graph::declared_range_indexes`.
@@ -1833,16 +2420,61 @@ pub struct Graph {
     /// no plan, so a workload could declare exactly the index it needed and be
     /// answered by a label scan anyway.
     range_index_cache: SyncRefCell<Option<(u64, std::sync::Arc<Vec<schema::RangeIndexDef>>)>>,
+    /// The declared TRIGRAM indexes as `(label, property)`, cached by the
+    /// catalogue's epoch exactly as the range catalogue is.
+    ///
+    /// Not an optimisation added on principle: without it, every statement
+    /// carrying a text predicate paid a `scan_index_defs` — a store scan of
+    /// the schema rows — to discover whether an index it might not even use
+    /// existed. On a 20,000-row corpus that turned a probe the planner then
+    /// correctly REFUSED into measurably more work than never consulting the
+    /// index at all. The bench caught it; this is the fix.
+    trigram_index_cache: SyncRefCell<Option<(u64, TrigramCatalogue)>>,
     /// Whether the Bolt retry loop may ESCALATE a write-write conflict to
     /// the store's FIFO entity lock (W2.2) — the A/B arm's toggle.
     conflict_escalation: BoolCell,
     /// The installed morsel executor (W3) — absent means every operator
     /// takes its serial path. See `scoped_exec`.
     exec: SyncRefCell<Option<std::sync::Arc<dyn ScopedExec>>>,
+    /// The installed executor's width (0 when none), kept beside it so a
+    /// per-call check — `rels_of_where` runs on every row of a parallel
+    /// stage — is a plain load, not the lock and `Arc` clone `exec()` costs
+    /// on lines every worker shares.
+    exec_width: UsizeCell,
     /// The fewest driving rows worth splitting: below this, spawn/join
     /// overhead exceeds the win and the serial loop runs. Settable so the
     /// differential tests exercise the parallel machinery on small corpora.
     parallel_min_rows: UsizeCell,
+    /// The fewest driving rows worth splitting for a COUNT FOLD, separately
+    /// from `parallel_min_rows` (fix 119). A fold's driving row is an entire
+    /// nested walk, not a cheap probe, so the floor that made sense for
+    /// `expand` (256) kept LSQB q3 — which seeds on 111 countries — serial on
+    /// a six-worker server for its whole measured life.
+    parallel_fold_min_rows: UsizeCell,
+    /// Fix 124's epoch-pair currency for the property-column cache: ON by
+    /// default. OFF = a cached column is current only while the commit clock
+    /// has not moved, the behaviour before the fix, so a differential proves
+    /// the change retires columns no later than it should.
+    prop_column_epoch_currency: BoolCell,
+    /// Fix 93 (strategy O4): the commit-time RE-STAMP for property columns
+    /// whose property has no change log. **OFF by default**, deliberately.
+    ///
+    /// It advances the commit clock a cached column is stamped with, past
+    /// commits that touched neither its label nor its property — which is
+    /// sound only while EVERY write path that can invalidate the column is
+    /// accounted for. The commit replay is accounted; the direct write path
+    /// is accounted through [`Graph::note_direct_prop_write`]. A path that is
+    /// neither would revive a stale column silently, so this ships off and is
+    /// turned on per-run until it has a differential of its own.
+    prop_column_restamp: BoolCell,
+    /// The largest label, in nodes, whose property column may be read WHOLE.
+    /// Settable for the same reason `parallel_min_rows` is: the behaviour at
+    /// the ceiling is only reachable on a corpus past it, and building a
+    /// 262,144-node label in a unit test to exercise one branch is not a
+    /// test, it is a benchmark. Fix 118 made this a lever after the ceiling
+    /// hid a permanent decline for the whole of the v82-v175 span.
+    whole_label_read_max: U64Cell,
+    path_estimate: BoolCell,
     /// Relationship populations by type set — see `Graph::rel_members`.
     rel_members_cache: arc_swap::ArcSwap<RelMembersCache>,
     /// Adjacency tables per (direction tag, type set), epoch-keyed; built
@@ -1885,6 +2517,10 @@ pub struct Graph {
     /// the next probe asks the same (table, freshness) question. Default on;
     /// see `set_adj_snap_memo`.
     adj_snap_memo: BoolCell,
+    /// Bumped by every in-place refold (`Slot::publish_refold`), so the
+    /// per-thread snapshot memo — which validates by stamp, and a refold
+    /// keeps the stamp — retires its entries. See `AdjSnapMemo::gen`.
+    adj_refold_gen: std::sync::atomic::AtomicU64,
     /// Whether a DIRECTED fold close probes from the BOUND endpoint's row
     /// (with the direction flipped) instead of the level var's — the hot-row
     /// locality `Dir::Both` closes already have. Default on; see
@@ -1927,7 +2563,6 @@ pub struct Graph {
     // never consumed by readers), a map of monotone SLOTS holding the current
     // snapshot per key, and a build-path guard. The source's epoch lives in
     // its log; nothing here is validated against the global commit clock.
-
     /// Membership snapshots per label token (`u32::MAX` = every node), one
     /// monotone slot each. A snapshot is a [`MembersView`] — a shared base plus
     /// a small overlay — so a catch-up is O(delta), never a copy of the label.
@@ -1936,6 +2571,9 @@ pub struct Graph {
     /// commit clock. Written only by `note_membership_of`, from the four sites
     /// that touch a membership row.
     label_log: SyncRefCell<BTreeMap<u32, ChangeLog<(u64, bool)>>>,
+    /// The overlay size past which a range-index catch-up folds — see
+    /// `Graph::set_range_fold_at`. Default `RangeIndex::FOLD_AT` (4,096).
+    range_fold_at: UsizeCell,
     /// Change log per property token: `(entity body, new index key)` entries,
     /// `None` when the row leaves the index. A property's log is created when
     /// an index for it is first built, so every write after that is carried
@@ -1962,10 +2600,8 @@ pub struct Graph {
     ///
     /// Exactly the shape `adj_type_epoch` below already had for adjacency; the
     /// membership side simply never got it.
-    label_epoch_map:
-        arc_swap::ArcSwap<BTreeMap<u32, std::sync::Arc<std::sync::atomic::AtomicU64>>>,
-    adj_type_epoch:
-        arc_swap::ArcSwap<BTreeMap<u32, std::sync::Arc<std::sync::atomic::AtomicU64>>>,
+    label_epoch_map: arc_swap::ArcSwap<BTreeMap<u32, std::sync::Arc<std::sync::atomic::AtomicU64>>>,
+    adj_type_epoch: arc_swap::ArcSwap<BTreeMap<u32, std::sync::Arc<std::sync::atomic::AtomicU64>>>,
     /// Change log per `(direction tag, relationship type)`: the nodes whose
     /// row for that tag and type changed. A stale table is repaired over
     /// exactly those rows. The type's epoch lives in its logs.
@@ -1992,6 +2628,27 @@ pub struct Graph {
     /// across writes instead of rebuilding them. Default on; off is the pre-fix
     /// behaviour.
     incremental_caches: BoolCell,
+    /// Whether a trigram index may serve a probe. The A/B lever: with it off
+    /// every `=~`, `CONTAINS` and `ENDS WITH` falls back to the scan that
+    /// answered them before this index existed, which is what makes "the
+    /// index helps" a measurement rather than an assertion.
+    trigram_indexes: BoolCell,
+    /// Whether a BM25-scored index may serve a query. Off, every fulltext
+    /// index falls back to a scan — the A/B for the index itself, kept
+    /// separate from the SCORING choice because they are two claims.
+    bm25_scoring: BoolCell,
+    /// The scoring a NEWLY created fulltext index is stamped with.
+    ///
+    /// Read at create and written into the catalogue row, never consulted at
+    /// query time — see `IndexDef::Fulltext`'s `scoring` field.
+    bm25_by_default: BoolCell,
+    /// Term indexes, one slot per fulltext index NAME.
+    ///
+    /// Keyed by name rather than by property, because a fulltext index spans
+    /// labels times properties: the unit here is the index, not the column.
+    term_cache: SyncRefCell<TermCache>,
+    /// Cached `mutate` results, by the user's own key.
+    algo_cache: SyncRefCell<crate::algo::cache::ResultCache>,
     /// Decide repair-vs-rebuild of a stale adjacency table by COST — the
     /// changed rows' re-read work against half the span a rebuild walks —
     /// instead of the fixed `ADJ_REPAIR_MAX` node cap. Default on; off is the
@@ -2038,16 +2695,26 @@ pub struct Graph {
     /// Range indexes per property token, one monotone slot each — see
     /// [`Graph::index_probe_eq`].
     range_cache: arc_swap::ArcSwap<RangeCache>,
+    /// Trigram indexes, one slot per `(label, property)`.
+    trigram_cache: arc_swap::ArcSwap<TrigramCache>,
+    /// Declared COMPOSITE indexes, derived from their component range
+    /// indexes — see [`Graph::ensure_composite_index`].
+    composite_cache: arc_swap::ArcSwap<CompositeCache>,
     /// Whole-label PROPERTY COLUMNS the columnar walks read, kept between
     /// statements under a byte budget — see [`Graph::prop_column`].
     prop_columns: std::sync::Mutex<PropColumnCache>,
+    /// Relationship property values already read — see
+    /// [`Graph::rel_prop_aligned`].
+    rel_prop_memo: std::sync::Mutex<RelPropMemo>,
     /// name -> the cached ANN build.
     ann_cache: SyncRefCell<BTreeMap<String, AnnEntry>>,
     /// The date-ordered per-creator message index (IC2's native lever): each
-    /// creator maps to its messages sorted `(creationDate DESC, id ASC)`. Keyed by
-    /// the commit epoch; a prototype of ordered adjacency at seal — see
+    /// creator maps to its messages sorted `(date DESC, id ASC)`. Keyed by the
+    /// commit epoch AND what it was built over — keyed by the epoch alone, an
+    /// index over one label or property answered a statement asking for
+    /// another. A prototype of ordered adjacency at seal — see
     /// `creator_sorted_messages`.
-    creator_msgs: SyncRefCell<Option<(u64, std::sync::Arc<CreatorMsgs>)>>,
+    creator_msgs: SyncRefCell<Option<(u64, CreatorMsgsKey, std::sync::Arc<CreatorMsgs>)>>,
     /// Per-vector-index pending writes since its cache was last current.
     vector_deltas: SyncRefCell<BTreeMap<String, VectorDelta>>,
     /// The vector indexes, cached; `None` until first needed, cleared when
@@ -2213,6 +2880,7 @@ struct StatsDelta {
     rels: i64,
     by_label: BTreeMap<u32, i64>,
     by_type: BTreeMap<u32, i64>,
+    self_loops_by_type: BTreeMap<u32, i64>,
 }
 
 /// An explicit, signed change to [`Stats`] — what a mutation DID, rather than a
@@ -2228,6 +2896,9 @@ struct StatsChange {
     rels: i64,
     by_label: Vec<(u32, i64)>,
     by_type: Vec<(u32, i64)>,
+    /// Fix 90: the self-loop share of `by_type` (a create/delete of a
+    /// relationship whose `src == dst`).
+    self_loops_by_type: Vec<(u32, i64)>,
 }
 
 impl StatsDelta {
@@ -2246,6 +2917,9 @@ impl StatsDelta {
         for (t, d) in &c.by_type {
             *self.by_type.entry(*t).or_insert(0) += *d;
         }
+        for (t, d) in &c.self_loops_by_type {
+            *self.self_loops_by_type.entry(*t).or_insert(0) += *d;
+        }
     }
 
     /// `after - before`, accumulated.
@@ -2262,6 +2936,12 @@ impl StatsDelta {
             let b = before.by_type.get(t).copied().unwrap_or(0);
             if *a != b {
                 *self.by_type.entry(*t).or_insert(0) += *a as i64 - b as i64;
+            }
+        }
+        for (t, a) in &after.self_loops_by_type {
+            let b = before.self_loops_by_type.get(t).copied().unwrap_or(0);
+            if *a != b {
+                *self.self_loops_by_type.entry(*t).or_insert(0) += *a as i64 - b as i64;
             }
         }
     }
@@ -2311,10 +2991,27 @@ impl StatsDelta {
                 }
             }
         }
+        for (t, d) in &self.self_loops_by_type {
+            match st.self_loops_by_type.entry(*t) {
+                std::collections::btree_map::Entry::Occupied(mut e) => {
+                    let v = e.get_mut();
+                    *v = v.saturating_add_signed(*d);
+                }
+                std::collections::btree_map::Entry::Vacant(v) => {
+                    if *d > 0 {
+                        v.insert(*d as u64);
+                    }
+                }
+            }
+        }
     }
 
     fn is_empty(&self) -> bool {
-        self.nodes == 0 && self.rels == 0 && self.by_label.is_empty() && self.by_type.is_empty()
+        self.nodes == 0
+            && self.rels == 0
+            && self.by_label.is_empty()
+            && self.by_type.is_empty()
+            && self.self_loops_by_type.is_empty()
     }
 }
 
@@ -2337,6 +3034,11 @@ thread_local! {
     /// synchronously on one thread, so a thread-local scopes the transaction to
     /// exactly that execution. `None` is autocommit — the default, and the only
     /// mode the read path and every existing caller ever see.
+    /// Whether [`ACTIVE_TXN`] is the server's single-statement autocommit
+    /// wrapper rather than a transaction the user opened. See
+    /// [`Graph::in_explicit_txn`].
+    static AUTOCOMMIT_TXN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
     static ACTIVE_TXN: std::cell::RefCell<Option<engram_store::Transaction>> =
         const { std::cell::RefCell::new(None) };
 
@@ -2370,6 +3072,13 @@ struct AdjSnapMemo {
     tag: u8,
     tokens: Vec<u32>,
     snap: std::sync::Arc<Snapshot<AdjTable>>,
+    /// The graph's refold generation when this entry was filed. An in-place
+    /// refold (fix 83's pass folding a quiet table) replaces a slot's snapshot
+    /// WITHOUT advancing its stamp, and the memo validates by stamp — so an
+    /// entry from before a refold would keep serving the unfolded table (its
+    /// base and overlay resident beside the new base) for as long as the
+    /// table stayed quiet. A generation mismatch retires the entry instead.
+    refold_gen: u64,
 }
 
 /// How many distinct tables a thread remembers at once.
@@ -2423,6 +3132,16 @@ impl AdjSnapMemoSet {
 
 /// Source of [`Graph::graph_id`]. Never reused, unlike an address.
 static NEXT_GRAPH_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A graph's algorithm projections and its match start chunk are kept
+/// outside it, keyed by its `graph_id` (`algo::graph::KEPT`,
+/// `interp::MATCH_START_CHUNKS`), and go when it does.
+impl Drop for Graph {
+    fn drop(&mut self) {
+        crate::algo::graph::forget_kept_projections(self.graph_id);
+        crate::interp::forget_match_start_chunk(self.graph_id);
+    }
+}
 
 /// One `count_hop` question: `(:start)-[:types]->(:end)` with `dir` as the
 /// probe direction byte. Labels and types in caller order — two spellings of
@@ -2480,7 +3199,9 @@ impl Graph {
     /// changed are touched AFTER the publish, stamped with the commit clock.
     pub fn commit_txn(&self) -> Result<(), GraphError> {
         let txn = ACTIVE_TXN.with(|t| t.borrow_mut().take());
-        let touched = TXN_TOUCHED.with(|t| t.borrow_mut().take()).unwrap_or_default();
+        let touched = TXN_TOUCHED
+            .with(|t| t.borrow_mut().take())
+            .unwrap_or_default();
         let Some(txn) = txn else {
             return Err(GraphError::Txn("no active transaction to commit".into()));
         };
@@ -2514,6 +3235,34 @@ impl Graph {
         ACTIVE_TXN.with(|t| t.borrow().is_some())
     }
 
+    /// Whether the active transaction is one the USER opened, rather than the
+    /// single-statement wrapper the server installs around a writing
+    /// autocommit statement.
+    ///
+    /// # Why the distinction has to exist
+    ///
+    /// An algorithm's `write` mode refuses to run inside an open transaction,
+    /// because an enclosing one would either see its own uncommitted writes in
+    /// the read snapshot or hold entity locks across the whole computation.
+    /// Both hazards are about a transaction that contains OTHER statements.
+    ///
+    /// The server wraps every statement that *can* write in a serialisable
+    /// autocommit transaction, and `write` mode can write — so it declared
+    /// itself a writer, the server wrapped it, and it then refused to run
+    /// inside the wrapper that exists to make its own write durable. Over
+    /// Bolt, on a fresh server, with one client and one statement. The mode
+    /// was catalogued, documented, and tested through `run_query` — which
+    /// installs no transaction — so every test passed and every real client
+    /// got a refusal.
+    ///
+    /// A single-statement wrapper has no prior uncommitted writes and holds no
+    /// locks across anything else: the statement IS the transaction. So the
+    /// rule is about EXPLICIT transactions, and this is the predicate that
+    /// says so.
+    pub fn in_explicit_txn(&self) -> bool {
+        ACTIVE_TXN.with(|t| t.borrow().is_some()) && !AUTOCOMMIT_TXN.with(std::cell::Cell::get)
+    }
+
     // ── Session-owned transactions ──────────────────────────────────────
     //
     // A Bolt worker MULTIPLEXES many sessions on one thread, so a session's
@@ -2539,6 +3288,18 @@ impl Graph {
             inner,
             touched: TxnTouched::default(),
         }
+    }
+
+    /// [`Graph::with_txn`], marking the transaction as the server's
+    /// single-statement AUTOCOMMIT wrapper rather than a user's explicit one.
+    ///
+    /// The only difference is what [`Graph::in_explicit_txn`] reports — see
+    /// there for why anything depends on it.
+    pub fn with_autocommit_txn<R>(&self, txn: GraphTxn, f: impl FnOnce() -> R) -> (GraphTxn, R) {
+        AUTOCOMMIT_TXN.with(|a| a.set(true));
+        let r = self.with_txn(txn, f);
+        AUTOCOMMIT_TXN.with(|a| a.set(false));
+        r
     }
 
     /// Run `f` with `txn` installed as this thread's active transaction, then
@@ -2593,9 +3354,7 @@ impl Graph {
                 self.touch_after_commit(touched, ts);
                 Ok(())
             }
-            Err((engram_store::StoreError::Conflict, info)) => {
-                Err((GraphError::TxnConflict, info))
-            }
+            Err((engram_store::StoreError::Conflict, info)) => Err((GraphError::TxnConflict, info)),
             Err((e, _)) => Err((GraphError::Store(e), None)),
         }
     }
@@ -2640,6 +3399,33 @@ impl Graph {
         })
     }
 
+    /// Fix 102: [`Graph::store_get_peek`] WITHOUT the copy — `f` sees the
+    /// newest visible bytes as a borrow: a transaction's buffered row, else
+    /// the committed store's (`Store::get_with`, the same resolution as
+    /// `get`), with the same read-set recording. `None` when nothing is
+    /// visible (a tombstone included). The transaction latch is released
+    /// before `f` runs.
+    fn store_get_with_peek<R>(
+        &self,
+        prefix: &KeyPrefix,
+        body: &[u8],
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Option<R> {
+        let buffered: Option<Option<Vec<u8>>> = ACTIVE_TXN.with(|t| {
+            let mut t = t.borrow_mut();
+            let txn = t.as_mut()?;
+            if let Some(b) = txn.peek(prefix, body) {
+                return Some(b);
+            }
+            txn.note_read(prefix, body);
+            None
+        });
+        match buffered {
+            Some(b) => b.map(|b| f(&b)),
+            None => self.store.get_with(prefix, body, f),
+        }
+    }
+
     /// [`Graph::store_get_peek`] WITHOUT recording the read.
     ///
     /// For materialising a CANDIDATE that may yet be rejected. See
@@ -2659,6 +3445,22 @@ impl Graph {
     /// `store_get_peek` would have made when the node was materialised.
     pub(crate) fn note_node_read(&self, id: u64) {
         self.store_note_read(&self.nodes, &id.to_be_bytes());
+    }
+
+    /// Record that a RELATIONSHIP became a binding — the counterpart of
+    /// [`Graph::note_node_read`], for the lean relationship bind.
+    pub(crate) fn note_rel_read(&self, id: u64) {
+        self.store_note_read(&self.rels, &id.to_be_bytes());
+    }
+
+    /// The active transaction's READ-SET size, or 0 when none is active.
+    ///
+    /// Test-only observability: comparing read sets directly is the only way
+    /// to show that a lean bind preserved one, because a conflict probe cannot
+    /// isolate a single binding's contribution.
+    #[doc(hidden)]
+    pub fn read_set_len_for_test(&self) -> usize {
+        ACTIVE_TXN.with(|t| t.borrow().as_ref().map_or(0, |x| x.read_set_len()))
     }
 
     /// Register a key in the active transaction's read set WITHOUT reading it.
@@ -2743,6 +3545,51 @@ impl Graph {
     /// goes through; the paths that BUILD a shared structure keep reading the
     /// committed store, because a private write must never enter a shared
     /// snapshot.
+    /// A node's adjacency index bodies under `[tag] + node`, NARROWED to
+    /// `type_tokens` when given: one prefix scan of `[tag] + node + type` per
+    /// token, ascending. The key is `tag | node | type | peer | rel`, so the
+    /// type is the next key field after the node, and a scan of the node's
+    /// whole row followed by a type filter visited EVERY edge of the node to
+    /// keep a few. SNB BI bi11 expands `(a)-[k1:KNOWS]-(b)` from 3,613 people,
+    /// and each person's row holds their LIKES, every HAS_CREATOR from their
+    /// messages and their forum memberships — ~3,400 rows per scan for ~40
+    /// KNOWS: 24.7M row visits for leg 1 alone.
+    ///
+    /// The order is the filtered order exactly: the key is type-major, so the
+    /// rows of ascending tokens, concatenated, ARE the whole row's rows of
+    /// those types in scan order — which `incident_rel_ids` (a delete's
+    /// commit log) and `adj_row_for` (byte-identical to a rebuild) rely on.
+    /// `overlaid` takes the transaction's buffered writes into account, as
+    /// [`Graph::index_bodies`] does; `tokens` must be sorted.
+    fn adj_bodies(&self, tag: u8, node: u64, tokens: Option<&[u32]>, overlaid: bool) -> Vec<Vec<u8>> {
+        let scan = |want: &[u8]| {
+            if overlaid {
+                self.index_bodies(want)
+            } else {
+                self.store.scan_bodies_prefix(&self.index, want)
+            }
+        };
+        let mut want = Vec::with_capacity(1 + 8 + 4);
+        want.push(tag);
+        want.extend_from_slice(&node.to_be_bytes());
+        let Some(tokens) = tokens else {
+            return scan(&want);
+        };
+        counted!("graph.adjacency row scanned per type");
+        let mut out = Vec::new();
+        let mut last = None;
+        for &t in tokens {
+            if last == Some(t) {
+                continue;
+            }
+            last = Some(t);
+            want.truncate(1 + 8);
+            want.extend_from_slice(&t.to_be_bytes());
+            out.extend(scan(&want));
+        }
+        out
+    }
+
     fn index_bodies(&self, body_prefix: &[u8]) -> Vec<Vec<u8>> {
         let mut out = self.store.scan_bodies_prefix(&self.index, body_prefix);
         if let Some(pending) = self.txn_pending(&self.index, body_prefix) {
@@ -2812,7 +3659,10 @@ impl Graph {
     /// commit registers once for the whole write-set.
     fn fence(&self) -> WriteFence<'_> {
         if self.in_txn() {
-            return WriteFence { graph: self, at: None };
+            return WriteFence {
+                graph: self,
+                at: None,
+            };
         }
         // The VISIBLE clock: every row this writer will commit is allocated
         // after this read, so it is stamped strictly above `at`.
@@ -2881,6 +3731,13 @@ impl Graph {
                 slot.retract();
             }
         }
+        // A composite over the property derives from that index: retracted
+        // with it, so it is re-derived from the rebuilt one.
+        for (key, slot) in self.composite_cache.load().iter() {
+            if key[1..].contains(&token) {
+                slot.retract();
+            }
+        }
     }
 
     /// Toggle the per-entity write latches (default on) — the A/B arm and the
@@ -2913,6 +3770,7 @@ impl Graph {
     /// server installs its thread-scope pool here behind
     /// `ENGRAM_QUERY_PARALLELISM`; tests install `SerialExec` or their own.
     pub fn set_exec(&self, e: Option<std::sync::Arc<dyn ScopedExec>>) {
+        self.exec_width.set(e.as_ref().map_or(0, |x| x.width()));
         *self.exec.borrow_mut() = e;
     }
 
@@ -2929,6 +3787,70 @@ impl Graph {
     /// See [`Graph::set_parallel_min_rows`].
     pub(crate) fn parallel_min_rows(&self) -> usize {
         self.parallel_min_rows.get()
+    }
+
+    /// The expand floor, for the test that pins it apart from the fold's
+    /// (fix 119). Public only so a differential can assert the two levers do
+    /// not move together.
+    #[doc(hidden)]
+    pub fn parallel_min_rows_for_test(&self) -> usize {
+        self.parallel_min_rows.get()
+    }
+
+    /// Fix 124: whether a cached property column is judged current by the
+    /// (label, property) epoch pair rather than by the global commit clock.
+    pub fn set_prop_column_epoch_currency(&self, on: bool) {
+        self.prop_column_epoch_currency.set(on);
+    }
+
+    /// Fix 93 (strategy O4): turn the commit-time re-stamp on. OFF by
+    /// default — see [`Graph::restamp_prop_columns`] for the soundness
+    /// argument it depends on.
+    pub fn set_prop_column_restamp(&self, on: bool) {
+        self.prop_column_restamp.set(on);
+    }
+
+    /// The fewest driving rows worth splitting for a count fold (default 2).
+    pub fn set_parallel_fold_min_rows(&self, n: usize) {
+        self.parallel_fold_min_rows.set(n.max(2));
+    }
+
+    /// See [`Graph::set_parallel_fold_min_rows`].
+    pub(crate) fn parallel_fold_min_rows(&self) -> usize {
+        self.parallel_fold_min_rows.get()
+    }
+
+    /// The largest label whose property column may be read whole
+    /// (default [`crate::batch::WHOLE_LABEL_READ_MAX`], 262,144 nodes).
+    pub fn set_whole_label_read_max(&self, n: u64) {
+        self.whole_label_read_max.set(n);
+    }
+
+    /// See [`Graph::set_whole_label_read_max`].
+    pub(crate) fn whole_label_read_max(&self) -> u64 {
+        self.whole_label_read_max.get()
+    }
+
+    /// How many start candidates the per-row matcher — the one every WRITING
+    /// statement takes — binds and carries through a path's hops at once
+    /// (default 4,096), with the statement's WHERE tested on each row as the
+    /// path's last hop finishes it rather than after every row is collected.
+    ///
+    /// `0` is the A/B arm: the whole candidate set at once and the WHERE after
+    /// collection, the matcher as it was when
+    /// `MATCH (m:Message) WHERE m.id >= $base DETACH DELETE m` — a delete of
+    /// nothing — held ~29M rows and took an SF10 server to the OOM killer.
+    /// The rows, their order, and every read are the same either way.
+    ///
+    /// Held outside `Graph`, keyed by its id, so the lever does not move the
+    /// layout of a struct every worker reads.
+    pub fn set_match_start_chunk(&self, n: usize) {
+        crate::interp::set_match_start_chunk(self.graph_id, n);
+    }
+
+    /// See [`Graph::set_match_start_chunk`].
+    pub(crate) fn match_start_chunk(&self) -> usize {
+        crate::interp::match_start_chunk(self.graph_id)
     }
 
     /// Toggle serialisable autocommit (default on): whether an adapter
@@ -3024,14 +3946,24 @@ impl Graph {
             ic11_semijoin: BoolCell::new(true),
             bi7_rollup: BoolCell::new(true),
             parallel_expand: BoolCell::new(false),
+            algo_parallel: BoolCell::new(false),
+            algo_min_vertices: UsizeCell::new(65_536),
+            algo_node_ceiling: U64Cell::new(crate::algo::NODE_CEILING),
+            algo_edge_ceiling: U64Cell::new(crate::algo::EDGE_CEILING),
+            algo_byte_ceiling: U64Cell::new(crate::algo::BYTE_CEILING),
+            algo_work_ceiling: U64Cell::new(crate::algo::WORK_CEILING),
+            algo_cache_bytes: UsizeCell::new(crate::algo::cache::CACHE_BYTES),
             ic3_datewindow: BoolCell::new(true),
             edge_probe: BoolCell::new(true),
             hop_reversal: BoolCell::new(true),
             scope_pruning: BoolCell::new(true),
             late_projection: BoolCell::new(true),
             frontier_expand: BoolCell::new(true),
+            rel_predicate_pushdown: BoolCell::new(true),
+            expand_truncation: BoolCell::new(false),
             property_seek: BoolCell::new(true),
             chain_count_fold: BoolCell::new(true),
+            prefix_streaming: BoolCell::new(true),
             lean_subquery_seed: BoolCell::new(true),
             pattern_map_seek: BoolCell::new(true),
             detach_via_rel_ids: BoolCell::new(true),
@@ -3044,6 +3976,11 @@ impl Graph {
             demote_adj_rebuild: BoolCell::new(true),
             reader_rebuild_admission: BoolCell::new(true),
             single_flight_repair: BoolCell::new(false),
+            bounded_derived_repair: BoolCell::new(true),
+            amortised_reader_repair: BoolCell::new(false),
+            members_unmetered_catch_up: BoolCell::new(true),
+            deferred_reader_fold: BoolCell::new(true),
+            cheap_repair_pricing: BoolCell::new(true),
             lazy_stale_serve: BoolCell::new(true),
             adj_change_filter_on: BoolCell::new(true),
             adj_overlay_fold: UsizeCell::new(ADJ_OVERLAY_FOLD),
@@ -3068,11 +4005,27 @@ impl Graph {
             }),
             constraint_cache: SyncRefCell::new(None),
             range_index_cache: SyncRefCell::new(None),
+            trigram_index_cache: SyncRefCell::new(None),
             conflict_escalation: BoolCell::new(true),
             exec: SyncRefCell::new(None),
+            exec_width: UsizeCell::new(0),
             parallel_min_rows: UsizeCell::new(256),
+            parallel_fold_min_rows: UsizeCell::new(2),
+            prop_column_epoch_currency: BoolCell::new(true),
+            // Fix 93 (O4): OFF until it has its own differential — see the
+            // field's doc for why a re-stamp is the one lever here that must
+            // not default on.
+            prop_column_restamp: BoolCell::new(false),
+            whole_label_read_max: U64Cell::new(crate::batch::WHOLE_LABEL_READ_MAX),
+            // OFF by default, and the reason is measured, not cautious — see
+            // `Graph::set_path_estimate`. `ENGRAM_PATH_ESTIMATE=1` turns it on.
+            path_estimate: BoolCell::new(matches!(
+                std::env::var("ENGRAM_PATH_ESTIMATE").as_deref(),
+                Ok("1")
+            )),
             adj_tables: arc_swap::ArcSwap::from_pointee(AdjTables::new()),
             adj_snap_memo: BoolCell::new(true),
+            adj_refold_gen: std::sync::atomic::AtomicU64::new(0),
             agg_topk_before_project: BoolCell::new(true),
             const_projection_fold: BoolCell::new(true),
             merge_race_hook: std::sync::RwLock::new(None),
@@ -3091,6 +4044,7 @@ impl Graph {
             end_set_memo: SyncRefCell::new(Vec::new()),
             members_cache: arc_swap::ArcSwap::from_pointee(MembersCache::new()),
             label_log: Default::default(),
+            range_fold_at: UsizeCell::new(engram_store::RangeIndex::FOLD_AT),
             prop_log: Default::default(),
             adj_epoch: std::sync::atomic::AtomicU64::new(0),
             adj_type_epoch: arc_swap::ArcSwap::from_pointee(BTreeMap::new()),
@@ -3100,6 +4054,11 @@ impl Graph {
             inflight: std::sync::Mutex::new(BTreeMap::new()),
             selective_anchor: BoolCell::new(true),
             incremental_caches: BoolCell::new(true),
+            trigram_indexes: BoolCell::new(true),
+            bm25_scoring: BoolCell::new(true),
+            bm25_by_default: BoolCell::new(true),
+            term_cache: SyncRefCell::new(BTreeMap::new()),
+            algo_cache: SyncRefCell::new(crate::algo::cache::ResultCache::default()),
             adj_cost_repair: BoolCell::new(true),
             guard_put_put_exempt: BoolCell::new(true),
             constraint_epoch_cache: BoolCell::new(true),
@@ -3115,7 +4074,14 @@ impl Graph {
             bulk_ingest: BoolCell::new(false),
             id_reservations: SyncRefCell::new(BTreeMap::new()),
             range_cache: Default::default(),
+            trigram_cache: Default::default(),
+            composite_cache: Default::default(),
             prop_columns: std::sync::Mutex::new(PropColumnCache::new(PROP_COLUMN_BUDGET_BYTES)),
+            rel_prop_memo: std::sync::Mutex::new(RelPropMemo {
+                at: 0,
+                cols: BTreeMap::new(),
+                bytes: 0,
+            }),
             ann_cache: Default::default(),
             creator_msgs: Default::default(),
             vector_deltas: Default::default(),
@@ -3142,24 +4108,33 @@ impl Graph {
 
     /// The date-ordered per-creator message index at the current epoch, if a
     /// build for this epoch is cached.
-    pub(crate) fn creator_msgs_get(&self) -> Option<std::sync::Arc<CreatorMsgs>> {
+    pub(crate) fn creator_msgs_get(
+        &self,
+        key: &CreatorMsgsKey,
+    ) -> Option<std::sync::Arc<CreatorMsgs>> {
         if self.in_txn_with_writes() {
             return None; // committed state: the ordinary path sees the overlay
         }
         let epoch = self.now_ts();
         let cache = self.creator_msgs.borrow();
-        cache
-            .as_ref()
-            .and_then(|(at, m)| (*at == epoch).then(|| std::sync::Arc::clone(m)))
+        // ONE index for every label set it can answer. Keyed by its labels
+        // too, SNB Interactive's IC2 (`(message:Message)`) and IC3 (an
+        // unlabelled `(message)`) each evicted the other's from this one
+        // slot, and each paid a whole-graph build on every run of a
+        // battery: 13.4 s and 14.7 s, where one build serves both.
+        cache.as_ref().and_then(|(at, k, m)| {
+            (*at == epoch && k.1 == key.1 && k.2 == key.2 && m.answers(&key.0))
+                .then(|| std::sync::Arc::clone(m))
+        })
     }
 
     /// Cache the date-ordered per-creator message index at the current epoch.
-    pub(crate) fn creator_msgs_set(&self, m: std::sync::Arc<CreatorMsgs>) {
+    pub(crate) fn creator_msgs_set(&self, key: CreatorMsgsKey, m: std::sync::Arc<CreatorMsgs>) {
         if self.in_txn_with_writes() {
             return; // built over a private view: never shared
         }
         let epoch = self.now_ts();
-        *self.creator_msgs.borrow_mut() = Some((epoch, m));
+        *self.creator_msgs.borrow_mut() = Some((epoch, key, m));
     }
 
     /// Inject the wall clock (epoch milliseconds). Un-set, `datetime()` and
@@ -3193,6 +4168,39 @@ impl Graph {
     /// that label's members, so probing it for a pattern that does not require
     /// the label would return a subset, not a superset — and the candidate set
     /// must always be a superset, because `node_satisfies` can only remove rows.
+    /// Live entries in the index `prop` would use under `label` — the SIZE of
+    /// the scoped index, for tests that must assert on the INDEX rather than on
+    /// an answer.
+    ///
+    /// A polluted scoped index still answers correctly, because a later filter
+    /// rejects the foreign row. That is exactly why `scoped_index_catch_up.rs`
+    /// has to look here: an answer-level assertion cannot see the defect.
+    #[must_use]
+    pub fn range_index_len_for_test(&self, prop: &str, label: Option<&str>) -> Option<usize> {
+        let idx = self.ensure_range_index_scoped(prop, label)?;
+        Some(idx.live_entries().count())
+    }
+
+    /// The node ids the scoped index over `prop` returns for integer `value`.
+    /// See [`Graph::range_index_len_for_test`] for why this exists.
+    #[must_use]
+    pub fn range_index_probe_for_test(
+        &self,
+        prop: &str,
+        label: Option<&str>,
+        value: i64,
+    ) -> Option<Vec<u64>> {
+        let idx = self.ensure_range_index_scoped(prop, label)?;
+        let want = engram_store::IndexKey::Int(value);
+        Some(
+            idx.live_entries()
+                .filter(|(k, _)| **k == want)
+                .filter_map(|(_, body)| <[u8; 8]>::try_from(body).ok().map(u64::from_be_bytes))
+                .collect(),
+        )
+    }
+
+    /// As [`Graph::index_probe_eq`], but against the DECLARED scoped index.
     pub fn index_probe_eq_scoped(
         &self,
         prop: &str,
@@ -3378,12 +4386,18 @@ impl Graph {
     /// race real threads for while staying deterministic. Consumed on first
     /// use, so a hook that itself runs statements cannot recurse.
     pub fn set_merge_race_hook_for_test(&self, hook: Option<MergeRaceHook>) {
-        *self.merge_race_hook.write().unwrap_or_else(|e| e.into_inner()) = hook;
+        *self
+            .merge_race_hook
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = hook;
     }
 
     /// See [`Graph::set_merge_race_hook_for_test`].
     pub(crate) fn take_merge_race_hook(&self) -> Option<MergeRaceHook> {
-        self.merge_race_hook.write().unwrap_or_else(|e| e.into_inner()).take()
+        self.merge_race_hook
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
 
     /// Fix 75: record the entity a uniqueness refusal named (the constraint
@@ -3455,12 +4469,18 @@ impl Graph {
     /// or a resident (WAL-backed) server refuses the call instead of
     /// answering "durable" about a store whose durability is elsewhere.
     pub fn set_checkpoint_hook(&self, hook: Option<CheckpointHook>) {
-        *self.checkpoint_hook.write().unwrap_or_else(|e| e.into_inner()) = hook;
+        *self
+            .checkpoint_hook
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = hook;
     }
 
     /// See [`Graph::set_checkpoint_hook`].
     pub(crate) fn checkpoint_hook(&self) -> Option<CheckpointHook> {
-        self.checkpoint_hook.read().unwrap_or_else(|e| e.into_inner()).clone()
+        self.checkpoint_hook
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// The prefix under which relationship RECORDS live — for a test that
@@ -3526,6 +4546,505 @@ impl Graph {
         label: Option<&str>,
     ) -> Option<std::sync::Arc<engram_store::RangeIndex>> {
         self.ensure_range_index_scoped(prop, label)
+    }
+
+    /// The label carrying a declared TRIGRAM index over `prop`, if one of
+    /// `labels` has one.
+    ///
+    /// The mirror of [`Graph::declared_scope_for`] for range indexes: an index
+    /// nobody declared is not consulted, because building one on the strength
+    /// of a single query would pay for a structure the operator never asked
+    /// for and never sees the cost of.
+    pub(crate) fn declared_trigram_for(&self, labels: &[String], prop: &str) -> Option<String> {
+        let declared = self.declared_trigram_indexes();
+        for (label, p) in declared.iter() {
+            if p == prop && labels.contains(label) {
+                return Some(label.clone());
+            }
+        }
+        None
+    }
+
+    /// The largest candidate set a trigram seek over `label` may MATERIALISE.
+    ///
+    /// **THE SELECTIVITY RULE APPLIED BEFORE THE ANSWER IS BUILT, NOT AFTER.**
+    /// The absolute cap alone is not enough: a predicate matching 2,000 rows of
+    /// a 2,000-row label is under it, so the probe intersected its postings,
+    /// materialised every id, and handed the planner a candidate set it then
+    /// correctly refused for being no smaller than the label — 2,005 store
+    /// reads spent to learn that the scan was better. Deriving the cap from the
+    /// label's own size makes that refusal cost two binary searches instead.
+    ///
+    /// The same `PROPERTY_SEEK_SELECTIVITY` margin the property seek uses, so
+    /// a text seek and a property seek agree about what "worth it" means.
+    pub(crate) fn text_seek_cap(&self, label: &str) -> usize {
+        let size = self.count_label_nodes(label);
+        let by_selectivity = (size / PROPERTY_SEEK_SELECTIVITY) as usize;
+        by_selectivity.clamp(1, PROPERTY_SEEK_MAX_PROBE)
+    }
+
+    /// Whether ANY trigram index is declared at all.
+    ///
+    /// The cheap gate in front of the whole mechanism. Deriving a trigram
+    /// condition from a pattern costs a parse and a tree analysis, and a
+    /// database with no trigram index should pay NONE of it — so every text
+    /// candidate collector asks this first. One cached `Arc` clone and an
+    /// emptiness test, against a parse per predicate per statement.
+    pub(crate) fn any_trigram_index(&self) -> bool {
+        !self.declared_trigram_indexes().is_empty()
+    }
+
+    /// Every declared trigram index as `(label, property)`, from the cache.
+    fn declared_trigram_indexes(&self) -> TrigramCatalogue {
+        // SERVED WITHOUT READING THE EPOCH, exactly as the range catalogue is
+        // (`declared_range_indexes`). Checking currency here would cost a KV
+        // get on EVERY statement carrying a text predicate — and a test that
+        // asserts an empty seek answer reads no record at all caught precisely
+        // that. The cache is invalidated where the catalogue is WRITTEN
+        // instead, which is the only place it can change.
+        if let Some((_, list)) = self.trigram_index_cache.borrow().as_ref() {
+            counted!("graph.trigram index catalogue served from cache");
+            return std::sync::Arc::clone(list);
+        }
+        let epoch = self.constraint_epoch_recorded();
+        let list = std::sync::Arc::new(
+            self.scan_index_defs()
+                .into_iter()
+                .filter_map(|(_, def)| match def {
+                    crate::schema::IndexDef::Trigram { label, prop } => Some((label, prop)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+        );
+        *self.trigram_index_cache.borrow_mut() = Some((epoch, std::sync::Arc::clone(&list)));
+        list
+    }
+
+    /// The trigram index over `prop`, scoped to `label`, building it if needed.
+    ///
+    /// # It reuses the property change log rather than adding a second one
+    ///
+    /// A derived structure needs to know what changed since it was built. The
+    /// property log already records exactly that — `(body, Option<IndexKey>)`
+    /// per write — and for a STRING property the `IndexKey` *is* the new value.
+    /// So a trigram index can be carried forward from the same log the range
+    /// index uses, and **no new write-path hook exists at all**: the sites that
+    /// call `note_prop_change` already deliver everything this needs.
+    ///
+    /// The one thing that must happen is creating the log BEFORE the scan, as
+    /// the range index does, so that no write can land in the gap between the
+    /// scan and the log's existence.
+    /// The term index for a fulltext index, building it if needed.
+    ///
+    /// # Its population has TWO clocks
+    ///
+    /// A fulltext index covers labels x properties, so it is stale when any of
+    /// its properties is written AND when any of its labels' membership moves.
+    /// `SET n:Article` makes a node a document without touching a property, and
+    /// judging currency on the property epoch alone would leave the cached
+    /// index missing that member — which here would also shift every other
+    /// document's idf, so the whole ranking would be wrong rather than merely
+    /// short a row. See `derived.rs` on scoped structures.
+    ///
+    /// Built lazily on the READ path under a single-flight guard, never on the
+    /// maintenance loop: a structure whose build is minutes long has no
+    /// business on a thread whose other work is latency-critical.
+    fn ensure_term_index(
+        &self,
+        name: &str,
+        labels: &[String],
+        props: &[String],
+    ) -> Option<std::sync::Arc<engram_store::term::TermIndex>> {
+        let prop_tokens: Vec<u32> = props
+            .iter()
+            .filter_map(|p| self.token_peek("prop:", &self.props, p))
+            .collect();
+        if prop_tokens.len() != props.len() {
+            // A property nobody has ever written has no token yet, so the
+            // index cannot cover it. The scan answers.
+            return None;
+        }
+        let label_tokens: Vec<u32> = labels
+            .iter()
+            .filter_map(|l| self.token_peek("lbl:", &self.labels, l))
+            .collect();
+
+        let slot = {
+            let mut cache = self.term_cache.borrow_mut();
+            if cache.len() >= TERM_CACHE_MAX && !cache.contains_key(name) {
+                cache.clear();
+            }
+            std::sync::Arc::clone(
+                cache
+                    .entry(name.to_string())
+                    .or_insert_with(|| std::sync::Arc::new(Slot::default())),
+            )
+        };
+
+        let epoch = prop_tokens
+            .iter()
+            .map(|t| self.prop_epoch(*t))
+            .chain(label_tokens.iter().map(|t| self.label_epoch(*t)))
+            .max()
+            .unwrap_or(0);
+
+        if let Some(snap) = slot.load() {
+            if snap.at >= self.store.now_ts() || (self.incremental_caches.get() && snap.at >= epoch)
+            {
+                counted!("graph.term index cache hit");
+                return Some(std::sync::Arc::clone(&snap.value));
+            }
+        }
+        let _build = slot.enter_build();
+        if let Some(snap) = slot.load() {
+            if snap.at >= epoch {
+                counted!("graph.term index built by another worker");
+                return Some(std::sync::Arc::clone(&snap.value));
+            }
+        }
+        // The logs come into existence BEFORE the scan, so no write can land
+        // in the gap between the scan and the log's existence.
+        for t in &prop_tokens {
+            self.prop_log
+                .borrow_mut()
+                .entry(*t)
+                .or_insert_with(|| ChangeLog::new(PROP_LOG_CAP));
+        }
+        let at = self.store.now_ts();
+        let mut bodies: Vec<u64> = Vec::new();
+        for l in labels {
+            bodies.extend(self.members(Some(l)).ok()?.iter());
+        }
+        bodies.sort_unstable();
+        bodies.dedup();
+        counted!("graph.term index built");
+        let fields: Vec<engram_store::PropertyId> = prop_tokens
+            .iter()
+            .map(|t| engram_store::PropertyId(*t))
+            .collect();
+        let idx = std::sync::Arc::new(engram_store::term::TermIndex::build_over(
+            &self.store,
+            &self.nodes,
+            fields,
+            at,
+            bodies.into_iter().map(|id| id.to_be_bytes().to_vec()),
+        ));
+        slot.publish(self.fenced(at), std::sync::Arc::clone(&idx));
+        Some(idx)
+    }
+
+    /// Answer a fulltext query from the term index, or `None` to scan.
+    pub(crate) fn fulltext_bm25(
+        &self,
+        name: &str,
+        labels: &[String],
+        props: &[String],
+        query: &str,
+    ) -> Result<Option<Vec<(Value, f64)>>, GraphError> {
+        let Some(idx) = self.ensure_term_index(name, labels, props) else {
+            return Ok(None);
+        };
+        let mut out = Vec::new();
+        for hit in idx.query(query) {
+            let Ok(b) = <[u8; 8]>::try_from(&hit.body[..]) else {
+                continue;
+            };
+            if let Some(node) = self.node(u64::from_be_bytes(b))? {
+                out.push((node, hit.score));
+            }
+        }
+        counted!("graph.fulltext queries");
+        Ok(Some(out))
+    }
+
+    /// The BM25 answer computed the slow way — a scan.
+    ///
+    /// **THE SAME SCORER, NOT AN APPROXIMATION OF IT.** This gathers the same
+    /// corpus statistics and calls the same summation, so a differential test
+    /// can compare the two arms bit for bit. A second scoring implementation
+    /// here would be a second set of rounding decisions, and the test
+    /// comparing them would have to loosen until it stopped catching anything.
+    pub(crate) fn fulltext_bm25_by_scan(
+        &self,
+        labels: &[String],
+        props: &[String],
+        query: &str,
+    ) -> Result<Vec<(Value, f64)>, GraphError> {
+        use engram_store::term::{Corpus, QueryPlan};
+        let tokens = engram_store::text::analyse(query);
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let nf = props.len();
+
+        let mut seen = std::collections::BTreeSet::new();
+        let mut docs: Vec<ScannedDoc> = Vec::new();
+        let mut corpus = Corpus {
+            docs: 0,
+            with_field: vec![0; nf],
+            sum_len: vec![0; nf],
+        };
+        // Document frequency per (field, TERM) — keyed by the term itself, so
+        // a query repeating a token counts that term's df once.
+        let mut df: BTreeMap<(u16, String), u64> = BTreeMap::new();
+
+        for label in labels {
+            for id in self.nodes_by_label(Some(label))? {
+                if !seen.insert(id) {
+                    continue;
+                }
+                let Some(node) = self.node(id)? else { continue };
+                let Value::Node { props: nprops, .. } = &node else {
+                    continue;
+                };
+                corpus.docs += 1;
+                let mut tfs = vec![vec![0u32; tokens.len()]; nf];
+                let mut dl = vec![0u32; nf];
+                for (f, p) in props.iter().enumerate() {
+                    let Some(Value::Str(text)) = nprops.get(p) else {
+                        continue;
+                    };
+                    let (freqs, len) = engram_store::text::term_freqs(text);
+                    if len == 0 {
+                        continue;
+                    }
+                    dl[f] = len;
+                    corpus.with_field[f] += 1;
+                    corpus.sum_len[f] += u64::from(len);
+                    let mut counted_here: std::collections::BTreeSet<&str> =
+                        std::collections::BTreeSet::new();
+                    for (i, tok) in tokens.iter().enumerate() {
+                        if let Ok(k) = freqs.binary_search_by(|(t, _)| t.as_str().cmp(tok)) {
+                            tfs[f][i] = freqs[k].1;
+                            if counted_here.insert(tok.as_str()) {
+                                *df.entry((f as u16, tok.clone())).or_insert(0) += 1;
+                            }
+                        }
+                    }
+                }
+                docs.push((node, tfs, dl, id));
+            }
+        }
+
+        let plan = QueryPlan::new(nf, tokens, &corpus, &mut |f, t| {
+            df.get(&(f, t.to_string())).copied().unwrap_or(0)
+        });
+
+        let mut scored: Vec<(u64, Value, f64)> = Vec::new();
+        for (node, tfs, dl, id) in docs {
+            let score = plan.score(&tfs, &dl);
+            if score > 0.0 {
+                scored.push((id, node, score));
+            }
+        }
+        // The SAME total order the index arm uses: score descending, then id.
+        scored.sort_by(|a, b| {
+            b.2.partial_cmp(&a.2)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        counted!("graph.fulltext queries");
+        Ok(scored.into_iter().map(|(_, n, s)| (n, s)).collect())
+    }
+
+    pub(crate) fn ensure_trigram_index_scoped(
+        &self,
+        prop: &str,
+        label: &str,
+    ) -> Option<std::sync::Arc<engram_store::trigram::TrigramIndex>> {
+        let token = self.token_peek("prop:", &self.props, prop)?;
+        let label_token = self.token_peek("lbl:", &self.labels, label)?;
+        let key = range_key(Some(label_token), token);
+        let slot = slot_in(&self.trigram_cache, &key, TRIGRAM_CACHE_MAX);
+        let incremental = self.incremental_caches.get();
+
+        if let Some(snap) = slot.load() {
+            if snap.at >= self.store.now_ts() {
+                counted!("graph.trigram index cache hit");
+                return Some(std::sync::Arc::clone(&snap.value));
+            }
+            if incremental {
+                // TWO SOURCES, NOT ONE. A range index over a property is stale
+                // only when THAT property was written. A trigram index is
+                // LABEL-SCOPED — it was built over the label's members — so it
+                // is also stale when the label's MEMBERSHIP moved.
+                //
+                // Testing only the property epoch made `SET n:File` invisible:
+                // the node gains the label, no property is written, the index
+                // is judged current, and every text predicate silently omits
+                // the row. An audit found it; `a_node_that_gains_the_label_...`
+                // pins it.
+                //
+                // A membership change cannot be caught up from the property
+                // log — the log has no entry for it — so it forces a rebuild
+                // rather than a catch-up. That is the conservative direction
+                // and the only one available.
+                let stale_at = self.prop_epoch(token).max(self.label_epoch(label_token));
+                if snap.at >= stale_at {
+                    counted!("graph.trigram index still current");
+                    return Some(std::sync::Arc::clone(&snap.value));
+                }
+                if snap.at >= self.label_epoch(label_token) {
+                    if let Some(next) = self.trigram_index_caught_up(token, &slot, &snap) {
+                        return Some(next);
+                    }
+                } else {
+                    sometimes!("trigram.index rebuilt for a membership change", true);
+                    counted!("graph.trigram index rebuilt for a label change");
+                }
+            }
+        }
+
+        let _build = slot.enter_build();
+        if let Some(snap) = slot.load() {
+            let epoch = if incremental {
+                self.prop_epoch(token).max(self.label_epoch(label_token))
+            } else {
+                self.store.now_ts()
+            };
+            if snap.at >= epoch {
+                counted!("graph.trigram index built by another worker");
+                return Some(std::sync::Arc::clone(&snap.value));
+            }
+        }
+        // BEFORE the scan, for the reason in the doc comment.
+        self.prop_log
+            .borrow_mut()
+            .entry(token)
+            .or_insert_with(|| ChangeLog::new(PROP_LOG_CAP));
+        let at = self.store.now_ts();
+        counted!("graph.trigram index built");
+        let def = engram_store::IndexDef::new(token, engram_store::PropertyId(token));
+        let view = self.members(Some(label)).ok()?;
+        let bodies: Vec<Vec<u8>> = view.iter().map(|id| id.to_be_bytes().to_vec()).collect();
+        // EARN A LOG WIDE ENOUGH TO BE WORTH KEEPING (fix 88b), from the one
+        // place this index's size is known for free.
+        //
+        // The default cap is a constant, so a trigram index over a large
+        // label falls below the floor after an idle stretch of writes and its
+        // next probe rebuilds — O(label) store gets, on a reader's thread,
+        // behind its own build guard. A catch-up is one `with_changes` fold
+        // and is far cheaper than the rebuild it replaces, so a log sized to
+        // the index it serves buys idle margin at a proportional price.
+        //
+        // `widen_prop_log` is called from the RANGE index's build too and
+        // never narrows, so two consumers over one property both asking is
+        // fine and the larger wins. Without this call a trigram index over a
+        // property with NO range index would sit at the default for ever,
+        // which is precisely the shape this index is for: a text column
+        // nothing else has an index on.
+        let rows = bodies.len();
+        let idx = std::sync::Arc::new(engram_store::trigram::TrigramIndex::build_over(
+            &self.store,
+            &self.nodes,
+            def,
+            at,
+            bodies,
+        ));
+        self.widen_prop_log(token, rows);
+        slot.publish(self.fenced(at), std::sync::Arc::clone(&idx));
+        Some(idx)
+    }
+
+    /// Carry a trigram snapshot forward from the property log, or `None` to
+    /// rebuild.
+    fn trigram_index_caught_up(
+        &self,
+        token: u32,
+        slot: &std::sync::Arc<Slot<engram_store::trigram::TrigramIndex>>,
+        snap: &std::sync::Arc<Snapshot<engram_store::trigram::TrigramIndex>>,
+    ) -> Option<std::sync::Arc<engram_store::trigram::TrigramIndex>> {
+        let (changes, at) = {
+            let logs = self.prop_log.borrow();
+            let log = logs.get(&token)?;
+            if !log.covers(snap.at) {
+                return None;
+            }
+            let mut changes: BTreeMap<
+                Vec<u8>,
+                Option<std::collections::BTreeSet<engram_store::trigram::Trigram>>,
+            > = BTreeMap::new();
+            for (_ts, (body, key)) in log.since(snap.at) {
+                let tris = match key {
+                    Some(engram_store::IndexKey::Str(bytes)) => {
+                        // The log carries the new value, so the trigrams are
+                        // derivable without touching the store.
+                        match std::str::from_utf8(bytes) {
+                            Ok(text) => Some(engram_store::trigram::trigrams_of_value(text)),
+                            // Not UTF-8, so it is not a value this index can
+                            // hold. Rebuild, which will count it unindexable
+                            // and disable the index honestly.
+                            Err(_) => return None,
+                        }
+                    }
+                    // A non-string value under an indexed property makes the
+                    // whole index unusable (a candidate set that skipped a row
+                    // is a wrong answer, not a caveated one), so the catch-up
+                    // declines and the rebuild records why.
+                    Some(_) => return None,
+                    None => None,
+                };
+                changes.insert(body.clone(), tris);
+            }
+            (changes, log.epoch())
+        };
+        let next = std::sync::Arc::new(snap.value.with_changes(&changes, at)?);
+        slot.publish(self.fenced(at), std::sync::Arc::clone(&next));
+        Some(next)
+    }
+
+    /// Candidate node ids whose `prop` satisfies `q`, or `None` to scan.
+    ///
+    /// **THE ANSWER IS A SUPERSET.** Every id must be re-verified against the
+    /// real predicate by the caller; nothing here is an oracle. `Ok(None)`
+    /// means the index cannot serve this and the planner should fall back —
+    /// which is also what it returns when the lever is off, when the condition
+    /// constrains nothing, and when the estimate is over `cap`.
+    pub(crate) fn trigram_probe_scoped(
+        &self,
+        prop: &str,
+        q: &engram_store::trigram::TrigramQuery,
+        cap: Option<usize>,
+        label: &str,
+    ) -> Option<Vec<u64>> {
+        if !self.trigram_indexes.get() {
+            return None;
+        }
+        let idx = self.ensure_trigram_index_scoped(prop, label)?;
+        let answer = idx.query(q, cap)?;
+        let mut ids: Vec<u64> = answer
+            .bodies
+            .iter()
+            .filter_map(|b| <[u8; 8]>::try_from(&b[..]).ok().map(u64::from_be_bytes))
+            .collect();
+        // A transaction's buffered writes are not in the store, so the index
+        // cannot have seen them. Their ids join the candidate set UNFILTERED:
+        // we do not know a buffered row's trigrams at the index's vintage, and
+        // the caller re-verifies every candidate anyway. This is what keeps
+        // the answer a superset inside a transaction.
+        if let Some(pending) = self.txn_pending(&self.nodes, &[]) {
+            for (body, is_put) in pending {
+                if !is_put {
+                    continue;
+                }
+                if let Ok(b) = <[u8; 8]>::try_from(body.as_slice()) {
+                    // COUNTED, NOT `sometimes!`. Reaching this needs an OPEN
+                    // transaction whose buffered write the probe then unions,
+                    // which the sweep's autocommit workload does not produce;
+                    // `a_write_inside_a_transaction_is_visible_to_a_trigram_probe`
+                    // proves it reachable instead. A `sometimes!` the sweep
+                    // cannot reach fails the coverage floor for ever, and
+                    // weakening the floor to accommodate it would cost more
+                    // than the declaration is worth.
+                    counted!("graph.trigram probe unioned a transaction write");
+                    ids.push(u64::from_be_bytes(b));
+                }
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        counted!("interp.seed probed a trigram index");
+        Some(ids)
     }
 
     /// [`Graph::ensure_range_index`], optionally scoped to a LABEL.
@@ -3620,7 +5139,11 @@ impl Graph {
             // writer's rows are the log's entries above the winner's stamp.
             // Catch up from there instead of scanning the partition again
             // (see `adj_table_snapshot_reporting`).
-            if incremental && !tried.as_ref().is_some_and(|t| std::sync::Arc::ptr_eq(t, &snap)) {
+            if incremental
+                && !tried
+                    .as_ref()
+                    .is_some_and(|t| std::sync::Arc::ptr_eq(t, &snap))
+            {
                 if let Some(next) = self.range_index_caught_up(token, label, &slot, &snap) {
                     counted!("graph.range index caught up behind the build guard");
                     return Some(next);
@@ -3636,7 +5159,13 @@ impl Graph {
         // rebuild — but only while it is still current. Its vintage is the clock
         // it was built at; if any write has advanced `now_ts` past it, the on-disk
         // index predates rows it must cover, so fall through and rebuild.
-        if let Some(idx) = self.store.persisted_index(token) {
+        // Looked up by THIS graph's coordinate: `token` is this graph's own
+        // number for the property, and another graph on the same store may
+        // use the same number for an unrelated one (security plan §2.7).
+        if let Some(idx) = self
+            .store
+            .persisted_index(self.realm(), self.namespace(), token)
+        {
             if idx.as_of() == at {
                 let idx = match label {
                     // Fix 54: the persisted index covers the WHOLE partition
@@ -3665,6 +5194,7 @@ impl Graph {
                     }
                 };
                 slot.publish(self.fenced(at), std::sync::Arc::clone(&idx));
+                self.widen_prop_log(token, idx.len());
                 return Some(idx);
             }
         }
@@ -3676,7 +5206,8 @@ impl Graph {
             // partition scan is O(every node carrying the property).
             Some(l) if label_token.is_some() => {
                 let view = self.members(Some(l)).ok()?;
-                let bodies: Vec<Vec<u8>> = view.iter().map(|id| id.to_be_bytes().to_vec()).collect();
+                let bodies: Vec<Vec<u8>> =
+                    view.iter().map(|id| id.to_be_bytes().to_vec()).collect();
                 engram_store::RangeIndex::build_over(&self.store, &self.nodes, def, at, bodies)
             }
             _ => engram_store::RangeIndex::build(&self.store, &self.nodes, def, at),
@@ -3686,6 +5217,9 @@ impl Graph {
         // stamped above the clamp and inside the next catch-up.
         let at = self.fenced(at);
         slot.publish(at, std::sync::Arc::clone(&idx));
+        // Fix 88b: the log is sized to THIS index while its size is free to
+        // read (no overlay yet, so `len` is O(1)).
+        self.widen_prop_log(token, idx.len());
         self.prune_prop_log(token, at);
         Some(idx)
     }
@@ -3715,19 +5249,53 @@ impl Graph {
             }
             (self.fenced(log.epoch()), changes)
         };
-        // The filter that used to stand here is GONE, and its absence is the
-        // point. It existed because a scoped index was carried forward from a
-        // log covering every label, so it had to reject rows that were not its
-        // own — and it cost a `members(label)` lookup on every catch-up to do
-        // it. Keying the log `(label, property)` means the log holds only this
-        // label's rows by construction, so there is nothing to reject.
+        // THE FILTER IS BACK, because the keying its removal assumed is not in
+        // the code. `PropLogs` is `BTreeMap<u32, ..>` keyed by the PROPERTY
+        // token alone and `note_prop_change(token, ..)` takes no label, so a
+        // `:Message` write lands in the very log a `:Person`-scoped index
+        // consumes. The comment that stood here claimed the log was keyed
+        // `(label, property)` and deferred the property to
+        // `scoped_index_catch_up.rs` — a file that did not exist. The isolation
+        // was guarded by nothing, and `scoped_index_catch_up.rs` now reproduces
+        // it: one `:Message {id: 99}` grew a one-entry `:Person.id` index to
+        // two, and probing id=99 returned the Message.
         //
-        // A guard that has become unreachable is not free: it is read as
-        // protection. This one was removed rather than left inert, and the
-        // property it protected is now held by `scoped_index_catch_up.rs`
-        // against the LOG KEYING instead — which is the thing that actually
-        // provides it.
-        let _ = label;
+        // ASYMMETRIC ON PURPOSE. An ADDITION is admitted only for a current
+        // member of this label. A REMOVAL is ALWAYS applied: the node may have
+        // left the label or been deleted, so current membership cannot see it,
+        // and dropping the removal would strand an entry this index already
+        // holds. Filtering removals by membership is the bug that looks like
+        // the fix.
+        //
+        // This restores CORRECTNESS, not cost: staleness is still tested
+        // against a property-name clock that every `:Message` write advances,
+        // so the catch-up still runs and now correctly applies an empty change
+        // set. Removing the WORK needs genuinely scoped delta streams.
+        let changes = match label {
+            None => changes,
+            Some(l) => {
+                let members = self.members(Some(l)).ok();
+                let mut kept: BTreeMap<Vec<u8>, Option<engram_store::IndexKey>> = BTreeMap::new();
+                for (body, key) in changes {
+                    let keep = if key.is_none() {
+                        true
+                    } else {
+                        <[u8; 8]>::try_from(body.as_slice())
+                            .ok()
+                            .map(u64::from_be_bytes)
+                            .zip(members.as_ref())
+                            .is_some_and(|(id, m)| self.members_contains(m, id))
+                    };
+                    if keep {
+                        kept.insert(body, key);
+                    } else {
+                        counters::SCOPED_INDEX_FOREIGN_ROW_REJECTED
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                kept
+            }
+        };
         // NOTHING FOR THIS LABEL: re-stamp, do not rebuild.
         //
         // Filtering fixed WHAT a scoped index takes; it did not change WHETHER
@@ -3756,7 +5324,9 @@ impl Graph {
             }
             return Some(same);
         }
-        let next = snap.value.with_changes(&changes, at)?;
+        let next = snap
+            .value
+            .with_changes_folding_at(&changes, at, self.range_fold_at.get())?;
         counted!("graph.range index caught up");
         let next = std::sync::Arc::new(next);
         if slot.publish(at, std::sync::Arc::clone(&next)) {
@@ -3767,17 +5337,134 @@ impl Graph {
         Some(next)
     }
 
-    /// Drop a property log's entries behind a PUBLISHED snapshot at `at`.
-    fn prune_prop_log(&self, token: u32, at: u64) {
+    fn widen_prop_log(&self, token: u32, rows: usize) {
+        let cap = prop_log_cap_for(rows);
         if let Some(log) = self.prop_log.borrow_mut().get_mut(&token) {
-            log.prune_below(at);
+            log.widen_to(cap);
+        }
+    }
+
+    /// The cap in force on `prop`'s change log, for the test that pins fix 88b.
+    #[doc(hidden)]
+    pub fn prop_log_cap_for_test(&self, prop: &str) -> Option<usize> {
+        let token = self.token_peek("prop:", &self.props, prop)?;
+        self.prop_log.borrow().get(&token).map(|l| l.cap())
+    }
+
+    /// Drop a property log's entries behind a PUBLISHED snapshot at `at` —
+    /// but never behind the OLDEST snapshot any other index over the same
+    /// property still stands at.
+    ///
+    /// Fix 116. The change log is keyed by the PROPERTY token, and a property
+    /// declared on two labels — `Person.id` and `Message.id` on every SNB
+    /// corpus — has two label-scoped indexes reading one log. After a write,
+    /// whichever index is probed first caught up and pruned the log behind
+    /// its own stamp; the other's snapshot then stood BELOW the log's floor,
+    /// `covers` said no, and it REBUILT from every record of its label:
+    /// 3,055,787 store gets and 7.3 s for `MATCH (m:Message {id: …})<-
+    /// [:REPLY_OF]-(c:Comment)` on every call of the read-heavy sweep, while
+    /// the Person index's rebuild over 9,892 members hid inside a
+    /// millisecond. read-heavy fell from 259 to 8 ops/s (v174 same-window,
+    /// 2026-09-07) and no write-free read could see it — `derived_structures`
+    /// pinned this leapfrog once before between the columnar and the anchored
+    /// seek and it was resolved by making the two SITES agree; two LABELS
+    /// cannot agree, so the log keeps what the slowest sibling still needs.
+    /// A sibling never probed again pins the log until its cap, after which
+    /// that one sibling rebuilds — the behaviour every slot had before.
+    ///
+    /// "That one sibling" is true only since fix 88 (`ChangeLog::record`):
+    /// the overflow used to clear the whole log and put EVERY sibling below
+    /// the floor, so a pinned log made the ACTIVE index rebuild too — the
+    /// v189 trace's 3,055,775-get `Message.id` rebuilds, every ~9 s of
+    /// write-heavy. It now drops the oldest half, and only a sibling whose
+    /// stamp is in that half rebuilds.
+    fn prune_prop_log(&self, token: u32, at: u64) {
+        // EVERY consumer that catches up from this log must be counted here,
+        // not merely the range indexes that used to be its only ones.
+        //
+        // A property's change log is shared by every structure derived from
+        // that property, and pruning below a consumer's snapshot strands it:
+        // its next probe finds `covers` false and rebuilds from every record
+        // of its label, O(label) store gets, on a READER's thread. The
+        // trigram cache was added as a second consumer — `trigram_index_caught_up`
+        // reads this same log — and was invisible here, so any range index
+        // over the same property could prune the trigram index's window out
+        // from under it simply by being probed more often.
+        //
+        // This is the fourth defect in `derived.rs` from the other side: there
+        // a structure's currency test failed to read all of its SOURCES; here
+        // a source's pruner failed to see all of its CONSUMERS. Both are a
+        // relationship recorded in one direction only, and adding a consumer
+        // is exactly when nobody thinks to look for the other end.
+        //
+        // The trigram cache keys with the same `range_key`, so one token
+        // filter serves both. The TERM index needs no entry: it does not
+        // catch up from the log at all — it rebuilds when stale — so it holds
+        // no snapshot that a prune could strand.
+        let range_oldest = self
+            .range_cache
+            .load()
+            .iter()
+            .filter(|(key, _)| (**key & 0xFFFF_FFFF) as u32 == token)
+            .filter_map(|(_, slot)| slot.load().map(|s| s.at))
+            .min();
+        let trigram_oldest = self
+            .trigram_cache
+            .load()
+            .iter()
+            .filter(|(key, _)| (**key & 0xFFFF_FFFF) as u32 == token)
+            .filter_map(|(_, slot)| slot.load().map(|s| s.at))
+            .min();
+        let oldest_sibling = match (range_oldest, trigram_oldest) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let floor = oldest_sibling.map_or(at, |oldest| oldest.min(at));
+        if floor < at {
+            counted!("graph.property log kept for an older sibling index");
+        }
+        if let Some(log) = self.prop_log.borrow_mut().get_mut(&token) {
+            log.prune_below(floor);
         }
     }
 
     /// Drop a label log's entries behind a PUBLISHED snapshot at `at`.
     fn prune_label_log(&self, token: u32, at: u64) {
+        // FIX 116'S GUARD, WHICH THE LABEL LOG NEVER GOT.
+        //
+        // `prune_prop_log` computes the oldest snapshot any consumer still
+        // stands at and prunes only below THAT, because — in its own words —
+        // "pruning below a consumer's snapshot strands it: its next probe
+        // finds `covers` false and rebuilds from every record of its label,
+        // O(label) store gets, on a READER's thread". The membership log is
+        // the same kind of source with the same kind of consumer, and it was
+        // pruning to the caller's own stamp unconditionally.
+        //
+        // That is the SNB `balanced` SF10 stall. `members_caught_up` declines
+        // on exactly `log.covers(snap.at)` — `at >= floor` — and pruning
+        // raises the floor, so a reader holding a snapshot from before the
+        // last prune cannot catch up and rebuilds the whole label. Membership
+        // snapshots churn fast (`members_contains`: "a concurrent write
+        // stream publishes tens of snapshots a second"), so readers are
+        // stranded routinely: mem_built=18 in 75 s of `is7-replies` under
+        // labelled writes, each rebuild O(:Comment) over tens of millions of
+        // nodes, throughput to a floor of 0.00 against a p95 of 1.25 ms.
+        //
+        // Pruning LESS is safe by construction: the log is a record of
+        // changes a snapshot can be carried forward over, so keeping more of
+        // it can only widen what catch-up covers. The cost is entries, and
+        // entries are already bounded by the log's cap.
+        let oldest = self
+            .members_cache
+            .load()
+            .get(&token)
+            .and_then(|slot| slot.load().map(|s| s.at));
+        let floor = match oldest {
+            Some(o) => at.min(o),
+            None => at,
+        };
         if let Some(log) = self.label_log.borrow_mut().get_mut(&token) {
-            log.prune_below(at);
+            log.prune_below(floor);
         }
     }
 
@@ -3822,7 +5509,13 @@ impl Graph {
             let Some(idx) = self.ensure_range_index(prop) else {
                 continue;
             };
-            engram_store::Store::write_index_sidecar(dir, token, &idx)?;
+            engram_store::Store::write_index_sidecar(
+                dir,
+                self.realm(),
+                self.namespace(),
+                token,
+                &idx,
+            )?;
             written += 1;
         }
         Ok(written)
@@ -3832,14 +5525,23 @@ impl Graph {
     /// messages" shape (IC9 stage 2), served by scanning a sorted property index
     /// newest-first instead of expanding every candidate and sorting.
     ///
-    /// Returns the top `limit` node ids carrying integer property `order_prop`
-    /// with value `< upper`, whose `edge_types`-neighbour in `dir` lies in
+    /// Returns the top `limit` node ids carrying property `order_prop` with
+    /// value `< upper`, whose `edge_types`-neighbour in `dir` lies in
     /// `filter_set`, ranked by `(order_prop DESC, tie_prop ASC)`. It walks the
     /// index DESC (`iter_desc_below`), semijoin-filters each candidate against
     /// `filter_set` (one adjacency probe), and stops as soon as the buffer is
     /// full and the current key falls strictly below the K-th best — so a
     /// NON-selective filter (IC9's dense friend set) touches only ~`limit /
     /// selectivity` candidates, not the whole fan-out.
+    ///
+    /// `upper` is an integer or a temporal. The walk ranks ONE key class: the
+    /// index orders classes one after another, and `<` against a temporal
+    /// bound is null for a value of any other class, so the first key of
+    /// another class ends the walk — nothing past it could qualify. An integer
+    /// bound behaves exactly as it always did (the integer class is the lowest,
+    /// so its walk never meets another). A float or string bound declines:
+    /// integers and floats compare with each other in Cypher but sit in two
+    /// classes here, so one class's walk could miss a qualifying value.
     ///
     /// `(order_prop, tie_prop)` is a total order (`tie_prop` = `message.id` is
     /// unique), so the result is the unique true top-k — byte-identical to the
@@ -3849,7 +5551,7 @@ impl Graph {
     pub(crate) fn index_ordered_topk_semijoin(
         &self,
         order_prop: &str,
-        upper: i64,
+        upper: &engram_store::IndexKey,
         edge_types: &Option<Vec<u32>>,
         dir: Dir,
         filter_set: &std::collections::BTreeSet<u64>,
@@ -3858,6 +5560,10 @@ impl Graph {
         scan_budget: usize,
     ) -> Result<Option<Vec<u64>>, GraphError> {
         use engram_store::IndexKey;
+        if matches!(upper, IndexKey::Float(_) | IndexKey::Str(_)) {
+            counted!("graph.index-ordered topk declined (a float or string bound)");
+            return Ok(None);
+        }
         let Some(idx) = self.ensure_range_index(order_prop) else {
             return Ok(Some(Vec::new()));
         };
@@ -3865,15 +5571,15 @@ impl Graph {
             return Ok(Some(Vec::new()));
         }
         counted!("graph.index-ordered topk ran");
-        // Buffer `(order_date, node_id)` for qualifying candidates in scan
-        // (date-DESC) order. The tie property is NOT read here — reading it per
+        // Buffer `(order_key, node_id)` for qualifying candidates in scan
+        // (key-DESC) order. The tie property is NOT read here — reading it per
         // candidate would materialise a node for every scanned message. Instead
-        // keep EVERY candidate whose date is >= the K-th largest date buffered
-        // (so a boundary-date tie group is complete), then a SINGLE bulk gather
+        // keep EVERY candidate whose key is >= the K-th largest key buffered
+        // (so a boundary tie group is complete), then a SINGLE bulk gather
         // reads the tie key for just this bounded set.
-        let mut buf: Vec<(i64, u64)> = Vec::new();
+        let mut buf: Vec<(IndexKey, u64)> = Vec::new();
         let mut scanned = 0usize;
-        for (key, body) in idx.iter_desc_below(&IndexKey::Int(upper)) {
+        for (key, body) in idx.iter_desc_below(upper) {
             // Cost-model bail: if the buffer is not even filled to K after
             // `scan_budget` index entries, the semijoin filter is too SELECTIVE
             // for the index-ordered scan to pay off (IC2's sparse friend set) —
@@ -3883,19 +5589,21 @@ impl Graph {
                 counted!("graph.index-ordered topk bailed (filter too selective)");
                 return Ok(None);
             }
-            let IndexKey::Int(ord) = key else {
-                // A non-integer key (mixed-type index) — this operator ranks
-                // integers; decline to the general path.
-                return Ok(None);
-            };
-            let ord = *ord;
-            // Descending scan: once K are buffered and this date is strictly
-            // below the K-th largest buffered date, nothing later can qualify
-            // (every remaining date is <= this one). Ties on that date are still
-            // captured — they compare EQUAL here and are appended above.
-            if buf.len() >= limit && ord < buf[limit - 1].0 {
+            if key.class() != upper.class() {
+                // Every later key is of a lower class, and `<` against the
+                // bound is null for all of them. (An integer bound cannot get
+                // here: the integer class is the lowest.)
+                counted!("graph.index-ordered topk left the bound's key class");
                 break;
             }
+            // Descending scan: once K are buffered and this key is strictly
+            // below the K-th largest buffered key, nothing later can qualify
+            // (every remaining key is <= this one). Ties on that key are still
+            // captured — they compare EQUAL here and are appended above.
+            if buf.len() >= limit && *key < buf[limit - 1].0 {
+                break;
+            }
+            let ord = key.clone();
             let Ok(idb) = <[u8; 8]>::try_from(body) else {
                 continue;
             };
@@ -3932,10 +5640,10 @@ impl Graph {
                 tie_of.insert(nid, i);
             }
         }
-        // Rank by (date DESC, tie ASC) — a total order — and take K.
-        let mut ranked: Vec<(i64, i64, u64)> = buf
+        // Rank by (key DESC, tie ASC) — a total order — and take K.
+        let mut ranked: Vec<(IndexKey, i64, u64)> = buf
             .into_iter()
-            .map(|(date, nid)| (date, tie_of.get(&nid).copied().unwrap_or(i64::MAX), nid))
+            .map(|(key, nid)| (key, tie_of.get(&nid).copied().unwrap_or(i64::MAX), nid))
             .collect();
         ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         ranked.truncate(limit);
@@ -4077,6 +5785,9 @@ impl Graph {
                     nb.push(0);
                     IndexKey::Str(nb)
                 }
+                // Temporal keys: `index_probe_eq_scoped` builds no temporal
+                // probe today, but the range they would need is the same one.
+                other => other.successor(),
             }
         };
         // Pre-count via binary search and bail before cloning a single body:
@@ -4207,7 +5918,11 @@ impl Graph {
         Some(log.since(at).count())
     }
 
-    fn members_refresh_token(&self, token: u32, may_rebuild: bool) -> Result<MembersOutcome, GraphError> {
+    fn members_refresh_token(
+        &self,
+        token: u32,
+        may_rebuild: bool,
+    ) -> Result<MembersOutcome, GraphError> {
         let name: Option<String> = if token == u32::MAX {
             None
         } else {
@@ -4295,7 +6010,11 @@ impl Graph {
             // winner's stamp. Catch up from there — O(delta) — rather than
             // walk the label again. (Same defect and fix as the adjacency
             // build guard; see `adj_table_snapshot_reporting`.)
-            if incremental && !tried.as_ref().is_some_and(|t| std::sync::Arc::ptr_eq(t, &snap)) {
+            if incremental
+                && !tried
+                    .as_ref()
+                    .is_some_and(|t| std::sync::Arc::ptr_eq(t, &snap))
+            {
                 if let Some((next, outcome)) = self.members_caught_up(token, &slot, &snap) {
                     counted!("graph.membership snapshots caught up behind the build guard");
                     return Ok(((*next).clone(), outcome));
@@ -4334,14 +6053,20 @@ impl Graph {
         snap: &Snapshot<MembersView>,
     ) -> Option<(std::sync::Arc<MembersView>, MembersOutcome)> {
         let batch = self.members_batch_fold.get();
-        let (at, next) = {
+        // COPY UNDER THE LOCK, FOLD OUTSIDE IT. `label_log` is the lock every
+        // node-creating commit takes the WRITE side of, and the fold — a copy of
+        // the WHOLE label once the overlay passes `MEMBERS_FOLD_AT` — used to run
+        // under its read side, so a large label's catch-up stopped every writer
+        // (and, through the RwLock's writer queue, every reader) for as long as
+        // the copy took. The stamp rule needs only the entries and the fence in
+        // one critical section; the fold needs neither lock.
+        let (at, changes) = {
             let logs = self.label_log.borrow();
             let log = logs.get(&token).filter(|log| log.covers(snap.at))?;
-            let next = snap
-                .value
-                .apply_with(log.since(snap.at).map(|(_, e)| *e), batch);
-            (self.fenced(log.epoch()), next)
+            let changes: Vec<(u64, bool)> = log.since(snap.at).map(|(_, e)| *e).collect();
+            (self.fenced(log.epoch()), changes)
         };
+        let next = snap.value.apply_with(changes, batch);
         counted!("graph.membership snapshots caught up");
         counters::MEMBERS_CAUGHT_UP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let next = std::sync::Arc::new(next);
@@ -4379,6 +6104,64 @@ impl Graph {
         m.to_arc_vec().binary_search(&id).is_ok()
     }
 
+    /// Is `id` a member of `label`? — [`Graph::members`] then
+    /// [`Graph::members_contains`], without the snapshot changing hands.
+    ///
+    /// `members` hands back an OWNED view: the slot's `Arc`, the snapshot's
+    /// and the view's six inner ones are each cloned and then dropped — about
+    /// sixteen atomic read-modify-writes per call, every one on a cache line
+    /// that every worker shares. A hop end's label test made that call per
+    /// END (twice, in `mat_end`): SNB BI bi15's weighting join made 57.7M of
+    /// them for 1/20 of SF3's pairs, and with the stage's continuation split
+    /// across 40 workers the split run spent ~4x the serial run's CPU — all of
+    /// it user time, none of it a lock. Borrowing the published snapshot
+    /// through the arc-swap guards, as the adjacency tables' hit path does
+    /// (`with_adj_table`), touches no refcount at all.
+    ///
+    /// The hit rule is `members_at_token`'s, exactly — a snapshot at or past
+    /// the visible clock, or (incremental) at or past the label's own epoch —
+    /// and it counts the same hit counters. Anything else — no slot yet, a
+    /// stale snapshot, a writing transaction's overlay — takes the owned path
+    /// unchanged.
+    pub(crate) fn label_contains(&self, label: &str, id: u64) -> Result<bool, GraphError> {
+        Ok(self.members_contains(self.members_ref(label)?.view(), id))
+    }
+
+    /// [`Graph::members`] for a caller that only TESTS membership, for as
+    /// long as one expansion lasts: the published snapshot BORROWED through
+    /// its arc-swap guard on a hit (see [`Graph::label_contains`]), an owned
+    /// view otherwise. Hold it briefly — a guard is a per-thread debt slot,
+    /// and a thread holding many falls back to counted references.
+    pub(crate) fn members_ref(&self, label: &str) -> Result<MembersRef, GraphError> {
+        if !self.in_txn_with_writes() {
+            if let Some(token) = self.token_peek("lbl:", &self.labels, label) {
+                let map = self.members_cache.load();
+                if let Some(slot) = map.get(&token) {
+                    let g = slot.peek();
+                    let hit = match g.as_ref() {
+                        Some(snap) if snap.at >= self.store.now_ts() => {
+                            counted!("graph.membership snapshots current");
+                            true
+                        }
+                        Some(snap)
+                            if self.incremental_caches.get()
+                                && snap.at >= self.label_epoch(token) =>
+                        {
+                            counted!("graph.membership snapshots still current");
+                            true
+                        }
+                        _ => false,
+                    };
+                    if hit {
+                        counted!("graph.membership tested through a borrowed snapshot");
+                        return Ok(MembersRef::Borrowed(g));
+                    }
+                }
+            }
+        }
+        Ok(MembersRef::Owned(self.members(Some(label))?))
+    }
+
     /// Apply a write to the count store if it is live; a store still
     /// awaiting its rebuild ignores writes (the rebuild sees them).
     /// Apply an EXPLICIT change to the counts.
@@ -4409,6 +6192,9 @@ impl Graph {
             }
             for (t, d) in &c.by_type {
                 bump(&mut st.by_type, *t, *d);
+            }
+            for (t, d) in &c.self_loops_by_type {
+                bump(&mut st.self_loops_by_type, *t, *d);
             }
         });
     }
@@ -4459,6 +6245,13 @@ impl Graph {
                 let t = u32::from_be_bytes(body[9..13].try_into().expect("4"));
                 bump(&mut st.by_type, t, 1);
                 st.rels += 1;
+                // Fix 90: an O row whose peer is its own node is a self-loop
+                // (the same layout `count_adjacent` reads them from).
+                let node = u64::from_be_bytes(body[1..9].try_into().expect("8"));
+                let peer = u64::from_be_bytes(body[13..21].try_into().expect("8"));
+                if node == peer {
+                    bump(&mut st.self_loops_by_type, t, 1);
+                }
             }
         }
         counted!("graph.stats rebuilt");
@@ -4560,7 +6353,12 @@ impl Graph {
     /// was 14,807 of 34,407 UserDataNode - 43% - and materialising them one
     /// at a time cost 1155 ms against the column scan's 125 ms.
     pub(crate) fn property_seek_wins(&self, label: Option<&str>, probe: usize) -> bool {
-        self.property_seek_wins_under(label, probe, PROPERTY_SEEK_MAX_PROBE, PROPERTY_SEEK_SELECTIVITY)
+        self.property_seek_wins_under(
+            label,
+            probe,
+            PROPERTY_SEEK_MAX_PROBE,
+            PROPERTY_SEEK_SELECTIVITY,
+        )
     }
 
     /// [`Graph::property_seek_wins`] under a caller's own cap and
@@ -4623,6 +6421,214 @@ impl Graph {
             .map(|d| d.label.clone()))
     }
 
+    /// The DECLARED COMPOSITE index a multi-key equality seek is served
+    /// from — `(label, props)` of the first catalogue entry with two or more
+    /// properties, on a label the pattern REQUIRES, whose every property is
+    /// one of `keys` — or `None`. Deterministic given the data: the
+    /// catalogue is sorted, and the first declaration that fits wins.
+    ///
+    /// Fix 115. `CREATE INDEX … FOR (n:UserDataNode) ON (n.userId,
+    /// n.nodeType)` was, until now, its leading key's scoped index and a
+    /// note that the trailing key counts as declared (fix 47): a seek on
+    /// both keys probed each single-key index and took the smaller answer
+    /// (or intersected two whole match sets, for a count) — the user's
+    /// every node and every contact in the store, to answer 391. Neo4j's
+    /// composite is one structure ordered by the tuple, and one probe of it
+    /// is the answer; this is that structure.
+    pub(crate) fn declared_composite_for(
+        &self,
+        labels: &[String],
+        keys: &[&str],
+    ) -> Result<Option<(String, Vec<String>)>, GraphError> {
+        if labels.is_empty() || keys.len() < 2 {
+            return Ok(None);
+        }
+        let declared = self.declared_range_indexes()?;
+        Ok(declared
+            .iter()
+            .filter(|d| {
+                d.props.len() >= 2
+                    && labels.contains(&d.label)
+                    && d.props.iter().all(|p| keys.contains(&p.as_str()))
+            })
+            // The WIDEST composite the keys cover: the platform declares both
+            // `UserDataNode(userId, nodeType)` and `(userId, nodeType,
+            // priority)`, and a seek on all three wants the one that answers
+            // all three rather than leaving a key to re-verification.
+            // `max_by_key` keeps the LAST maximum, so iterating the sorted
+            // catalogue in reverse keeps the FIRST of equal widths —
+            // deterministic given the catalogue.
+            .rev()
+            .max_by_key(|d| d.props.len())
+            .map(|d| (d.label.clone(), d.props.clone())))
+    }
+
+    /// The composite index over `label`'s `props` (declaration order),
+    /// DERIVED from the label-scoped single-key indexes of its components —
+    /// no record is read: each component is served as any probe serves it
+    /// (from its slot, from disk, or caught up over its log), and the
+    /// tuple entries are joined by body. Current while no component's
+    /// property has been written since; a write to either re-derives it
+    /// from the (caught-up) components, O(label) with no store read, under
+    /// the slot's single-flight guard.
+    ///
+    /// Only all-STRING tuples are indexed (see `composite_key_bytes`); the
+    /// `unindexable` floor carries the components' plus the tuples left out.
+    /// `None` when composites are off with label scoping, when a property or
+    /// the label was never minted, or when a component cannot be served —
+    /// every caller keeps its per-key path for that.
+    pub(crate) fn ensure_composite_index(
+        &self,
+        label: &str,
+        props: &[String],
+    ) -> Option<std::sync::Arc<engram_store::RangeIndex>> {
+        if props.len() < 2 || !self.label_scoped_indexes.get() {
+            return None;
+        }
+        let label_token = self.token_peek("lbl:", &self.labels, label)?;
+        let mut key: Vec<u32> = Vec::with_capacity(props.len() + 1);
+        key.push(label_token);
+        for p in props {
+            key.push(self.token_peek("prop:", &self.props, p)?);
+        }
+        let slot = slot_in(&self.composite_cache, &key, COMPOSITE_CACHE_MAX);
+        let epoch = if self.incremental_caches.get() {
+            key[1..]
+                .iter()
+                .map(|t| self.prop_epoch(*t))
+                .max()
+                .unwrap_or(0)
+        } else {
+            self.store.now_ts()
+        };
+        if let Some(snap) = slot.load() {
+            if snap.at >= self.store.now_ts() {
+                counted!("graph.composite index cache hit");
+                return Some(std::sync::Arc::clone(&snap.value));
+            }
+            if snap.at >= epoch {
+                counted!("graph.composite index still current");
+                return Some(std::sync::Arc::clone(&snap.value));
+            }
+        }
+        let _build = slot.enter_build();
+        if let Some(snap) = slot.load() {
+            if snap.at >= epoch {
+                counted!("graph.composite index derived by another worker");
+                return Some(std::sync::Arc::clone(&snap.value));
+            }
+        }
+        // `at` is read BEFORE the components are taken: each is current for
+        // its property at or after this clock, so every row written at or
+        // below `at` is in the join; one written after it is stamped above
+        // and re-derived on the next read, as a range index re-applies it.
+        let at = self.store.now_ts();
+        let mut components = Vec::with_capacity(props.len());
+        for p in props {
+            components.push(self.ensure_range_index_scoped(p, Some(label))?);
+        }
+        let (last, leading) = components.split_last()?;
+        // Body → key of every leading component; the LAST component's live
+        // entries drive the join, so a body absent from any component (no
+        // value, or one the index does not order) is simply not a tuple.
+        let maps: Vec<ComponentKeys<'_>> = leading
+            .iter()
+            .map(|c| c.live_entries().map(|(k, b)| (b, k)).collect())
+            .collect();
+        let mut entries: Vec<(engram_store::IndexKey, Vec<u8>)> = Vec::new();
+        let mut left_out = 0u64;
+        let mut parts: Vec<&[u8]> = Vec::with_capacity(props.len());
+        for (k_last, body) in last.live_entries() {
+            parts.clear();
+            let mut all_str = true;
+            for m in &maps {
+                match m.get(body) {
+                    Some(engram_store::IndexKey::Str(b)) => parts.push(b.as_slice()),
+                    _ => {
+                        all_str = false;
+                        break;
+                    }
+                }
+            }
+            if !all_str {
+                left_out += 1;
+                continue;
+            }
+            let engram_store::IndexKey::Str(b_last) = k_last else {
+                left_out += 1;
+                continue;
+            };
+            parts.push(b_last.as_slice());
+            entries.push((
+                engram_store::IndexKey::Str(composite_key_bytes(&parts)),
+                body.to_vec(),
+            ));
+        }
+        let unindexable = components.iter().map(|c| c.unindexable()).sum::<u64>() + left_out;
+        let def = engram_store::IndexDef::new(key[1], engram_store::PropertyId(key[1]));
+        let idx = std::sync::Arc::new(engram_store::RangeIndex::from_entries(
+            def,
+            at,
+            entries,
+            unindexable,
+        ));
+        counted!("graph.composite index derived");
+        slot.publish(self.fenced(at), std::sync::Arc::clone(&idx));
+        Some(idx)
+    }
+
+    /// The ids whose `props` equal `values` (one STRING per property, in the
+    /// composite's declaration order), from the declared composite index
+    /// over `label` — `None` when a value is not a string (the per-key path
+    /// orders numbers), when the composite cannot be served, or when the
+    /// match set would exceed `cap`. The ids are a CANDIDATE set exactly as
+    /// [`Graph::index_probe_eq_scoped`]'s are: ascending, overlaid with a
+    /// transaction's own buffered writes, and re-verified by every caller.
+    pub fn index_probe_composite(
+        &self,
+        label: &str,
+        props: &[String],
+        values: &[Value],
+        cap: Option<usize>,
+    ) -> Result<Option<Vec<u64>>, GraphError> {
+        if values.len() != props.len() {
+            return Ok(None);
+        }
+        let mut parts: Vec<&[u8]> = Vec::with_capacity(values.len());
+        for v in values {
+            match v {
+                Value::Str(s) => parts.push(s.as_bytes()),
+                _ => return Ok(None),
+            }
+        }
+        let Some(idx) = self.ensure_composite_index(label, props) else {
+            return Ok(None);
+        };
+        let probe = engram_store::IndexKey::Str(composite_key_bytes(&parts));
+        let mut ids = Self::probe_ids(&idx, &[probe], cap);
+        if let (Some(ids), Some(pending)) = (ids.as_mut(), self.txn_pending(&self.nodes, &[])) {
+            // As `index_probe_eq_scoped`: the index is committed state, so
+            // every node the transaction has written is a candidate too.
+            let mut extra = 0usize;
+            for (body, is_put) in pending {
+                if !is_put {
+                    continue;
+                }
+                if let Ok(b) = <[u8; 8]>::try_from(body.as_slice()) {
+                    let id = u64::from_be_bytes(b);
+                    if !ids.contains(&id) {
+                        ids.push(id);
+                        extra += 1;
+                    }
+                }
+            }
+            if extra > 0 {
+                counted!("graph.index probe overlaid a transaction's writes");
+            }
+        }
+        Ok(ids)
+    }
+
     /// What this graph's derived structures hold in memory right now — the
     /// attribution a memory limit has to be sized from. `kubectl top` gave a
     /// number (9.8 GiB idle, 25 GiB under shadow reads on the production
@@ -4635,7 +6641,18 @@ impl Graph {
             if let Some(snap) = slot.load() {
                 r.adjacency_tables += 1;
                 r.adjacency_bytes += snap.value.index.bytes()
-                    + snap.value.entries.len() * std::mem::size_of::<SlimAdj>();
+                    + snap.value.entries.len() * std::mem::size_of::<SlimAdj>()
+                    // Fix 83: the OVERLAY a repair carries — a complete copy
+                    // of every repaired node's current row behind its map
+                    // node — which the deferred fold leaves in place between
+                    // passes. It was charged nowhere, so the memory line's
+                    // `unattributed` grew by exactly what fix 83 defers.
+                    + snap
+                        .value
+                        .overlay
+                        .values()
+                        .map(|row| row.len() * std::mem::size_of::<SlimAdj>() + 48)
+                        .sum::<usize>();
             }
         }
         for slot in self.members_cache.load().values() {
@@ -4651,6 +6668,13 @@ impl Graph {
                 // plus an 8-byte body plus the vector headers: ~64 B is the
                 // integer/short-string shape the platform's keys take.
                 r.range_index_bytes += snap.value.len() * 64;
+            }
+        }
+        for slot in self.composite_cache.load().values() {
+            if let Some(snap) = slot.load() {
+                r.range_indexes += 1;
+                // A tuple key: two escaped strings and their terminators.
+                r.range_index_bytes += snap.value.len() * 96;
             }
         }
         {
@@ -4670,7 +6694,10 @@ impl Graph {
 
     /// The property-column cache's byte budget.
     pub(crate) fn prop_column_budget(&self) -> usize {
-        self.prop_columns.lock().unwrap_or_else(|e| e.into_inner()).budget
+        self.prop_columns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .budget
     }
 
     /// The byte budget of the property-column cache (default
@@ -4715,7 +6742,125 @@ impl Graph {
     ///
     /// Least-recently-used under `set_prop_column_budget` (512 MB default);
     /// a column wider than the whole budget is handed back but not kept.
-    pub(crate) fn prop_column(&self, label: &str, prop: &str, presence: bool) -> Option<PropColumn> {
+    /// Fix 124: the epoch pair to stamp a property column with, or `None`
+    /// when one of the two epochs cannot be trusted to move.
+    ///
+    /// `prop_epoch` reads a per-property `ChangeLog`, and a log exists only
+    /// once an index has been built over that property. For a property with
+    /// no log it returns 0 for ever — so keying currency on it would mean the
+    /// column NEVER invalidates, which is a wrong answer rather than a slow
+    /// one. Those columns keep the commit-clock test they have always had.
+    fn prop_column_epochs(&self, lt: u32, pt: u32) -> Option<(u64, u64)> {
+        if !self.prop_column_epoch_currency.get() {
+            return None;
+        }
+        if !self.prop_log.borrow().contains_key(&pt) {
+            counted!("graph.property column epoch currency declined: the property has no log");
+            return None;
+        }
+        Some((self.label_epoch(lt), self.prop_epoch(pt)))
+    }
+
+    /// Whether a cached property column is still current (fix 124). An entry
+    /// carrying an epoch pair is current while NEITHER epoch has moved; one
+    /// without keeps the commit-clock test, under which any write anywhere
+    /// retires it.
+    fn prop_column_entry_current(&self, e: &PropColumnEntry, lt: u32, pt: u32, now: u64) -> bool {
+        match e.epochs {
+            Some((label_at, prop_at)) => {
+                let ok = label_at >= self.label_epoch(lt) && prop_at >= self.prop_epoch(pt);
+                if ok && e.at < now {
+                    counted!("graph.property column survived a commit that touched neither epoch");
+                }
+                ok
+            }
+            // Fix 93 (O4): the label half is tested even with no property
+            // epoch. It is free (always available, bumped by both write
+            // paths) and it is what makes the re-stamp safe against
+            // MEMBERSHIP change — the re-stamp advances only the commit
+            // clock, so without this a commit that added a member and touched
+            // no property would be re-stamped past.
+            None => e.label_at >= self.label_epoch(lt) && e.at >= now,
+        }
+    }
+
+    /// Fix 93 (strategy O4): a DIRECT (non-transaction) property write tells
+    /// the column cache what it touched.
+    ///
+    /// The direct path records into an EXISTING change log only, so for a
+    /// property with no log it writes nothing, anywhere. Under the plain
+    /// commit-clock test that is harmless — the clock retires the column
+    /// regardless. Under the re-stamp it stops being harmless: a later commit
+    /// touching some OTHER property would advance this column's stamp and
+    /// REVIVE it, serving values the direct write had already replaced, with
+    /// no error. Retiring here is what makes the re-stamp sound, because then
+    /// every path that can invalidate a column has accounted for itself.
+    fn note_direct_prop_write(&self, pt: u32) {
+        if !self.prop_column_restamp.get() {
+            return;
+        }
+        let mut cache = self.prop_columns.lock().unwrap_or_else(|e| e.into_inner());
+        let doomed: Vec<(u32, u32, bool)> = cache
+            .entries
+            .keys()
+            .filter(|(_, p, _)| *p == pt)
+            .copied()
+            .collect();
+        for k in doomed {
+            if let Some(e) = cache.entries.remove(&k) {
+                cache.bytes = cache.bytes.saturating_sub(e.bytes);
+                counted!("graph.property column retired by a direct write");
+            }
+        }
+    }
+
+    /// Fix 93 (strategy O4): advance the commit clock a cached column carries,
+    /// past a commit that touched neither its label nor its property.
+    ///
+    /// This is the strategy. Fix 124 gave currency to properties that HAVE a
+    /// change log, and a log exists only once an index is built over the
+    /// property; an unindexed property therefore fell back to `at >= now`,
+    /// under which any write anywhere retired its column. The commit knows
+    /// its own write set — `TxnTouched::props` carries every property token
+    /// it wrote, INCLUDING unindexed ones, which the buffered path carries
+    /// deliberately — so the columns it did not touch can keep their
+    /// currency. **No log is held open:** the write set is used at the one
+    /// instant it exists and is then discarded, which is the whole difference
+    /// from the design the review killed for trading one unbounded growth for
+    /// another.
+    ///
+    /// Only `epochs: None` entries are re-stamped: an entry with a real epoch
+    /// pair has currency already and never consults `at`.
+    ///
+    /// MEMBERSHIP cannot be re-stamped past. This skips any label the commit
+    /// touched, and `prop_column_entry_current` independently tests
+    /// `label_at` against `label_epoch` — which BOTH write paths bump — so a
+    /// membership change invalidates from either direction.
+    fn restamp_prop_columns(&self, touched: &TxnTouched, ts: u64) {
+        if !self.prop_column_restamp.get() {
+            return;
+        }
+        let mut cache = self.prop_columns.lock().unwrap_or_else(|e| e.into_inner());
+        for (&(lt, pt, _), e) in cache.entries.iter_mut() {
+            if e.epochs.is_some()
+                || touched.props.contains_key(&pt)
+                || touched.labels.contains_key(&lt)
+            {
+                continue;
+            }
+            if e.at < ts {
+                e.at = ts;
+                counted!("graph.property column re-stamped past an untouching commit");
+            }
+        }
+    }
+
+    pub(crate) fn prop_column(
+        &self,
+        label: &str,
+        prop: &str,
+        presence: bool,
+    ) -> Option<PropColumn> {
         let lt = self.token_peek("lbl:", &self.labels, label)?;
         let pt = self.token_peek("prop:", &self.props, prop)?;
         let mut cache = self.prop_columns.lock().unwrap_or_else(|e| e.into_inner());
@@ -4724,7 +6869,10 @@ impl Graph {
         }
         let now = self.store.now_ts();
         let key = (lt, pt, presence);
-        let current = cache.entries.get(&key).is_some_and(|e| e.at >= now);
+        let current = cache
+            .entries
+            .get(&key)
+            .is_some_and(|e| self.prop_column_entry_current(e, lt, pt, now));
         if !current {
             if let Some(e) = cache.entries.remove(&key) {
                 cache.bytes = cache.bytes.saturating_sub(e.bytes);
@@ -4742,7 +6890,122 @@ impl Graph {
 
     /// Keep a whole-label column a walk assembled (see [`Graph::prop_column`]):
     /// `at` is the stamp read before the gather. Returns whether it was kept.
-    pub(crate) fn keep_prop_column(&self, label: &str, prop: &str, at: u64, col: PropColumn) -> bool {
+    /// The property columns the cache is holding, as `(label, prop, presence)`
+    /// NAMES rather than tokens — the set a boot would want back.
+    ///
+    /// These are not a guess at what matters. Every entry here was built
+    /// because a query read it and has SURVIVED a budgeted LRU against
+    /// everything read since, so the set is the workload's own statement of
+    /// its working set. That is the same standard index warming already uses:
+    /// an operator who declared an index said they intend it to be used, and a
+    /// column the workload keeps re-reading has said the same thing by doing
+    /// it.
+    ///
+    /// Tokens are resolved to names deliberately. A token is only meaningful
+    /// against the dictionary that minted it, so a persisted set keyed on
+    /// tokens would silently warm the WRONG columns if the dictionary were
+    /// ever rebuilt in a different order.
+    pub fn cached_prop_columns(&self) -> Vec<(String, String, bool)> {
+        let keys: Vec<(u32, u32, bool)> = {
+            let cache = self.prop_columns.lock().unwrap_or_else(|e| e.into_inner());
+            cache.entries.keys().copied().collect()
+        };
+        let mut out = Vec::with_capacity(keys.len());
+        for (lt, pt, presence) in keys {
+            let (Ok(label), Ok(prop)) = (self.token_name("lbl:", lt), self.token_name("prop:", pt))
+            else {
+                // a token the dictionary cannot name is not warmable; skipping
+                // it is right, and counting it keeps that visible
+                counted!("graph.warm-set entry had no name");
+                continue;
+            };
+            out.push((label, prop, presence));
+        }
+        out
+    }
+
+    /// Rebuild the named property columns, for a boot that wants the working
+    /// set back before the first query pays for it.
+    ///
+    /// # Why this exists
+    ///
+    /// [`Graph::warm`] builds derived TOPOLOGY — memberships, adjacency,
+    /// declared indexes — and no property data at all. Queries filter on
+    /// properties, so the first one to touch a `(label, prop)` pair built its
+    /// column on the QUERYING CLIENT'S THREAD: exactly the latency cliff
+    /// warming exists to remove, moved from topology to predicates. Measured
+    /// on SNB BI at SF3, a first query took 108 s where the next one — doing
+    /// strictly MORE work — took 40 s.
+    ///
+    /// This is the third instance of one mistake in this file, and the
+    /// comments on `warm` record the other two: untyped adjacency warmed while
+    /// the typed tables every traversal uses were not, and the partition-wide
+    /// membership warmed while the per-label views were not. Each time the
+    /// structures were warm and the thing the workload actually reads was not.
+    ///
+    /// # Why it takes a LIST rather than warming everything
+    ///
+    /// Adjacency can be warmed exhaustively because the relationship-type set
+    /// is a small bounded schema property. `(label x property)` is not, and
+    /// the cache has a byte budget a blanket warm would simply thrash: it
+    /// would evict the columns it had just built and finish holding an
+    /// arbitrary tail. `warm`'s own comment states the rule — warming what the
+    /// workload does not use is indistinguishable from not warming, AND WORSE,
+    /// because it looks like it worked.
+    ///
+    /// Returns the number of columns actually kept, which is NOT the number
+    /// asked for: a label that no longer exists, a property nothing carries,
+    /// or a column that no longer fits the budget all fail individually and
+    /// none of them is fatal. A boot that cannot warm must still serve.
+    pub fn warm_prop_columns(&self, want: &[(String, String, bool)]) -> usize {
+        let mut kept = 0usize;
+        for (label, prop, presence) in want {
+            // the stamp is read BEFORE the data, so a commit landing during
+            // the gather retires the column instead of being hidden by it —
+            // the same ordering `keep_prop_column` documents as fix 124
+            let at = self.column_stamp();
+            let Ok(members) = self.members(Some(label)) else {
+                continue;
+            };
+            let ids: Vec<u64> = members.iter().collect();
+            if ids.is_empty() {
+                continue;
+            }
+            let Ok(mut cols) = self.column_entries_gather_many(
+                ColumnFamily::Nodes,
+                std::slice::from_ref(prop),
+                &ids,
+            ) else {
+                continue;
+            };
+            let Some(entries) = cols.pop() else { continue };
+            // The GATHER is the same path a declining range scan already falls
+            // back to, and is documented there as byte-identical per column to
+            // what the scan would have produced. Warming through it means a
+            // warmed column is the object a lazily built one would be, with no
+            // second builder to diverge.
+            let col = if *presence {
+                PropColumn::Presence(std::sync::Arc::new(
+                    entries.iter().map(|(id, _)| *id).collect::<Vec<u64>>(),
+                ))
+            } else {
+                PropColumn::Values(std::sync::Arc::new(entries))
+            };
+            if self.keep_prop_column(label, prop, at, col) {
+                kept += 1;
+                counters::WARM_PROP_COLUMNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        kept
+    }
+
+    pub(crate) fn keep_prop_column(
+        &self,
+        label: &str,
+        prop: &str,
+        at: u64,
+        col: PropColumn,
+    ) -> bool {
         let Some(lt) = self.token_peek("lbl:", &self.labels, label) else {
             return false;
         };
@@ -4756,6 +7019,15 @@ impl Graph {
             ),
             PropColumn::Presence(ids) => (true, ids.len() * 8),
         };
+        // Fix 124: read the epochs BEFORE taking the cache lock, and before
+        // the column is filed. Stamping after would record an epoch newer
+        // than the data the column actually holds, which is the classic way a
+        // cache convinces itself it is current.
+        let epochs = self.prop_column_epochs(lt, pt);
+        // Fix 93 (O4): likewise BEFORE the lock — `label_epoch` borrows the
+        // label logs, and taking that borrow while holding the cache mutex
+        // would put a second lock under the leaf.
+        let label_at = self.label_epoch(lt);
         let mut cache = self.prop_columns.lock().unwrap_or_else(|e| e.into_inner());
         if cache.budget == 0 || bytes > cache.budget {
             counted!("graph.property column not kept: over budget");
@@ -4763,6 +7035,46 @@ impl Graph {
         }
         let key = (lt, pt, presence);
         if let Some(old) = cache.entries.remove(&key) {
+            // Strategy L4, Phase 0 — the REDUNDANCY INSTRUMENT, and the only
+            // part of that strategy which survived review. L4 proposed
+            // single-flighting the column rebuild so concurrent readers do it
+            // once. That is refused on measured precedent:
+            // `set_single_flight_repair` did exactly this for adjacency and
+            // took throughput 26,986 -> 16,190 ops/s, 40% WORSE, because the
+            // readers that had duplicated the work in parallel then queued on
+            // one mutex. What was never built is the measurement that would
+            // say whether the redundancy is even happening here, so the
+            // question stayed open on argument rather than evidence.
+            //
+            // This is that measurement: we are replacing `old`, so ask
+            // whether `old` was ALREADY CURRENT when this gather began. If it
+            // was, some other reader had already built and filed a usable
+            // column and this thread rebuilt it for nothing — a de-duplicable
+            // rebuild, which is precisely what L4 wanted to remove.
+            //
+            // The predicate is the one the SERVE path uses
+            // (`prop_column_entry_current`), not the plan's original
+            // `old.at >= at`. That test was superseded by fix 124's epoch
+            // pair and stops firing exactly as the write rate rises — it
+            // would have reported "no redundancy" most loudly under the
+            // write load where redundancy matters most.
+            //
+            // Evaluated from the values read BEFORE the lock, deliberately:
+            // `label_epoch` / `prop_epoch` borrow the logs, and taking that
+            // borrow while holding the cache mutex would put a second lock
+            // under the leaf (the same trap fix 93 documents above).
+            let old_was_current = match old.epochs {
+                Some((l, p)) => match epochs {
+                    Some((cur_l, cur_p)) => l >= cur_l && p >= cur_p,
+                    // The property's log has gone since `old` was filed; its
+                    // epoch pair can no longer be compared, so claim nothing.
+                    None => false,
+                },
+                None => old.label_at >= label_at && old.at >= at,
+            };
+            if old_was_current {
+                counted!("graph.property column rebuilt while a current one was already cached");
+            }
             cache.bytes = cache.bytes.saturating_sub(old.bytes);
         }
         cache.evict_to(bytes);
@@ -4772,6 +7084,8 @@ impl Graph {
             key,
             PropColumnEntry {
                 at,
+                epochs,
+                label_at,
                 col,
                 aligned: None,
                 bytes,
@@ -4818,7 +7132,10 @@ impl Graph {
         }
         let now = self.store.now_ts();
         let key = (lt, pt, false);
-        let current = cache.entries.get(&key).is_some_and(|e| e.at >= now);
+        let current = cache
+            .entries
+            .get(&key)
+            .is_some_and(|e| self.prop_column_entry_current(e, lt, pt, now));
         if !current {
             if let Some(e) = cache.entries.remove(&key) {
                 cache.bytes = cache.bytes.saturating_sub(e.bytes);
@@ -4860,7 +7177,12 @@ impl Graph {
     /// has a CURRENT cached column over `label` — the aggregate's batch
     /// decision: a first read over a wide label walks it whole so that the
     /// columns it assembles are kept; later reads batch against the cache.
-    pub(crate) fn prop_columns_current(&self, label: &str, props: &[String], presence: &[String]) -> bool {
+    pub(crate) fn prop_columns_current(
+        &self,
+        label: &str,
+        props: &[String],
+        presence: &[String],
+    ) -> bool {
         let Some(lt) = self.token_peek("lbl:", &self.labels, label) else {
             return props.is_empty() && presence.is_empty();
         };
@@ -4871,7 +7193,10 @@ impl Graph {
         let now = self.store.now_ts();
         let has = |p: &String, presence: bool| -> bool {
             match self.token_peek("prop:", &self.props, p) {
-                Some(pt) => cache.entries.get(&(lt, pt, presence)).is_some_and(|e| e.at >= now),
+                Some(pt) => cache
+                    .entries
+                    .get(&(lt, pt, presence))
+                    .is_some_and(|e| self.prop_column_entry_current(e, lt, pt, now)),
                 None => true, // a property nothing ever wrote — no column to read
             }
         };
@@ -4886,6 +7211,104 @@ impl Graph {
         };
         let committed = self.with_stats(|st| st.by_label.get(&t).copied().unwrap_or(0));
         committed.saturating_add_signed(self.txn_row_delta(&self.index, &membership_prefix(t)))
+    }
+
+    /// Whether a both-ends-bound path is priced along its WHOLE length rather
+    /// than by its first hop (`reverse_both_bound_path`).
+    ///
+    /// BI16's optional leg leaves `person1` by 139 KNOWS edges and the tag by
+    /// 13,512 HAS_TAG edges, so a first-hop comparison keeps `person1` — and
+    /// then walks 14,293,280 messages to produce 90 people. Pricing the whole
+    /// path takes BI16 from 149 s to 76 s at SF3, same 3 rows.
+    ///
+    /// DEFAULT OFF, because it costs BI8 what it saves BI16. BI8 prices
+    /// `size([(tag)<-[:HAS_TAG]-(m)-[:HAS_CREATOR]->(person) | m])` once per
+    /// person AND once per friend, and this decision sits on that path:
+    /// 146 s -> 199 s at SF3, one binary, this lever the only variable.
+    ///
+    /// Two attempts to make it affordable, both measured, both recorded so
+    /// they are not retried blind:
+    ///
+    /// - Caching the estimate's shape-only half (`shape_tails`) recovered a
+    ///   third of it, 248 s -> 199 s, and no more.
+    /// - Caching the DECISION per shape — the first partial deciding for
+    ///   every later one — took BI8 past 400 s and it was killed with no
+    ///   rows. The shape is constant between rows; the magnitudes are not,
+    ///   and a frozen direction is a runaway on every row it does not fit.
+    ///
+    /// A third attempt removed the row dependence entirely, pricing the FIRST
+    /// hop from the counts as well so the decision could be made once per
+    /// shape. That loses a reversal the measured probe gets right — 40 tagged
+    /// messages against an average of 20 messages per person, where THIS
+    /// person has one — and an existing test holds that case. An average
+    /// cannot see a particular node's degree, and the bound end's degree is
+    /// what decides.
+    ///
+    /// So the estimate needs a measured first hop, a measured first hop
+    /// cannot leave the per-partial path, and on that path it costs BI8 more
+    /// than it saves BI16. The win is real and available by lever; the
+    /// regression is paid by nobody who does not ask. The open work is to
+    /// decide join order where the pattern is known and the rows are not —
+    /// at plan time, with the per-row probe as a correction rather than the
+    /// whole input.
+    ///
+    /// CORRECTED 2026-09-23. This comment used to say that at SF10 the lever
+    /// "does not even win on BI16" — killed at 900 s either way. That was
+    /// measured on a long-lived server, where `shape_tails` could price one
+    /// statement with another's tails (keyed by address; see
+    /// `docs/bench/engram-gap-closure.md` §27). With that fixed, BI16 at SF10
+    /// completes with the lever ON (506 / 438 s) and cannot without it.
+    ///
+    /// Two further changes then moved the trade:
+    /// - a leg shorter than THREE hops is decided by its first hops whatever
+    ///   this says (its "whole-path" estimate IS that comparison plus a 4x
+    ///   margin), which took BI8's cost to nothing: 6.61 / 6.83 s off,
+    ///   6.65 / 6.71 s on, SF3;
+    /// - `memo_orientation` seeds and follows the first-hop WHERE memo with
+    ///   the lever OFF, which is what BI16 actually needed.
+    ///
+    /// What still keeps it OFF by default is BI14: its OPTIONAL legs are three
+    /// hops, both ends bound, no WHERE, and the estimate prices them worse
+    /// than the first-hop rule — +15 % at SF3, three runs an arm, no overlap.
+    pub fn set_path_estimate(&self, on: bool) {
+        self.path_estimate.set(on);
+    }
+
+    /// See [`Graph::set_path_estimate`].
+    pub(crate) fn path_estimate_enabled(&self) -> bool {
+        self.path_estimate.get()
+    }
+
+    /// Live nodes of `label` as the COMMITTED counts hold them — no
+    /// transaction delta.
+    ///
+    /// `count_label_nodes` adds the open transaction's own delta, which walks
+    /// the txn index. That is right for an ANSWER and wrong for an ESTIMATE:
+    /// a join-order decision runs per row (bi8 prices a pattern comprehension
+    /// once per person and once per friend), and it does not become a better
+    /// decision for knowing about uncommitted rows.
+    pub(crate) fn committed_label_count(&self, label: &str) -> u64 {
+        let Some(t) = self.token_peek("lbl:", &self.labels, label) else {
+            return 0;
+        };
+        self.with_stats(|st| st.by_label.get(&t).copied().unwrap_or(0))
+    }
+
+    /// Live relationships carrying any of `tokens` — `None` means every type.
+    ///
+    /// The per-type half of the maintained counts, and the numerator of the
+    /// average degree a join-order estimate needs: a hop of type T leaving a
+    /// label L expands by roughly `type_edge_count(T) / count_label_nodes(L)`.
+    /// O(1), from the same committed `Stats` that answers `count_label_nodes`.
+    pub(crate) fn type_edge_count(&self, tokens: &Option<Vec<u32>>) -> u64 {
+        let Some(ts) = tokens else {
+            return self.with_stats(|st| st.rels);
+        };
+        self.with_stats(|st| {
+            ts.iter()
+                .map(|t| st.by_type.get(t).copied().unwrap_or(0))
+                .fold(0u64, u64::saturating_add)
+        })
     }
 
     /// Count every live relationship — `MATCH ()-[r]->() RETURN count(r)`.
@@ -5057,11 +7480,176 @@ impl Graph {
     pub fn warm(&self) -> WarmReport {
         let started = self.store.now_ts();
         let members = self.members(None).map(|m| m.len()).unwrap_or(0);
+
+        // PER-LABEL MEMBERSHIPS, not just the untyped aggregate.
+        //
+        // `members(None)` warms the partition-wide view. Queries anchor on a
+        // LABEL — `MATCH (p:Person ...)` — and those views were left cold, so
+        // the first query per label built one on its own thread. This is the
+        // SAME SHAPE as the adjacency defect fixed alongside it, in the same
+        // function: an untyped aggregate warmed while the typed structures
+        // every query actually uses were not. Two instances of one mistake is
+        // the pattern, not the instance.
+        //
+        // Bounded by the label count, and each build is the ordinary path, so a
+        // warmed view is the object a lazily built one would be.
+        //
+        // READ FROM THE STORE, not from `self.labels`. That cache is filled one
+        // name at a time by `Graph::token`, so at boot it holds only what the
+        // start-up path touched: SF10 warmed 3 label memberships (487 MB) where
+        // adopting the same store from its sidecar restored 10 (718 MB). The
+        // loop ran, the counter moved, and two thirds of the labels stayed cold
+        // — a warm pass reporting success for work it had no way to see.
+        let mut label_views = 0usize;
+        for label in self.label_names_in_store() {
+            if self.members(Some(&label)).is_ok() {
+                label_views += 1;
+                counters::WARM_LABEL_MEMBERSHIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let _ = label_views;
+
+        // THE COUNT STORE IS WARMED TOO.
+        //
+        // Every planned statement reads it — cardinality estimates, the count
+        // fast paths — and on a store this process did not write it is built
+        // on first read: three store-wide key walks on whichever client asked
+        // first. At SF3 that was a 61 s first query regardless of the query,
+        // the fourth instance of the mistake the sections above record.
+        // Built through `with_stats`, so a warmed store is the object a lazy
+        // one would be; a store whose counts are already maintained is left
+        // alone and counts nothing.
+        if self.stats.borrow().is_none() {
+            self.with_stats(|_| ());
+            counters::WARM_STATS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        // DECLARED INDEXES ARE WARMED TOO.
+        //
+        // Warming covered memberships and adjacency and stopped there, so the
+        // first seek against a declared index still built it on the querying
+        // client's thread — measured at SF10 as 249.7 s for `Person.id` and
+        // 70.6 s for `Message.id`. An operator who declared an index has
+        // already said they intend it to be used; building it at boot is what
+        // the declaration means.
+        //
+        // Each is built through the ordinary scoped path, so a warmed index is
+        // the same object a lazily built one would be — no second code path to
+        // diverge. Failures are counted, not fatal: a boot that cannot warm an
+        // index must still serve, exactly as it did before.
+        let mut indexes = 0usize;
+        if let Ok(declared) = self.declared_range_indexes() {
+            for def in declared.iter() {
+                for prop in &def.props {
+                    if self
+                        .ensure_range_index_scoped(prop, Some(&def.label))
+                        .is_some()
+                    {
+                        indexes += 1;
+                        counters::WARM_INDEXES_BUILT
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        let _ = indexes;
+
+        // COMPOSITE, TRIGRAM AND FULLTEXT INDEXES TOO.
+        //
+        // The loop above walks a declared def's properties ONE AT A TIME, so a
+        // `CREATE INDEX … ON (n.userId, n.nodeType)` was warmed as two
+        // single-key indexes and the composite — the structure the planner
+        // seeks (fix 115) — was still built by whichever query asked first.
+        // Trigram and fulltext were covered by nothing at all. All three are
+        // the same defect as the label memberships: a declaration is the
+        // operator saying they intend the structure, so boot is where it is
+        // built.
+        //
+        // Each goes through its ordinary `ensure_*` path and each carries its
+        // own counter, so a pass that silently builds nothing is visible
+        // rather than assumed.
+        let mut composites = 0usize;
+        if let Ok(declared) = self.declared_range_indexes() {
+            for def in declared.iter().filter(|d| d.props.len() >= 2) {
+                if self
+                    .ensure_composite_index(&def.label, &def.props)
+                    .is_some()
+                {
+                    composites += 1;
+                    counters::WARM_COMPOSITE_INDEXES
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        let _ = composites;
+
+        let mut trigrams = 0usize;
+        if self.trigram_indexes.get() {
+            for (label, prop) in self.declared_trigram_indexes().iter() {
+                if self.ensure_trigram_index_scoped(prop, label).is_some() {
+                    trigrams += 1;
+                    counters::WARM_TRIGRAM_INDEXES
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        let _ = trigrams;
+
+        let mut terms = 0usize;
+        for (name, def) in self.scan_index_defs() {
+            if let crate::schema::IndexDef::Fulltext { labels, props, .. } = def {
+                if self.ensure_term_index(&name, &labels, &props).is_some() {
+                    terms += 1;
+                    counters::WARM_TERM_INDEXES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        let _ = terms;
+
         let epoch = self.store.now_ts();
         let mut edges = [0usize; 2];
         let mut tables = 0usize;
         let (mut table_bytes, mut table_capacity_bytes) = (0usize, 0usize);
         for (i, tag) in [b'O', b'I'].into_iter().enumerate() {
+            // AN ADOPTED DIRECTION IS NOT REBUILT. When the derived sidecar
+            // published this direction's untyped table at a stamp no
+            // relationship change has passed since, the walk below would build
+            // the same tables again — and then lose every publish to the
+            // adopted ones (a slot publishes only forward), so the whole walk
+            // was thrown away. On 2026-09-27 that was most of a 64-127 s SF3
+            // warm after 17 structures had been adopted in 1.3 s. A typed
+            // table the sidecar did not carry is built by the query path that
+            // first needs it, as for any table not warmed.
+            //
+            // KEPT only when EVERY published table of the direction is current
+            // by the persist's own test (`snap.at >= adjacency_epoch`): the
+            // untyped one AND each typed one. One stale table left published
+            // would stop the next sidecar write (it refuses a stale base), and
+            // the walk below rebuilds the whole direction in one pass anyway.
+            let adopted = {
+                let map = self.adj_tables.load();
+                let untyped = map.get(&(tag, Vec::new())).and_then(|slot| {
+                    let g = slot.peek();
+                    g.as_ref()
+                        .filter(|snap| snap.at >= self.adjacency_epoch(&None))
+                        .map(|snap| snap.value.len())
+                });
+                let typed_current = map
+                    .iter()
+                    .filter(|((t, ty), _)| *t == tag && !ty.is_empty())
+                    .all(|((_, ty), slot)| {
+                        let g = slot.peek();
+                        g.as_ref()
+                            .is_none_or(|snap| snap.at >= self.adjacency_epoch(&Some(ty.clone())))
+                    });
+                untyped.filter(|_| typed_current)
+            };
+            if let Some(n) = adopted {
+                edges[i] = n;
+                counted!("graph.warm kept an adopted adjacency direction");
+                counters::WARM_ADOPTED_DIRECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                continue;
+            }
             let Some(built) = self.build_adj_tables_all_types(tag) else {
                 continue;
             };
@@ -5128,9 +7716,86 @@ impl Graph {
         self.incremental_caches.set(on);
     }
 
+    /// Whether a trigram index may serve a probe.
+    ///
+    /// Off, every `=~`, `CONTAINS`, `STARTS WITH` and `ENDS WITH` falls back to
+    /// the label scan that answered them before this index existed. That is the
+    /// A/B: with one switch, "the index helps" becomes a measurement rather
+    /// than an assertion, and a differential test can require the two paths to
+    /// return the same rows.
+    pub fn set_trigram_indexes(&self, on: bool) {
+        self.trigram_indexes.set(on);
+    }
+
+    /// Whether trigram indexes may serve a probe.
+    pub fn trigram_indexes_enabled(&self) -> bool {
+        self.trigram_indexes.get()
+    }
+
+    /// Whether a BM25-scored fulltext index may serve a query.
+    ///
+    /// Off, the query falls back to a scan computing the SAME scores the slow
+    /// way. That is the A/B for the index, and it is deliberately not the same
+    /// switch as the one choosing the formula: "the index is faster" and "BM25
+    /// ranks better than term frequency" are two claims, and one lever could
+    /// not tell you which you had measured.
+    pub fn set_bm25_scoring(&self, on: bool) {
+        self.bm25_scoring.set(on);
+    }
+
+    /// Whether a BM25-scored fulltext index may serve a query.
+    #[must_use]
+    pub fn bm25_scoring_enabled(&self) -> bool {
+        self.bm25_scoring.get()
+    }
+
+    /// Whether a NEWLY created fulltext index is stamped BM25.
+    ///
+    /// Existing indexes are unaffected however this is set: their scoring is
+    /// recorded in their catalogue row.
+    pub fn set_bm25_by_default(&self, on: bool) {
+        self.bm25_by_default.set(on);
+    }
+
+    /// The scoring a newly created fulltext index is stamped with.
+    pub(crate) fn fulltext_default_scoring(&self) -> crate::schema::Scoring {
+        if self.bm25_by_default.get() {
+            crate::schema::Scoring::Bm25
+        } else {
+            crate::schema::Scoring::Tf
+        }
+    }
+
     /// Whether incremental cache maintenance is on.
     pub fn incremental_caches_enabled(&self) -> bool {
         self.incremental_caches.get()
+    }
+
+    /// The reader-repair ceiling in rows, and the A/B switch over it.
+    ///
+    /// ON: `ADJ_LOG_CAP` — repair whenever the change log can answer,
+    /// because the alternative is a store-wide prefix scan paid PER VISIT while
+    /// the repair is paid once and serves every reader behind it.
+    /// OFF (DEFAULT): the shipped 8,192. Deliberately below a mixed profile's
+    /// change rate — §8 chose to decline and let the maintenance pass republish,
+    /// and `adjacency_repair_differential` pins that the decline path is
+    /// exercised. That decision was taken where the walk is CHEAP; at SF10 the
+    /// walk is a store-wide prefix scan and one query pays ~1,000 of them. This
+    /// stays OFF until an A/B says otherwise, rather than silently reversing a
+    /// documented design choice.
+    #[must_use]
+    pub fn reader_repair_max_rows(&self) -> usize {
+        if self.amortised_reader_repair.get() {
+            ADJ_READER_REPAIR_MAX_ROWS_AMORTISED
+        } else {
+            ADJ_READER_REPAIR_MAX_ROWS
+        }
+    }
+
+    /// Toggle the amortised reader-repair ceiling (default OFF). The A/B arm
+    /// for the SF10 write-path collapse.
+    pub fn set_amortised_reader_repair(&self, on: bool) {
+        self.amortised_reader_repair.set(on);
     }
 
     /// Toggle **cost-based adjacency repair** (default on).
@@ -5293,6 +7958,16 @@ impl Graph {
     /// (a writer registered at that stamp still in flight) advances the slot
     /// by nothing and is reported deferred — see `AdjOutcome::Deferred`.
     pub fn refresh_stale_derived(&self) -> RefreshReport {
+        self.refresh_stale_derived_timed(&|| 0)
+    }
+
+    /// [`Graph::refresh_stale_derived`] with a caller-supplied millisecond
+    /// clock for fix 82's per-family wall time. The graph reads no clock of
+    /// its own — a direct `Instant::now()` is invisible to the simulation and
+    /// the determinism gate forbids it — so the maintenance thread, which is
+    /// outside the simulation and already times the whole pass, passes one
+    /// in; every other caller gets `|| 0` and a report with no clock.
+    pub fn refresh_stale_derived_timed(&self, now_ms: &dyn Fn() -> u64) -> RefreshReport {
         let mut report = RefreshReport::default();
         if !self.incremental_caches.get() {
             return report;
@@ -5310,9 +7985,104 @@ impl Graph {
         } else {
             budget_rows
         };
+        // Fix 82's instrument: the pass's wall time PER FAMILY, so a log line
+        // says which half a long pass spent its time in. The budget curve had
+        // to be attributed from the report's counts alone.
+        let adjacency_started = now_ms();
         // Adjacency tables: the map is loaded once; a slot inserted meanwhile
         // belongs to a reader that is building it right now.
         let tables = self.adj_tables.load();
+        // THE BUDGET IS SHARED, NOT RACED FOR — and this is the half of the
+        // stall the truncation alone does not reach.
+        //
+        // First-come-first-served over a stable iteration order STARVES every
+        // table the pass does not reach. The rule below the loop takes the
+        // first stale table it prices, and defers the rest for the rest of the
+        // pass; the map's order does not change between passes, so it is the
+        // same table that is taken and the same tables that are deferred,
+        // every time. Their deltas never drain — they grow until one of them
+        // is finally the first stale table in some pass and is taken whole.
+        // That is where a 262,144-entry change set comes from on a mix whose
+        // pass fires every 8,192 commits, and it is why the field's refresh
+        // line reads `adjacency repaired=1 adjacency deferred=2` on every one
+        // of 109 refreshes while 55 of them run over 500 ms.
+        //
+        // So each stale table gets a SLICE of the pass instead: every table
+        // drains a little, every pass, and no table's delta can grow because
+        // it lost a race it was never going to win. The slice is a repair
+        // bound (`RefreshBudget::repair_rows`), so a table whose delta is
+        // bigger than its slice takes what it can and stays stale for the rest
+        // — the guarantee is progress everywhere, not currency anywhere.
+        //
+        // THE SLICES ARE MAX-MIN FAIR, NOT EQUAL. An equal split is the wrong
+        // shape when the stale set is lopsided, which is the normal case: four
+        // tables stale, three of them one write behind and the fourth holding
+        // the backlog, and a flat quarter each throttles the only table that
+        // needed the budget while three-quarters of it goes unspent. So each
+        // table takes the SMALLER of its own cost and an even share of what is
+        // left, cheapest first — every table that can finish does, and the
+        // remainder falls to the tables that cannot. With one stale table that
+        // is the whole pool, which is exactly the old behaviour minus the
+        // unbounded step; `adjacency_repair_differential`'s overlay fold is
+        // what caught the flat split (its 2,500-node ranged repairs came back
+        // truncated and the overlay never reached its 4,096 fold).
+        //
+        // A table the repair-vs-rebuild gate would REBUILD (`None` from
+        // `adj_repair_cost_rows`) is not in the pool at all: slicing it would
+        // smuggle past a gate that judged the whole repair dearer than a walk
+        // and then pay that cost in instalments, each with its own overlay
+        // carry. It falls through unsliced to the rebuild budget, exactly as
+        // before.
+        //
+        // Adjacency takes HALF the pass's budget under this rule and leaves
+        // the other half to the membership family below, which has no
+        // truncation of its own and would otherwise find the pool empty. The
+        // OFF arm keeps the whole budget and the first-come rule, so the two
+        // are comparable on answers and not on scheduling.
+        let per_table_rows: Option<BTreeMap<(u8, Vec<u32>), usize>> =
+            if budget_rows != 0 && self.bounded_derived_repair.get() {
+                let mut priced: Vec<((u8, Vec<u32>), usize)> = Vec::new();
+                for ((tag, types), slot) in tables.iter() {
+                    let Some(snap) = slot.load() else { continue };
+                    let tt = if types.is_empty() {
+                        None
+                    } else {
+                        Some(types.clone())
+                    };
+                    if snap.at >= self.adjacency_epoch(&tt) {
+                        continue;
+                    }
+                    if let Some(cost) =
+                        self.adj_repair_cost_rows(*tag, &tt, snap.at, snap.value.len(), true)
+                    {
+                        priced.push(((*tag, types.clone()), cost));
+                    }
+                }
+                if priced.is_empty() {
+                    None
+                } else {
+                    let half = (budget_rows / 2).max(1);
+                    rows_left = budget_rows - half;
+                    priced.sort_by_key(|(_, c)| *c);
+                    let mut left = half;
+                    let mut unserved = priced.len();
+                    let mut alloc: BTreeMap<(u8, Vec<u32>), usize> = BTreeMap::new();
+                    for (key, cost) in priced {
+                        let share = (left / unserved).max(1);
+                        let give = cost.min(share);
+                        left = left.saturating_sub(give);
+                        unserved -= 1;
+                        alloc.insert(key, give);
+                    }
+                    counted!(
+                        "graph.derived refresh shared its budget across stale tables",
+                        alloc.len() as u64
+                    );
+                    Some(alloc)
+                }
+            } else {
+                None
+            };
         for ((tag, types), slot) in tables.iter() {
             let Some(snap) = slot.load() else {
                 continue; // a build in flight, or declined by the budget
@@ -5324,56 +8094,116 @@ impl Graph {
             };
             let epoch = self.adjacency_epoch(&type_tokens);
             if snap.at >= epoch {
+                // Fix 83: a CURRENT table can still carry the overlay a
+                // reader's repair left unfolded — a burst, then quiet. No
+                // later write makes it stale, so no repair would ever fold
+                // it, and every hop through it would pay the `BTreeMap`
+                // descent for the life of the process. Fold it in place, at
+                // the SAME stamp: the same rows in a different layout.
+                if snap.value.overlay.len() > self.adj_overlay_fold.get() {
+                    let folded = std::sync::Arc::new(Snapshot {
+                        at: snap.at,
+                        value: std::sync::Arc::new(snap.value.folded()),
+                    });
+                    // Only the EXACT snapshot that was folded may be replaced:
+                    // a retract (the fail-closed response to a poisoned log)
+                    // followed by a rebuild can put a DIFFERENT table at the
+                    // same stamp, and a swap on the stamp alone would have
+                    // reinstated the rows the retract threw away.
+                    if slot.publish_refold(&snap, folded) {
+                        self.adj_refold_gen
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        counted!("graph.adjacency pass folded a current table in place");
+                        counted!("graph.adjacency table overlay folded");
+                    }
+                }
                 continue;
             }
             if !self.adj_tables_usable() {
                 break; // a zero budget: tables are not served at all
             }
-            // PRICE THE REPAIR BEFORE PAYING FOR IT. A rebuild is already
-            // budgeted at one per pass; repairs were not, and a pass that
-            // repaired every stale table in turn is what taxed the writers.
-            // `None` here means no repair is available (the log does not
-            // reach, or a cap refuses), so the rebuild budget decides — the
-            // pass never skips a table it could only rebuild on the grounds
-            // of a repair cost that does not apply.
-            if rows_left != usize::MAX {
-                if let Some(cost) =
-                    self.adj_repair_cost_rows(*tag, &type_tokens, snap.at, snap.value.len())
-                {
-                    // THE BUDGET IS WORK-CONSERVING: it bounds what a pass does
-                    // ON TOP of one unavoidable item, never what it can do at
-                    // all.
-                    //
-                    // "Deferring is a delay, never a drop" holds only while a
-                    // later pass can afford what this one skipped. A table
-                    // whose repair ALONE exceeds the whole budget breaks that:
-                    // every future pass declines it for the same reason and its
-                    // delta only grows, so the delay is permanent and the table
-                    // comes back only when the change log finally overflows and
-                    // some reader rebuilds it — 262,144 entries later, with
-                    // every read walking the span meanwhile.
-                    //
-                    // §8 is what made this reachable. Readers used to repair on
-                    // every stale read, which kept the delta small for the pass
-                    // as a side effect nobody had named; now they decline the
-                    // expensive ones, and the pass has to be able to finish the
-                    // job it was already nominally responsible for.
-                    // `review_repair_over_cap_differential` caught it: five
-                    // tables deferred, nothing repaired, nothing rebuilt.
-                    //
-                    // Taking it only when the pass has spent nothing yet keeps
-                    // the bound meaningful — one oversized item per pass, not
-                    // an unbounded run of them.
-                    let untouched = rows_left == budget_rows;
-                    if cost > rows_left && !untouched {
-                        counted!("graph.derived refresh deferred by the row budget");
-                        report.adjacency_deferred += 1;
-                        continue;
+            // What this table's repair may re-read. `None` — the whole delta —
+            // is what a repair that FITS the budget takes, what every reader
+            // takes, and what a table the gate would REBUILD gets (it is not
+            // in the allocation at all: see the pre-pass above).
+            let mut repair_rows: Option<usize> = None;
+            if let Some(alloc) = per_table_rows.as_ref() {
+                // Under the shared budget nothing is deferred: a table that is
+                // in the allocation takes its slice, and one that is not falls
+                // through unsliced to the rebuild budget. Both were priced in
+                // the pre-pass, so there is no second walk of the change set
+                // here.
+                repair_rows = alloc.get(&(*tag, types.clone())).copied();
+            } else {
+                // PRICE THE REPAIR BEFORE PAYING FOR IT. A rebuild is already
+                // budgeted at one per pass; repairs were not, and a pass that
+                // repaired every stale table in turn is what taxed the writers.
+                // `None` here means no repair is available (the log does not
+                // reach, or a cap refuses), so the rebuild budget decides — the
+                // pass never skips a table it could only rebuild on the grounds
+                // of a repair cost that does not apply.
+                if rows_left != usize::MAX {
+                    if let Some(cost) = self.adj_repair_cost_rows(
+                        *tag,
+                        &type_tokens,
+                        snap.at,
+                        snap.value.len(),
+                        true,
+                    ) {
+                        // THE BUDGET IS WORK-CONSERVING: it bounds what a pass does
+                        // ON TOP of one unavoidable item, never what it can do at
+                        // all.
+                        //
+                        // "Deferring is a delay, never a drop" holds only while a
+                        // later pass can afford what this one skipped. A table
+                        // whose repair ALONE exceeds the whole budget breaks that:
+                        // every future pass declines it for the same reason and its
+                        // delta only grows, so the delay is permanent and the table
+                        // comes back only when the change log finally overflows and
+                        // some reader rebuilds it — 262,144 entries later, with
+                        // every read walking the span meanwhile.
+                        //
+                        // §8 is what made this reachable. Readers used to repair on
+                        // every stale read, which kept the delta small for the pass
+                        // as a side effect nobody had named; now they decline the
+                        // expensive ones, and the pass has to be able to finish the
+                        // job it was already nominally responsible for.
+                        // `review_repair_over_cap_differential` caught it: five
+                        // tables deferred, nothing repaired, nothing rebuilt.
+                        //
+                        // Taking it only when the pass has spent nothing yet keeps
+                        // the bound meaningful — one oversized item per pass, not
+                        // an unbounded run of them.
+                        //
+                        // ONE PER PASS BOUNDS THE COUNT AND SAYS NOTHING ABOUT THE
+                        // COST — which is how an escape hatch against permanent
+                        // deferral became the stall it was protecting against. A
+                        // 400 s sweep took 109 refreshes totalling 82,748 ms, 55
+                        // of them over 500 ms and the longest 9,935 ms, every one
+                        // reporting `adjacency repaired=1`; the per-second series
+                        // shows `write-only @ 1` at ~1,600 ops/s for nineteen
+                        // seconds and at exactly 0 for the twentieth. The levels
+                        // that failed moved between runs because the pass fires at
+                        // a different second, not because the machine differed.
+                        //
+                        // This whole branch is now the LEVER-OFF arm — the
+                        // shared-budget rule above replaces it, and takes both
+                        // halves of the fix with it: every stale table gets a
+                        // slice, and each slice bounds the repair it pays for.
+                        // What is left here is the behaviour that produced the
+                        // measurement, kept as the arm the differential
+                        // compares against.
+                        let untouched = rows_left == budget_rows;
+                        if cost > rows_left && !untouched {
+                            counted!("graph.derived refresh deferred by the row budget");
+                            report.adjacency_deferred += 1;
+                            continue;
+                        }
+                        if cost > rows_left {
+                            counted!("graph.derived refresh took a repair over its whole budget");
+                        }
+                        rows_left = rows_left.saturating_sub(cost);
                     }
-                    if cost > rows_left {
-                        counted!("graph.derived refresh took a repair over its whole budget");
-                    }
-                    rows_left = rows_left.saturating_sub(cost);
                 }
             }
             // §5.3 — THE REBUILD IS DEMOTED TO A FALLBACK, not deleted. A
@@ -5392,10 +8222,21 @@ impl Graph {
             // frequent enough to keep the fallback rare. That frequency is not
             // assumed here: it is the measured quantity §5.5's decision rule
             // turns on, and `graph.adjacency tables built` is what reports it.
-            let may_rebuild =
-                type_tokens.is_some() && rebuilds_left > 0 && !self.demote_adj_rebuild.get();
-            let (_, outcome) =
-                self.adj_table_snapshot_reporting(*tag, &type_tokens, epoch, false, may_rebuild, false);
+            let budget = RefreshBudget {
+                rebuild: type_tokens.is_some()
+                    && rebuilds_left > 0
+                    && !self.demote_adj_rebuild.get(),
+                repair_rows,
+            };
+            let (_, outcome) = self.adj_table_snapshot_reporting(
+                *tag,
+                &type_tokens,
+                epoch,
+                false,
+                budget,
+                false,
+                0,
+            );
             let refreshed = match outcome {
                 AdjOutcome::Repaired => {
                     report.adjacency_repaired += 1;
@@ -5426,6 +8267,8 @@ impl Graph {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
+        report.adjacency_ms = now_ms().saturating_sub(adjacency_started);
+        let members_started = now_ms();
         // Membership snapshots, likewise.
         let members = self.members_cache.load();
         for (token, slot) in members.iter() {
@@ -5440,7 +8283,14 @@ impl Graph {
             // pass folds every stale label's whole change set, and the
             // O(k log k) fold over a write burst's labels is the other half
             // of the write tax the adjacency budget alone did not remove.
-            if rows_left != usize::MAX {
+            //
+            // Fix 82: a catch-up the log covers is NOT metered. The budget is
+            // rows re-read and a catch-up reads none — it is an in-memory
+            // fold bounded by `LABEL_LOG_CAP` — and metering it at one row
+            // per entry deferred it until the log overflowed and the pass
+            // REBUILT the label instead (the budget curve's 5–7 s passes,
+            // `members rebuilt=1`). See `set_members_unmetered_catch_up`.
+            if rows_left != usize::MAX && !self.members_unmetered_catch_up.get() {
                 if let Some(cost) = self.members_catch_up_cost(*token, snap.at) {
                     if cost > rows_left {
                         counted!("graph.derived refresh deferred by the row budget");
@@ -5449,6 +8299,8 @@ impl Graph {
                     }
                     rows_left -= cost;
                 }
+            } else if rows_left != usize::MAX {
+                counted!("graph.derived refresh membership catch-up unmetered");
             }
             let refreshed = match self.members_refresh_token(*token, rebuilds_left > 0) {
                 Ok(MembersOutcome::CaughtUp) => {
@@ -5472,6 +8324,7 @@ impl Graph {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
+        report.members_ms = now_ms().saturating_sub(members_started);
         report
     }
 
@@ -5515,6 +8368,43 @@ impl Graph {
         self.frontier_expand.get()
     }
 
+    /// Push an `all(x IN <var-length rels> WHERE p)` predicate into the
+    /// expansion instead of filtering the finished paths. Off restores the
+    /// enumerate-then-filter behaviour, which is what makes the two arms
+    /// comparable: the predicate is still applied either way, so the arms
+    /// must agree on every row and differ only in work.
+    pub fn set_rel_predicate_pushdown(&self, on: bool) {
+        self.rel_predicate_pushdown.set(on);
+    }
+
+    /// Whether per-relationship predicates are pushed into the expansion.
+    pub fn rel_predicate_pushdown_enabled(&self) -> bool {
+        self.rel_predicate_pushdown.get()
+    }
+
+    /// Follow only the highest-ranked `truncationLimit` edges out of each node
+    /// on a variable-length hop, ordered by a relationship property.
+    ///
+    /// This CHANGES ANSWERS by design, which is why it is off unless asked
+    /// for. LDBC FinBench defines it — "maximum edges traversed at each step",
+    /// introduced because a hub vertex's degree "may reach million and even
+    /// billion scales" — and every official implementation applies it through
+    /// a vendor extension of its own. Ours is driven by the benchmark's own
+    /// parameters rather than a new syntax, so a FinBench query needs no
+    /// rewriting: `truncationLimit`, `truncationOrder`, and
+    /// `truncationProperty` (default `timestamp`).
+    ///
+    /// A stray parameter must never silently change a result, so the
+    /// parameters alone do nothing: the server has to be told as well.
+    pub fn set_expand_truncation(&self, on: bool) {
+        self.expand_truncation.set(on);
+    }
+
+    /// Whether variable-length expansion honours `truncationLimit`.
+    pub fn expand_truncation_enabled(&self) -> bool {
+        self.expand_truncation.get()
+    }
+
     /// Toggle bounded-memory batching of the two-stage top-k tail. Default on;
     /// off forces the whole-chunk expand (the A/B byte-identity lever).
     pub fn set_multistage_topk_batch(&self, on: bool) {
@@ -5548,6 +8438,19 @@ impl Graph {
     /// Whether the count-over-chain fold is on.
     pub fn chain_count_fold_enabled(&self) -> bool {
         self.chain_count_fold.get()
+    }
+
+    /// Toggle streaming a read-only statement's prefix when the pipeline
+    /// refuses the statement as a whole (a procedure `CALL` in the middle).
+    /// Default on; off runs every clause on the materialising loop, for the
+    /// differential test.
+    pub fn set_prefix_streaming(&self, on: bool) {
+        self.prefix_streaming.set(on);
+    }
+
+    /// Whether a refused statement's prefix streams.
+    pub fn prefix_streaming_enabled(&self) -> bool {
+        self.prefix_streaming.get()
     }
 
     /// Fix 76: whether a subquery body's seed row carries each bound node
@@ -5772,6 +8675,120 @@ impl Graph {
         self.single_flight_repair.set(on);
     }
 
+    /// Whether the maintenance pass SHARES its row budget across every stale
+    /// table and bounds each repair to its slice, or races for the pool
+    /// first-come-first-served and takes one unbounded item as it did before.
+    ///
+    /// The pass has always been row-budgeted, and has always had one escape
+    /// hatch: a table whose repair alone exceeds the WHOLE budget is taken
+    /// anyway, because deferring it would defer it for ever and its delta
+    /// would only grow. That hatch bounds the COUNT of oversized items at one
+    /// per pass and says nothing about their cost, and the cost is what a
+    /// client feels: 109 refreshes totalling 82,748 ms in a 400 s sweep, the
+    /// longest 9,935 ms, with the write level's throughput at exactly 0 for
+    /// the second the pass ran in. A background maintenance thread became
+    /// indistinguishable from the stall it exists to prevent.
+    ///
+    /// There are two halves, and the second is the one the numbers demanded.
+    ///
+    /// **The step is bounded.** A repair runs only as far as its slice
+    /// reaches; the table is published at the last stamp it holds IN FULL and
+    /// stays stale for the rest, which the next pass takes. That is sound for
+    /// the same reason a fenced publish is — a snapshot carries the stamp it
+    /// is current to — and the escape hatch's guarantee survives, because
+    /// `adj_repair_change_set` always admits the first stamp, so every pass
+    /// makes progress.
+    ///
+    /// **The budget is shared, not raced for.** First-come-first-served over
+    /// a stable iteration order starves every table the pass does not reach:
+    /// the same table is taken and the same tables are deferred, every pass,
+    /// so their deltas only grow until one is finally taken whole. That is
+    /// where a change set 32 passes long comes from on a mix whose pass fires
+    /// every 8,192 commits, and it is what `adjacency repaired=1 adjacency
+    /// deferred=2` on all 109 refreshes was saying. Slices are MAX-MIN fair —
+    /// each table takes the smaller of its own cost and an even share of what
+    /// is left, cheapest first — so a lopsided stale set gives its backlogged
+    /// table the remainder rather than one nth of the pool.
+    ///
+    /// A table the repair-vs-rebuild gate would REBUILD is not sliced at all:
+    /// it falls through to the rebuild budget as before, because slicing it
+    /// would pay in instalments the very cost that gate declined.
+    ///
+    /// Off is the arm that reproduces the stall, and it is what the
+    /// differential compares against: both arms must reach the same answers,
+    /// because a partial repair publishes a table that is honestly current at
+    /// an earlier stamp rather than one that is wrong at a later one.
+    pub fn set_bounded_derived_repair(&self, on: bool) {
+        self.bounded_derived_repair.set(on);
+    }
+
+    /// Whether a membership catch-up the label's log covers runs regardless
+    /// of the pass's row budget (fix 82). Default ON.
+    ///
+    /// The budget meters ROWS RE-READ, and a catch-up re-reads none: it is
+    /// `MembersView::apply_batched` over the log's `(id, joined)` entries —
+    /// O(k log k) in memory, with k bounded by `LABEL_LOG_CAP` — plus one
+    /// O(label) fold past `MEMBERS_FOLD_AT`. Pricing it at one row per entry,
+    /// against the same pool a ~20 µs paged row read draws on, deferred it
+    /// whenever k exceeded the membership half; nothing then drained the log,
+    /// the log aged past its cap, `covers` went false, and the pass took its
+    /// one unbounded REBUILD — a walk of the whole label. That is the 5–7 s
+    /// tail the v186 budget curve measured at every budget below 250k rows
+    /// (`members rebuilt=1` on each of them; `members caught up=3` and no
+    /// rebuild at 250k), and it did not move with the budget because a
+    /// rebuild costs the label's size, not the pass's. A deferral was meant
+    /// to be a delay; priced this way it was a promotion.
+    ///
+    /// Off is that arm: a catch-up over the membership half is deferred, and
+    /// `a_deferred_catch_up_becomes_a_rebuild` shows the deferral turning
+    /// into the rebuild while the on arm catches up every pass.
+    pub fn set_members_unmetered_catch_up(&self, on: bool) {
+        self.members_unmetered_catch_up.set(on);
+    }
+
+    /// Whether a READER's repair leaves the overlay fold to the maintenance
+    /// pass (fix 83). Default ON.
+    ///
+    /// A repair past `adj_overlay_fold` rows folds the overlay into a fresh
+    /// base: `AdjTable::folded` is one pass over EVERY row of the table, and
+    /// for the SF1 tables that is 50–100 MB of new base per fold. The pass
+    /// pays that on its own thread. A reader paid it on a QUERY thread, once
+    /// per stale table per multi-node statement, because under a 5k-writes/s
+    /// stream every table crosses the 4,096-row threshold about once a
+    /// second and every multi-node read that arrives repairs it: the v187
+    /// sweep's server log carries `[bolt] statement grew rss by 130–240 MB`
+    /// on 877 read statements, and its `write-heavy @ 8` level stops for
+    /// ~2 s every ~6 s while `write-only @ 8` — the same writes with no
+    /// readers, so no reader folds — never dips (floor 0.94 against 0.08).
+    ///
+    /// On, a reader's repair publishes the overlay as it is and the pass —
+    /// which repairs the same table within about a second — folds it then.
+    /// The cost is the per-hop `BTreeMap` descent an overlaid table pays
+    /// until that pass (`set_adj_overlay_fold` explains it). The deferral is
+    /// BOUNDED: past `ADJ_DEFERRED_FOLD_CEILING` × the fold threshold the
+    /// reader folds after all, so a graph with no pass, a pass that keeps
+    /// losing its publish to reader repairs, and a table that goes quiet
+    /// after a burst all carry at most the ceiling plus one repair's change
+    /// set (`a_reader_repair_leaves_the_fold_to_the_pass` pins it), and the
+    /// maintenance pass folds a CURRENT table whose overlay is past the
+    /// threshold in place, so a quiet table does not pay the descent for the
+    /// life of the process.
+    ///
+    /// Off is the old shape, kept as the A/B arm: readers fold. Both arms
+    /// answer identically — a fold changes a table's layout and nothing it
+    /// says.
+    pub fn set_deferred_reader_fold(&self, on: bool) {
+        self.deferred_reader_fold.set(on);
+    }
+
+    /// Whether a repair is PRICED from the change logs' lengths (fix 79)
+    /// instead of by walking the whole delta and building a `BTreeSet` of
+    /// every changed node under the writers' lock. Default ON; the arm is
+    /// `--no-cheap-repair-pricing`.
+    pub fn set_cheap_repair_pricing(&self, on: bool) {
+        self.cheap_repair_pricing.set(on);
+    }
+
     /// Whether a SINGLE-NODE reader may be served from a stale adjacency table
     /// when the change set since that table was built does not touch its node.
     ///
@@ -5814,6 +8831,36 @@ impl Graph {
     /// rows with a counter half showing the filter actually cleared reads.
     pub fn set_adj_change_filter(&self, on: bool) {
         self.adj_change_filter_on.set(on);
+    }
+
+    /// The overlay size past which a range-index catch-up folds.
+    ///
+    /// A READER is the only thing that folds a range index — `with_changes`
+    /// has one caller, `range_index_caught_up`, and no maintenance pass folds
+    /// one — so this is the only knob on how often a query thread pays the
+    /// O(base) `folded()` pass. At SF10 that pass is 3.7 s inside the SNB
+    /// `is7-replies` shape, whose p95 is 1.25 ms.
+    ///
+    /// RAISING IT DOES NOT MAKE A FOLD DEARER. `folded()` is O(base)
+    /// regardless of how much overlay it collapses, so a threshold `k` times
+    /// larger yields `k` times fewer folds at the same cost each. What it buys
+    /// is paid back on every ordinary read, which merges the base against a
+    /// larger overlay — so the right value is a measurement on the corpus and
+    /// not a constant this comment can name.
+    ///
+    /// 0 restores the built-in default.
+    pub fn set_range_fold_at(&self, n: usize) {
+        self.range_fold_at.set(if n == 0 {
+            engram_store::RangeIndex::FOLD_AT
+        } else {
+            n
+        });
+    }
+
+    /// The fold threshold in force, for the test that pins the lever.
+    #[doc(hidden)]
+    pub fn range_fold_at(&self) -> usize {
+        self.range_fold_at.get()
     }
 
     /// Overlay rows a repaired adjacency table may carry before folding.
@@ -5945,7 +8992,6 @@ impl Graph {
         self.const_projection_fold.get()
     }
 
-
     /// Restore the pre-fix cardinality estimation: every `count_hop` with a
     /// labelled end WALKS the smaller label — 2M nodes for `(:Comment)` at SF1,
     /// through the degree table or the adjacency table — on every call.
@@ -6051,14 +9097,22 @@ impl Graph {
             (None, None) => unreachable!("handled above"),
         };
         let (iter, walk_dir, far) = if iterate_start {
-            (start_members.as_ref().expect("labelled"), dir, end_members.as_ref())
+            (
+                start_members.as_ref().expect("labelled"),
+                dir,
+                end_members.as_ref(),
+            )
         } else {
             let flipped = match dir {
                 Dir::Out => Dir::In,
                 Dir::In => Dir::Out,
                 Dir::Both => Dir::Both,
             };
-            (end_members.as_ref().expect("labelled"), flipped, start_members.as_ref())
+            (
+                end_members.as_ref().expect("labelled"),
+                flipped,
+                start_members.as_ref(),
+            )
         };
         let n = iter.len();
         let budget = self.estimate_sample_budget.get().max(1);
@@ -6320,6 +9374,81 @@ impl Graph {
         self.parallel_expand.get()
     }
 
+    /// Enable morsel-parallel graph algorithms (default OFF — see the field
+    /// docs). The A/B arm for `pagerank_is_bit_identical_at_every_scoped_exec_width`,
+    /// which is the only reason to believe the parallel lane and the serial
+    /// one give the same answer.
+    pub fn set_algo_parallel(&self, enabled: bool) {
+        self.algo_parallel.set(enabled);
+    }
+
+    /// Whether morsel-parallel graph algorithms are on.
+    pub(crate) fn algo_parallel_enabled(&self) -> bool {
+        self.algo_parallel.get()
+    }
+
+    /// Set the vertex count below which a fixpoint stays serial. See the field
+    /// docs for the measurements behind the default.
+    pub fn set_algo_min_vertices(&self, n: usize) {
+        self.algo_min_vertices.set(n);
+    }
+
+    /// The vertex floor for splitting a fixpoint.
+    pub(crate) fn algo_min_vertices(&self) -> usize {
+        self.algo_min_vertices.get()
+    }
+
+    /// Raise or lower the node ceiling an algorithm projection is priced
+    /// against. The lever `ENGRAM_ALGO_NODE_CEILING` names.
+    pub fn set_algo_node_ceiling(&self, n: u64) {
+        self.algo_node_ceiling.set(n);
+    }
+
+    /// Raise or lower the edge ceiling. `ENGRAM_ALGO_EDGE_CEILING`.
+    pub fn set_algo_edge_ceiling(&self, n: u64) {
+        self.algo_edge_ceiling.set(n);
+    }
+
+    /// Raise or lower the working-set byte ceiling. `ENGRAM_ALGO_BYTE_CEILING`.
+    pub fn set_algo_byte_ceiling(&self, n: u64) {
+        self.algo_byte_ceiling.set(n);
+    }
+
+    /// Raise or lower the all-pairs work ceiling. `ENGRAM_ALGO_WORK_CEILING`.
+    pub fn set_algo_work_ceiling(&self, n: u64) {
+        self.algo_work_ceiling.set(n);
+    }
+
+    /// Raise or lower the result cache's byte budget. `ENGRAM_ALGO_CACHE_BYTES`.
+    pub fn set_algo_cache_bytes(&self, n: usize) {
+        self.algo_cache_bytes.set(n);
+    }
+
+    /// The node ceiling in force.
+    pub(crate) fn algo_node_ceiling(&self) -> u64 {
+        self.algo_node_ceiling.get()
+    }
+
+    /// The edge ceiling in force.
+    pub(crate) fn algo_edge_ceiling(&self) -> u64 {
+        self.algo_edge_ceiling.get()
+    }
+
+    /// The byte ceiling in force.
+    pub(crate) fn algo_byte_ceiling(&self) -> u64 {
+        self.algo_byte_ceiling.get()
+    }
+
+    /// The all-pairs work ceiling in force.
+    pub(crate) fn algo_work_ceiling(&self) -> u64 {
+        self.algo_work_ceiling.get()
+    }
+
+    /// The result cache's byte budget in force.
+    pub(crate) fn algo_cache_bytes(&self) -> usize {
+        self.algo_cache_bytes.get()
+    }
+
     /// Force-build and cache the adjacency table(s) for `dir` × `type_tokens` at
     /// the current epoch, so a subsequent morsel-parallel scan reads them
     /// lock-free (arc-swap) rather than each worker redundantly rebuilding on a
@@ -6446,6 +9575,44 @@ impl Graph {
     }
 
     // ── The catalog ─────────────────────────────────────────────────────
+
+    /// How many labels the in-memory token cache holds. Test hook: the point
+    /// of `label_names_in_store` is that this number is NOT the label count.
+    pub fn labels_cached_for_test(&self) -> usize {
+        self.labels.load().len()
+    }
+
+    /// Every label name the STORE knows, read from the token catalogue.
+    ///
+    /// `self.labels` is a lazily-filled cache: [`Graph::token`] inserts a name
+    /// the first time something asks for it, and nothing bulk-loads it at open.
+    /// So on a freshly opened store it holds only the handful of labels the
+    /// boot path happened to touch — three, on SF10, against ten in the store.
+    ///
+    /// Anything that must act on ALL labels therefore has to read the
+    /// catalogue, exactly as `scan_range_indexes` reads `idx:`. Boot warming
+    /// did not, and silently warmed a third of the label memberships while
+    /// reporting success.
+    pub(crate) fn label_names_in_store(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (body, _) in self.store.scan_body_prefix(&self.kv, b"lbl:") {
+            let Some(pos) = body.windows(4).position(|w| w == b"lbl:") else {
+                continue;
+            };
+            if let Ok(name) = std::str::from_utf8(&body[pos + 4..]) {
+                if !name.is_empty() {
+                    out.push(name.to_string());
+                }
+            }
+        }
+        // Deterministic, for the same reason the index catalogue is sorted: a
+        // warm pass whose order varied between runs would build the same
+        // structures in a different sequence and the determinism gate compares
+        // the trace.
+        out.sort();
+        out.dedup();
+        out
+    }
 
     fn token(
         &self,
@@ -6679,7 +9846,10 @@ impl Graph {
                         continue;
                     }
                     let has_vec = matches!(props.get(&vi.prop), Some(Value::List(_)));
-                    t.vectors.entry(vi.name.clone()).or_default().push((id, has_vec));
+                    t.vectors
+                        .entry(vi.name.clone())
+                        .or_default()
+                        .push((id, has_vec));
                 }
             });
             return;
@@ -6725,7 +9895,10 @@ impl Graph {
                 .get(&token)
                 .map_or(0, |c| c.load(std::sync::atomic::Ordering::Acquire));
         }
-        self.label_log.borrow().get(&token).map_or(0, ChangeLog::epoch)
+        self.label_log
+            .borrow()
+            .get(&token)
+            .map_or(0, ChangeLog::epoch)
     }
 
     /// Raise a label's epoch to `now`.
@@ -6753,7 +9926,10 @@ impl Graph {
     /// The epoch of a property's values. `0` until an index exists for it —
     /// nothing derives from an unindexed property, so nothing is logged.
     fn prop_epoch(&self, token: u32) -> u64 {
-        self.prop_log.borrow().get(&token).map_or(0, ChangeLog::epoch)
+        self.prop_log
+            .borrow()
+            .get(&token)
+            .map_or(0, ChangeLog::epoch)
     }
 
     /// The epoch of the adjacency a table over `type_tokens` derives from: the
@@ -6858,6 +10034,13 @@ impl Graph {
                 None => false,
             }
         };
+        // Fix 93 (O4): AFTER the borrow above is dropped — this takes the
+        // column-cache mutex, and holding the log borrow across it would put
+        // two locks in an order nothing else uses. The `None` arm of the
+        // match is exactly the case that motivates this call: a property with
+        // no log records nothing, so without it the re-stamp could revive
+        // this column.
+        self.note_direct_prop_write(token);
         if poisoned {
             self.retract_range_index(token);
         }
@@ -6889,6 +10072,10 @@ impl Graph {
         if touched.is_empty() {
             return;
         }
+        // Fix 93 (O4): FIRST, while `touched` is still whole — the loops
+        // below consume it. The column cache is independent of the logs this
+        // function goes on to replay, so the order between them is free.
+        self.restamp_prop_columns(&touched, ts);
         // The count store first: the committed rows are visible, so the
         // counts must move with them. A store still awaiting its rebuild
         // ignores the delta (the rebuild sees the rows).
@@ -6991,7 +10178,7 @@ impl Graph {
     /// The index key a property VALUE presents, or `None` when this index
     /// cannot order it. One conversion point, so a value that is indexable on
     /// the write path is indexable on the build path and vice versa.
-    fn index_key_of(v: &Value) -> Option<engram_store::IndexKey> {
+    pub(crate) fn index_key_of(v: &Value) -> Option<engram_store::IndexKey> {
         encode_prop(v)
             .ok()
             .and_then(|tagged| engram_store::IndexKey::from_tagged(&tagged))
@@ -7095,11 +10282,7 @@ impl Graph {
     /// (`0`, ignored, while a transaction is installed). Called inside the
     /// caller's write fence.
     fn note_membership_of(&self, id: u64, tokens: &[u32], added: bool, touch_all: bool, ts: u64) {
-        let all = if touch_all {
-            Some(u32::MAX)
-        } else {
-            None
-        };
+        let all = if touch_all { Some(u32::MAX) } else { None };
         if self.in_txn() {
             self.txn_touch(|t| {
                 for token in tokens.iter().copied().chain(all) {
@@ -7144,7 +10327,10 @@ impl Graph {
             self.txn_touch(|t| {
                 for vi in list.iter() {
                     if labels.iter().any(|l| l == &vi.label) {
-                        t.vectors.entry(vi.name.clone()).or_default().push((id, false));
+                        t.vectors
+                            .entry(vi.name.clone())
+                            .or_default()
+                            .push((id, false));
                     }
                 }
             });
@@ -7176,7 +10362,7 @@ impl Graph {
         match decode_prop_opt(tagged) {
             Some(Value::List(items)) => {
                 let mut v = Vec::with_capacity(items.len());
-                for it in &items {
+                for it in items.iter() {
                     match it {
                         Value::Float(f) => v.push(*f),
                         Value::Int(n) => v.push(*n as f64),
@@ -7331,6 +10517,7 @@ impl Graph {
         self.stats_change(StatsChange {
             rels: 1,
             by_type: vec![(t, 1)],
+            self_loops_by_type: if src == dst { vec![(t, 1)] } else { Vec::new() },
             ..Default::default()
         });
         self.note_adjacency_changed(t, src, dst, stamp_o.max(stamp_i));
@@ -7615,7 +10802,9 @@ impl Graph {
         // commit order (see `guard_row`), and nothing strands: the guard is
         // gone once the node is.
         self.store_delete_w(&self.index, &guard_row(id));
-        let stamp = self.store_delete_w(&self.nodes, &id.to_be_bytes()).max(stamp);
+        let stamp = self
+            .store_delete_w(&self.nodes, &id.to_be_bytes())
+            .max(stamp);
         // EVERY entry is stamped with the commit ts of the last write it
         // describes, recorded AFTER that write.
         //
@@ -7658,14 +10847,27 @@ impl Graph {
         // Both endpoints' guards move — see `guard_row`. A PUT, not a
         // delete: the nodes still exist and later writers must keep
         // conflicting through the same key.
-        self.store_put_volatile(&self.index, &guard_row(r.src), StoredValue::Plain(Vec::new()))
-            .map_err(GraphError::Store)?;
-        self.store_put_volatile(&self.index, &guard_row(r.dst), StoredValue::Plain(Vec::new()))
-            .map_err(GraphError::Store)?;
+        self.store_put_volatile(
+            &self.index,
+            &guard_row(r.src),
+            StoredValue::Plain(Vec::new()),
+        )
+        .map_err(GraphError::Store)?;
+        self.store_put_volatile(
+            &self.index,
+            &guard_row(r.dst),
+            StoredValue::Plain(Vec::new()),
+        )
+        .map_err(GraphError::Store)?;
         self.store_delete_w(&self.rels, &id.to_be_bytes());
         self.stats_change(StatsChange {
             rels: -1,
             by_type: vec![(t, -1)],
+            self_loops_by_type: if r.src == r.dst {
+                vec![(t, -1)]
+            } else {
+                Vec::new()
+            },
             ..Default::default()
         });
         self.note_adjacency_changed(t, r.src, r.dst, stamp_o.max(stamp_i));
@@ -7686,22 +10888,57 @@ impl Graph {
 
     /// Materialise a node as a value, or None.
     pub fn node(&self, id: u64) -> Result<Option<Value>, GraphError> {
-        let Some(bytes) = self.store_get_peek(&self.nodes, &id.to_be_bytes()) else {
-            return Ok(None);
-        };
-        self.node_from_bytes(id, &bytes)
+        // Fix 102: decoded off the store's BORROWED bytes — `store_get_peek`
+        // copied the whole record out first, one more memory pass over
+        // every fat listing row (a 40 KB value's copy is a fifth of its
+        // 23 µs full decode on the record-decode bench; the repository
+        // listing's 182 multi-kilobyte records paid it on every execution).
+        self.store_get_with_peek(&self.nodes, &id.to_be_bytes(), |b| {
+            self.node_from_bytes(id, b)
+        })
+        .unwrap_or(Ok(None))
     }
 
     /// The decode half of [`Graph::node`], shared with the unrecorded variant
     /// so the two cannot produce different values — only different read sets.
     fn node_from_bytes(&self, id: u64, bytes: &[u8]) -> Result<Option<Value>, GraphError> {
         counted!("graph.nodes materialised in full");
-        let rec = Record::decode(bytes).map_err(|e| GraphError::Corrupt(format!("{e:?}")))?;
+        // Fix 98: ONE walk over the record's bytes — `Record::decode` copied
+        // every value into a map of its own before this could turn each into
+        // a `Value` and build the name map (two maps and ~96 allocations for
+        // a 32-property record: 12.7 µs of a full decode on the record-decode
+        // bench, the largest share of every fat listing's row). The token
+        // table is loaded once per record, and the name map is built in
+        // bulk from the decoded entries. The values, labels and every
+        // structural check are `decode`'s: a truncated or unskippable
+        // record and trailing bytes are `Corrupt`, a duplicate id too.
+        let corrupt = |e: engram_store::RecordError| GraphError::Corrupt(format!("{e:?}"));
+        let mut walk = RecordWalk::new(bytes).map_err(corrupt)?;
         let mut labels = Vec::new();
-        for t in decode_label_set(rec.get(P_LABELS))? {
-            labels.push(self.token_name("lbl:", t)?);
+        let rev = self.rev_names.load();
+        let mut entries: Vec<(String, Value)> = Vec::with_capacity(walk.remaining());
+        for item in &mut walk {
+            let (pid, tagged) = item.map_err(corrupt)?;
+            if pid == P_LABELS {
+                for t in decode_label_set(Some(tagged))? {
+                    labels.push(self.token_name("lbl:", t)?);
+                }
+                continue;
+            }
+            let name = match rev.get(&("prop:", pid.0)) {
+                Some(n) => n.clone(),
+                None => self.token_name("prop:", pid.0)?,
+            };
+            let v = decode_prop_opt(tagged)
+                .ok_or_else(|| GraphError::Corrupt(format!("undecodable property {name}")))?;
+            entries.push((name, v));
         }
-        let props = self.decode_props(&rec, &[P_LABELS])?;
+        walk.finish().map_err(corrupt)?;
+        let n = entries.len();
+        let props: BTreeMap<String, Value> = entries.into_iter().collect();
+        if props.len() != n {
+            return Err(GraphError::Corrupt("duplicate property".into()));
+        }
         Ok(Some(Value::Node { id, labels, props }))
     }
 
@@ -7837,6 +11074,60 @@ impl Graph {
             }
         };
         counted!("graph.rel-driven seeds");
+        // A TYPED scan does not have to read the whole relationship
+        // partition. The span walk below is O(ALL relationships) whatever the
+        // type's selectivity, because the type filter is a per-record test
+        // and the records sit in id order — so a type loaded late in a corpus
+        // cannot be reached without reading most of what precedes it. At SF3
+        // that is ~50M records and 22 s to yield 696 `CHURN` edges, and the
+        // cost is identical under a `LIMIT 5`: the producer's stop
+        // (`plain_cap` -> `RunError::Saturated`, returned as `false` below)
+        // fires correctly, but only once the scan REACHES the first record of
+        // the type.
+        //
+        // The out-table is already the index this wants. Every relationship
+        // has exactly one source, so each edge of the type appears exactly
+        // once across the `b'O'` rows — self-loops included — and `SlimAdj`
+        // carries the relationship id, so the walk costs O(edges OF THE TYPE)
+        // plus one record read each.
+        //
+        // The same two guards the hop-count walk uses, for the same reasons:
+        // a transaction with buffered adjacency rows falls through to the
+        // span scan, which overlays; and `adj_table` resolves the epoch, so a
+        // table that cannot be shown current declines rather than answering
+        // short. Admission keeps a reader off a full-span rebuild, so a COLD
+        // type declines here instead of building a whole store table on a
+        // query thread.
+        //
+        // `rel` resolves each id through the ordinary read path, so a
+        // relationship deleted since the table was built reads `None` and is
+        // skipped rather than becoming a phantom row.
+        //
+        // WHAT THIS COSTS, so the next reader does not have to find it:
+        // `sources()` materialises one `u64` per node with a row, which the
+        // span scan never allocated. It is bounded by the nodes that HAVE an
+        // edge of the type — small for the selective types this exists for,
+        // but on a type most of the graph carries it is tens of MB, against a
+        // scan of every relationship record. Worth revisiting with a
+        // row-at-a-time cursor if a caller ever wants this on a dense type.
+        if let Some(toks) = filter.as_ref() {
+            if !self.in_txn_with_writes() {
+                let type_tokens = Some(toks.clone());
+                let epoch = self.adjacency_epoch(&type_tokens);
+                if let Some(table) = self.adj_table_existing(b'O', &type_tokens, epoch) {
+                    counted!("graph.rel-driven seed walked the adjacency table");
+                    for src in table.sources() {
+                        for e in table.slice(src) {
+                            if let Some(rel) = self.rel(e.rel)? {
+                                f(rel)?;
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        counted!("graph.rel-driven seed scanned the whole partition");
         // The active transaction's buffered relationship rows overlay the
         // committed scan: a replaced record is visited with its buffered
         // bytes, a buffered delete is skipped, and buffered CREATIONS are
@@ -7849,39 +11140,34 @@ impl Graph {
         // The visitor scan: no wholesale clone of 5M relationship records.
         let mut gerr: Option<GraphError> = None;
         self.store
-            .for_each_span(
-                &self.rels,
-                &[],
-                u64::MAX,
-                &mut |body, bytes| {
-                    let over = pending.as_ref().and_then(|p| p.get(body));
-                    let bytes: &[u8] = match over {
-                        Some(None) => {
-                            seen.insert(body.to_vec());
-                            return true; // buffered delete: not visited
-                        }
-                        Some(Some(b)) => {
-                            seen.insert(body.to_vec());
-                            b
-                        }
-                        None => bytes,
-                    };
-                    match Self::rel_from_record(self, body, bytes, filter.as_deref()) {
-                        Ok(Some(rel)) => match f(rel) {
-                            Ok(()) => true,
-                            Err(e) => {
-                                gerr = Some(e);
-                                false
-                            }
-                        },
-                        Ok(None) => true,
+            .for_each_span(&self.rels, &[], u64::MAX, &mut |body, bytes| {
+                let over = pending.as_ref().and_then(|p| p.get(body));
+                let bytes: &[u8] = match over {
+                    Some(None) => {
+                        seen.insert(body.to_vec());
+                        return true; // buffered delete: not visited
+                    }
+                    Some(Some(b)) => {
+                        seen.insert(body.to_vec());
+                        b
+                    }
+                    None => bytes,
+                };
+                match Self::rel_from_record(self, body, bytes, filter.as_deref()) {
+                    Ok(Some(rel)) => match f(rel) {
+                        Ok(()) => true,
                         Err(e) => {
                             gerr = Some(e);
                             false
                         }
+                    },
+                    Ok(None) => true,
+                    Err(e) => {
+                        gerr = Some(e);
+                        false
                     }
-                },
-            );
+                }
+            });
         if let Some(e) = gerr {
             return Err(e);
         }
@@ -8006,6 +11292,109 @@ impl Graph {
         Ok(Some(ids))
     }
 
+    /// Fix 103: materialise a relationship with ONLY the named properties —
+    /// [`Graph::node_projected`]'s rule for a relationship: the endpoints and
+    /// the type always come along (identity needs them), the record is
+    /// walked for the wanted tokens and never named property by property,
+    /// and a transaction's own buffered version wins with the read
+    /// recorded. The matcher binds a relationship variable read by property
+    /// (`coalesce(mm.role, 'owner')`) from the adjacency entry plus this
+    /// read, where `rels_of` walked the start's adjacency prefix and
+    /// decoded every relationship record in full — 77 prefix scans and 77
+    /// full decodes for the dashboard's 77 projects.
+    pub fn rel_projected(
+        &self,
+        id: u64,
+        props: &std::collections::BTreeSet<String>,
+    ) -> Result<Option<RelRow>, GraphError> {
+        let mut want: Vec<u32> = props
+            .iter()
+            .filter_map(|p| self.token_peek("prop:", &self.props, p))
+            .collect();
+        want.extend([P_SRC.0, P_DST.0, P_TYPE.0]);
+        let body = id.to_be_bytes();
+        let buffered = ACTIVE_TXN.with(|t| {
+            let mut t = t.borrow_mut();
+            let txn = t.as_mut()?;
+            match txn.peek(&self.rels, &body) {
+                Some(hit) => Some(hit),
+                None => {
+                    txn.note_read(&self.rels, &body);
+                    None
+                }
+            }
+        });
+        let got = match buffered {
+            Some(None) => return Ok(None),
+            Some(Some(bytes)) => engram_store::Projected::Record(bytes),
+            None => match self.store.get_projected(&self.rels, &body, &want) {
+                Some(got) => got,
+                None => return Ok(None),
+            },
+        };
+        let mut src = None;
+        let mut dst = None;
+        let mut typ = None;
+        let mut out = BTreeMap::new();
+        let mut take = |pid: u32, tagged: &[u8]| -> Result<(), GraphError> {
+            if pid == P_SRC.0 || pid == P_DST.0 || pid == P_TYPE.0 {
+                let v = match decode_prop_opt(tagged) {
+                    Some(Value::Int(v)) if v >= 0 => v as u64,
+                    _ => {
+                        return Err(GraphError::Corrupt(format!(
+                            "relationship {id} lacks an endpoint or type"
+                        )));
+                    }
+                };
+                if pid == P_SRC.0 {
+                    src = Some(v);
+                } else if pid == P_DST.0 {
+                    dst = Some(v);
+                } else {
+                    typ = Some(v as u32);
+                }
+                return Ok(());
+            }
+            let name = self.token_name("prop:", pid)?;
+            if !props.contains(&name) {
+                return Ok(()); // a token the caller did not ask for cannot be here
+            }
+            let v = decode_prop_opt(tagged)
+                .ok_or_else(|| GraphError::Corrupt(format!("undecodable property {name}")))?;
+            out.insert(name, v);
+            Ok(())
+        };
+        match got {
+            engram_store::Projected::Record(bytes) => {
+                let rec = Record::decode_projected(&bytes, &want)
+                    .map_err(|e| GraphError::Corrupt(format!("{e:?}")))?;
+                for (pid, tagged) in rec.iter() {
+                    take(pid.0, tagged)?;
+                }
+            }
+            engram_store::Projected::Columns(cols) => {
+                counted!("graph.projected gets served from columns");
+                for (pid, tagged) in cols {
+                    take(pid, &tagged)?;
+                }
+            }
+        }
+        let (Some(src), Some(dst), Some(t)) = (src, dst, typ) else {
+            return Err(GraphError::Corrupt(format!(
+                "relationship {id} lacks an endpoint or type"
+            )));
+        };
+        let rel_type = self.token_name("typ:", t)?;
+        counted!("graph.rels materialised projected");
+        Ok(Some(RelRow {
+            id,
+            src,
+            dst,
+            rel_type,
+            props: out,
+        }))
+    }
+
     /// Materialise a relationship record.
     pub fn rel(&self, id: u64) -> Result<Option<RelRow>, GraphError> {
         let Some(bytes) = self.store_get_peek(&self.rels, &id.to_be_bytes()) else {
@@ -8077,11 +11466,9 @@ impl Graph {
     pub(crate) fn rels_of_type(&self, rel_type: &str) -> Result<Vec<RelRow>, GraphError> {
         let mut ids: Vec<u64> = Vec::new();
         for (body, _bytes) in self.store.scan_body_prefix(&self.rels, &[]) {
-            ids.push(u64::from_be_bytes(
-                body.as_slice()
-                    .try_into()
-                    .map_err(|_| GraphError::Corrupt("relationship id width".into()))?,
-            ));
+            ids.push(u64::from_be_bytes(body.as_slice().try_into().map_err(
+                |_| GraphError::Corrupt("relationship id width".into()),
+            )?));
         }
         // The active transaction's buffered CREATES are candidates too — a
         // uniqueness constraint must see the relationship an earlier clause
@@ -8144,7 +11531,11 @@ impl Graph {
     /// `overlay`: whether the active transaction's buffered writes are laid
     /// over the committed rows (the query-answering read) or not (the
     /// snapshot-building read).
-    fn nodes_by_label_in(&self, label: Option<&str>, overlay: bool) -> Result<Vec<u64>, GraphError> {
+    fn nodes_by_label_in(
+        &self,
+        label: Option<&str>,
+        overlay: bool,
+    ) -> Result<Vec<u64>, GraphError> {
         match label {
             Some(l) => {
                 // A label never seen has no token and therefore no members —
@@ -8210,6 +11601,30 @@ impl Graph {
         }
     }
 
+    /// Fix 113: one node's fan-out in `dir` over `type_tokens` read from the
+    /// type's adjacency TABLE when one is served — the slice's length — and
+    /// `None` otherwise: no table is built for the question (`admit` is
+    /// false), no prefix is walked, and `Both` (two sides and a self-loop
+    /// rule) is left to the direct count.
+    pub(crate) fn adjacency_fanout_from_table(
+        &self,
+        node: u64,
+        dir: Dir,
+        type_tokens: &Option<Vec<u32>>,
+    ) -> Option<u64> {
+        let tag = match dir {
+            Dir::Out => b'O',
+            Dir::In => b'I',
+            Dir::Both => return None,
+        };
+        if node > DEGREE_TABLE_MAX_ID || self.in_txn_with_writes() {
+            return None;
+        }
+        let epoch = self.adjacency_epoch(type_tokens);
+        self.with_adj_table(tag, type_tokens, epoch, false, Some(node), |tbl| {
+            tbl.map(|t| t.slice(node).len() as u64)
+        })
+    }
     /// A node's adjacency rows in `dir`, filtered by type tokens, read from
     /// KEY BYTES only — no relationship record is fetched. Served from the
     /// per-epoch adjacency table once this epoch has probed past the
@@ -8225,6 +11640,39 @@ impl Graph {
         let mut out = Vec::new();
         self.adjacent_slim_visit(node, dir, type_tokens, false, &mut |e| out.push(*e));
         out
+    }
+
+    /// Fix 84's size hint: how many rows `node` has in `dir` under the types,
+    /// read from the RESIDENT adjacency table(s) — O(1) on a folded table, a
+    /// map descent on an overlaid one — without building anything. `None`
+    /// when a side has no current table: a probe would walk that row anyway,
+    /// so the caller hoists it once rather than walking it per probe. A
+    /// transaction's buffered rows are not counted; it is a hint.
+    pub fn adjacent_slim_len_hint(
+        &self,
+        node: u64,
+        dir: Dir,
+        type_tokens: &Option<Vec<u32>>,
+    ) -> Option<usize> {
+        if matches!(type_tokens, Some(v) if v.is_empty()) {
+            return Some(0);
+        }
+        if node > DEGREE_TABLE_MAX_ID {
+            return None;
+        }
+        let epoch = self.adjacency_epoch(type_tokens);
+        let sides: &[u8] = match dir {
+            Dir::Out => b"O",
+            Dir::In => b"I",
+            Dir::Both => b"OI",
+        };
+        let mut total = 0usize;
+        for &tag in sides {
+            total += self.with_adj_table(tag, type_tokens, epoch, false, Some(node), |t| {
+                t.map(|t| t.slice(node).len())
+            })?;
+        }
+        Some(total)
     }
 
     /// The same adjacency `adjacent_slim` produces, delivered to `f` WITHOUT
@@ -8347,6 +11795,21 @@ impl Graph {
         rev: bool,
         f: &mut F,
     ) {
+        // An UNMINTED type — a named type this graph has never seen —
+        // resolves to `Some([])` (`type_tokens_peek`), and it has NO edges,
+        // by definition. Say so here, on the one path every adjacency read
+        // shares: the table path keys its cache by
+        // `type_tokens.unwrap_or_default()`, under which `Some([])` and
+        // `None` (UNTYPED) COLLIDE, so once the untyped table was resident
+        // (`warm()`, or any admitted `-[]-` hop) an unminted type was served
+        // EVERY type's edges — the walk path filtered them out, the table
+        // path did not, and a fold OPTIONAL leg or a hoisted close over such a
+        // type overcounted. `edges_to_peer_slim` / `edge_count_slim` carried
+        // this guard already; now the reads they fall back to do too.
+        if matches!(type_tokens, Some(v) if v.is_empty()) {
+            counted!("graph.adjacency unminted type yields no edges");
+            return;
+        }
         // The gate counts probes per ADJACENCY epoch of these types. Keyed on
         // the commit clock it reset on every write of any kind, and the first
         // `DEGREE_TABLE_AFTER` hops after each one walked the prefix past a
@@ -8412,35 +11875,57 @@ impl Graph {
             // workers and collapses concurrent complex-join reads). `handled` is
             // false only when the table is skipped or declined by the budget, in
             // which case we fall through to the direct prefix scan below.
-            let handled = if table_ok && !overlaid {
-                self.with_adj_table(tag, type_tokens, epoch, admit, Some(node), |tbl| match tbl {
-                    Some(t) => {
-                        // Zero-copy: iterate the cached CSR slice in place,
-                        // holding the guard's borrow. No per-node Vec, no copy.
-                        let slice = t.slice(node);
-                        if rev {
-                            for e in slice.iter().rev() {
-                                if tag == b'I' && both && e.peer == node {
-                                    continue; // the O side already offered this self-loop
+            let handled =
+                if table_ok && !overlaid {
+                    self.with_adj_table(tag, type_tokens, epoch, admit, Some(node), |tbl| match tbl
+                    {
+                        Some(t) => {
+                            // Zero-copy: iterate the cached CSR slice in place,
+                            // holding the guard's borrow. No per-node Vec, no copy.
+                            let slice = t.slice(node);
+                            if rev {
+                                for e in slice.iter().rev() {
+                                    if tag == b'I' && both && e.peer == node {
+                                        continue; // the O side already offered this self-loop
+                                    }
+                                    f(e);
                                 }
-                                f(e);
-                            }
-                        } else {
-                            for e in slice {
-                                if tag == b'I' && both && e.peer == node {
-                                    continue; // the O side already offered this self-loop
+                            } else {
+                                for e in slice {
+                                    if tag == b'I' && both && e.peer == node {
+                                        continue; // the O side already offered this self-loop
+                                    }
+                                    f(e);
                                 }
-                                f(e);
                             }
+                            true
                         }
-                        true
-                    }
-                    None => false,
-                })
-            } else {
-                false
-            };
+                        None => false,
+                    })
+                } else {
+                    false
+                };
+            if handled {
+                // The denominator: without it a fall-through count is an
+                // absolute with nothing to be a share OF. Batched per thread —
+                // see `note_adj_served`; the trace counter beside it is the
+                // exact per-thread figure the batched one must add up to.
+                counted!("graph.adjacency visit served by a table");
+                note_adj_served();
+            }
             if !handled {
+                // COUNTED, split by reason. This branch is the whole SF10
+                // write-path defect: the walk it enters spans the corpus, so at
+                // SF10 it is the 2.5-125 s blocking event. Which reason fires
+                // decides whether the fix is the overlay or the epoch.
+                ADJ_FELL_TO_WALK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if !table_ok {
+                    ADJ_WALK_ID_CEILING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else if overlaid {
+                    ADJ_WALK_OVERLAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    ADJ_WALK_NO_CURRENT_TABLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 {
                     // The prefix walk is forward-only, so `rev` buffers this
                     // side's rows and replays them reversed. This is the cold,
@@ -8494,11 +11979,11 @@ impl Graph {
         // body into an owned `Vec<Vec<u8>>` first (~125MB over 2.24M rows on the port
         // benchmark) — one body is held at a time, and the type filter keeps only the
         // matching entries. `body` is exactly what `scan_bodies_prefix` returned.
-        let mut over_budget = false;
         // `sorted_by_peer` is ESTABLISHED here, one comparison per entry against
         // the previous entry of the same node — see the field's doc for why it
         // is checked rather than read off the key layout.
         let mut sorted = true;
+        let mut over_budget = false;
         self.walk_adjacency_span(tag, &mut |body| {
             if body.len() != 1 + 8 + 4 + 8 + 8 {
                 return true;
@@ -8568,9 +12053,9 @@ impl Graph {
         // same claim a lazily built one does. The directory is built SPARSE
         // as the rows arrive: a dense offsets vector per bucket was ~6.5 GB
         // of transient for the ported corpus's 318 buckets.
-        type Bucket = (RowIndexBuilder, Vec<SlimAdj>, bool);
+        /// builder, entries, sorted-by-peer, and OVER ITS OWN BUDGET.
+        type Bucket = (RowIndexBuilder, Vec<SlimAdj>, bool, bool);
         let mut buckets: BTreeMap<Option<u32>, Bucket> = BTreeMap::new();
-        let mut over_budget = false;
         self.walk_adjacency_span(tag, &mut |body| {
             if body.len() != 1 + 8 + 4 + 8 + 8 {
                 return true;
@@ -8590,17 +12075,38 @@ impl Graph {
             // each bucket exactly as a single-type build would, so each
             // bucket ends up byte-identical to its `build_adj_table`.
             for key in [Some(t), None] {
-                let (index, entries, sorted) = buckets
+                let (index, entries, sorted, poisoned) = buckets
                     .entry(key)
-                    .or_insert_with(|| (RowIndexBuilder::new(), Vec::new(), true));
+                    .or_insert_with(|| (RowIndexBuilder::new(), Vec::new(), true, false));
+                if *poisoned {
+                    continue;
+                }
                 if entries.len() >= max {
-                    // ANY bucket over budget declines the whole pass.
-                    // Skipping just that bucket would publish a TRUNCATED
-                    // table for that type — a table that answers, and
-                    // answers short. Declining costs a lazy rebuild later,
-                    // which is the behaviour without warming at all.
-                    over_budget = true;
-                    return false;
+                    // THIS BUCKET IS ABANDONED — the pass is not.
+                    //
+                    // The rule was "any bucket over budget declines the whole
+                    // pass", because publishing a truncated table would answer
+                    // SHORT. That reasoning is right and is kept: a poisoned
+                    // bucket is DROPPED below, never published.
+                    //
+                    // What it got wrong is the blast radius. The `None` bucket
+                    // holds EVERY type's edges, so it overflows first on any
+                    // large corpus — and took every TYPED table down with it,
+                    // including the ones that fit comfortably. At SF10 that
+                    // meant boot warming built NOTHING: the server printed
+                    // "warmed in ..." and then every query paid its own lazy
+                    // first build (q4 269.8 s cold against 7.8 s warm; a first
+                    // index seek 249.7 s). Users pay that on every restart.
+                    //
+                    // A bucket that never overflowed saw every row of its type,
+                    // so it is COMPLETE and safe to publish. Only the
+                    // overflowing one is discarded.
+                    *poisoned = true;
+                    counters::WARM_BUCKET_OVER_BUDGET
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    entries.clear();
+                    entries.shrink_to_fit();
+                    continue;
                 }
                 let row_start = index.note(node, entries.len());
                 if entries.len() > row_start && entries[entries.len() - 1].peer > e.peer {
@@ -8608,9 +12114,10 @@ impl Graph {
                 }
                 entries.push(e);
             }
-            !over_budget
+            true
         });
-        if over_budget {
+        buckets.retain(|_, (_, _, _, poisoned)| !*poisoned);
+        if buckets.is_empty() {
             sometimes!("graph.adjacency table declined by the entry budget", true);
             return None;
         }
@@ -8618,7 +12125,7 @@ impl Graph {
         Some(
             buckets
                 .into_iter()
-                .map(|(key, (index, entries, sorted))| {
+                .map(|(key, (index, entries, sorted, _))| {
                     (
                         key,
                         AdjTable {
@@ -8648,9 +12155,7 @@ impl Graph {
         if node > DEGREE_TABLE_MAX_ID {
             return row; // the base omits these, so the overlay must too
         }
-        let mut want = vec![tag];
-        want.extend_from_slice(&node.to_be_bytes());
-        for body in self.store.scan_bodies_prefix(&self.index, &want) {
+        for body in self.adj_bodies(tag, node, type_tokens.as_deref(), false) {
             if body.len() != 1 + 8 + 4 + 8 + 8 {
                 continue;
             }
@@ -8757,43 +12262,140 @@ impl Graph {
         }
     }
 
+    /// The nodes whose adjacency rows changed since `built_at`, how many log
+    /// entries describe them, and the epoch that set is COMPLETE to.
+    ///
+    /// `within` bounds what repairing the set would cost, in rows re-read.
+    /// Every reader passes `None` — the whole delta, the behaviour this has
+    /// always had. `Some(rows)` is the maintenance pass keeping one item
+    /// inside its budget, and it TRUNCATES THE SET AT A STAMP BOUNDARY: the
+    /// returned epoch is the last stamp held in full, so the table repaired
+    /// from it is honestly current at that epoch and simply still stale for
+    /// anything later.
+    ///
+    /// That partial answer is sound for the same reason a fenced publish is,
+    /// and nothing downstream can tell them apart: a snapshot carries the
+    /// stamp it is current to, `snap.at >= epoch` is the whole currency test,
+    /// and re-reading a row that a LATER stamp also moved is idempotent — the
+    /// table simply holds a row fresher than its own stamp, which the repair
+    /// path already documents and relies on.
+    ///
+    /// **The first stamp is always admitted, whatever it costs.** A bound
+    /// allowed to return an empty set would put the caller exactly where the
+    /// unbounded budget put it — a table nobody can ever afford, deferred by
+    /// every future pass while its delta grows — and one stamp is the
+    /// smallest unit that makes progress. So this bounds the pass's work
+    /// without weakening the guarantee the budget's escape hatch exists for.
+    ///
+    /// Truncation happens after the caps, not instead of them: a set the node
+    /// cap or the memory ceiling refuses is still `None` here, still the
+    /// rebuild budget's problem, and the pass still prices it the same way.
     fn adj_repair_change_set(
         &self,
         tag: u8,
         type_tokens: &Option<Vec<u32>>,
         built_at: u64,
+        within: Option<usize>,
     ) -> Option<(std::collections::BTreeSet<u64>, usize, u64)> {
         let cost_based = self.adj_cost_repair.get();
-        let logs = self.adj_log.borrow();
-        let mut nodes: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
-        let mut entries = 0usize;
-        let mut at = built_at;
-        for ((t, ty), log) in logs.iter() {
-            if *t != tag {
-                continue;
-            }
-            if let Some(want) = type_tokens {
-                if want.binary_search(ty).is_err() {
-                    continue; // a type this table does not cover
+        // COPY UNDER THE LOCK, COMPUTE OUTSIDE IT.
+        //
+        // `adj_log` is the lock every relationship commit takes the WRITE side
+        // of to record its change. This used to hold the READ side while it
+        // walked the whole delta, built the node set, sorted every stamp and
+        // cut the budget — and on Linux a writer waiting on a held RwLock also
+        // queues every reader behind it. That hold was the maintenance pass's
+        // write tax (docs/derived-refresh-write-tax.md: write-only 1,164 ops/s
+        // with the pass on against 5,833 with it off, at SF1; 62 passes in a
+        // two-minute SF3 write run on 2026-09-27). Now the section copies the
+        // (stamp, node) pairs and reads the fence — the only two things the
+        // stamp rule needs in ONE critical section — and everything else runs
+        // after the lock is released.
+        //
+        // The stamp is unchanged: `f = fenced(epoch)` is read in the same
+        // section as the entries, and a truncated repair publishes at
+        // `min(cut, f)`, which is exactly the `fenced(cut)` that section would
+        // have returned (`fenced(x)` is `min(x, lowest in-flight writer)`, and
+        // `cut <= epoch`).
+        let (stamped, f) = {
+            let logs = self.adj_log.borrow();
+            let mut stamped: Vec<(u64, u64)> = Vec::new();
+            let mut at = built_at;
+            for ((t, ty), log) in logs.iter() {
+                if *t != tag {
+                    continue;
                 }
-            }
-            if !log.covers(built_at) {
-                return None;
-            }
-            for (_, n) in log.since(built_at) {
-                entries += 1;
-                nodes.insert(*n);
-                if !cost_based && nodes.len() > ADJ_REPAIR_MAX {
-                    counted!("graph.adjacency repair declined by the node cap");
+                if let Some(want) = type_tokens {
+                    if want.binary_search(ty).is_err() {
+                        continue; // a type this table does not cover
+                    }
+                }
+                if !log.covers(built_at) {
                     return None;
                 }
-                if nodes.len() > ADJ_REPAIR_MAX_NODES {
-                    return None; // the memory ceiling, whatever the cost says
-                }
+                stamped.extend(log.since(built_at).map(|(ts, n)| (*ts, *n)));
+                at = at.max(log.epoch());
             }
-            at = at.max(log.epoch());
+            (stamped, self.fenced(at))
+        };
+        let entries = stamped.len();
+        let mut nodes: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        for (_, n) in &stamped {
+            nodes.insert(*n);
+            if !cost_based && nodes.len() > ADJ_REPAIR_MAX {
+                counted!("graph.adjacency repair declined by the node cap");
+                return None;
+            }
+            if nodes.len() > ADJ_REPAIR_MAX_NODES {
+                return None; // the memory ceiling, whatever the cost says
+            }
         }
-        Some((nodes, entries, self.fenced(at)))
+        let Some(budget) = within else {
+            return Some((nodes, entries, f));
+        };
+        if repair_cost_rows(entries, nodes.len()) <= budget {
+            return Some((nodes, entries, f));
+        }
+        let mut stamped = stamped;
+        // Past the budget: keep whole stamps until it is spent.
+        //
+        // The stamps are MERGED first because a table covers several type
+        // logs and their entries interleave in time. A cut taken per log
+        // would publish an epoch that one log has reached and another has
+        // not, and the table would then claim to hold changes it never read.
+        stamped.sort_unstable();
+        let mut kept: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        let mut kept_entries = 0usize;
+        // `since` is strictly above `built_at`, so every stamp below is too:
+        // `cut > built_at` is exactly "at least one stamp taken".
+        let mut cut = built_at;
+        let mut i = 0usize;
+        while i < stamped.len() {
+            let ts = stamped[i].0;
+            let mut j = i;
+            let mut added: Vec<u64> = Vec::new();
+            while j < stamped.len() && stamped[j].0 == ts {
+                if kept.insert(stamped[j].1) {
+                    added.push(stamped[j].1);
+                }
+                j += 1;
+            }
+            kept_entries += j - i;
+            if repair_cost_rows(kept_entries, kept.len()) > budget && cut > built_at {
+                for n in added {
+                    kept.remove(&n);
+                }
+                kept_entries -= j - i;
+                break;
+            }
+            cut = ts;
+            i = j;
+            if repair_cost_rows(kept_entries, kept.len()) >= budget {
+                break;
+            }
+        }
+        counted!("graph.adjacency repair truncated to a row budget");
+        Some((kept, kept_entries, cut.min(f)))
     }
 
     /// What one repair of this table would cost, in rows re-read — but ONLY
@@ -8810,15 +12412,94 @@ impl Graph {
     /// The gate below is `repaired_adj_table`'s, on the same numbers from the
     /// same walk — if the two ever disagree, the budget meters a quantity
     /// nobody pays.
+    /// How many log entries a repair of this table would apply, or `None` when
+    /// a covering log cannot reach its epoch — the same refusal
+    /// [`Graph::adj_repair_change_set`] makes, taken from the logs' LENGTHS
+    /// instead of from their contents.
+    ///
+    /// O(log n) per log against O(delta), and no `BTreeSet` is built.
+    fn adj_log_entries_since(
+        &self,
+        tag: u8,
+        type_tokens: &Option<Vec<u32>>,
+        built_at: u64,
+    ) -> Option<usize> {
+        let logs = self.adj_log.borrow();
+        let mut entries = 0usize;
+        for ((t, ty), log) in logs.iter() {
+            if *t != tag {
+                continue;
+            }
+            if let Some(want) = type_tokens {
+                if want.binary_search(ty).is_err() {
+                    continue; // a type this table does not cover
+                }
+            }
+            if !log.covers(built_at) {
+                return None; // must rebuild — exactly the walk's answer
+            }
+            entries += log.count_since(built_at);
+        }
+        Some(entries)
+    }
+
+    /// PRICING A REPAIR MUST NOT COST WHAT THE REPAIR COSTS.
+    ///
+    /// This used to call [`Graph::adj_repair_change_set`] with `within: None` —
+    /// the WHOLE, untruncated delta — walk every entry, insert every node into
+    /// a `BTreeSet`, and then keep two integers and drop the set. Under
+    /// `adj_log`'s lock, which is the lock a writer takes to record its change.
+    ///
+    /// Fix 76 turned that from once into once PER STALE TABLE: its shared
+    /// budget prices every stale table before serving any of them. That is the
+    /// median a 400 s sweep measured going 320 -> 920 ms while the worst case
+    /// fell 12,344 -> 1,772 — the peak came down and a per-pass cost went up,
+    /// and this is where the second half came from.
+    ///
+    /// **The cheap price agrees with the walk wherever the answer can differ.**
+    /// A delta's distinct-node count is at most its entry count, so when the
+    /// ENTRIES alone cannot reach `ADJ_REPAIR_MAX` neither the cost gate
+    /// (`nodes > ADJ_REPAIR_MAX`), the node cap, nor the memory ceiling
+    /// (`ADJ_REPAIR_MAX_NODES`, which is `ADJ_LOG_CAP` and larger) can fire —
+    /// so `None` is not a possible answer and only the number is at stake.
+    /// Past that threshold the exact count decides repair-versus-rebuild and
+    /// the walk still runs.
+    ///
+    /// The number the cheap path returns is an UPPER bound (it charges the
+    /// per-node scan for every entry, as though no two entries touched the same
+    /// node). Over-pricing is safe in both ways the MAINTENANCE PASS uses it:
+    /// the shared budget hands out `min(cost, share)`, so a table takes at most
+    /// its share and the truncation inside the change set bounds the real work
+    /// by ROWS regardless; and the lever-off arm's `cost > rows_left` test
+    /// defers slightly sooner, which is a delay and never a drop.
+    ///
+    /// **A READER MUST NOT TAKE THE CHEAP PRICE**, and `cheap` is how it says
+    /// so. The single-node reader prices ONCE PER SNAPSHOT (`Slot::priced`) and
+    /// compares the number against `ADJ_READER_REPAIR_MAX_ROWS` to decide
+    /// whether to repair or to decline and walk its own span. There an
+    /// over-estimate is not a delay, it flips the decision: `derived_refresh`'s
+    /// canary caught the first cut of this declining a 3,000-entry repair it
+    /// had always taken, because 3,000 entries priced as 3,000 nodes cleared
+    /// the reader's ceiling. The reader's walk is paid once per snapshot and
+    /// was never the cost this fix removes, so the reader keeps it.
     fn adj_repair_cost_rows(
         &self,
         tag: u8,
         type_tokens: &Option<Vec<u32>>,
         built_at: u64,
         base_len: usize,
+        cheap: bool,
     ) -> Option<usize> {
-        let (nodes, entries, _) = self.adj_repair_change_set(tag, type_tokens, built_at)?;
-        let work = entries.saturating_add(nodes.len().saturating_mul(ADJ_REPAIR_SCAN_ROWS));
+        if cheap && self.cheap_repair_pricing.get() {
+            let entries = self.adj_log_entries_since(tag, type_tokens, built_at)?;
+            if entries <= ADJ_REPAIR_MAX {
+                counted!("graph.adjacency repair priced from the log's length");
+                return Some(repair_cost_rows(entries, entries));
+            }
+        }
+        counted!("graph.adjacency repair priced by walking the change set");
+        let (nodes, entries, _) = self.adj_repair_change_set(tag, type_tokens, built_at, None)?;
+        let work = repair_cost_rows(entries, nodes.len());
         if self.adj_cost_repair.get() && nodes.len() > ADJ_REPAIR_MAX && work >= base_len {
             return None; // the gate rebuilds; the rebuild budget owns it
         }
@@ -8843,12 +12524,18 @@ impl Graph {
         type_tokens: &Option<Vec<u32>>,
         base: &AdjTable,
         built_at: u64,
+        within: Option<usize>,
+        // Fix 83: whether THIS repair may fold its overlay into a fresh base.
+        // The maintenance pass folds; a reader leaves the fold to the pass —
+        // see `set_deferred_reader_fold`.
+        fold: bool,
     ) -> Option<(AdjTable, u64)> {
         if !self.incremental_caches.get() {
             return None;
         }
         let cost_based = self.adj_cost_repair.get();
-        let (nodes, entries, at) = self.adj_repair_change_set(tag, type_tokens, built_at)?;
+        let (nodes, entries, at) =
+            self.adj_repair_change_set(tag, type_tokens, built_at, within)?;
         // THE GATE, additive: a change set the fixed cap admits is repaired
         // whatever the cost model would say (the old rule never declined it,
         // and on the small tables every repair test uses it never should);
@@ -8860,7 +12547,7 @@ impl Graph {
         // Repair wins below the table; no half — a repair reuses the base
         // and a rebuild pays for every row of it.
         if cost_based && nodes.len() > ADJ_REPAIR_MAX {
-            let work = entries + nodes.len() * ADJ_REPAIR_SCAN_ROWS;
+            let work = repair_cost_rows(entries, nodes.len());
             if work >= base.len() {
                 counted!("graph.adjacency repair declined by cost");
                 return None;
@@ -8888,8 +12575,10 @@ impl Graph {
         // The counter stays because the spine walk is still O(overlay) and the
         // fold's mean is still ~2,048 — a bound is not an absence, and the
         // number is how the next question gets asked.
-        counters::ADJ_OVERLAY_ROWS_CLONED
-            .fetch_add(base.overlay.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        counters::ADJ_OVERLAY_ROWS_CLONED.fetch_add(
+            base.overlay.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let mut overlay = base.overlay.clone();
         // The flag survives a repair only if every re-read row is itself
         // sorted: a single unsorted row anywhere in the table would make the
@@ -8910,6 +12599,28 @@ impl Graph {
             sorted_by_peer: sorted,
         };
         if fixed.overlay.len() > self.adj_overlay_fold.get() {
+            let ceiling = self
+                .adj_overlay_fold
+                .get()
+                .saturating_mul(ADJ_DEFERRED_FOLD_CEILING);
+            if !fold && fixed.overlay.len() <= ceiling {
+                // Fix 83: a READER past the fold threshold publishes the
+                // overlay as it is. `folded()` is one pass over EVERY row of
+                // the table — 50–100 MB of fresh base for the SF1 tables —
+                // and on a query thread, under a write stream, it ran once
+                // per stale table per multi-node statement: the `[bolt]
+                // statement grew rss by 130–240 MB` lines on 877 read
+                // statements of the v187 sweep. The pass repairs the same
+                // table within about a second and folds it then — and when
+                // it does not (no pass, a pass that keeps losing its publish,
+                // a table gone quiet), `ADJ_DEFERRED_FOLD_CEILING` bounds
+                // what the deferral can accumulate: past it the reader folds.
+                counted!("graph.adjacency reader repair left its fold to the pass");
+                return Some((fixed, at));
+            }
+            if !fold {
+                counted!("graph.adjacency reader repair folded past the deferral ceiling");
+            }
             counted!("graph.adjacency table overlay folded");
             return Some((fixed.folded(), at));
         }
@@ -8923,7 +12634,8 @@ impl Graph {
             self.store
                 .for_each_key_span_scan(&self.index, &[tag], u64::MAX, f);
         } else {
-            self.store.for_each_key_span(&self.index, &[tag], u64::MAX, f);
+            self.store
+                .for_each_key_span(&self.index, &[tag], u64::MAX, f);
         }
     }
 
@@ -8970,30 +12682,68 @@ impl Graph {
         epoch: u64,
         admit: bool,
     ) -> Option<std::sync::Arc<Snapshot<AdjTable>>> {
-        self.adj_table_snapshot_reporting(tag, type_tokens, epoch, admit, true, true)
-            .0
+        self.adj_table_snapshot_walk_priced(tag, type_tokens, epoch, admit, 0)
+    }
+
+    /// [`Graph::adj_table_snapshot`] told what the DECLINE would cost.
+    ///
+    /// `walk_rows` is the size of the walk a decline sends the caller to — one
+    /// node's row. The reader-repair ceiling exists to stop a reader paying a
+    /// large repair, but declining is not free: it forces a walk of that row,
+    /// and at SF10 that walk is the defect this whole campaign chased. One
+    /// `balanced` run at 32 clients produced NO quotable throughput because a
+    /// single operation walked for 316.9 s, while `balanced-disjoint` — the
+    /// same write volume on a type no read traverses, so no table ever goes
+    /// stale — sustained 5,121 ops/s with zero stalls. Counters at the
+    /// fall-through put 100% of it here: `walk_overlaid=0`,
+    /// `walk_nocur=1182` of 1,182.
+    ///
+    /// 0 means the caller has no single node in hand and keeps the old
+    /// behaviour exactly.
+    fn adj_table_snapshot_walk_priced(
+        &self,
+        tag: u8,
+        type_tokens: &Option<Vec<u32>>,
+        epoch: u64,
+        admit: bool,
+        walk_rows: usize,
+    ) -> Option<std::sync::Arc<Snapshot<AdjTable>>> {
+        self.adj_table_snapshot_reporting(
+            tag,
+            type_tokens,
+            epoch,
+            admit,
+            RefreshBudget::reader(),
+            true,
+            walk_rows,
+        )
+        .0
     }
 
     /// [`Graph::adj_table_snapshot`] that also says WHAT it did — the
     /// maintenance refresh reports it; the read path discards it. With
-    /// `may_rebuild` false (the refresh's budget) a stale table that cannot be
-    /// repaired is left as it is and reported `Deferred`; every reader passes
-    /// `true`.
+    /// `budget.rebuild` false (the refresh's budget) a stale table that cannot
+    /// be repaired is left as it is and reported `Deferred`; every reader
+    /// passes [`RefreshBudget::reader`].
+    #[allow(clippy::too_many_arguments)]
     fn adj_table_snapshot_reporting(
         &self,
         tag: u8,
         type_tokens: &Option<Vec<u32>>,
         epoch: u64,
         admit: bool,
-        may_rebuild: bool,
+        budget: RefreshBudget,
         // Whether the caller is a READER on a query thread, as opposed to the
         // maintenance pass. Only a reader is kept off a full-span rebuild by
         // admission: the pass passes `admit: false` to mean "do not build on my
-        // account" and governs itself with `may_rebuild`, so applying the gate
+        // account" and governs itself with `budget.rebuild`, so applying the gate
         // to it would silence the one rebuild per tick it is allowed — which is
         // precisely what the first cut did, and what
         // `the_pass_stops_rebuilding_and_answers_do_not_change` caught.
         reader: bool,
+        // Rows the DECLINE would cost — see `adj_table_snapshot_walk_priced`.
+        // 0 keeps the ceiling exactly as it was.
+        walk_rows: usize,
     ) -> (Option<std::sync::Arc<Snapshot<AdjTable>>>, AdjOutcome) {
         let key = (tag, type_tokens.clone().unwrap_or_default());
         let slot = slot_in(&self.adj_tables, &key, ADJ_TABLE_CACHE_MAX);
@@ -9062,16 +12812,56 @@ impl Graph {
             // it for two atomic loads. Doing it per read was correct and cost
             // the writers 2.7x (`Slot::priced`).
             if reader && self.single_node_stale_walk.get() {
-                let decline = match slot.priced(snap.at) {
+                let mut decline = match slot.priced(snap.at) {
                     Some(d) => d,
                     None => {
+                        // EXACT, never the cheap price: this number decides
+                        // repair-or-decline against a ceiling, and an
+                        // over-estimate flips it — see `adj_repair_cost_rows`.
                         let d = self
-                            .adj_repair_cost_rows(tag, type_tokens, snap.at, snap.value.len())
-                            .is_some_and(|rows| rows > ADJ_READER_REPAIR_MAX_ROWS);
+                            .adj_repair_cost_rows(
+                                tag,
+                                type_tokens,
+                                snap.at,
+                                snap.value.len(),
+                                false,
+                            )
+                            .is_some_and(|rows| rows > self.reader_repair_max_rows());
                         slot.note_priced(snap.at, d);
                         d
                     }
                 };
+                // NEVER DECLINE A REPAIR THAT IS CHEAPER THAN THE WALK IT
+                // FORCES. The ceiling above is a bare constant: it asks "is this
+                // repair large?" and never "larger than what?". Declining sends
+                // the reader to a walk of this node's row, and for a
+                // high-degree node at SF10 that walk is orders of magnitude
+                // dearer than the repair just refused — measured as a single
+                // operation holding a 316.9 s window, against 5,121 ops/s and
+                // zero stalls on the same corpus when no table goes stale.
+                //
+                // Only re-priced when the walk is ALREADY above the ceiling:
+                // below it the comparison cannot change the answer, so the hot
+                // path is untouched and the exact price is paid only for the
+                // rare node whose walk would dwarf it. Purely a COST decision —
+                // repair and walk return identical rows, so this can make a
+                // query slower or faster but never wrong.
+                if decline && walk_rows > self.reader_repair_max_rows() {
+                    if let Some(rows) = self.adj_repair_cost_rows(
+                        tag,
+                        type_tokens,
+                        snap.at,
+                        snap.value.len(),
+                        false,
+                    ) {
+                        if rows <= walk_rows {
+                            counted!("graph.adjacency repaired rather than walk a bigger row");
+                            counters::ADJ_REPAIR_BEAT_THE_WALK
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            decline = false;
+                        }
+                    }
+                }
                 if decline {
                     counted!("graph.adjacency stale table declined to a single-node reader");
                     counters::ADJ_STALE_DECLINED_TO_WALK
@@ -9083,12 +12873,17 @@ impl Graph {
             // rows that moved rather than rebuilding every row that did not; a
             // rebuild here walked all 447k relationships and showed up as a
             // 62 ms p95 on every traversal shape.
-            if let Some((fixed, at)) =
-                self.repaired_adj_table(tag, type_tokens, &snap.value, snap.at)
-            {
+            if let Some((fixed, at)) = self.repaired_adj_table(
+                tag,
+                type_tokens,
+                &snap.value,
+                snap.at,
+                budget.repair_rows,
+                !(reader && self.deferred_reader_fold.get()),
+            ) {
                 return self.publish_repaired_adj_table(&slot, tag, fixed, at);
             }
-            if !may_rebuild {
+            if !budget.rebuild {
                 counted!("graph.adjacency rebuild deferred by the refresh budget");
                 return (Some(snap), AdjOutcome::Deferred);
             }
@@ -9144,10 +12939,18 @@ impl Graph {
             // writer in flight did 4 full builds, serially, and a reader
             // waiting behind the refresh's rebuild rebuilt the same table
             // again (`tests/review_build_guard_fenced_loser.rs`).
-            if !tried.as_ref().is_some_and(|t| std::sync::Arc::ptr_eq(t, &snap)) {
-                if let Some((fixed, at)) =
-                    self.repaired_adj_table(tag, type_tokens, &snap.value, snap.at)
-                {
+            if !tried
+                .as_ref()
+                .is_some_and(|t| std::sync::Arc::ptr_eq(t, &snap))
+            {
+                if let Some((fixed, at)) = self.repaired_adj_table(
+                    tag,
+                    type_tokens,
+                    &snap.value,
+                    snap.at,
+                    budget.repair_rows,
+                    !(reader && self.deferred_reader_fold.get()),
+                ) {
                     counted!("graph.adjacency tables repaired behind the build guard");
                     return self.publish_repaired_adj_table(&slot, tag, fixed, at);
                 }
@@ -9216,7 +13019,39 @@ impl Graph {
         if !self.adj_tables_usable() {
             return None;
         }
+        // An unminted type has no table (see `with_adj_table`).
+        if matches!(type_tokens, Some(v) if v.is_empty()) {
+            counted!("graph.adjacency unminted type has no table");
+            return None;
+        }
         self.adj_table_snapshot(tag, type_tokens, epoch, true)
+            .map(|s| std::sync::Arc::clone(&s.value))
+    }
+
+    /// [`Graph::adj_table`] that will NOT build one: `admit: false` is the
+    /// maintenance pass's "do not build on my account", and it is the right
+    /// setting for a caller that merely PREFERS a table to its own fallback.
+    ///
+    /// The typed relationship seed is that caller. Building here would make a
+    /// cold type's first scan pay a whole-store table build on a query
+    /// thread, and — as `before_admission_the_probe_walks_and_agrees` caught
+    /// — would publish a table that a deployment holding the admission gate
+    /// shut had asked never to exist, which every later probe then searches.
+    /// Wanting the table is not a reason to create it.
+    fn adj_table_existing(
+        &self,
+        tag: u8,
+        type_tokens: &Option<Vec<u32>>,
+        epoch: u64,
+    ) -> Option<std::sync::Arc<AdjTable>> {
+        if !self.adj_tables_usable() {
+            return None;
+        }
+        if matches!(type_tokens, Some(v) if v.is_empty()) {
+            counted!("graph.adjacency unminted type has no table");
+            return None;
+        }
+        self.adj_table_snapshot(tag, type_tokens, epoch, false)
             .map(|s| std::sync::Arc::clone(&s.value))
     }
 
@@ -9339,6 +13174,17 @@ impl Graph {
                 if e.graph != self.graph_id || e.tag != tag || e.tokens.as_slice() != toks {
                     continue;
                 }
+                // Filed before an in-place refold: the slot's snapshot changed
+                // under the same stamp. Not this thread's to serve any more —
+                // the full path re-resolves the slot and re-files it.
+                if e.refold_gen
+                    != self
+                        .adj_refold_gen
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    counted!("graph.adjacency memo entry retired by a refold");
+                    continue;
+                }
                 // Found the table, but this caller needs it fresher. Decline,
                 // so the full path runs its stale-table handling as before.
                 if e.snap.at < epoch {
@@ -9376,6 +13222,9 @@ impl Graph {
                 tag,
                 tokens: toks.to_vec(),
                 snap: std::sync::Arc::clone(snap),
+                refold_gen: self
+                    .adj_refold_gen
+                    .load(std::sync::atomic::Ordering::Relaxed),
             });
             // Refresh the entry for this table if a way already holds one — it
             // went stale, which is why the caller reached the full path —
@@ -9385,7 +13234,9 @@ impl Graph {
             // of a STALE entry cannot be live anyway — serve declines on
             // `at < epoch` — so the skip never strands a stale refresh.
             for w in &set.ways {
-                let Ok(mut g) = w.try_borrow_mut() else { continue };
+                let Ok(mut g) = w.try_borrow_mut() else {
+                    continue;
+                };
                 if g.as_ref().is_some_and(|e| {
                     e.graph == self.graph_id && e.tag == tag && e.tokens.as_slice() == toks
                 }) {
@@ -9398,7 +13249,9 @@ impl Graph {
             // so a completely unwritable set does not arise; decline loudly if
             // it somehow does.
             for w in &set.ways {
-                let Ok(mut g) = w.try_borrow_mut() else { continue };
+                let Ok(mut g) = w.try_borrow_mut() else {
+                    continue;
+                };
                 if g.is_none() {
                     *g = fresh.take();
                     return;
@@ -9428,6 +13281,14 @@ impl Graph {
         if !self.adj_tables_usable() {
             return f(None);
         }
+        // An UNMINTED type has no table — and must not be served the UNTYPED
+        // one, which the `(tag, tokens.unwrap_or_default())` key below would
+        // do (see `adjacent_slim_visit`). `None` sends the caller to its walk
+        // path, which yields nothing for it.
+        if matches!(type_tokens, Some(v) if v.is_empty()) {
+            counted!("graph.adjacency unminted type has no table");
+            return f(None);
+        }
         // WHAT THIS RESOLUTION COSTS, AND HOW OFTEN. Everything below finds a
         // table that is CONSTANT for a whole hop — only `node` varies — and it
         // was paid once per PROBE: a `Vec<u32>` heap allocation to build the
@@ -9440,6 +13301,13 @@ impl Graph {
             Err(f) => f,
         };
         let key = (tag, type_tokens.clone().unwrap_or_default());
+        // The WALK a fall-through would force, in rows — this node's row in the
+        // stale table. Carried out of the block below so the decline in
+        // `adj_table_snapshot` can price the repair against its real
+        // alternative instead of against a bare constant. 0 means "no single
+        // node in hand", which keeps every other caller's behaviour exactly as
+        // it was.
+        let mut walk_rows: usize = 0;
         {
             let map = self.adj_tables.load();
             if let Some(slot) = map.get(&key) {
@@ -9449,6 +13317,12 @@ impl Graph {
                         counted!("graph.adjacency tables reused");
                         self.adj_snap_memo_put(tag, type_tokens, snap);
                         return f(Some(&snap.value));
+                    }
+                    if let Some(n) = node {
+                        // O(1) off the CSR index. The row is stale, but a
+                        // node's degree is what the walk pays and the stale row
+                        // estimates it closely enough to compare costs.
+                        walk_rows = snap.value.slice(n).len();
                     }
                     // STALE AS A TABLE, CURRENT FOR THIS NODE.
                     //
@@ -9488,9 +13362,7 @@ impl Graph {
                             // collision). Ask the log, which is exact.
                             match self.adj_stale_probe(tag, type_tokens, snap.at, n) {
                                 StaleProbe::Unmoved => {
-                                    counted!(
-                                        "graph.adjacency stale table served an unmoved node"
-                                    );
+                                    counted!("graph.adjacency stale table served an unmoved node");
                                     counters::ADJ_STALE_SERVED_UNMOVED
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     return f(Some(&snap.value));
@@ -9522,10 +13394,39 @@ impl Graph {
                 }
             }
         }
-        match self.adj_table_snapshot(tag, type_tokens, epoch, admit) {
+        match self.adj_table_snapshot_walk_priced(tag, type_tokens, epoch, admit, walk_rows) {
             Some(snap) => f(Some(&snap.value)),
             None => f(None),
         }
+    }
+
+    /// Fix 90: the live SELF-LOOP relationships of `types` (every type when
+    /// `types` is empty) — the committed count plus the active transaction's
+    /// own delta, so a self-loop this transaction has buffered is seen. Read
+    /// at EXECUTION by the count fold's symmetry breaking, never at plan
+    /// time: the recogniser's answer is a property of the query and can be
+    /// cached, this one is a property of the data at this instant and cannot
+    /// (a self-loop written after the plan would otherwise undercount by
+    /// |S|! — a wrong answer that looks entirely plausible).
+    pub fn type_self_loops(&self, types: &[String]) -> u64 {
+        let tokens = self.type_tokens_peek(types);
+        let base: u64 = self.with_stats(|st| match &tokens {
+            None => st.self_loops_by_type.values().sum::<u64>(),
+            Some(tt) => tt
+                .iter()
+                .map(|t| st.self_loops_by_type.get(t).copied().unwrap_or(0))
+                .sum::<u64>(),
+        });
+        let delta: i64 = self
+            .with_txn_stats(|d| match &tokens {
+                None => d.self_loops_by_type.values().sum::<i64>(),
+                Some(tt) => tt
+                    .iter()
+                    .map(|t| d.self_loops_by_type.get(t).copied().unwrap_or(0))
+                    .sum::<i64>(),
+            })
+            .unwrap_or(0);
+        base.saturating_add_signed(delta)
     }
 
     /// Resolve type names to sorted tokens without minting; `None` = any
@@ -9637,6 +13538,28 @@ impl Graph {
         // Current at the adjacency epoch of the probed types (read BEFORE the
         // scan): a node or property write leaves a per-node snapshot current.
         let epoch = self.adjacency_epoch(&type_tokens);
+        // SERVED FROM THE RESIDENT TABLE when one is current for these types.
+        // The per-node snapshots below are a store prefix scan each, kept in
+        // ONE latched map capped at 65,536 entries and cleared whole at the
+        // cap. SNB BI bi15's `(c1)-[:KNOWS]-(c2)`, probed once per reply
+        // between two people, touches every person on both sides: 20,471
+        // snapshot builds for 1/200 of SF3's comments, and at SF10 — ~65k
+        // people, twice over, past the cap — the map cleared and refilled
+        // until a step that needed no store read at all ran past 900 s with a
+        // fifth of its CPU in the kernel. The table answers the same question
+        // with two binary searches and no lock: `edges_to_peer_slim`, the
+        // matcher's own both-ends-bound probe, which walks exactly the sides
+        // a table cannot serve.
+        if !self.in_txn_with_writes()
+            && tags.iter().all(|tag| {
+                self.with_adj_table(*tag, &type_tokens, epoch, false, None, |t| t.is_some())
+            })
+        {
+            counted!("graph.adjacency probe answered by the table");
+            let mut hit = false;
+            self.edges_to_peer_slim(from, dir, &type_tokens, to, |_| hit = true);
+            return Ok(hit);
+        }
         for tag in tags {
             // The per-node snapshots are committed state: neither served nor
             // stored while a transaction with buffered writes is active.
@@ -9771,18 +13694,26 @@ impl Graph {
             if !table_ok || overlaid {
                 return self.edge_count_walked(from, dir, type_tokens, to);
             }
-            let side = self.with_adj_table(tag, type_tokens, epoch, admit, Some(from), |tbl| match tbl {
-                Some(t) if t.sorted_by_peer => {
-                    let row = t.slice(from);
-                    let lo = row.partition_point(|e| e.peer < to);
-                    let hi = row.partition_point(|e| e.peer <= to);
-                    Some((hi - lo) as u64)
-                }
-                // No table, or one whose order was never established: the
-                // whole call walks, so one counter fires per call, not one
-                // per side.
-                _ => None,
-            });
+            let side =
+                self.with_adj_table(
+                    tag,
+                    type_tokens,
+                    epoch,
+                    admit,
+                    Some(from),
+                    |tbl| match tbl {
+                        Some(t) if t.sorted_by_peer => {
+                            let row = t.slice(from);
+                            let lo = row.partition_point(|e| e.peer < to);
+                            let hi = row.partition_point(|e| e.peer <= to);
+                            Some((hi - lo) as u64)
+                        }
+                        // No table, or one whose order was never established: the
+                        // whole call walks, so one counter fires per call, not one
+                        // per side.
+                        _ => None,
+                    },
+                );
             match side {
                 Some(c) => total += c,
                 None => return self.edge_count_walked(from, dir, type_tokens, to),
@@ -9852,38 +13783,74 @@ impl Graph {
             let overlaid = self
                 .txn_pending(&self.index, &key[..])
                 .is_some_and(|p| !p.is_empty());
+            // A side that cannot be served from its table is WALKED — and
+            // only THAT side. `dir` may be `Both`, and the O side may already
+            // have been delivered from its table (a stale table serves an
+            // unmoved node; a transaction overlays one side and not the
+            // other), so a `Both` walk here delivered the O side a second
+            // time: a tracked undirected close counted an edge twice, and the
+            // answer depended on which arm answered it (the hoisted row, one
+            // visit per entry, was right). The per-side walk is the visit's
+            // own prefix walk; the self-loop dedup is the `continue` above.
+            let side = if tag == b'O' { Dir::Out } else { Dir::In };
             if !table_ok || overlaid {
-                self.adjacent_slim_for_each(from, dir, type_tokens, |e| {
+                counted!("graph.edge probe walked one side");
+                self.adjacent_slim_for_each(from, side, type_tokens, |e| {
                     if e.peer == to {
                         f(e);
                     }
                 });
-                return;
+                continue;
             }
-            let served = self.with_adj_table(tag, type_tokens, epoch, admit, Some(from), |tbl| {
-                match tbl {
-                    Some(t) if t.sorted_by_peer => {
-                        let row = t.slice(from);
-                        let lo = row.partition_point(|e| e.peer < to);
-                        let hi = row.partition_point(|e| e.peer <= to);
-                        for e in &row[lo..hi] {
-                            f(e);
+            let served =
+                self.with_adj_table(
+                    tag,
+                    type_tokens,
+                    epoch,
+                    admit,
+                    Some(from),
+                    |tbl| match tbl {
+                        Some(t) if t.sorted_by_peer => {
+                            let row = t.slice(from);
+                            let lo = row.partition_point(|e| e.peer < to);
+                            let hi = row.partition_point(|e| e.peer <= to);
+                            for e in &row[lo..hi] {
+                                f(e);
+                            }
+                            true
                         }
-                        true
-                    }
-                    _ => false,
-                }
-            });
+                        _ => false,
+                    },
+                );
             if !served {
-                self.adjacent_slim_for_each(from, dir, type_tokens, |e| {
+                counted!("graph.edge probe walked one side");
+                self.adjacent_slim_for_each(from, side, type_tokens, |e| {
                     if e.peer == to {
                         f(e);
                     }
                 });
-                return;
+                continue;
             }
         }
         counted!("graph.edge entries by binary search");
+    }
+
+    /// `edges_to_peer_slim` for a test: the rel ids of every `from`–`to` edge
+    /// the tracked close would be offered, in delivery order. Exposed so the
+    /// per-side fallback can be pinned in the regime that broke it — one side
+    /// served from its table, the other overlaid by an open transaction —
+    /// which the fold itself declines to enter.
+    #[doc(hidden)]
+    pub fn edges_to_peer_slim_for_test(
+        &self,
+        from: u64,
+        dir: Dir,
+        type_tokens: &Option<Vec<u32>>,
+        to: u64,
+    ) -> Vec<u64> {
+        let mut out = Vec::new();
+        self.edges_to_peer_slim(from, dir, type_tokens, to, |e| out.push(e.rel));
+        out
     }
 
     /// `edge_count_slim`'s fallback: the existing linear walk of `from`'s
@@ -9973,9 +13940,7 @@ impl Graph {
         let count_side = |tag: u8, note_self_loops: bool| -> (u64, u64) {
             let mut n = 0u64;
             let mut self_loops = 0u64;
-            let mut want = vec![tag];
-            want.extend_from_slice(&node.to_be_bytes());
-            for body in self.index_bodies(&want) {
+            for body in self.adj_bodies(tag, node, type_tokens.as_deref(), true) {
                 if body.len() != 1 + 8 + 4 + 8 + 8 {
                     continue;
                 }
@@ -10195,8 +14160,14 @@ impl Graph {
                     return Ok(e.count);
                 }
             }
-            let count =
-                self.count_hop_labelled(start_labels, dir, type_tokens, end_labels, start_label, end_label)?;
+            let count = self.count_hop_labelled(
+                start_labels,
+                dir,
+                type_tokens,
+                end_labels,
+                start_label,
+                end_label,
+            )?;
             let mut m = self.hop_count_memo.borrow_mut();
             if m.len() >= HOP_COUNT_MEMO_MAX {
                 counted!("graph.hop count memo cleared at its cap");
@@ -10212,7 +14183,14 @@ impl Graph {
             );
             return Ok(count);
         }
-        self.count_hop_labelled(start_labels, dir, type_tokens, end_labels, start_label, end_label)
+        self.count_hop_labelled(
+            start_labels,
+            dir,
+            type_tokens,
+            end_labels,
+            start_label,
+            end_label,
+        )
     }
 
     /// The newest membership epoch across every named label — the second clock
@@ -10312,13 +14290,7 @@ impl Graph {
         let overlaid = self.in_txn_with_writes();
         let mut n = 0u64;
         for node in iter.iter() {
-            let mut want = vec![tag];
-            want.extend_from_slice(&node.to_be_bytes());
-            let bodies = if overlaid {
-                self.index_bodies(&want)
-            } else {
-                self.store.scan_bodies_prefix(&self.index, &want)
-            };
+            let bodies = self.adj_bodies(tag, node, type_tokens.as_deref(), overlaid);
             for body in bodies {
                 if body.len() != 1 + 8 + 4 + 8 + 8 {
                     continue;
@@ -10339,6 +14311,42 @@ impl Graph {
             }
         }
         Ok(n)
+    }
+
+    /// Fix 101: whether NO live relationship carries any of `types` — a hop
+    /// over such types can match nothing, so a MATCH that requires it need
+    /// not seed. From the maintained type counts (the same statistic
+    /// `count(r)` over a type is answered from), with the active
+    /// transaction's buffered relationships folded in; a type never minted
+    /// has none. `false` for an untyped hop, whatever the graph holds.
+    pub fn rel_types_have_no_live_rels(&self, types: &[String]) -> bool {
+        if types.is_empty() {
+            return false;
+        }
+        let mut tokens = Vec::with_capacity(types.len());
+        for t in types {
+            if let Some(tok) = self.token_peek("typ:", &self.types, t) {
+                tokens.push(tok);
+            }
+        }
+        if tokens.is_empty() {
+            return true; // no named type was ever minted
+        }
+        let committed: u64 = self.with_stats(|st| {
+            tokens
+                .iter()
+                .map(|t| st.by_type.get(t).copied().unwrap_or(0))
+                .sum()
+        });
+        let delta: i64 = self
+            .with_txn_stats(|d| {
+                tokens
+                    .iter()
+                    .map(|t| d.by_type.get(t).copied().unwrap_or(0))
+                    .sum()
+            })
+            .unwrap_or(0);
+        committed.saturating_add_signed(delta) == 0
     }
 
     /// The relationship-type histogram — (type name, count) over every
@@ -10673,20 +14681,172 @@ impl Graph {
         };
         counted!("graph.column point-gather");
         let mut out: Vec<(u64, Value)> = Vec::with_capacity(ids.len());
-        for &id in ids {
-            let Some(bytes) = self.store.get(prefix, &id.to_be_bytes()) else {
-                continue; // no record for this id — absent, as the scan omits it
-            };
-            let Some(tagged) = get_property(&bytes, PropertyId(token)) else {
-                continue; // record present, property absent — absent, as the scan omits it
-            };
-            match decode_prop_opt(&tagged) {
-                Some(v) => out.push((id, v)),
-                None => return Err(GraphError::Corrupt(format!("undecodable property {prop}"))),
-            }
+        let mut corrupt = false;
+        // Fix 98: the property is read off the store's borrowed bytes —
+        // `get` copied the whole record to read one column of it, a memcpy
+        // of every wide record per gather. Fix 100: the run of reads shares
+        // a block cursor per segment (`get_many_with`), so a sorted id set
+        // touches each block once. An id with no record, or a record
+        // without the property, is omitted — exactly as the scan omits it.
+        self.store
+            .get_many_with(prefix, ids.iter().map(|id| id.to_be_bytes()), |i, bytes| {
+                if corrupt {
+                    return;
+                }
+                if let Some(tagged) = get_property(bytes, PropertyId(token)) {
+                    match decode_prop_opt(&tagged) {
+                        Some(v) => out.push((ids[i], v)),
+                        None => corrupt = true,
+                    }
+                }
+            });
+        if corrupt {
+            return Err(GraphError::Corrupt(format!("undecodable property {prop}")));
         }
         settle_column(&mut out);
         Ok(out)
+    }
+
+    /// `prop` of each relationship in `ids` (sorted, distinct), ALIGNED to
+    /// `ids` — `Null` where a relationship does not carry it — served from
+    /// the values earlier statements read ([`RelPropMemo`]) and gathered
+    /// only for the rest, which are then kept.
+    ///
+    /// The values are [`Graph::column_entries_gather`]'s, unchanged, so the
+    /// column is byte-identical to the gather it replaces. `None` inside a
+    /// transaction with buffered writes: the committed values here cannot see
+    /// them, and the caller's own path must answer.
+    pub(crate) fn rel_prop_aligned(
+        &self,
+        prop: &str,
+        ids: &[u64],
+    ) -> Result<Option<Vec<Value>>, GraphError> {
+        if self.in_txn_with_writes() {
+            return Ok(None);
+        }
+        let Some(pt) = self.token_peek("prop:", &self.props, prop) else {
+            return Ok(Some(vec![Value::Null; ids.len()]));
+        };
+        let now = self.store.now_ts();
+        let cached = {
+            let mut memo = self.rel_prop_memo.lock().unwrap_or_else(|e| e.into_inner());
+            if memo.at != now {
+                if !memo.cols.is_empty() {
+                    counted!("graph.relationship property values dropped by a commit");
+                }
+                memo.cols.clear();
+                memo.bytes = 0;
+                memo.at = now;
+            }
+            memo.cols.get(&pt).cloned()
+        };
+        let mut out: Vec<Value> = Vec::with_capacity(ids.len());
+        let mut missing: Vec<u64> = Vec::new();
+        let mut miss_at: Vec<usize> = Vec::new();
+        match &cached {
+            Some(col) => {
+                // A few ids against a long column are each found by a binary
+                // search over the rest of it; the step-by-step merge walked
+                // the column up to the largest id asked, so a statement asking
+                // a thousand relationships paid for every one kept before them.
+                let sparse = ids.len().saturating_mul(8) < col.len();
+                let mut c = 0usize;
+                for (i, &id) in ids.iter().enumerate() {
+                    if sparse {
+                        c += col[c..].partition_point(|e| e.0 < id);
+                    } else {
+                        while c < col.len() && col[c].0 < id {
+                            c += 1;
+                        }
+                    }
+                    if c < col.len() && col[c].0 == id {
+                        out.push(col[c].1.clone());
+                    } else {
+                        out.push(Value::Null);
+                        missing.push(id);
+                        miss_at.push(i);
+                    }
+                }
+            }
+            None => {
+                out.resize(ids.len(), Value::Null);
+                missing = ids.to_vec();
+                miss_at = (0..ids.len()).collect();
+            }
+        }
+        if missing.len() < ids.len() {
+            counted!("graph.relationship property served from values already read");
+        }
+        if missing.is_empty() {
+            return Ok(Some(out));
+        }
+        let gathered = self.column_entries_gather(ColumnFamily::Rels, prop, &missing)?;
+        let mut fresh: Vec<(u64, Value)> = Vec::with_capacity(missing.len());
+        let mut g = 0usize;
+        for (k, &id) in missing.iter().enumerate() {
+            while g < gathered.len() && gathered[g].0 < id {
+                g += 1;
+            }
+            let v = if g < gathered.len() && gathered[g].0 == id {
+                gathered[g].1.clone()
+            } else {
+                Value::Null
+            };
+            out[miss_at[k]] = v.clone();
+            fresh.push((id, v));
+        }
+        // File the union: the cached entries and the fresh ones, both sorted.
+        // Not when the fresh ones are few against what is kept: filing them
+        // copies the whole column, so a run of small statements each asking
+        // for relationships not yet kept would copy it once apiece. They are
+        // read again next time instead.
+        let old = cached.as_deref().map_or(&[][..], Vec::as_slice);
+        if fresh.len().saturating_mul(16) < old.len() {
+            counted!("graph.relationship property values not kept: too few to file");
+            return Ok(Some(out));
+        }
+        let mut merged: Vec<(u64, Value)> = Vec::with_capacity(old.len() + fresh.len());
+        let (mut a, mut b) = (old.iter().peekable(), fresh.into_iter().peekable());
+        loop {
+            let take_old = match (a.peek(), b.peek()) {
+                (Some(x), Some(y)) => x.0 < y.0,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
+            };
+            if take_old {
+                merged.extend(a.next().cloned());
+            } else {
+                merged.extend(b.next());
+            }
+        }
+        let bytes = merged.len() * 40 + merged.iter().map(|(_, v)| value_heap_bytes(v)).sum::<usize>();
+        // THE BUDGET IS THE PROPERTY-COLUMN CACHE'S (`set_prop_column_budget`,
+        // `--prop-column-budget-mb`): one knob for what property values are
+        // kept between statements, nodes' and relationships' alike, 512 MB by
+        // default as this memo's own constant was. The constant was sized at
+        // SF3, where IC5's HAS_MEMBER dates are 4.7M values (~190 MB); at SF10
+        // they are 14.8M (~590 MB), so they were never kept and every
+        // statement gathered them again -- 25 s of IC5's 30 against Neo4j's
+        // 22. Read before the memo's lock, which the column cache's never
+        // nests inside.
+        let budget = self.prop_column_budget();
+        let mut memo = self.rel_prop_memo.lock().unwrap_or_else(|e| e.into_inner());
+        // Kept only if nothing committed while it was read, and it fits.
+        if memo.at == now {
+            let old_bytes = memo.cols.get(&pt).map_or(0, |c| {
+                c.len() * 40 + c.iter().map(|(_, v)| value_heap_bytes(v)).sum::<usize>()
+            });
+            let total = memo.bytes.saturating_sub(old_bytes).saturating_add(bytes);
+            if total <= budget {
+                memo.cols.insert(pt, std::sync::Arc::new(merged));
+                memo.bytes = total;
+                counted!("graph.relationship property values kept for the next statement");
+            } else {
+                counted!("graph.relationship property values not kept: over budget");
+            }
+        }
+        Ok(Some(out))
     }
 
     /// The PRESENCE form of [`Graph::column_entries_gather`]: which of `ids`
@@ -10752,50 +14912,105 @@ impl Graph {
             .iter()
             .map(|p| self.token_peek("prop:", &self.props, p))
             .collect();
-        let mut out: Vec<Vec<(u64, Value)>> =
-            props.iter().map(|_| Vec::with_capacity(ids.len())).collect();
         if tokens.iter().all(Option::is_none) {
-            return Ok(out); // properties nothing ever wrote — absent everywhere
+            // properties nothing ever wrote — absent everywhere
+            return Ok(props.iter().map(|_| Vec::new()).collect());
         }
         // Counted as a point-gather too: that is what it is, and the sparse-
         // population tests read that counter to prove the fallback fired.
         counted!("graph.column point-gather");
         counted!("graph.column record-gather");
-        for &id in ids {
-            // The record is BORROWED from the store (`get_with`), never copied:
-            // a wide record — an email body, an embedding — is scanned in place
-            // for the requested properties and only those values are copied.
-            let found: Option<Result<Vec<(usize, Value)>, GraphError>> =
-                self.store.get_with(prefix, &id.to_be_bytes(), |bytes| {
-                    let mut got = Vec::with_capacity(tokens.len());
-                    for (j, token) in tokens.iter().enumerate() {
-                        let Some(token) = token else {
-                            continue;
-                        };
-                        let Some(tagged) = get_property(bytes, PropertyId(*token)) else {
-                            continue; // record present, property absent — absent, as the scan omits it
-                        };
-                        match decode_prop_opt(&tagged) {
-                            Some(v) => got.push((j, v)),
-                            None => {
-                                return Err(GraphError::Corrupt(format!(
-                                    "undecodable property {}",
-                                    props[j]
-                                )));
-                            }
-                        }
-                    }
-                    Ok(got)
+        // A LARGE gather splits across the executor: one contiguous run of
+        // the ids per worker, each with its own block cursor, the runs'
+        // columns concatenated in run order — the serial gather's order.
+        // SNB Interactive IC8's pipeline gathered 3,110 comments' dates by
+        // point reads on one thread (~4 µs each: most of its 15 ms, against
+        // Neo4j's 11). Not inside a transaction: a worker cannot see the
+        // calling thread's buffered writes, which a read there must.
+        if ids.len() >= GATHER_SPLIT_MIN && !self.in_txn() {
+            if let Some(exec) = self.exec().filter(|e| e.width() > 1) {
+                counted!("graph.column record-gather split across the executor");
+                let per = ids.len().div_ceil(exec.width()).max(GATHER_SPLIT_MIN / 4);
+                let runs: Vec<&[u64]> = ids.chunks(per).collect();
+                type Run = std::sync::Mutex<Option<Result<Vec<Vec<(u64, Value)>>, GraphError>>>;
+                let slots: Vec<Run> = runs.iter().map(|_| std::sync::Mutex::new(None)).collect();
+                exec.for_each(runs.len(), &|k| {
+                    let got = self.gather_run(prefix, &tokens, props, runs[k]);
+                    *slots[k].lock().unwrap_or_else(|e| e.into_inner()) = Some(got);
                 });
-            let Some(found) = found else {
-                continue; // no record for this id — absent, as the scan omits it
-            };
-            for (j, v) in found? {
-                out[j].push((id, v));
+                let mut out: Vec<Vec<(u64, Value)>> = props
+                    .iter()
+                    .map(|_| Vec::with_capacity(ids.len()))
+                    .collect();
+                for slot in slots {
+                    let part = slot
+                        .into_inner()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .expect("every run ran")?;
+                    for (col, more) in out.iter_mut().zip(part) {
+                        col.extend(more);
+                    }
+                }
+                for col in &mut out {
+                    settle_column(col);
+                }
+                return Ok(out);
             }
         }
+        let mut out = self.gather_run(prefix, &tokens, props, ids)?;
         for col in &mut out {
             settle_column(col);
+        }
+        Ok(out)
+    }
+
+    /// One run of `column_entries_gather_many`: the columns of `props`
+    /// (their `tokens`) over `ids`, in `ids`' order, before settling.
+    fn gather_run(
+        &self,
+        prefix: &KeyPrefix,
+        tokens: &[Option<u32>],
+        props: &[String],
+        ids: &[u64],
+    ) -> Result<Vec<Vec<(u64, Value)>>, GraphError> {
+        let mut out: Vec<Vec<(u64, Value)>> = props
+            .iter()
+            .map(|_| Vec::with_capacity(ids.len()))
+            .collect();
+        // The record is BORROWED from the store, never copied: a wide record
+        // — an email body, an embedding — is scanned in place for the
+        // requested properties and only those values are copied. Fix 106:
+        // the run of reads shares a block cursor per segment
+        // (`get_many_with`, fix 100's pass), so a sorted id set touches each
+        // block once here too. An id with no record is absent, as the scan
+        // omits it; a record without a property is absent from that column.
+        let mut corrupt: Option<usize> = None;
+        self.store
+            .get_many_with(prefix, ids.iter().map(|id| id.to_be_bytes()), |i, bytes| {
+                if corrupt.is_some() {
+                    return;
+                }
+                for (j, token) in tokens.iter().enumerate() {
+                    let Some(token) = token else {
+                        continue;
+                    };
+                    let Some(tagged) = get_property(bytes, PropertyId(*token)) else {
+                        continue;
+                    };
+                    match decode_prop_opt(&tagged) {
+                        Some(v) => out[j].push((ids[i], v)),
+                        None => {
+                            corrupt = Some(j);
+                            return;
+                        }
+                    }
+                }
+            });
+        if let Some(j) = corrupt {
+            return Err(GraphError::Corrupt(format!(
+                "undecodable property {}",
+                props[j]
+            )));
         }
         Ok(out)
     }
@@ -10822,7 +15037,8 @@ impl Graph {
 
     /// A property's token, if it was ever minted — never mints.
     ///
-    /// The token is what names a persisted index sidecar (`idx-<token>.idx`),
+    /// The token, with this graph's coordinate, is what names a persisted index
+    /// sidecar (`idx-<realm><ns>-<token>.idx`),
     /// so this is how a caller asks whether the index it just persisted is the
     /// one a reopened store carries.
     pub fn prop_token_peek(&self, name: &str) -> Option<u32> {
@@ -10868,9 +15084,7 @@ impl Graph {
             Dir::In => &[b'I'][..],
             Dir::Both => &[b'O', b'I'][..],
         } {
-            let mut want = vec![*tag];
-            want.extend_from_slice(&node.to_be_bytes());
-            for body in self.index_bodies(&want) {
+            for body in self.adj_bodies(*tag, node, type_tokens.as_deref(), true) {
                 if body.len() != 1 + 8 + 4 + 8 + 8 {
                     continue;
                 }
@@ -10897,6 +15111,22 @@ impl Graph {
         dir: Dir,
         types: Option<&[String]>,
     ) -> Result<Vec<RelRow>, GraphError> {
+        self.rels_of_where(node, dir, types, &|_| true)
+    }
+
+    /// `rels_of` keeping only the relationships whose FAR END passes `keep`,
+    /// tested on the adjacency entry BEFORE the record is decoded — the same
+    /// entries in the same order, less the refused ones. `allShortestPaths`
+    /// walks only the edges that lie on a shortest route this way
+    /// (`expand_var_length`'s distance prune): SNB Interactive IC14 decoded
+    /// 84,044 relationships to keep the few dozen between two people.
+    pub(crate) fn rels_of_where(
+        &self,
+        node: u64,
+        dir: Dir,
+        types: Option<&[String]>,
+        keep: &dyn Fn(u64) -> bool,
+    ) -> Result<Vec<RelRow>, GraphError> {
         let mut type_tokens = None;
         if let Some(ts) = types {
             let mut v = Vec::with_capacity(ts.len());
@@ -10906,6 +15136,12 @@ impl Graph {
             v.sort_unstable();
             type_tokens = Some(v);
         }
+        // With an executor that could split them (`rels_by_id`), the records'
+        // ids are gathered first; otherwise each record is read as its entry is
+        // met, as it always was — a reader racing a writer's detach-delete sees
+        // what it saw before.
+        let splittable = self.exec_width.get() > 1 && !self.in_txn();
+        let mut ids = Vec::new();
         let mut out = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
         for tag in match dir {
@@ -10913,10 +15149,9 @@ impl Graph {
             Dir::In => &[b'I'][..],
             Dir::Both => &[b'O', b'I'][..],
         } {
-            let mut want = vec![*tag];
-            want.extend_from_slice(&node.to_be_bytes());
-            // Bounded by (direction, node): O(degree), never O(all edges).
-            for body in self.index_bodies(&want) {
+            // Bounded by (direction, node, type): O(degree of the types
+            // asked), never O(all the node's edges) — see `adj_bodies`.
+            for body in self.adj_bodies(*tag, node, type_tokens.as_deref(), true) {
                 if body.len() != 1 + 8 + 4 + 8 + 8 {
                     continue;
                 }
@@ -10927,19 +15162,74 @@ impl Graph {
                     }
                 }
                 let rel_id = u64::from_be_bytes(body[21..29].try_into().expect("8"));
+                if !keep(u64::from_be_bytes(body[13..21].try_into().expect("8"))) {
+                    continue;
+                }
                 if seen.insert(rel_id) {
-                    if let Some(r) = self.rel(rel_id)? {
+                    if splittable {
+                        ids.push(rel_id);
+                    } else if let Some(r) = self.rel(rel_id)? {
                         out.push(r);
                     }
                 }
+            }
+        }
+        if splittable {
+            return self.rels_by_id(&ids);
+        }
+        Ok(out)
+    }
+
+    /// The relationship records of `ids`, in `ids`' order (an id with no
+    /// record is left out). Many of them are read across the executor, one
+    /// contiguous run per worker, the runs concatenated in order: SNB
+    /// Interactive IS3 reads a person's 1,190 KNOWS records, ~4 µs each on one
+    /// thread — near half of its 10 ms of engine, against Neo4j's 10 end to
+    /// end. Never inside a transaction, whose buffered writes a worker cannot
+    /// see.
+    fn rels_by_id(&self, ids: &[u64]) -> Result<Vec<RelRow>, GraphError> {
+        if ids.len() >= RELS_SPLIT_MIN && !self.in_txn() {
+            if let Some(exec) = self.exec().filter(|e| e.width() > 1) {
+                counted!("graph.relationship reads split across the executor");
+                let per = ids.len().div_ceil(exec.width()).max(RELS_SPLIT_MIN / 4);
+                let runs: Vec<&[u64]> = ids.chunks(per).collect();
+                type Run = std::sync::Mutex<Option<Result<Vec<RelRow>, GraphError>>>;
+                let slots: Vec<Run> = runs.iter().map(|_| std::sync::Mutex::new(None)).collect();
+                exec.for_each(runs.len(), &|k| {
+                    let got: Result<Vec<RelRow>, GraphError> = runs[k]
+                        .iter()
+                        .filter_map(|&id| self.rel(id).transpose())
+                        .collect();
+                    *slots[k].lock().unwrap_or_else(|e| e.into_inner()) = Some(got);
+                });
+                let mut out = Vec::with_capacity(ids.len());
+                for slot in slots {
+                    out.extend(
+                        slot.into_inner()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .expect("every run ran")?,
+                    );
+                }
+                return Ok(out);
+            }
+        }
+        let mut out = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if let Some(r) = self.rel(id)? {
+                out.push(r);
             }
         }
         Ok(out)
     }
 }
 
+/// The fewest relationship records `Graph::rels_by_id` reads across the
+/// executor: a read costs ~4 µs, so a thousand of them are a few milliseconds
+/// against a dispatch of tens of microseconds.
+const RELS_SPLIT_MIN: usize = 1024;
+
 /// Traversal direction, from the matched pattern's point of view.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Dir {
     /// Outgoing.
     Out,
@@ -11116,7 +15406,7 @@ pub fn encode_prop(v: &Value) -> Result<Vec<u8>, GraphError> {
                 )
             }) {
                 let mut payload = (items.len() as u32).to_le_bytes().to_vec();
-                for item in items {
+                for item in (items).iter() {
                     let enc = encode_prop(item)?;
                     payload.extend_from_slice(&(enc.len() as u32).to_le_bytes());
                     payload.extend_from_slice(&enc);
@@ -11140,7 +15430,7 @@ pub fn encode_prop(v: &Value) -> Result<Vec<u8>, GraphError> {
                 Str,
             }
             let mut kind: Option<Elem> = None;
-            for item in items {
+            for item in (items).iter() {
                 let k = match item {
                     Value::Int(_) => Elem::Int,
                     Value::Float(_) => Elem::Float,
@@ -11173,7 +15463,7 @@ pub fn encode_prop(v: &Value) -> Result<Vec<u8>, GraphError> {
             match kind.unwrap_or(Elem::Int) {
                 Elem::Str => {
                     let mut payload = (items.len() as u32).to_le_bytes().to_vec();
-                    for item in items {
+                    for item in (items).iter() {
                         let Value::Str(s) = item else {
                             unreachable!("checked above")
                         };
@@ -11195,7 +15485,7 @@ pub fn encode_prop(v: &Value) -> Result<Vec<u8>, GraphError> {
                     let mut out = vec![Tag::LIST.byte()];
                     out.extend_from_slice(&(items.len() as u32).to_le_bytes());
                     out.push(elem_tag.byte());
-                    for item in items {
+                    for item in (items).iter() {
                         match (item, k) {
                             // An int in a promoted double[] writes as f64 —
                             // writing i64 bits under a FLOAT64 element tag
@@ -11298,6 +15588,11 @@ pub fn encode_prop(v: &Value) -> Result<Vec<u8>, GraphError> {
 /// STABLE sort plus a dedup keeps exactly the entry the map-based scan
 /// returned. A column from one block is already in order and is not
 /// sorted (counted either way).
+/// The fewest ids a record-gather splits across the executor for
+/// (`column_entries_gather_many`): a point read costs ~4 µs, so a thousand
+/// of them are a few milliseconds against a dispatch of tens of microseconds.
+const GATHER_SPLIT_MIN: usize = 1024;
+
 fn settle_column<T>(col: &mut Vec<(u64, T)>) {
     if col.is_sorted_by_key(|(id, _)| *id) {
         counted!("graph.column visits already in id order");
@@ -11337,7 +15632,7 @@ fn decode_prop_opt(tagged: &[u8]) -> Option<Value> {
                     _ => return None,
                 });
             }
-            Value::List(items)
+            Value::List((items).into())
         }
         t if t == Tag::LIST_TEMPORAL => {
             // u32 total length (skip framing), then u32 count, then each element
@@ -11353,7 +15648,7 @@ fn decode_prop_opt(tagged: &[u8]) -> Option<Value> {
                 items.push(decode_prop_opt(payload.get(at..at + len)?)?);
                 at += len;
             }
-            Value::List(items)
+            Value::List((items).into())
         }
         t if t == Tag::BYTES => {
             // In a user property position, BYTES is the string-array
@@ -11374,7 +15669,7 @@ fn decode_prop_opt(tagged: &[u8]) -> Option<Value> {
             if at != payload.len() {
                 return None;
             }
-            Value::List(items)
+            Value::List((items).into())
         }
         t if t == Tag::DATE => Value::Date(i64::from_le_bytes(body.get(..8)?.try_into().ok()?)),
         t if t == Tag::TIME => Value::Time {
@@ -11432,6 +15727,12 @@ impl Subsystem for GraphLayer {
     fn register() -> Registration {
         Registration::new()
             .crash_point("graph.between_node_and_membership")
+            .gate(
+                Gate::new(
+                    "two tenants on one store answer exactly as each does alone",
+                    Canary::new("make any per-graph structure store-wide — a persisted index looked up by token alone — and assert the tenant-isolation differential fails"),
+                ),
+            )
             .sometimes("graph.null set removed a property")
             .sometimes("interp.row budget refused a statement")
             .sometimes("interp.unbound WHERE variable refused")
@@ -11475,6 +15776,75 @@ impl Subsystem for GraphLayer {
             .sometimes("interp.columnar hop scan filtered an end by label")
             .sometimes("interp.columnar stage unwound a list")
             .sometimes("interp.columnar stage folded an aggregating breaker")
+            .counter("algo.runs")
+            .counter("algo.graph built")
+            .counter("algo.fixpoint iterations")
+            .counter("algo.fixpoint hit the iteration cap")
+            .counter("algo.pagerank runs")
+            .counter("algo.wcc runs")
+            .counter("algo.degree runs")
+            .counter("algo.bfs runs")
+            .counter("algo.sssp runs")
+            .counter("algo.sssp refused a negative weight")
+            .counter("algo.triangle runs")
+            .counter("algo.lpa runs")
+            .counter("algo.lpa oscillated")
+            .counter("algo.louvain runs")
+            .counter("algo.result published")
+            .counter("algo.result evicted for budget")
+            .counter("trigram.overlay folded")
+            .counter("fulltext.overlay folded")
+            .counter("algo.result served from the cache")
+            .counter("algo.write chunks")
+            .counter("algo.weights defaulted")
+            .counter("algo.fixpoint parallel")
+            .counter("algo.fixpoint morsels above one")
+            .counter("algo.fixpoint below the parallel floor")
+            .counter("algo.betweenness runs")
+            .counter("algo.refused for all-pairs work")
+            .counter("algo.kshortest runs")
+            .counter("algo.scc runs")
+            .counter("algo.closeness runs")
+            .counter("algo.concurrency narrowed the executor")
+            .counter("algo.kshortest refused a negative weight")
+            .sometimes("algo.kshortest exhausted before k")
+            .counter("interp.shortest path grouped by endpoint")
+            .sometimes("interp.allShortestPaths returned more than one route")
+            .sometimes("algo.fixpoint converged before the cap")
+            .sometimes("algo.fixpoint hit the iteration cap")
+            .sometimes("algo.an edge left the projection")
+            .sometimes("algo.a weight property was missing")
+            .sometimes("algo.label propagation oscillated")
+            .sometimes("algo.a cached result was served stale")
+            .sometimes("algo.a write batched across more than one transaction")
+            .counter("graph.term index built")
+            .counter("graph.term index cache hit")
+            .counter("graph.term index built by another worker")
+            .counter("graph.fulltext answered from the index")
+            .counter("graph.fulltext fell back to a scan")
+            .counter("graph.fulltext index declined")
+            .counter("interp.seed sought a trigram index")
+            .counter("graph.trigram index catalogue served from cache")
+            .counter("graph.trigram probe unioned a transaction write")
+            .counter("graph.trigram index rebuilt for a label change")
+            .sometimes("trigram.index rebuilt for a membership change")
+            .counter("graph.trigram index built")
+            .counter("graph.trigram index cache hit")
+            .counter("graph.trigram index still current")
+            .counter("graph.trigram index caught up")
+            .counter("graph.trigram index built by another worker")
+            .counter("interp.seed probed a trigram index")
+            .counter("interp.columnar seek probed a declared trigram index")
+            .counter("interp.trigram probe declined")
+            .counter("interp.procedure dispatched from the registry")
+            .counter("interp.algorithm run shared by rows with the same configuration")
+            .counter("interp.procedure yielded its default signature")
+            .counter("interp.procedure refused: unknown name")
+            .counter("interp.procedure refused: YIELD required")
+            .counter("interp.awaitIndexes answered immediately")
+            .sometimes("trigram.query analysis returned match-all")
+            .sometimes("interp.a standalone CALL produced its default columns")
+            .sometimes("interp.a CALL without YIELD was refused for not being last")
             .counter("interp.columnar hop scan declined an end column")
             .sometimes("interp.columnar stage fused the next aggregating WITH")
             .sometimes("interp.columnar order sorted a primitive key")
@@ -11500,12 +15870,63 @@ impl Subsystem for GraphLayer {
             .counter("graph.column visits already in id order")
             .counter("graph.column visits sorted across blocks")
             .counter("graph.column point-gather")
+            .counter("interp.columnar column read skipped the span walk for a sparse population")
+            .counter("interp.pipeline reduce folded its rows per distinct id")
+            .counter("interp.columnar aggregate folded over cached columns")
+            .counter("interp.columnar projection walked its label whole to keep the columns for its limit")
+            .counter("interp.matcher skipped the fan-out probe: the end's columns are cached")
+            .counter("interp.columnar projection sought ids visited newest first for the limit")
+            .counter("interp.matcher fan-out read from the adjacency table")
+            .counter("interp.pipeline aggregate native multi-key group-by")
+            .counter("graph.property log kept for an older sibling index")
+            .counter("graph.composite index cache hit")
+            .counter("graph.composite index still current")
+            .counter("graph.composite index derived by another worker")
+            .counter("graph.composite index derived")
+            .counter("interp.columnar covered count sought a composite")
+            .counter("interp.columnar seek probed a declared composite")
+            .counter("interp.seed probed a declared composite")
             .counter("graph.column record-gather")
             .counter("graph.column presence point-gather")
             .counter("interp.columnar projection single-phase nodes")
             .counter("interp.columnar projection stopped at the limit")
             .counter("interp.columnar projection predicate evaluated column-at-a-time")
             .counter("interp.pipeline hop borrowed its adjacency table once")
+            // Fix 119. The fold's own row floor is 2, not 
+            // (256): a fold's driving row is a whole nested walk, and q3's
+            // 111-country seed sat under the expand-sized floor, serial.
+            .counter("interp.pipeline fold cut finer than its worker count")
+            // Fix 120. Each fold level's children are multiplied in an order
+            // chosen STRUCTURALLY — closes before expands, smaller subtrees
+            // first — so a factor that can be zero is computed before the
+            // wide expansion it would annul. q3 expanded person2's ~36
+            // friends before testing person2's country, and 72.4% of SF1's
+            // KNOWS edges cross a country boundary.
+            .counter("interp.pipeline fold children ordered semijoin-first")
+            .counter("interp.pipeline fold hop walks")
+            // Fix 92. The probe cap needs a SINGLE fold root: `reached` is one
+            // accumulator and roots' weights MULTIPLY, so one root's partial
+            // is not the count and judging the cap against it starved a later
+            // root of its first row — a `RETURN <const> LIMIT k` answering
+            // NONE. Dropped for a multi-root fold, which then sums every row.
+            .counter("pipeline.count fold probe cap dropped: more than one root")
+            // Fix 90 (strategy Q3). A var set the planner proves
+            // interchangeable is enumerated in ONE id order and the count
+            // multiplied by the set's size factorial. `planned` is the
+            // recogniser's verdict on the QUERY; `broken` is the gate's on
+            // the DATA — they differ exactly when a joining type carries a
+            // self-loop, which is the one way two members could bind the
+            // same node and make the multiplier overcount.
+            .counter("interp.pipeline fold symmetry planned")
+            .counter("interp.pipeline fold symmetry broken")
+            .counter("interp.pipeline fold symmetry declined: a joining type carries self-loops")
+            .counter("interp.pipeline fold symmetry declined: the set is too wide")
+            .counter("interp.pipeline fold symmetry declined: a materialised member is not first")
+            .counter("interp.pipeline fold symmetry declined: two members are not adjacent")
+            .counter(
+                "interp.pipeline fold symmetry declined: a transposition is not an automorphism",
+            )
+            .counter("interp.pipeline fold symmetry declined: the position rule")
             .counter("interp.columnar probes answered over the population")
             .counter("interp.type filter folded into its hop")
             .counter("interp.columnar label test answered from membership")
@@ -11601,6 +16022,37 @@ impl Subsystem for GraphLayer {
             .counter("interp.columnar stages")
             .counter("interp.columnar hop aggregate scans")
             .counter("interp.columnar hop scan seeded from a sought end")
+            .counter("interp.columnar seeded hop filtered its seeds by the start's predicate")
+            .counter("interp.columnar seeded hop summed degrees per seed")
+            .counter("interp.columnar seeded hop folded per distinct far end")
+            .counter("interp.columnar projection scanned its chunks from both ends for the limit")
+            .counter("interp.matcher warmed a hop end label's columns for a wide fan-out")
+            .counter("interp.columnar stage predicate evaluated column-at-a-time")
+            .counter("interp.columnar count distinct of the scanned variable counted its members")
+            .counter("interp.matcher warmed a hop end label's columns after repeated misses")
+            .counter("interp.exists remainder answered from its first-hop memo")
+            .counter("interp.exists remainder evaluated for its first-hop memo")
+            .counter("interp.top-k keyed its rows and projected the survivors alone")
+            .counter("interp.top-k pushed below its grouping stage")
+            .counter("interp.pipeline unlabelled var's label discovered from its members")
+            .counter("interp.columnar projection deduplicated its one column")
+            // Fix 126. Every projected item is a bare column local, so the
+            // rows are the walk's columns transposed: no scope, no per-member
+            // bind, no expression evaluation to move a value the walk already
+            // holds.
+            .counter("interp.columnar projection emitted its rows from the columns")
+            .counter("interp.seed answered empty from a label with no member")
+            .counter("interp.expansion skipped a non-member peer before its frame")
+            .counter("interp.projection took a properties map out of its row")
+            .counter("paged.block reused by the gather cursor")
+            .counter("interp.grouping top-k hydrated its page's keys alone")
+            .counter("interp.match over a relationship type with no live relationship matched nothing")
+            .counter("interp.expansion skipped a hop over a relationship type with no live relationship")
+            .counter("graph.rels materialised projected")
+            .counter("interp.matcher bound a relationship by a projected read")
+            .counter("interp.expansion skipped a peer outside the resolved end set before its frame")
+            .counter("interp.projection took a whole value out of its row")
+            .counter("interp.projection ordered by keys read from its row")
             .counter("interp.columnar stage hydrated a survivor projected to its continuation")
             .counter("graph.relationship populations built")
             .counter("graph.constraint epoch served from cache")
@@ -11633,6 +16085,7 @@ impl Subsystem for GraphLayer {
             .counter("interp.seed probe walked its path lean")
             .counter("interp.seed probe's conjunct pruned from the WHERE")
             .counter("interp.matcher bound a hop end bare")
+            .counter("interp.label test outside the pattern bound its end from the record")
             .counter("interp.constant conjunct folded")
             .counter("interp.subquery hop evaluated column-at-a-time")
             .counter("interp.seed undeclared probe capped at the label")
@@ -11647,10 +16100,26 @@ impl Subsystem for GraphLayer {
             .counter("interp.subquery seeded with a lean row")
             .counter("interp.columnar population read its label whole to keep the columns")
             .counter("interp.subquery hop loaded its far end's column whole")
+            // Fix 118. The three sites that refuse on WHOLE_LABEL_READ_MAX:
+            // one READ site and the two MINT sites. A label over the ceiling
+            // therefore declines the vectorised path AND can never acquire
+            // the column that would lift the decline, so the slow path is
+            // permanent rather than cold. These were silent, and a permanent
+            // decline that is silent reads exactly like a fast path.
+            .counter("interp.subquery hop declined: label over the whole-read ceiling")
+            // Fix 121. The decline is now a CHOICE: knowing the hop's ends
+            // first turns |label| into |ends|, so a 3M-node label whose hop
+            // touches a few thousand gathers exactly those.
+            .counter("interp.subquery hop gathered only its own ends")
+            .counter("interp.warm after misses declined: label over the whole-read ceiling")
+            .counter("interp.warm after misses minted a big label's column by budget")
+            .counter("interp.fan-out warm minted a big label's column by budget")
+            .counter("interp.fan-out warm declined: label over the whole-read ceiling")
             .counter("interp.breaker bound a bare group key lean for the RETURN after its aggregation")
             .counter("interp.columnar whole-label read for a population declined")
             .counter("graph.merge settled behind an in-flight writer")
             .counter("interp.matcher reused the bound start")
+            .counter("interp.matcher seeded its start from an id equality")
             .counter("interp.columnar column read served from the property-column cache")
             .counter("interp.columnar cached column restricted to the population")
             .counter("interp.columnar multi-label column read through its smallest label")
@@ -11696,6 +16165,20 @@ impl Subsystem for GraphLayer {
             .counter("graph.property column served")
             .counter("graph.property column kept")
             .counter("graph.property column retired by a commit")
+            // Fix 124. A cached property column is judged current by the
+            // (label, property) epoch pair, so a commit that touches neither
+            // no longer retires it. The two counters below are how a run says
+            // which regime it is in.
+            .counter("graph.property column survived a commit that touched neither epoch")
+            .counter("graph.property column epoch currency declined: the property has no log")
+            // Fix 93 (strategy O4): the two halves of the re-stamp. The
+            // second is the strategy's own win — an unindexed property's
+            // column keeping its currency across a commit that touched
+            // neither it nor its label. The first is what makes the second
+            // sound, and a run where it never fires while writes are direct
+            // is a run whose re-stamp has not been exercised.
+            .counter("graph.property column retired by a direct write")
+            .counter("graph.property column re-stamped past an untouching commit")
             .counter("graph.property column evicted")
             .counter("graph.property column not kept: over budget")
             .counter("interp.merge races converged")
@@ -11812,7 +16295,7 @@ mod index_topk_tests {
         let run = |friends: &BTreeSet<u64>, upper: i64| {
             g.index_ordered_topk_semijoin(
                 "creationDate",
-                upper,
+                &engram_store::IndexKey::Int(upper),
                 &Some(vec![hc]),
                 Dir::Out,
                 friends,
@@ -11864,7 +16347,7 @@ mod index_topk_tests {
         let declined = g
             .index_ordered_topk_semijoin(
                 "creationDate",
-                1300,
+                &engram_store::IndexKey::Int(1300),
                 &Some(vec![hc]),
                 Dir::Out,
                 &sparse,
@@ -11877,7 +16360,7 @@ mod index_topk_tests {
         let served = g
             .index_ordered_topk_semijoin(
                 "creationDate",
-                1300,
+                &engram_store::IndexKey::Int(1300),
                 &Some(vec![hc]),
                 Dir::Out,
                 &dense,
@@ -11915,7 +16398,7 @@ mod anchored_hierarchy_tests {
         let rows = run_query(g, &q, BTreeMap::new()).expect("run").rows;
         let mut out = BTreeSet::new();
         if let Some(Value::List(items)) = rows.first().and_then(|r| r.first()) {
-            for v in items {
+            for v in items.iter() {
                 if let Value::Int(i) = v {
                     out.insert(*i);
                 }
@@ -12065,5 +16548,108 @@ mod edge_probe_flag_tests {
         assert!(typed_a.folded().sorted_by_peer);
         assert!(!untyped.folded().sorted_by_peer);
         assert!(!typed_a.unsorted().sorted_by_peer);
+    }
+}
+
+#[cfg(test)]
+mod l4_phase0_redundancy_instrument {
+    //! Strategy L4 proposed single-flighting the property-column rebuild so
+    //! concurrent readers do it once. That is REFUSED on measured precedent —
+    //! `set_single_flight_repair` did exactly this for adjacency and took
+    //! throughput 26,986 -> 16,190 ops/s, 40% WORSE, because the readers that
+    //! had duplicated the work in parallel then queued on one mutex.
+    //!
+    //! What survived the refusal is Phase 0: the INSTRUMENT that says whether
+    //! the redundancy is happening at all. Without it the question rests on
+    //! argument. `keep_prop_column` now counts a keep that REPLACES a still
+    //! current entry, which is exactly a rebuild another reader had already
+    //! made unnecessary.
+    //!
+    //! These tests exist because an uncounted counter is the trap this ledger
+    //! keeps recording: a metric that never fires reads identically to a
+    //! system with nothing to report. `a` proves it CAN fire; `b` proves it
+    //! does not fire when the entry it replaced was genuinely stale, which is
+    //! the case that would inflate the redundancy and argue for a fix nothing
+    //! needs.
+
+    use super::*;
+    use engram_key::{Namespace, Realm};
+    use engram_store::Store;
+
+    const REDUNDANT: &str = "graph.property column rebuilt while a current one was already cached";
+
+    fn corpus() -> Graph {
+        let g = Graph::new(Store::new(), Realm(1), Namespace(1));
+        // The tokens have to exist before `keep_prop_column` can resolve them.
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(
+            "nickname".to_string(),
+            engram_cypher::Value::Str("n0".into()),
+        );
+        g.create_node(&["Person".into()], &m).expect("person");
+        g
+    }
+
+    fn a_column() -> PropColumn {
+        PropColumn::Values(std::sync::Arc::new(vec![(
+            1u64,
+            engram_cypher::Value::Str("n0".into()),
+        )]))
+    }
+
+    fn count_of(c: &std::collections::BTreeMap<String, u64>, k: &str) -> u64 {
+        c.get(k).copied().unwrap_or(0)
+    }
+
+    #[test]
+    fn a_replacing_a_still_current_entry_counts_the_rebuild_as_redundant() {
+        let g = corpus();
+        let at = g.column_stamp();
+        assert!(g.keep_prop_column("Person", "nickname", at, a_column()));
+
+        // A SECOND keep at the same stamp: nothing has moved, so the entry it
+        // displaces was still usable and this rebuild bought nothing.
+        let (kept, t) =
+            engram_observe::with_trace(|| g.keep_prop_column("Person", "nickname", at, a_column()));
+        assert!(kept, "the second keep was refused, so nothing was replaced");
+        assert!(
+            count_of(t.counters(), REDUNDANT) > 0,
+            "the instrument did not fire on a keep that replaced a CURRENT \
+             entry — it cannot report redundancy that is happening: {:?}",
+            t.counters()
+        );
+    }
+
+    #[test]
+    fn b_replacing_a_stale_entry_is_not_counted_redundant() {
+        let g = corpus();
+        let at = g.column_stamp();
+        assert!(g.keep_prop_column("Person", "nickname", at, a_column()));
+
+        // Move the world on: a new Person changes the LABEL epoch, so the
+        // cached entry is genuinely stale and rebuilding it was necessary
+        // work. Counting that as redundant would argue for de-duplicating
+        // rebuilds that are not duplicates.
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(
+            "nickname".to_string(),
+            engram_cypher::Value::Str("n1".into()),
+        );
+        g.create_node(&["Person".into()], &m)
+            .expect("second person");
+
+        let later = g.column_stamp();
+        let (kept, t) = engram_observe::with_trace(|| {
+            g.keep_prop_column("Person", "nickname", later, a_column())
+        });
+        assert!(kept);
+        assert_eq!(
+            count_of(t.counters(), REDUNDANT),
+            0,
+            "a rebuild over a STALE entry was counted redundant — the \
+             instrument would over-report and argue for a fix nothing \
+             needs: {:?}",
+            t.counters()
+        );
     }
 }

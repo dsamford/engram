@@ -58,9 +58,15 @@ const GATHER: &str = "graph.column point-gather";
 fn corpus(declare_both: bool) -> Graph {
     let g = Graph::new(Store::new(), Realm(1), Namespace(1));
     g.set_label_scoped_indexes(true);
-    ddl(&g, "CREATE INDEX doc_owner IF NOT EXISTS FOR (n:Doc) ON (n.owner)");
+    ddl(
+        &g,
+        "CREATE INDEX doc_owner IF NOT EXISTS FOR (n:Doc) ON (n.owner)",
+    );
     if declare_both {
-        ddl(&g, "CREATE INDEX doc_kind IF NOT EXISTS FOR (n:Doc) ON (n.kind)");
+        ddl(
+            &g,
+            "CREATE INDEX doc_kind IF NOT EXISTS FOR (n:Doc) ON (n.kind)",
+        );
     }
     for i in 0..700i64 {
         let mut m = BTreeMap::new();
@@ -76,7 +82,8 @@ fn corpus(declare_both: bool) -> Graph {
 }
 
 const COUNT_N: &str = "MATCH (d:Doc {kind: 'email', owner: 'u8'}) RETURN count(d) AS n";
-const COUNT_STAR: &str = "MATCH (d:Doc) WHERE d.owner = 'u8' AND d.kind = 'email' RETURN count(*) AS n";
+const COUNT_STAR: &str =
+    "MATCH (d:Doc) WHERE d.owner = 'u8' AND d.kind = 'email' RETURN count(*) AS n";
 const COUNT_UNSELECTIVE: &str = "MATCH (d:Doc {kind: 'email'}) RETURN count(d) AS n";
 
 #[test]
@@ -85,8 +92,15 @@ fn a_covered_count_is_answered_from_the_index_intersection_without_a_record_read
     for src in [COUNT_N, COUNT_STAR] {
         let (on, off) = both(&g, src);
         assert_eq!(on, off, "covered vs general disagree on `{src}`");
-        assert_eq!(on, vec![vec![Value::Int(2)]], "u8 owns docs 8 and 358, both email");
-        assert!(counter(&g, src, COVERED) > 0, "`{src}` must be answered by the intersection");
+        assert_eq!(
+            on,
+            vec![vec![Value::Int(2)]],
+            "u8 owns docs 8 and 358, both email"
+        );
+        assert!(
+            counter(&g, src, COVERED) > 0,
+            "`{src}` must be answered by the intersection"
+        );
         assert_eq!(counter(&g, src, GATHER), 0, "`{src}` must read no record");
     }
     // The UNSELECTIVE single key: 600 of 700 — a seek would lose to the scan,
@@ -106,16 +120,35 @@ fn the_covered_path_declines_everything_it_cannot_answer_exactly() {
     let g = corpus(false); // `kind` undeclared
     let cases = [
         ("undeclared key", COUNT_N),
-        ("numeric value", "MATCH (d:Doc {owner: 'u8', n: 8}) RETURN count(d) AS n"),
-        ("extra predicate", "MATCH (d:Doc {owner: 'u8'}) WHERE d.n > 100 RETURN count(d) AS n"),
-        ("distinct", "MATCH (d:Doc {owner: 'u8'}) RETURN count(DISTINCT d.kind) AS n"),
-        ("another aggregate", "MATCH (d:Doc {owner: 'u8'}) RETURN count(d) AS n, max(d.n) AS m"),
-        ("grouping key", "MATCH (d:Doc {owner: 'u8'}) RETURN d.kind AS k, count(d) AS n ORDER BY k"),
+        (
+            "numeric value",
+            "MATCH (d:Doc {owner: 'u8', n: 8}) RETURN count(d) AS n",
+        ),
+        (
+            "extra predicate",
+            "MATCH (d:Doc {owner: 'u8'}) WHERE d.n > 100 RETURN count(d) AS n",
+        ),
+        (
+            "distinct",
+            "MATCH (d:Doc {owner: 'u8'}) RETURN count(DISTINCT d.kind) AS n",
+        ),
+        (
+            "another aggregate",
+            "MATCH (d:Doc {owner: 'u8'}) RETURN count(d) AS n, max(d.n) AS m",
+        ),
+        (
+            "grouping key",
+            "MATCH (d:Doc {owner: 'u8'}) RETURN d.kind AS k, count(d) AS n ORDER BY k",
+        ),
     ];
     for (why, src) in cases {
         let (on, off) = both(&g, src);
         assert_eq!(on, off, "{why}: columnar vs general disagree on `{src}`");
-        assert_eq!(counter(&g, src, COVERED), 0, "{why}: must not be covered: `{src}`");
+        assert_eq!(
+            counter(&g, src, COVERED),
+            0,
+            "{why}: must not be covered: `{src}`"
+        );
     }
     // And the one it CAN answer here — the declared key alone — still fires.
     let src = "MATCH (d:Doc {owner: 'u8'}) RETURN count(d) AS n";
@@ -133,7 +166,13 @@ fn a_removed_label_is_not_counted() {
     assert_eq!(rows(&g, COUNT_N), vec![vec![Value::Int(2)]]);
     rows(&g, "MATCH (d:Doc {n: 8}) REMOVE d:Doc");
     let (on, off) = both(&g, COUNT_N);
-    assert_eq!(on, off, "after the label removal the paths must still agree");
+    assert_eq!(
+        on, off,
+        "after the label removal the paths must still agree"
+    );
     assert_eq!(on, vec![vec![Value::Int(1)]], "doc 8 left the label");
-    assert!(counter(&g, COUNT_N, COVERED) > 0, "and the covered path still answers");
+    assert!(
+        counter(&g, COUNT_N, COVERED) > 0,
+        "and the covered path still answers"
+    );
 }

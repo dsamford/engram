@@ -124,6 +124,19 @@ pub enum IndexKey {
     Float(f64),
     /// STRING, ordered bytewise over UTF-8 (code-point order).
     Str(Vec<u8>),
+    /// DATE: days since the epoch.
+    Date(i64),
+    /// TIME: nanoseconds since midnight NORMALISED TO UTC (`nanos - offset`),
+    /// which is exactly what `Value::eq3` and `Value::lt3` compare.
+    Time(i64),
+    /// LOCAL TIME: nanoseconds since midnight.
+    LocalTime(i64),
+    /// DATETIME — offset and zone-id forms alike — as its INSTANT: epoch
+    /// seconds, then nanoseconds. The offset is presentation (`eq3`/`lt3`
+    /// compare by instant), so it is not part of the key.
+    DateTime(i64, u32),
+    /// LOCAL DATETIME: wall-clock epoch seconds, then nanoseconds.
+    LocalDateTime(i64, u32),
 }
 
 impl Eq for IndexKey {}
@@ -135,11 +148,11 @@ impl Ord for IndexKey {
             (Int(a), Int(b)) => a.cmp(b),
             (Float(a), Float(b)) => a.total_cmp(b),
             (Str(a), Str(b)) => a.cmp(b),
+            (Date(a), Date(b)) | (Time(a), Time(b)) | (LocalTime(a), LocalTime(b)) => a.cmp(b),
+            (DateTime(sa, na), DateTime(sb, nb))
+            | (LocalDateTime(sa, na), LocalDateTime(sb, nb)) => (sa, na).cmp(&(sb, nb)),
             // Cross-type: tag-class order, stable and documented as arbitrary.
-            (Int(_), _) => std::cmp::Ordering::Less,
-            (_, Int(_)) => std::cmp::Ordering::Greater,
-            (Float(_), _) => std::cmp::Ordering::Less,
-            (_, Float(_)) => std::cmp::Ordering::Greater,
+            _ => self.class().cmp(&other.class()),
         }
     }
 }
@@ -151,14 +164,41 @@ impl PartialOrd for IndexKey {
 }
 
 impl IndexKey {
+    /// The key's CLASS, in the documented cross-type order: every key of a
+    /// lower class sorts below every key of a higher one. Keys of different
+    /// classes are never comparable in Cypher except integers with floats
+    /// (`1 < 1.5`), which this order does NOT interleave — a caller ranking a
+    /// numeric range must account for both classes itself.
+    pub fn class(&self) -> u8 {
+        match self {
+            IndexKey::Int(_) => 0,
+            IndexKey::Float(_) => 1,
+            IndexKey::Str(_) => 2,
+            IndexKey::Date(_) => 3,
+            IndexKey::Time(_) => 4,
+            IndexKey::LocalTime(_) => 5,
+            IndexKey::DateTime(..) => 6,
+            IndexKey::LocalDateTime(..) => 7,
+        }
+    }
+
     /// Interpret a tagged value as an index key. `None` for types this index
     /// does not order (which the build COUNTS rather than skips silently).
+    ///
+    /// Temporals are ordered since 2026-09-24. Before that every typed date
+    /// was unindexable, so on a corpus with typed temporals a range index over
+    /// `creationDate` held no dates at all, and the one operator that walks
+    /// such an index in order (IC9's index-ordered top-k) declined every run.
     pub fn from_tagged(tagged: &[u8]) -> Option<IndexKey> {
         let tag = Tag::from_byte(*tagged.first()?);
+        let i64_at = |at: usize| -> Option<i64> {
+            Some(i64::from_le_bytes(tagged.get(at..at + 8)?.try_into().ok()?))
+        };
+        let u32_at = |at: usize| -> Option<u32> {
+            Some(u32::from_le_bytes(tagged.get(at..at + 4)?.try_into().ok()?))
+        };
         match tag {
-            t if t == Tag::INT64 => Some(IndexKey::Int(i64::from_le_bytes(
-                tagged.get(1..9)?.try_into().ok()?,
-            ))),
+            t if t == Tag::INT64 => Some(IndexKey::Int(i64_at(1)?)),
             t if t == Tag::FLOAT64 => Some(IndexKey::Float(f64::from_le_bytes(
                 tagged.get(1..9)?.try_into().ok()?,
             ))),
@@ -166,7 +206,69 @@ impl IndexKey {
                 let len = u32::from_le_bytes(tagged.get(1..5)?.try_into().ok()?) as usize;
                 Some(IndexKey::Str(tagged.get(5..5 + len)?.to_vec()))
             }
+            // [days i64]
+            t if t == Tag::DATE => Some(IndexKey::Date(i64_at(1)?)),
+            // [nanos i64][offset i32] — normalised to UTC as `lt3` compares it.
+            t if t == Tag::TIME => {
+                let offset = i32::from_le_bytes(tagged.get(9..13)?.try_into().ok()?);
+                Some(IndexKey::Time(i64_at(1)? - i64::from(offset) * 1_000_000_000))
+            }
+            // [nanos i64]
+            t if t == Tag::LOCAL_TIME => Some(IndexKey::LocalTime(i64_at(1)?)),
+            // [epoch i64][nanos u32][offset i32]
+            t if t == Tag::DATETIME_OFFSET => Some(IndexKey::DateTime(i64_at(1)?, u32_at(9)?)),
+            // [len u32][epoch i64][nanos u32][offset i32][zone bytes]
+            t if t == Tag::DATETIME_ZONE_ID => Some(IndexKey::DateTime(i64_at(5)?, u32_at(13)?)),
+            // [epoch i64][nanos u32]
+            t if t == Tag::LOCAL_DATETIME => {
+                Some(IndexKey::LocalDateTime(i64_at(1)?, u32_at(9)?))
+            }
             _ => None,
+        }
+    }
+
+    /// The smallest key strictly above this one — the exclusive upper end of
+    /// an equality range `[k, successor(k))`. At a class's maximum it is the
+    /// next class's minimum; the maximum of the last class has no successor
+    /// and answers itself (an empty range there is the only possible loss,
+    /// and no temporal the engine can produce reaches it).
+    pub fn successor(&self) -> IndexKey {
+        match self {
+            IndexKey::Int(i) if *i < i64::MAX => IndexKey::Int(i + 1),
+            // the smallest float in total_cmp order sorts above every Int
+            IndexKey::Int(_) => IndexKey::Float(f64::from_bits(u64::MAX)),
+            IndexKey::Float(f) => {
+                let bits = f.to_bits();
+                // total_cmp order: negative floats run from bits u64::MAX down
+                // to 0x8000…, positives from 0 up; step to the next in that
+                // order, and past +NaN's maximum to the empty string.
+                if bits == 0x7FFF_FFFF_FFFF_FFFF {
+                    IndexKey::Str(Vec::new())
+                } else if bits == 0x8000_0000_0000_0000 {
+                    IndexKey::Float(f64::from_bits(0))
+                } else if bits & 0x8000_0000_0000_0000 != 0 {
+                    IndexKey::Float(f64::from_bits(bits - 1))
+                } else {
+                    IndexKey::Float(f64::from_bits(bits + 1))
+                }
+            }
+            IndexKey::Str(b) => {
+                let mut nb = b.clone();
+                nb.push(0);
+                IndexKey::Str(nb)
+            }
+            IndexKey::Date(d) if *d < i64::MAX => IndexKey::Date(d + 1),
+            IndexKey::Date(_) => IndexKey::Time(i64::MIN),
+            IndexKey::Time(t) if *t < i64::MAX => IndexKey::Time(t + 1),
+            IndexKey::Time(_) => IndexKey::LocalTime(i64::MIN),
+            IndexKey::LocalTime(t) if *t < i64::MAX => IndexKey::LocalTime(t + 1),
+            IndexKey::LocalTime(_) => IndexKey::DateTime(i64::MIN, 0),
+            IndexKey::DateTime(s, n) if *n < u32::MAX => IndexKey::DateTime(*s, n + 1),
+            IndexKey::DateTime(s, _) if *s < i64::MAX => IndexKey::DateTime(s + 1, 0),
+            IndexKey::DateTime(..) => IndexKey::LocalDateTime(i64::MIN, 0),
+            IndexKey::LocalDateTime(s, n) if *n < u32::MAX => IndexKey::LocalDateTime(*s, n + 1),
+            IndexKey::LocalDateTime(s, _) if *s < i64::MAX => IndexKey::LocalDateTime(s + 1, 0),
+            IndexKey::LocalDateTime(..) => self.clone(),
         }
     }
 }
@@ -324,6 +426,30 @@ impl RangeIndex {
         }
     }
 
+    /// An index assembled from `entries` the caller has ALREADY derived —
+    /// `(key, body)` pairs, sorted here — at vintage `ts`, with the
+    /// `unindexable` floor the caller carries over. No store read: a
+    /// COMPOSITE index is built this way, its tuple keys joined from its
+    /// component single-key indexes' live entries, so it holds exactly the
+    /// rows those indexes hold and nothing they do not.
+    pub fn from_entries(
+        def: IndexDef,
+        ts: u64,
+        mut entries: Vec<(IndexKey, Vec<u8>)>,
+        unindexable: u64,
+    ) -> RangeIndex {
+        entries.sort();
+        RangeIndex {
+            def,
+            entries: Arc::new(entries),
+            added: Vec::new(),
+            removed: Arc::new(BTreeSet::new()),
+            removed_recent: Vec::new(),
+            as_of: ts,
+            unindexable,
+        }
+    }
+
     /// This index over ONLY the bodies `keep` admits — the LABEL-SCOPED view
     /// of a partition-wide index, derived WITHOUT a store read: the live
     /// entries (overlay resolved) filtered by membership, in the same order,
@@ -399,6 +525,29 @@ impl RangeIndex {
         changes: &BTreeMap<Vec<u8>, Option<IndexKey>>,
         ts: u64,
     ) -> Option<RangeIndex> {
+        self.with_changes_folding_at(changes, ts, Self::FOLD_AT)
+    }
+
+    /// [`RangeIndex::with_changes`] with the fold threshold named by the
+    /// caller.
+    ///
+    /// A FOLD IS O(base) WHATEVER THE OVERLAY COSTS — `folded()` walks and
+    /// clones the whole base — so raising this does not make a fold dearer,
+    /// it makes folds RARER, in proportion. That is the one knob on the SNB
+    /// `balanced` SF10 stall: there a reader's fold is 3.7 s inside a query
+    /// whose p95 is 1.25 ms, and the reader is the only thing that folds a
+    /// range index (no maintenance pass does).
+    ///
+    /// What it costs: every read merges the base against a larger overlay and
+    /// tests each base entry against `removed`, so a bigger threshold is paid
+    /// back on ordinary reads. That is the trade, and it is a measurement
+    /// rather than an argument — see `--range-fold-at`.
+    pub fn with_changes_folding_at(
+        &self,
+        changes: &BTreeMap<Vec<u8>, Option<IndexKey>>,
+        ts: u64,
+        fold_at: usize,
+    ) -> Option<RangeIndex> {
         if self.unindexable > 0 {
             // The count cannot be maintained across a change to an unorderable
             // row, and we cannot tell whether one of these bodies is such a row.
@@ -456,14 +605,14 @@ impl RangeIndex {
         // read latency. Folding is the O(base) pass this method exists to
         // avoid doing per write — amortised over `FOLD_AT` writes, it is
         // O(base / FOLD_AT) each, which is what makes a write O(1) in practice.
-        if next.added.len() + next.removed_len() > Self::FOLD_AT {
+        if next.added.len() + next.removed_len() > fold_at {
             return Some(next.folded());
         }
         Some(next)
     }
 
     /// Past this much pending overlay, collapse it into a fresh base.
-    const FOLD_AT: usize = 4_096;
+    pub const FOLD_AT: usize = 4_096;
 
     /// Removals held in the small sorted bucket before being merged into the
     /// shared set. Small enough that cloning it per catch-up is noise; large
@@ -577,6 +726,35 @@ impl RangeIndex {
             let e = if take_add { add.next()? } else { base.next()? };
             Some((&e.0, e.1.as_slice()))
         })
+    }
+
+    /// EVERY live `(key, body)` pair in key order — the base minus `removed`,
+    /// merged with `added`; [`RangeIndex::live_range`] over the whole key
+    /// space. What a structure DERIVED from this index reads (the composite
+    /// index joins two of these by body), so it sees the overlay resolved
+    /// exactly as a query does.
+    pub fn live_entries<'a>(&'a self) -> impl Iterator<Item = (&'a IndexKey, &'a [u8])> + 'a {
+        let mut base = self
+            .entries
+            .iter()
+            .filter(|(_, b)| !self.is_removed(b))
+            .peekable();
+        let mut add = self.added.iter().peekable();
+        std::iter::from_fn(move || {
+            let take_add = match (base.peek(), add.peek()) {
+                (Some(b), Some(a)) => a < b,
+                (None, Some(_)) => true,
+                _ => false,
+            };
+            let e = if take_add { add.next()? } else { base.next()? };
+            Some((&e.0, e.1.as_slice()))
+        })
+    }
+
+    /// Rows this index could not order (a value of a type it does not
+    /// order) — a floor a census over the index must add back.
+    pub fn unindexable(&self) -> u64 {
+        self.unindexable
     }
 
     /// Indexed entries.
@@ -695,6 +873,11 @@ impl RangeIndex {
     // rebuild it. Same BLAKE3 discipline as the segment format — a corrupt index
     // file fails to load rather than answering wrong.
 
+    /// The sidecar format's magic. v2 (2026-09-24) adds the temporal key
+    /// classes; a v1 file is read only when it skipped nothing (see
+    /// [`RangeIndex::from_bytes`]).
+    const MAGIC: &[u8; 8] = b"ENGRIDX2";
+
     /// Serialise this index to bytes: `as_of`, `unindexable`, then the sorted
     /// `(key, body)` entries, with a trailing BLAKE3 over all of it. The `def`
     /// is NOT stored — the caller supplies it on load (the file is named by its
@@ -709,7 +892,7 @@ impl RangeIndex {
             return self.folded().to_bytes();
         }
         let mut out = Vec::new();
-        out.extend_from_slice(b"ENGRIDX1");
+        out.extend_from_slice(Self::MAGIC);
         out.extend_from_slice(&self.as_of.to_le_bytes());
         out.extend_from_slice(&self.unindexable.to_le_bytes());
         out.extend_from_slice(&(self.entries.len() as u64).to_le_bytes());
@@ -727,6 +910,19 @@ impl RangeIndex {
                     out.push(2);
                     out.extend_from_slice(&(s.len() as u64).to_le_bytes());
                     out.extend_from_slice(s);
+                }
+                IndexKey::Date(v) | IndexKey::Time(v) | IndexKey::LocalTime(v) => {
+                    out.push(match key {
+                        IndexKey::Date(_) => 3,
+                        IndexKey::Time(_) => 4,
+                        _ => 5,
+                    });
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                IndexKey::DateTime(s, n) | IndexKey::LocalDateTime(s, n) => {
+                    out.push(if matches!(key, IndexKey::DateTime(..)) { 6 } else { 7 });
+                    out.extend_from_slice(&s.to_le_bytes());
+                    out.extend_from_slice(&n.to_le_bytes());
                 }
             }
             out.extend_from_slice(&(body.len() as u64).to_le_bytes());
@@ -754,20 +950,49 @@ impl RangeIndex {
             *p += n;
             Some(s)
         };
-        if take(&mut p, 8)? != b"ENGRIDX1" {
+        let magic = take(&mut p, 8)?;
+        let v1 = magic == b"ENGRIDX1";
+        if !v1 && magic != Self::MAGIC {
             return None;
         }
         let as_of = u64::from_le_bytes(take(&mut p, 8)?.try_into().ok()?);
         let unindexable = u64::from_le_bytes(take(&mut p, 8)?.try_into().ok()?);
+        // A v1 file was written when temporals were UNINDEXABLE: any it met
+        // were counted and left out. Loaded now, such a file would claim to be
+        // complete while missing every date — and its vintage can still match
+        // the store, so nothing else would catch it. It is trusted only when
+        // it skipped NOTHING, which makes it complete under either rule.
+        if v1 && unindexable != 0 {
+            return None;
+        }
         let n = u64::from_le_bytes(take(&mut p, 8)?.try_into().ok()?) as usize;
         let mut entries = Vec::with_capacity(n);
         for _ in 0..n {
-            let key = match take(&mut p, 1)?[0] {
-                0 => IndexKey::Int(i64::from_le_bytes(take(&mut p, 8)?.try_into().ok()?)),
+            let tag = take(&mut p, 1)?[0];
+            if v1 && tag > 2 {
+                return None;
+            }
+            let i64_next = |p: &mut usize| -> Option<i64> {
+                Some(i64::from_le_bytes(take(p, 8)?.try_into().ok()?))
+            };
+            let key = match tag {
+                0 => IndexKey::Int(i64_next(&mut p)?),
                 1 => IndexKey::Float(f64::from_le_bytes(take(&mut p, 8)?.try_into().ok()?)),
                 2 => {
                     let len = u64::from_le_bytes(take(&mut p, 8)?.try_into().ok()?) as usize;
                     IndexKey::Str(take(&mut p, len)?.to_vec())
+                }
+                3 => IndexKey::Date(i64_next(&mut p)?),
+                4 => IndexKey::Time(i64_next(&mut p)?),
+                5 => IndexKey::LocalTime(i64_next(&mut p)?),
+                6 | 7 => {
+                    let s = i64_next(&mut p)?;
+                    let n = u32::from_le_bytes(take(&mut p, 4)?.try_into().ok()?);
+                    if tag == 6 {
+                        IndexKey::DateTime(s, n)
+                    } else {
+                        IndexKey::LocalDateTime(s, n)
+                    }
                 }
                 _ => return None,
             };

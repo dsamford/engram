@@ -28,11 +28,22 @@ and no such statement claims a relationship with the mark's owner.
   `crates/engram-tck/` is Apache-2.0, copyright Neo4j Sweden AB, redistributed
   under its own terms. Conformance figures quoted by this project are produced
   by running it. That crate is not published to crates.io.
-- **LDBC.** Benchmark results here use a corpus generated to the SNB schema by
-  this project's own generator. They are **not** official LDBC audited results
-  and must never be presented as such: an audited result requires the official
-  Datagen, the official workload driver, and an LDBC-appointed auditor. Ours
-  has none of those.
+- **LDBC.** Benchmark results here use the **official LDBC Datagen corpora**,
+  downloaded from `datasets.ldbcouncil.org` on 2026-08-29 and recorded in
+  `measurements/pod/datasets.md`; this project's own `snbgen` is the secondary
+  path, used where an official archive is not on the volume. CORRECTED
+  2026-09-10: this clause previously said the corpus came from "this project's
+  own generator", which had been false since 2026-08-29. A trademark note that
+  UNDERSTATES what was used is the worse failure of the two, because it reads as
+  a disclaimer written against a weaker claim than the project actually makes.
+
+  They are still **not** official LDBC audited results and must never be
+  presented as such. An audited result requires the official Datagen, the
+  official workload driver, and an LDBC-appointed auditor, and having the first
+  of those three is not two thirds of an audit — it is one input. LDBC's Fair
+  Use terms require the exact sentence "These are not LDBC Benchmark Results"
+  on any comparison drawn from an unaudited run; see
+  `docs/bench/ldbc-coverage-plan.md` §5 for what may and may not be claimed.
 
 ## This project's own name
 

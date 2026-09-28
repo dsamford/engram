@@ -43,8 +43,8 @@
 //! fold fired rather than assuming it.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use engram_graph::counters::{ADJ_STALE_DECLINED_TO_WALK, ADJ_STALE_SERVED_UNMOVED};
 use engram_graph::{Dir, Graph, SlimAdj};

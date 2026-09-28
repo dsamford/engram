@@ -76,7 +76,7 @@ fn scalar_and_container_goldens() {
     assert_eq!(enc(&Value::Str(s15.clone()))[0], 0x8F);
     assert_eq!(&enc(&Value::Str(s16.clone()))[..2], &[0xD0, 16]);
     assert_eq!(
-        enc(&Value::List(vec![Value::Int(1), Value::Int(2)])),
+        enc(&Value::List((vec![Value::Int(1), Value::Int(2)]).into())),
         vec![0x92, 0x01, 0x02]
     );
     let mut m = BTreeMap::new();
@@ -89,18 +89,18 @@ fn every_value_shape_round_trips() {
     let mut props = BTreeMap::new();
     props.insert(
         "k".to_string(),
-        Value::List(vec![Value::Str("x".into()), Value::Null]),
+        Value::List((vec![Value::Str("x".into()), Value::Null]).into()),
     );
     let values = [
         Value::Null,
         Value::Int(-9_007_199_254_740_993),
         Value::Float(f64::MIN_POSITIVE),
         Value::Str("héllo — ünïcode".into()),
-        Value::List(vec![
+        Value::List((vec![
             Value::Bool(true),
             Value::Float(0.1),
             Value::Str("s".into()),
-        ]),
+        ]).into()),
         Value::Map(props.clone()),
         Value::Node {
             id: 42,
@@ -245,8 +245,13 @@ fn the_manifest_is_answered_with_the_whole_offer_and_the_client_picks() {
     // Nothing is negotiated until the client answers.
     assert_eq!(s.version(), (0, 0));
     // The client picks 6.0 and selects no capabilities.
-    let done = s.feed(&[0x00, 0x00, 0x00, 0x06, 0x00]).expect("pick accepted");
-    assert!(done.is_empty(), "the server sends nothing for the pick itself");
+    let done = s
+        .feed(&[0x00, 0x00, 0x00, 0x06, 0x00])
+        .expect("pick accepted");
+    assert!(
+        done.is_empty(),
+        "the server sends nothing for the pick itself"
+    );
     assert_eq!(s.version(), (6, 0));
 }
 
@@ -260,7 +265,9 @@ fn the_manifest_client_may_pick_any_offered_5_x_and_pipeline_hello() {
     let r = replies(&s.feed(&bytes).expect("pick + hello"));
     assert_eq!(s.version(), (5, 3));
     assert_eq!(r[0].0, 0x70, "HELLO succeeded behind the pick");
-    let Pack::Value(Value::Map(meta)) = &r[0].1[0] else { panic!("no metadata") };
+    let Pack::Value(Value::Map(meta)) = &r[0].1[0] else {
+        panic!("no metadata")
+    };
     assert_eq!(
         meta.get("protocol_version"),
         Some(&Value::Str("5.3".into())),
@@ -272,8 +279,13 @@ fn the_manifest_client_may_pick_any_offered_5_x_and_pipeline_hello() {
 fn a_legacy_session_is_not_told_a_protocol_version() {
     let mut s = BoltServer::new(graph());
     s.feed(&LEGACY_HANDSHAKE).expect("legacy");
-    let r = replies(&s.feed(&msg(0x01, vec![map_field(BTreeMap::new())])).expect("hello"));
-    let Pack::Value(Value::Map(meta)) = &r[0].1[0] else { panic!("no metadata") };
+    let r = replies(
+        &s.feed(&msg(0x01, vec![map_field(BTreeMap::new())]))
+            .expect("hello"),
+    );
+    let Pack::Value(Value::Map(meta)) = &r[0].1[0] else {
+        panic!("no metadata")
+    };
     assert!(
         !meta.contains_key("protocol_version"),
         "the spec reserves protocol_version for the manifest exchange"
@@ -307,7 +319,11 @@ fn the_pick_waits_for_a_whole_varint() {
     let mut s = BoltServer::new(graph());
     s.feed(&DRIVER_HANDSHAKE).expect("manifest offered");
     // A continuation bit with nothing after it: not yet decidable.
-    assert!(s.feed(&[0x00, 0x00, 0x00, 0x06, 0x80]).expect("waits").is_empty());
+    assert!(
+        s.feed(&[0x00, 0x00, 0x00, 0x06, 0x80])
+            .expect("waits")
+            .is_empty()
+    );
     assert_eq!(s.version(), (0, 0));
     // The varint completes to 0 (`80 00`), which selects nothing.
     s.feed(&[0x00]).expect("completes");
@@ -393,7 +409,10 @@ fn replies(bytes: &[u8]) -> Vec<(u8, Vec<Pack>)> {
 const PICK_6_0: [u8; 5] = [0x00, 0x00, 0x00, 0x06, 0x00];
 
 fn negotiate_6_0(s: &mut BoltServer) {
-    assert_eq!(s.feed(&DRIVER_HANDSHAKE).expect("handshake"), MANIFEST_REPLY.to_vec());
+    assert_eq!(
+        s.feed(&DRIVER_HANDSHAKE).expect("handshake"),
+        MANIFEST_REPLY.to_vec()
+    );
     s.feed(&PICK_6_0).expect("pick");
     assert_eq!(s.version(), (6, 0));
 }
@@ -456,7 +475,7 @@ fn a_whole_session_streams_IDENTICAL_values_to_the_interpreter() {
     // interpreter's own answer — THE kill-criterion check, in miniature.
     let raw = &records[0][0];
     let wire_row: Vec<Value> = match raw {
-        Pack::Value(Value::List(vs)) => vs.clone(),
+        Pack::Value(Value::List(vs)) => vs.as_ref().clone(),
         _ => unreachable!("asserted above"),
     };
     let g2 = graph();
@@ -544,8 +563,15 @@ fn rollback_now_genuinely_undoes_instead_of_refusing() {
 #[test]
 fn the_trace_marker_changes_nothing_on_the_wire() {
     let mut s = ready_server();
+    // Permitted, so the marked statements really take the traced path — the
+    // path whose wire behaviour this test pins. Unpermitted, the marker is an
+    // ordinary comment (`the_trace_marker_is_honoured_only_when_the_operator_permits_it`).
+    s.set_trace_marker(true);
     run_stmt(&mut s, "UNWIND [1, 2, 3] AS x CREATE (:T {v: x})");
-    let plain = run_stmt(&mut s, "MATCH (t:T) WHERE t.v > 1 RETURN t.v AS v ORDER BY v");
+    let plain = run_stmt(
+        &mut s,
+        "MATCH (t:T) WHERE t.v > 1 RETURN t.v AS v ORDER BY v",
+    );
     let marked = run_stmt(
         &mut s,
         &format!(
@@ -553,7 +579,11 @@ fn the_trace_marker_changes_nothing_on_the_wire() {
             engram_bolt::TRACE_MARKER
         ),
     );
-    assert_eq!(marked.len(), plain.len(), "same messages: SUCCESS, 2 RECORDs, SUCCESS");
+    assert_eq!(
+        marked.len(),
+        plain.len(),
+        "same messages: SUCCESS, 2 RECORDs, SUCCESS"
+    );
     assert_eq!(marked.iter().filter(|(tag, _)| *tag == 0x71).count(), 2);
     for ((tp, fp), (tm, fm)) in plain.iter().zip(marked.iter()) {
         assert_eq!(tp, tm);
@@ -563,7 +593,10 @@ fn the_trace_marker_changes_nothing_on_the_wire() {
     }
     // A marker in the MIDDLE of a statement is an ordinary comment: no trace,
     // no error, same answer.
-    let mid = run_stmt(&mut s, "MATCH (t:T) /* engram:trace */ WHERE t.v > 1 RETURN t.v AS v ORDER BY v");
+    let mid = run_stmt(
+        &mut s,
+        "MATCH (t:T) /* engram:trace */ WHERE t.v > 1 RETURN t.v AS v ORDER BY v",
+    );
     assert_eq!(
         mid.iter().filter(|(tag, _)| *tag == 0x71).count(),
         2,
@@ -572,8 +605,15 @@ fn the_trace_marker_changes_nothing_on_the_wire() {
     // A syntax error behind the marker is still the statement's own. Last,
     // because a FAILURE puts the session in the failed state (every message
     // until RESET is IGNORED) — the protocol, not the marker.
-    let err = run_stmt(&mut s, &format!("{} MATCH (t:T RETURN t", engram_bolt::TRACE_MARKER));
-    assert_eq!(err[0].0, 0x7F, "FAILURE, not a silent success: {:?}", err[0]);
+    let err = run_stmt(
+        &mut s,
+        &format!("{} MATCH (t:T RETURN t", engram_bolt::TRACE_MARKER),
+    );
+    assert_eq!(
+        err[0].0, 0x7F,
+        "FAILURE, not a silent success: {:?}",
+        err[0]
+    );
 }
 
 #[test]
@@ -639,7 +679,7 @@ fn noop_chunks_are_tolerated_between_messages() {
     bytes.extend(msg(0x3F, vec![map_field(pull)]));
     let r = replies(&s.feed(&bytes).expect("noop tolerated"));
     assert!(r.iter().any(|(t, f)| {
-        *t == 0x71 && matches!(&f[0], Pack::Value(Value::List(vs)) if vs == &vec![Value::Int(7)])
+        *t == 0x71 && matches!(&f[0], Pack::Value(Value::List(vs)) if **vs == vec![Value::Int(7)])
     }));
 }
 
@@ -651,7 +691,7 @@ fn the_route_stub_names_itself_all_three_roles() {
             0x66,
             vec![
                 map_field(BTreeMap::new()),
-                Pack::Value(Value::List(vec![])),
+                Pack::Value(Value::List((vec![]).into())),
                 map_field(BTreeMap::new()),
             ],
         ))
@@ -745,7 +785,7 @@ fn sessions_over_one_graph_share_its_indexes_without_rebuilding() {
         let Pack::Value(Value::List(row)) = &r[1].1[0] else {
             panic!()
         };
-        assert_eq!(row, &vec![Value::Int(1)]);
+        assert_eq!(**row, vec![Value::Int(1)]);
     });
     assert_eq!(
         t.counters().get("graph.vector ann index builds"),
@@ -869,10 +909,14 @@ fn ready_at(handshake: &[u8; 20], pick: Option<&[u8]>) -> BoltServer {
     if let Some(p) = pick {
         s.feed(p).expect("pick");
     }
-    let r = s.feed(&msg(0x01, vec![map_field(BTreeMap::new())])).expect("hello");
+    let r = s
+        .feed(&msg(0x01, vec![map_field(BTreeMap::new())]))
+        .expect("hello");
     assert_eq!(replies(&r)[0].0, 0x70);
     if s.version() >= (5, 1) {
-        let r = s.feed(&msg(0x6A, vec![map_field(BTreeMap::new())])).expect("logon");
+        let r = s
+            .feed(&msg(0x6A, vec![map_field(BTreeMap::new())]))
+            .expect("logon");
         assert_eq!(replies(&r)[0].0, 0x70);
     }
     s
@@ -881,7 +925,9 @@ fn ready_at(handshake: &[u8; 20], pick: Option<&[u8]>) -> BoltServer {
 fn failure_meta(s: &mut BoltServer, q: &str) -> BTreeMap<String, Value> {
     let r = run_stmt(s, q);
     assert_eq!(r[0].0, 0x7F, "expected a FAILURE, got tag {:#x}", r[0].0);
-    let Pack::Value(Value::Map(meta)) = &r[0].1[0] else { panic!("FAILURE without metadata") };
+    let Pack::Value(Value::Map(meta)) = &r[0].1[0] else {
+        panic!("FAILURE without metadata")
+    };
     meta.clone()
 }
 
@@ -889,15 +935,31 @@ fn failure_meta(s: &mut BoltServer, q: &str) -> BTreeMap<String, Value> {
 fn a_6_0_failure_carries_the_5_7_fields_and_a_5_0_failure_does_not() {
     let mut six = ready_at(&DRIVER_HANDSHAKE, Some(&[0x00, 0x00, 0x00, 0x06, 0x00]));
     let m = failure_meta(&mut six, "MATCH (n RETURN n");
-    assert_eq!(m.get("neo4j_code"), Some(&Value::Str("Neo.ClientError.Statement.SyntaxError".into())));
-    assert_eq!(m.get("code"), m.get("neo4j_code"), "`code` stays beside `neo4j_code`");
-    assert_eq!(m.get("gql_status"), Some(&Value::Str("42001".into())), "a syntax error is GQL 42001");
+    assert_eq!(
+        m.get("neo4j_code"),
+        Some(&Value::Str("Neo.ClientError.Statement.SyntaxError".into()))
+    );
+    assert_eq!(
+        m.get("code"),
+        m.get("neo4j_code"),
+        "`code` stays beside `neo4j_code`"
+    );
+    assert_eq!(
+        m.get("gql_status"),
+        Some(&Value::Str("42001".into())),
+        "a syntax error is GQL 42001"
+    );
     assert!(matches!(m.get("description"), Some(Value::Str(d)) if d.contains("invalid syntax")));
-    let Some(Value::Map(rec)) = m.get("diagnostic_record") else { panic!("no diagnostic_record") };
+    let Some(Value::Map(rec)) = m.get("diagnostic_record") else {
+        panic!("no diagnostic_record")
+    };
     assert_eq!(rec.get("OPERATION"), Some(&Value::Str(String::new())));
     assert_eq!(rec.get("OPERATION_CODE"), Some(&Value::Str("0".into())));
     assert_eq!(rec.get("CURRENT_SCHEMA"), Some(&Value::Str("/".into())));
-    assert_eq!(rec.get("_classification"), Some(&Value::Str("CLIENT_ERROR".into())));
+    assert_eq!(
+        rec.get("_classification"),
+        Some(&Value::Str("CLIENT_ERROR".into()))
+    );
 
     // A 5.0 client (legacy range 5.0..5.0) sees the pre-5.7 shape.
     let mut hs = LEGACY_HANDSHAKE;
@@ -905,8 +967,14 @@ fn a_6_0_failure_carries_the_5_7_fields_and_a_5_0_failure_does_not() {
     let mut five = ready_at(&hs, None);
     assert_eq!(five.version(), (5, 0));
     let m = failure_meta(&mut five, "MATCH (n RETURN n");
-    assert_eq!(m.get("code"), Some(&Value::Str("Neo.ClientError.Statement.SyntaxError".into())));
-    assert!(!m.contains_key("neo4j_code") && !m.contains_key("gql_status"), "5.0 never saw these keys");
+    assert_eq!(
+        m.get("code"),
+        Some(&Value::Str("Neo.ClientError.Statement.SyntaxError".into()))
+    );
+    assert!(
+        !m.contains_key("neo4j_code") && !m.contains_key("gql_status"),
+        "5.0 never saw these keys"
+    );
 }
 
 #[test]
@@ -914,21 +982,34 @@ fn a_non_syntax_failure_is_the_general_gql_status_with_its_classification() {
     let mut six = ready_at(&DRIVER_HANDSHAKE, Some(&[0x00, 0x00, 0x00, 0x06, 0x00]));
     let m = failure_meta(&mut six, "CALL db.noSuchProcedure()");
     assert_eq!(m.get("gql_status"), Some(&Value::Str("50N42".into())));
-    let Some(Value::Map(rec)) = m.get("diagnostic_record") else { panic!("no diagnostic_record") };
-    assert_eq!(rec.get("_classification"), Some(&Value::Str("CLIENT_ERROR".into())));
+    let Some(Value::Map(rec)) = m.get("diagnostic_record") else {
+        panic!("no diagnostic_record")
+    };
+    assert_eq!(
+        rec.get("_classification"),
+        Some(&Value::Str("CLIENT_ERROR".into()))
+    );
 }
 
 #[test]
 fn begin_and_run_report_the_home_db_from_5_8() {
     let mut six = ready_at(&DRIVER_HANDSHAKE, Some(&[0x00, 0x00, 0x00, 0x06, 0x00]));
     let r = run_stmt(&mut six, "RETURN 1");
-    let Pack::Value(Value::Map(meta)) = &r[0].1[0] else { panic!("no RUN metadata") };
+    let Pack::Value(Value::Map(meta)) = &r[0].1[0] else {
+        panic!("no RUN metadata")
+    };
     assert_eq!(meta.get("db"), Some(&Value::Str("neo4j".into())));
     let mut five = ready_at(&LEGACY_HANDSHAKE, None);
     assert_eq!(five.version(), (5, 8));
     let r = run_stmt(&mut five, "RETURN 1");
-    let Pack::Value(Value::Map(meta)) = &r[0].1[0] else { panic!("no RUN metadata") };
-    assert_eq!(meta.get("db"), Some(&Value::Str("neo4j".into())), "5.8 is where `db` began");
+    let Pack::Value(Value::Map(meta)) = &r[0].1[0] else {
+        panic!("no RUN metadata")
+    };
+    assert_eq!(
+        meta.get("db"),
+        Some(&Value::Str("neo4j".into())),
+        "5.8 is where `db` began"
+    );
 }
 
 /// Encode a Vector structure by hand: `B2 56`, the type marker as an
@@ -937,7 +1018,10 @@ fn vector_bytes(marker: u8, data: &[u8]) -> Vec<u8> {
     let mut out = vec![0xB2, 0x56];
     engram_bolt::packstream::encode_struct(
         0x56,
-        &[Pack::Value(Value::Int(i64::from(marker))), Pack::Bytes(data.to_vec())],
+        &[
+            Pack::Value(Value::Int(i64::from(marker))),
+            Pack::Bytes(data.to_vec()),
+        ],
         &mut out,
     )
     .expect("encodes");
@@ -954,14 +1038,14 @@ fn a_vector_decodes_to_a_list_of_numbers_at_the_markers_width() {
     data.extend_from_slice(&(-2.0f32).to_be_bytes());
     let bytes = vector_bytes(0xC6, &data);
     let v = decode_value(Decoder::new(&bytes).decode().expect("decodes")).expect("a value");
-    assert_eq!(v, Value::List(vec![Value::Float(1.5), Value::Float(-2.0)]));
+    assert_eq!(v, Value::List((vec![Value::Float(1.5), Value::Float(-2.0)]).into()));
     // int16 [300, -1]
     let mut data = Vec::new();
     data.extend_from_slice(&300i16.to_be_bytes());
     data.extend_from_slice(&(-1i16).to_be_bytes());
     let bytes = vector_bytes(0xC9, &data);
     let v = decode_value(Decoder::new(&bytes).decode().expect("decodes")).expect("a value");
-    assert_eq!(v, Value::List(vec![Value::Int(300), Value::Int(-1)]));
+    assert_eq!(v, Value::List((vec![Value::Int(300), Value::Int(-1)]).into()));
     // A ragged payload is refused by name, not truncated.
     let bytes = vector_bytes(0xCA, &[0, 0, 1]);
     assert!(decode_value(Decoder::new(&bytes).decode().expect("decodes")).is_err());
@@ -971,7 +1055,10 @@ fn a_vector_decodes_to_a_list_of_numbers_at_the_markers_width() {
 fn a_byte_array_parameter_arrives_as_a_list_of_byte_values() {
     let bytes = [0xCC, 0x03, 0x01, 0xFF, 0x10];
     let v = decode_value(Decoder::new(&bytes).decode().expect("decodes")).expect("a value");
-    assert_eq!(v, Value::List(vec![Value::Int(1), Value::Int(255), Value::Int(16)]));
+    assert_eq!(
+        v,
+        Value::List((vec![Value::Int(1), Value::Int(255), Value::Int(16)]).into())
+    );
 }
 
 #[test]
@@ -986,10 +1073,14 @@ fn a_vector_travels_as_a_run_parameter() {
     params.extend_from_slice(&[0xA1, 0x81, b'v']);
     params.extend(vector_bytes(0xC1, &data));
     let mut payload = vec![0xB3, 0x10];
-    engram_bolt::packstream::encode_value(&Value::Str("RETURN $v AS v, size($v) AS n".into()), &mut payload)
-        .expect("encodes");
+    engram_bolt::packstream::encode_value(
+        &Value::Str("RETURN $v AS v, size($v) AS n".into()),
+        &mut payload,
+    )
+    .expect("encodes");
     payload.extend(params);
-    engram_bolt::packstream::encode_value(&Value::Map(BTreeMap::new()), &mut payload).expect("encodes");
+    engram_bolt::packstream::encode_value(&Value::Map(BTreeMap::new()), &mut payload)
+        .expect("encodes");
     let mut bytes = (payload.len() as u16).to_be_bytes().to_vec();
     bytes.extend_from_slice(&payload);
     bytes.extend_from_slice(&[0, 0]);
@@ -998,7 +1089,16 @@ fn a_vector_travels_as_a_run_parameter() {
     bytes.extend(msg(0x3F, vec![map_field(pull)]));
     let r = replies(&six.feed(&bytes).expect("run+pull"));
     assert_eq!(r[0].0, 0x70, "RUN succeeded: {:?}", r[0].1);
-    let Pack::Value(Value::List(row)) = &r[1].1[0] else { panic!("no record") };
-    assert_eq!(row[0], Value::List(vec![Value::Float(0.25), Value::Float(0.5), Value::Float(1.0)]));
+    let Pack::Value(Value::List(row)) = &r[1].1[0] else {
+        panic!("no record")
+    };
+    assert_eq!(
+        row[0],
+        Value::List((vec![
+            Value::Float(0.25),
+            Value::Float(0.5),
+            Value::Float(1.0)
+        ]).into())
+    );
     assert_eq!(row[1], Value::Int(3));
 }

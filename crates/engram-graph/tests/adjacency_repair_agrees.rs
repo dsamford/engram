@@ -46,7 +46,8 @@ fn agrees(g: &Graph, src: &str, what: &str) -> usize {
     };
     let (a, b) = (key(&mut with_table), key(&mut without));
     assert_eq!(
-        a, b,
+        a,
+        b,
         "the adjacency table and the direct walk disagree after {what}\n  `{src}`\n  \
          table returned {} row(s), direct walk returned {} row(s)",
         a.len(),
@@ -57,7 +58,10 @@ fn agrees(g: &Graph, src: &str, what: &str) -> usize {
 
 fn seeded(n: i64) -> Graph {
     let g = Graph::new(Store::new(), Realm(1), Namespace(1));
-    run(&g, &format!("UNWIND range(0, {}) AS i CREATE (:N {{k: i}})", n - 1));
+    run(
+        &g,
+        &format!("UNWIND range(0, {}) AS i CREATE (:N {{k: i}})", n - 1),
+    );
     run(
         &g,
         &format!(
@@ -98,7 +102,9 @@ fn the_oracle_really_declines_the_table() {
         let c = t.counters();
         c.get("graph.adjacency tables built").copied().unwrap_or(0)
             + c.get("graph.adjacency tables reused").copied().unwrap_or(0)
-            + c.get("graph.adjacency tables repaired").copied().unwrap_or(0)
+            + c.get("graph.adjacency tables repaired")
+                .copied()
+                .unwrap_or(0)
     };
     assert!(
         used(&with) >= 1,
@@ -114,11 +120,18 @@ fn the_oracle_really_declines_the_table() {
 #[test]
 fn agrees_after_adding_edges() {
     let g = seeded(600);
-    agrees(&g, "MATCH (a:N)-[:R]->(b:N) RETURN count(*) AS c", "the initial load");
+    agrees(
+        &g,
+        "MATCH (a:N)-[:R]->(b:N) RETURN count(*) AS c",
+        "the initial load",
+    );
     for i in 0..30 {
         run(
             &g,
-            &format!("MATCH (a:N {{k: {i}}}), (b:N {{k: {}}}) CREATE (a)-[:R]->(b)", i + 100),
+            &format!(
+                "MATCH (a:N {{k: {i}}}), (b:N {{k: {}}}) CREATE (a)-[:R]->(b)",
+                i + 100
+            ),
         );
         agrees(
             &g,
@@ -126,7 +139,11 @@ fn agrees_after_adding_edges() {
             &format!("adding edge {i} (the changed row)"),
         );
     }
-    agrees(&g, "MATCH (a:N)-[:R]->(b:N) RETURN count(*) AS c", "30 added edges");
+    agrees(
+        &g,
+        "MATCH (a:N)-[:R]->(b:N) RETURN count(*) AS c",
+        "30 added edges",
+    );
 }
 
 #[test]
@@ -141,7 +158,11 @@ fn agrees_after_deleting_edges() {
         );
         assert_eq!(n, 0, "node {i} still has an :R edge after deleting it");
     }
-    agrees(&g, "MATCH (a:N)-[:R]->(b:N) RETURN count(*) AS c", "20 deleted edges");
+    agrees(
+        &g,
+        "MATCH (a:N)-[:R]->(b:N) RETURN count(*) AS c",
+        "20 deleted edges",
+    );
 }
 
 /// The INCOMING direction, which is a different table (`b'I'`) and a different
@@ -152,7 +173,10 @@ fn agrees_on_incoming_edges() {
     for i in 0..20 {
         run(
             &g,
-            &format!("MATCH (a:N {{k: {}}}), (b:N {{k: {i}}}) CREATE (a)-[:R]->(b)", i + 300),
+            &format!(
+                "MATCH (a:N {{k: {}}}), (b:N {{k: {i}}}) CREATE (a)-[:R]->(b)",
+                i + 300
+            ),
         );
         agrees(
             &g,
@@ -170,12 +194,19 @@ fn agrees_on_incoming_edges() {
 #[test]
 fn agrees_on_an_untouched_type_while_another_is_written() {
     let g = seeded(600);
-    agrees(&g, "MATCH (a:N)-[:S]->(b:N) RETURN count(*) AS c", "the initial load");
+    agrees(
+        &g,
+        "MATCH (a:N)-[:S]->(b:N) RETURN count(*) AS c",
+        "the initial load",
+    );
     for i in 0..25 {
         // Write :R ...
         run(
             &g,
-            &format!("MATCH (a:N {{k: {i}}}), (b:N {{k: {}}}) CREATE (a)-[:R]->(b)", i + 50),
+            &format!(
+                "MATCH (a:N {{k: {i}}}), (b:N {{k: {}}}) CREATE (a)-[:R]->(b)",
+                i + 50
+            ),
         );
         // ... and read :S, which must be unaffected AND correct.
         agrees(
@@ -184,10 +215,21 @@ fn agrees_on_an_untouched_type_while_another_is_written() {
             &format!(":S read after :R write {i}"),
         );
     }
-    agrees(&g, "MATCH (a:N)-[:S]->(b:N) RETURN count(*) AS c", "25 :R writes");
+    agrees(
+        &g,
+        "MATCH (a:N)-[:S]->(b:N) RETURN count(*) AS c",
+        "25 :R writes",
+    );
     // And :S must still be right after :S itself is written.
-    run(&g, "MATCH (a:N {k: 3}), (b:N {k: 400}) CREATE (a)-[:S]->(b)");
-    agrees(&g, "MATCH (a:N {k: 3})-[:S]->(b:N) RETURN b.k", "an :S write");
+    run(
+        &g,
+        "MATCH (a:N {k: 3}), (b:N {k: 400}) CREATE (a)-[:S]->(b)",
+    );
+    agrees(
+        &g,
+        "MATCH (a:N {k: 3})-[:S]->(b:N) RETURN b.k",
+        "an :S write",
+    );
 }
 
 /// The UNTYPED table (`MATCH (a)-[]->(b)`) covers every type, so a change to
@@ -195,11 +237,18 @@ fn agrees_on_an_untouched_type_while_another_is_written() {
 #[test]
 fn agrees_on_the_untyped_table() {
     let g = seeded(600);
-    agrees(&g, "MATCH (a:N)-[]->(b:N) RETURN count(*) AS c", "the initial load");
+    agrees(
+        &g,
+        "MATCH (a:N)-[]->(b:N) RETURN count(*) AS c",
+        "the initial load",
+    );
     for i in 0..20 {
         run(
             &g,
-            &format!("MATCH (a:N {{k: {i}}}), (b:N {{k: {}}}) CREATE (a)-[:T]->(b)", i + 200),
+            &format!(
+                "MATCH (a:N {{k: {i}}}), (b:N {{k: {}}}) CREATE (a)-[:T]->(b)",
+                i + 200
+            ),
         );
         agrees(
             &g,
@@ -207,7 +256,11 @@ fn agrees_on_the_untyped_table() {
             &format!("adding a :T edge from {i}, read untyped"),
         );
     }
-    agrees(&g, "MATCH (a:N)-[]->(b:N) RETURN count(*) AS c", "20 :T edges");
+    agrees(
+        &g,
+        "MATCH (a:N)-[]->(b:N) RETURN count(*) AS c",
+        "20 :T edges",
+    );
 }
 
 /// A detach delete removes a node AND all of its edges — many rows at once,
@@ -287,7 +340,10 @@ fn warming_does_not_change_any_answer() {
         for g in [&warmed, &cold] {
             run(
                 g,
-                &format!("MATCH (a:N {{k: {i}}}), (b:N {{k: {}}}) CREATE (a)-[:R]->(b)", i + 77),
+                &format!(
+                    "MATCH (a:N {{k: {i}}}), (b:N {{k: {}}}) CREATE (a)-[:R]->(b)",
+                    i + 77
+                ),
             );
         }
         let mut w = run(&warmed, "MATCH (a:N)-[:R]->(b:N) RETURN count(*) AS c");
@@ -334,7 +390,10 @@ fn after_warming_a_query_builds_nothing() {
     }
 
     let report = g.warm();
-    eprintln!("warmed {} adjacency tables for {TYPES} types", report.tables);
+    eprintln!(
+        "warmed {} adjacency tables for {TYPES} types",
+        report.tables
+    );
     assert!(
         report.tables >= (TYPES + 1) * 2,
         "warming cached {} tables for {TYPES} relationship types — expected at least \
@@ -346,8 +405,14 @@ fn after_warming_a_query_builds_nothing() {
     // Now read every type. None of them may build.
     let ((), trace) = engram_observe::with_trace(|| {
         for t in 0..TYPES {
-            run(&g, &format!("MATCH (a:N)-[:T{t}]->(b:N) RETURN count(*) AS c"));
-            run(&g, &format!("MATCH (a:N)<-[:T{t}]-(b:N) RETURN count(*) AS c"));
+            run(
+                &g,
+                &format!("MATCH (a:N)-[:T{t}]->(b:N) RETURN count(*) AS c"),
+            );
+            run(
+                &g,
+                &format!("MATCH (a:N)<-[:T{t}]-(b:N) RETURN count(*) AS c"),
+            );
         }
         run(&g, "MATCH (a:N)-[]->(b:N) RETURN count(*) AS c");
     });
@@ -383,15 +448,24 @@ fn agrees_across_a_long_interleaving() {
     for round in 0..40i64 {
         run(
             &g,
-            &format!("MATCH (a:N {{k: {round}}}), (b:N {{k: {}}}) CREATE (a)-[:R]->(b)", round + 11),
+            &format!(
+                "MATCH (a:N {{k: {round}}}), (b:N {{k: {}}}) CREATE (a)-[:R]->(b)",
+                round + 11
+            ),
         );
         if round % 3 == 0 {
-            run(&g, &format!("MATCH (a:N {{k: {}}})-[r:S]->() DELETE r", round + 1));
+            run(
+                &g,
+                &format!("MATCH (a:N {{k: {}}})-[r:S]->() DELETE r", round + 1),
+            );
         }
         if round % 4 == 0 {
             run(
                 &g,
-                &format!("MATCH (a:N {{k: {}}}), (b:N {{k: {round}}}) CREATE (a)-[:S]->(b)", round + 5),
+                &format!(
+                    "MATCH (a:N {{k: {}}}), (b:N {{k: {round}}}) CREATE (a)-[:S]->(b)",
+                    round + 5
+                ),
             );
         }
         agrees(
@@ -405,8 +479,16 @@ fn agrees_across_a_long_interleaving() {
             &format!("round {round} in"),
         );
     }
-    agrees(&g, "MATCH (a:N)-[:R]->(b:N) RETURN count(*) AS c", "the whole interleaving");
-    agrees(&g, "MATCH (a:N)-[:S]->(b:N) RETURN count(*) AS c", "the whole interleaving (:S)");
+    agrees(
+        &g,
+        "MATCH (a:N)-[:R]->(b:N) RETURN count(*) AS c",
+        "the whole interleaving",
+    );
+    agrees(
+        &g,
+        "MATCH (a:N)-[:S]->(b:N) RETURN count(*) AS c",
+        "the whole interleaving (:S)",
+    );
     agrees(
         &g,
         "MATCH (a:N)-[:R]->()-[:S]->(c:N) RETURN count(*) AS c",

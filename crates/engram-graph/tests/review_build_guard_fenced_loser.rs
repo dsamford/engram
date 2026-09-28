@@ -54,7 +54,9 @@ fn fixture() -> (Arc<Graph>, Vec<u64>, u64, u32) {
     g.set_degree_table_after(0);
     let label = vec!["N".to_string()];
     let none = BTreeMap::new();
-    let ids: Vec<u64> = (0..NODES).map(|_| g.create_node(&label, &none).expect("node")).collect();
+    let ids: Vec<u64> = (0..NODES)
+        .map(|_| g.create_node(&label, &none).expect("node"))
+        .collect();
     let hub = g.create_node(&label, &none).expect("hub");
     let mut rng = Lcg(0x9E37_79B9_7F4A_7C15);
     for &src in &ids {
@@ -101,11 +103,17 @@ fn readers_race(g: &Arc<Graph>, ids: &[u64], u: u32, n: usize) -> (u64, u64, u64
             let (g, barrier, node) = (Arc::clone(g), Arc::clone(&barrier), ids[i]);
             std::thread::spawn(move || {
                 barrier.wait();
-                let (_, trace) = engram_observe::with_trace(|| g.adjacent_slim(node, Dir::Out, &Some(vec![u])).len());
+                let (_, trace) = engram_observe::with_trace(|| {
+                    g.adjacent_slim(node, Dir::Out, &Some(vec![u])).len()
+                });
                 let c = trace.counters();
                 (
-                    c.get("graph.adjacency tables built by another worker").copied().unwrap_or(0),
-                    c.get("graph.adjacency tables repaired").copied().unwrap_or(0),
+                    c.get("graph.adjacency tables built by another worker")
+                        .copied()
+                        .unwrap_or(0),
+                    c.get("graph.adjacency tables repaired")
+                        .copied()
+                        .unwrap_or(0),
                 )
             })
         })
@@ -139,12 +147,18 @@ fn with_a_writer_in_flight_every_loser_behind_the_build_guard_rebuilds_again() {
     let (g, ids, hub, u) = fixture();
     let none = BTreeMap::new();
     let del = start_hub_delete(&g, hub);
-    g.create_rel(ids[1], "U", ids[2], &none).expect("U after the fence registered");
+    g.create_rel(ids[1], "U", ids[2], &none)
+        .expect("U after the fence registered");
     let (builds, by_other, repaired) = readers_race(&g, &ids, u, 4);
     let still_running = !g.rels_of(hub, Dir::Out, None).expect("rels").is_empty();
     del.join().expect("delete");
-    eprintln!("[fenced] builds={builds} by_other={by_other} repaired={repaired} writer_still_in_flight={still_running}");
-    assert!(still_running, "the fixture is too small: the delete finished before the readers raced");
+    eprintln!(
+        "[fenced] builds={builds} by_other={by_other} repaired={repaired} writer_still_in_flight={still_running}"
+    );
+    assert!(
+        still_running,
+        "the fixture is too small: the delete finished before the readers raced"
+    );
     assert_eq!(
         builds, 1,
         "{builds} FULL REBUILDS of one table by 4 readers missing at once while a writer was in flight \
@@ -170,7 +184,8 @@ fn a_reader_waiting_on_the_refresh_rebuild_rebuilds_again_when_the_publish_was_f
         g.create_rel(src, "U", ids[0], &none).expect("burst");
     }
     let del = start_hub_delete(&g, hub);
-    g.create_rel(ids[3], "U", ids[4], &none).expect("U after the fence registered");
+    g.create_rel(ids[3], "U", ids[4], &none)
+        .expect("U after the fence registered");
     let before = built();
     let barrier = Arc::new(Barrier::new(2));
     let counter = |t: &engram_observe::Trace, k: &str| t.counters().get(k).copied().unwrap_or(0);
@@ -190,7 +205,9 @@ fn a_reader_waiting_on_the_refresh_rebuild_rebuilds_again_when_the_publish_was_f
         let (g, barrier, node) = (Arc::clone(&g), Arc::clone(&barrier), ids[5]);
         std::thread::spawn(move || {
             barrier.wait();
-            let (rows, trace) = engram_observe::with_trace(|| g.adjacent_slim(node, Dir::Out, &Some(vec![u])).len());
+            let (rows, trace) = engram_observe::with_trace(|| {
+                g.adjacent_slim(node, Dir::Out, &Some(vec![u])).len()
+            });
             (
                 rows,
                 counter(&trace, "graph.adjacency tables built"),
@@ -208,7 +225,10 @@ fn a_reader_waiting_on_the_refresh_rebuild_rebuilds_again_when_the_publish_was_f
          refresh_repaired={refresh_repaired} reader_built={reader_built} reader_repaired={reader_repaired} \
          rows={rows} writer_still_in_flight={still_running}"
     );
-    assert!(still_running, "the fixture is too small: the delete finished first");
+    assert!(
+        still_running,
+        "the fixture is too small: the delete finished first"
+    );
     // WHICH of the two wins the build guard is timing (under a loaded host
     // the reader has won it); the invariant is the same either way. Exactly
     // one span walk happened, by whichever won...
@@ -237,5 +257,8 @@ fn a_reader_waiting_on_the_refresh_rebuild_rebuilds_again_when_the_publish_was_f
     );
     // ...and the reader saw the acknowledged rows: ids[5]'s original `U`
     // and the burst's — the post-fence write is on ids[3], not here.
-    assert_eq!(rows, 2, "the reader must observe every acknowledged U row of ids[5]");
+    assert_eq!(
+        rows, 2,
+        "the reader must observe every acknowledged U row of ids[5]"
+    );
 }

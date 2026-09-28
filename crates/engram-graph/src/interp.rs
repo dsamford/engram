@@ -8,15 +8,16 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use engram_cypher::ast::Expr;
+use engram_cypher::ast::{BinOp, Expr};
 use engram_cypher::eval::{EvalError, GraphHooks, Scope, eval_with, is_known_function};
 use engram_cypher::stmt::{
     Clause, NodePattern, PathPattern, Pattern, ProjItem, Projection, Query, RelDir, RelPattern,
-    RemoveItem, SetItem, SingleQuery, SubqueryBody,
+    RemoveItem, SetItem, Shortest, SingleQuery, SubqueryBody,
 };
 use engram_cypher::value::{Truth, Value};
 use engram_observe::{counted, sometimes};
 
+use crate::procbind::{Binding, ProcRow, emit_procedure_rows, resolve_bindings};
 use crate::{Dir, Graph, GraphError};
 
 /// The NULL sentinel for an OPTIONAL-MATCH binding in a columnar id column
@@ -376,11 +377,13 @@ pub(crate) fn pattern_body(body: &SubqueryBody) -> Option<(&Pattern, Option<&Exp
     match body {
         SubqueryBody::Pattern { pattern, where_ } => Some((pattern, where_.as_ref())),
         SubqueryBody::Query(q) => match q.clauses.as_slice() {
-            [Clause::Match {
-                optional: false,
-                pattern,
-                where_,
-            }] => Some((pattern, where_.as_ref())),
+            [
+                Clause::Match {
+                    optional: false,
+                    pattern,
+                    where_,
+                },
+            ] => Some((pattern, where_.as_ref())),
             _ => None,
         },
     }
@@ -496,6 +499,27 @@ fn check_where_scope(where_: &Expr, pattern: &Pattern, rows: &[Row]) -> Result<(
     if free.is_empty() {
         return Ok(());
     }
+    // NO ROWS, NOTHING TO REFUSE.
+    //
+    // The bound set below is read from `rows.first()` — a SAMPLE ROW — so when
+    // the incoming result is empty it is empty too, and every variable the
+    // WHERE reads looks undefined. That turns a query which should return zero
+    // rows into `Variable \`x\` not defined`.
+    //
+    // Measured 2026-09-15: SNB BI bi13 at SF3 returns 100 rows, and the SAME
+    // statement on the SAME binary at SF0.1 failed with
+    // `Variable \`zombies\` not defined` — because SF0.1 has no person meeting
+    // the zombie criteria, so the preceding WITH produced nothing. The scale
+    // factor decided whether a valid query was an error.
+    //
+    // There is also nothing to protect here: the refusal exists because
+    // evaluating an unbound name materialises every row first (see above), and
+    // with no rows there is nothing to materialise. A genuinely undefined
+    // variable is still caught by `validate_single`'s compile-time
+    // UndefinedVariable check, which does not depend on the data.
+    if rows.is_empty() {
+        return Ok(());
+    }
     let mut bound: Vec<String> = rows
         .first()
         .map(|r| r.keys().cloned().collect())
@@ -553,7 +577,7 @@ fn try_rel_histogram_fast(
         return None;
     }
     let path = &pattern.paths[0];
-    if path.var.is_some() || path.shortest || path.hops.len() != 1 {
+    if path.var.is_some() || path.shortest.is_some() || path.hops.len() != 1 {
         return None;
     }
     let (rel, end) = &path.hops[0];
@@ -691,7 +715,7 @@ fn fast_count_for_path(
     path: &PathPattern,
     counted_var: Option<&str>,
 ) -> Option<u64> {
-    if path.var.is_some() || path.shortest || path.start.props.is_some() {
+    if path.var.is_some() || path.shortest.is_some() || path.start.props.is_some() {
         return None;
     }
     Some(match path.hops.as_slice() {
@@ -771,7 +795,7 @@ fn try_count_fast(graph: &Graph, q: &SingleQuery) -> Option<QueryResult> {
         return None;
     }
     let path = &pattern.paths[0];
-    if path.var.is_some() || path.shortest || path.start.props.is_some() {
+    if path.var.is_some() || path.shortest.is_some() || path.start.props.is_some() {
         return None;
     }
     if proj.distinct
@@ -820,19 +844,209 @@ fn try_count_fast(graph: &Graph, q: &SingleQuery) -> Option<QueryResult> {
     })
 }
 
-/// Refuse a statement whose intermediate row set outgrows the configured
-/// budget — the alternative is the OOM killer, which refuses NOTHING and
-/// takes every other session with it.
+/// Statements currently executing, so the row budget can be a SHARED POOL
+/// rather than a per-statement grant.
+///
+/// THE BUG THIS FIXES. `row_budget` was handed in full to EVERY concurrent
+/// statement. The server derives it as `cgroup_ceiling / 4 / 96 B` — at the
+/// 160Gi bench pod, 447,392,426 rows — so four concurrent statements were
+/// entitled to the whole container and 32 to EIGHT TIMES it (measured; see
+/// engram-server/tests/the_row_budget_cannot_bound_concurrency_and_admit_q7.rs).
+/// That over-commit OOM-killed two bench pods on 2026-09-11 and is why bounding
+/// the budget by hand closed only half the SF10 write-path gap (0.27 -> 0.55).
+///
+/// It cannot be fixed with a bigger divisor: LSQB q7 at SF10 needs 447,392,426
+/// rows — EXACTLY the 160Gi derivation — so any divisor that bounds 8 concurrent
+/// statements refuses q7, and a shrinking default is a breaking change. The same
+/// test proves no constant in 1..=64 satisfies both.
+///
+/// So the grant is divided by the number of statements actually in flight: one
+/// statement alone still gets the whole pool (q7 is unaffected), while N
+/// together cannot exceed it. That is the property the tests demand.
+pub static STATEMENTS_IN_FLIGHT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Floor under a statement's share, so heavy concurrency cannot drive the
+/// effective budget to zero and refuse trivial statements. Matches the server's
+/// own `MIN_AUTO_ROW_BUDGET`.
+const MIN_SHARED_SHARE: usize = 1_000_000;
+
+/// RAII: counts this statement as in flight for as long as it runs. A guard and
+/// not a pair of calls, because every early return in `run_stmt` — and there are
+/// many, including every error path — must decrement, and one that does not
+/// would shrink every other statement's share permanently.
+pub(crate) struct InFlight;
+
+impl InFlight {
+    pub(crate) fn enter() -> Self {
+        STATEMENTS_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        STATEMENTS_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// This statement's share of the row budget: the configured grant divided by the
+/// statements in flight, floored so concurrency cannot refuse trivial work.
+#[must_use]
+pub fn shared_row_budget(configured: usize) -> usize {
+    let in_flight = STATEMENTS_IN_FLIGHT
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .max(1);
+    (configured / in_flight).max(MIN_SHARED_SHARE.min(configured))
+}
+
+/// Refuse a statement whose intermediate row set outgrows its SHARE of the
+/// configured budget — the alternative is the OOM killer, which refuses NOTHING
+/// and takes every other session with it.
 pub(crate) fn budget_check(graph: &Graph, n: usize) -> Result<(), RunError> {
     if let Some(b) = graph.row_budget() {
-        if n > b {
+        let share = shared_row_budget(b);
+        if n > share {
             sometimes!("interp.row budget refused a statement", true);
+            let inflight = STATEMENTS_IN_FLIGHT
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .max(1);
             return Err(RunError::Semantic(format!(
-                "row budget exceeded: the statement materialised more than {b} intermediate rows; it would exhaust memory rather than stream"
+                "row budget exceeded: the statement materialised more than {share} intermediate rows (its share of {b} across {inflight} statement(s) in flight); it would exhaust memory rather than stream"
             )));
         }
     }
     Ok(())
+}
+
+/// **The memory governor's verdict, published by the server's sampler.**
+///
+/// True while resident memory is above the ceiling's high-water mark. New
+/// statements are then refused; statements already running are left alone,
+/// because draining them is what brings the number back down.
+///
+/// # Why this exists beside the row budget rather than instead of it
+///
+/// The row budget is a PROXY — rows times an assumed 96 B — and a proxy that
+/// is wrong in both directions. It refused LSQB q7 at SF10, a query that
+/// answers in 31 s, while a single `REPLY_OF` statement in the same corpus
+/// grew RSS by 1,388 MB without approaching its row ceiling. A benchmark then
+/// has to choose between refusing legitimate work and permitting a runaway.
+///
+/// This measures the actual resident set instead, so the two guards do
+/// different jobs: the row budget bounds ONE statement's materialisation
+/// between samples, and this bounds the PROCESS. A deployment that trusts the
+/// governor can set `--row-budget 0` and keep a real ceiling.
+pub static MEMORY_CEILING_REACHED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Resident MiB as the sampler last saw it, for the refusal message.
+///
+/// A refusal that cannot say how much memory was in use is untraceable three
+/// hours later, which is the complaint that produced `auto_row_budget`'s
+/// printed derivation.
+pub static MEMORY_RSS_MB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The ceiling in MiB, as the sampler was configured, for the same reason.
+pub static MEMORY_MAX_MB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Statements that WAITED for memory before running.
+///
+/// The interesting number for a server under pressure: queueing that admits is
+/// backpressure working, and is invisible to a client except as latency.
+pub static MEMORY_QUEUED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Statements that waited and were then admitted — queueing that WORKED.
+pub static MEMORY_QUEUE_ADMITTED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Milliseconds spent waiting, summed. With [`MEMORY_QUEUED`] this gives the
+/// mean wait, which is the cost backpressure is charging.
+pub static MEMORY_QUEUE_WAIT_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Statements refused because they waited the whole deadline and memory never
+/// came back. The LAST resort, not the first response.
+pub static MEMORY_REFUSALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Times the sampler crossed INTO pressure, so a run can say whether the
+/// ceiling was approached once or was being ridden continuously.
+pub static MEMORY_PRESSURE_ENTRIES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How long a statement may WAIT for memory before it is refused, in ms.
+///
+/// Zero means do not queue at all — refuse the moment the ceiling is reached.
+/// The default is set by the server; a graph nobody configured never queues,
+/// because [`MEMORY_CEILING_REACHED`] is false and the gate is not reached.
+pub static MEMORY_QUEUE_MAX_WAIT_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How often a queued statement re-checks. Short enough that a drained server
+/// is not left idle, long enough that a hundred queued statements are not a
+/// spin loop.
+const MEMORY_QUEUE_POLL_MS: u64 = 10;
+
+/// One queue poll: the waiting statement's own thread sleeps. The server runs
+/// each statement on a real worker thread, where there is no cooperative
+/// runtime to yield to, and the wait is bounded by `MEMORY_QUEUE_MAX_WAIT_MS`.
+/// The determinism rule the lint enforces is about simulated runs, which never
+/// reach a memory ceiling.
+#[allow(clippy::disallowed_methods)]
+fn memory_queue_poll() {
+    std::thread::sleep(std::time::Duration::from_millis(MEMORY_QUEUE_POLL_MS));
+}
+
+/// Admit a statement, WAITING for memory rather than refusing on sight.
+///
+/// # Why queue instead of refuse
+///
+/// Refusing turns a transient peak into a client-visible error for work that
+/// would have succeeded a second later. Under a benchmark that is a failed
+/// operation; under a real workload it is an incident. Queueing spends latency
+/// instead, which is the currency backpressure is supposed to be paid in.
+///
+/// # Why the wait is bounded
+///
+/// Pressure caused by STATEMENTS drains as they finish, so waiting works. But
+/// pressure caused by anything else — caches, adjacency tables, a corpus that
+/// simply does not fit — never clears, and an unbounded queue would turn that
+/// into a hang with no error, which is strictly worse than a refusal. So the
+/// wait has a deadline and the refusal is what happens when queueing has been
+/// given its chance and failed.
+///
+/// This is ADMISSION control, never a mid-statement abort: a statement killed
+/// halfway has already paid for its memory, so the door is the only place
+/// where stopping is cheaper than proceeding.
+fn memory_admit() -> Result<(), RunError> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !MEMORY_CEILING_REACHED.load(Relaxed) {
+        return Ok(());
+    }
+    let budget_ms = MEMORY_QUEUE_MAX_WAIT_MS.load(Relaxed);
+    let mut waited_ms = 0u64;
+    if budget_ms > 0 {
+        MEMORY_QUEUED.fetch_add(1, Relaxed);
+        sometimes!("interp.a statement queued for memory", true);
+        while waited_ms < budget_ms {
+            memory_queue_poll();
+            waited_ms += MEMORY_QUEUE_POLL_MS;
+            if !MEMORY_CEILING_REACHED.load(Relaxed) {
+                MEMORY_QUEUE_WAIT_MS.fetch_add(waited_ms, Relaxed);
+                MEMORY_QUEUE_ADMITTED.fetch_add(1, Relaxed);
+                counted!("interp.queued for memory, then admitted");
+                return Ok(());
+            }
+        }
+        MEMORY_QUEUE_WAIT_MS.fetch_add(waited_ms, Relaxed);
+    }
+    MEMORY_REFUSALS.fetch_add(1, Relaxed);
+    sometimes!("interp.memory ceiling refused a statement", true);
+    Err(RunError::Semantic(format!(
+        "memory ceiling reached: the process holds {} MiB of a {} MiB ceiling. The          statement waited {waited_ms} ms for memory to come back and it did not, so          the pressure is not statements that will drain. The server is still serving          — this is a limit, not a crash",
+        MEMORY_RSS_MB.load(Relaxed),
+        MEMORY_MAX_MB.load(Relaxed)
+    )))
 }
 
 /// Run any statement — a query, a schema command (whose result is the
@@ -843,6 +1057,15 @@ pub fn run_stmt(
     stmt: &engram_cypher::stmt::Stmt,
     params: BTreeMap<String, Value>,
 ) -> Result<QueryResult, RunError> {
+    // Counted in flight for the whole statement, so `budget_check` can divide
+    // the grant by the statements actually running. Held across BOTH arms: a
+    // schema command materialises nothing itself, but it must still be visible
+    // to the queries sharing the pool with it.
+    // Before anything is admitted, and before the in-flight count moves: a
+    // refused statement must not change the divisor other statements are
+    // sharing.
+    memory_admit()?;
+    let _in_flight = InFlight::enter();
     match stmt {
         engram_cypher::stmt::Stmt::Query(q) => run_query(graph, q, params),
         engram_cypher::stmt::Stmt::Schema(cmd) => {
@@ -1856,6 +2079,21 @@ thread_local! {
     /// `run_single`, so the set spans the whole statement as required.
     static DELETED_ENTITIES: std::cell::RefCell<DeletedSets> =
         std::cell::RefCell::new(DeletedSets::default());
+
+    /// Fix 87: per statement, the hop ends bound by a PROJECTED RECORD READ
+    /// because their label's demanded columns were not cached — the label
+    /// and its miss count. At `LEAN_COLUMN_BATCH` misses the label's columns
+    /// are read whole and kept, and every later end of the statement binds
+    /// from them (`warm_label_columns_after_misses`). Cleared at each
+    /// top-level [`run_query`].
+    static HOP_END_MISSES: std::cell::RefCell<Vec<(String, u32)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+
+    /// Fix 89: per statement, the truth of an EXISTS body's REMAINDER — the
+    /// body past its first hop — keyed by the body and the first hop's end
+    /// (`exists_by_first_hop_memo`). Cleared at each top-level [`run_query`].
+    static EXISTS_REMAINDER_MEMO: std::cell::RefCell<BTreeMap<(usize, u64), bool>> =
+        const { std::cell::RefCell::new(BTreeMap::new()) };
 }
 
 /// Record DELETEd node and relationship ids for the running statement.
@@ -1935,7 +2173,16 @@ pub fn run_query(
 ) -> Result<QueryResult, RunError> {
     counted!("interp.statements run");
     // A fresh statement: no entity is deleted-from-under-us yet.
+    //
+    // The comprehension memo is keyed by this generation rather than cleared,
+    // because it is read on WORKER threads too and only this one runs here: a
+    // thread-local a worker never clears would answer a later statement from
+    // an earlier one's graph. Bumping a generation every thread reads makes
+    // every earlier entry unmatchable at once.
+    let _statement = StatementScope::enter();
     DELETED_ENTITIES.with(|d| *d.borrow_mut() = DeletedSets::default());
+    HOP_END_MISSES.with(|m| m.borrow_mut().clear());
+    EXISTS_REMAINDER_MEMO.with(|m| m.borrow_mut().clear());
     // §7 — RECORD THE PREDICATES, once, BEFORE any planner is chosen.
     //
     // This deliberately does not live in a planner. There are at least three
@@ -2106,7 +2353,11 @@ fn fold_chain_counts(q: &SingleQuery) -> Option<SingleQuery> {
     }
     /// The names a projection leaves bound after it.
     fn projected_names(proj: &Projection, before: &[String]) -> Vec<String> {
-        let mut names: Vec<String> = if proj.star { before.to_vec() } else { Vec::new() };
+        let mut names: Vec<String> = if proj.star {
+            before.to_vec()
+        } else {
+            Vec::new()
+        };
         for it in &proj.items {
             match (&it.alias, &it.expr) {
                 (Some(a), _) => names.push(a.clone()),
@@ -2151,7 +2402,7 @@ fn fold_chain_counts(q: &SingleQuery) -> Option<SingleQuery> {
             return None;
         }
         let path = &pattern.paths[0];
-        if path.shortest || path.var.is_some() || path.hops.is_empty() {
+        if path.shortest.is_some() || path.var.is_some() || path.hops.is_empty() {
             return None;
         }
         if !path.start.labels.is_empty() || path.start.props.is_some() {
@@ -2186,6 +2437,28 @@ fn fold_chain_counts(q: &SingleQuery) -> Option<SingleQuery> {
             if free
                 .iter()
                 .any(|v| !chain.contains(v) && !visible.contains(v))
+            {
+                return None;
+            }
+            // The WHERE moves INSIDE the folded `count { ... }`, which is an
+            // item of THIS projection — so it is evaluated in the projection's
+            // scope, where every visible variable the projection does not keep
+            // is already gone. A WHERE reading one of those folded to a
+            // subquery that could not see it, and the statement failed at
+            // evaluation with `variable ... is not in scope` rather than
+            // declining to the general path, which answers it correctly.
+            //
+            // SNB BI's bi13 is the shape: `WITH country, collect(zombie) AS
+            // zombies` / `UNWIND zombies AS zombie` / `OPTIONAL MATCH (zombie)
+            // <-[:HAS_CREATOR]-(message)<-[:LIKES]-(likerZombie) WHERE
+            // likerZombie IN zombies` / `WITH zombie, count(likerZombie) ...`
+            // — `zombies` is visible and read by the WHERE, and the grouping
+            // keeps only `zombie`. Neither OPTIONAL nor the list is essential:
+            // a plain MATCH and a scalar sibling fail identically.
+            let kept = projected_names(proj, visible);
+            if free
+                .iter()
+                .any(|v| visible.contains(v) && !chain.contains(v) && !kept.contains(v))
             {
                 return None;
             }
@@ -2245,8 +2518,7 @@ fn fold_chain_counts(q: &SingleQuery) -> Option<SingleQuery> {
         };
         Some(match next {
             Clause::With { where_: w, .. } => {
-                if w
-                    .as_ref()
+                if w.as_ref()
                     .is_some_and(|w| contains_aggregate(w) || reads_chain(w, &chain))
                 {
                     return None;
@@ -2338,6 +2610,485 @@ fn fold_chain_counts(q: &SingleQuery) -> Option<SingleQuery> {
         counted!("interp.chain count folded into its projection");
     }
     Some(SingleQuery { clauses: out })
+}
+
+/// Fix 92: the RETURN's ORDER BY / SKIP / LIMIT pushed BELOW a grouping
+/// stage whose keys alone the order reads. The production conversation
+/// listing, `MATCH (u:User {userId: $u})-[:HAS_CONVERSATION]->(c) OPTIONAL
+/// MATCH (c)-[:HAS_BRANCH]->()-[:HAS_MESSAGE]->(m) WITH c, count(m) AS
+/// messageCount RETURN … ORDER BY c.updatedAt DESC SKIP … LIMIT …`, counted
+/// the messages of every one of a user's 1,122 conversations to keep fifty
+/// (14 ms against Neo4j's 4.3 on the mirror). The page is decided by
+/// `c.updatedAt` alone, so the conversations are grouped, ordered and paged
+/// FIRST — `WITH c, count(*) AS <mult> ORDER BY c.updatedAt DESC SKIP …
+/// LIMIT …` — their input multiplicity is re-expanded — `UNWIND range(1,
+/// <mult>)` — and the OPTIONAL chain is counted for the page's
+/// conversations only; the RETURN keeps its ORDER BY and loses its SKIP
+/// and LIMIT.
+///
+/// Exact: the grouping WITH yields one row per distinct key tuple (bare
+/// variables bound before the OPTIONAL run), in first-appearance order,
+/// and its aggregates see every input row of the tuple; the OPTIONAL run
+/// never drops a tuple and multiplies rows only by its own matches; no
+/// later clause reads anything of the scope but the keys. So the
+/// original's sorted, paged output rows are exactly the tuples the pushed
+/// grouping keeps under the same stable sort — same set, same tie order —
+/// each tuple's input rows come back in their original number through the
+/// UNWIND, and each survivor's aggregates depend on its own rows alone.
+/// The RETURN's ORDER BY over the survivors is the same stable sort, so
+/// the rows come out in the same order.
+///
+/// Declined, and left exactly as written: a RETURN with no LIMIT, with
+/// DISTINCT or `*`, whose ORDER BY reads an aggregate, a subquery or
+/// anything but the keys (through an alias of a key-only RETURN item is
+/// fine), whose alias shadows a key, or that reads a key WHOLE rather than
+/// by property (`RETURN p, ids …` is fix 62's late-full carry, which binds
+/// the key lean and hydrates the page alone); a grouping WITH with a WHERE, an
+/// ORDER BY, SKIP, LIMIT, DISTINCT or `*`, with no aggregate, or whose key
+/// is not a bare variable bound before the OPTIONAL run; a non-OPTIONAL
+/// clause between the keys' binding and the grouping (a plain MATCH drops
+/// rows); an OPTIONAL clause, a grouping item or a RETURN item reading a
+/// scope variable that is not a key; a path variable or shortestPath in
+/// the OPTIONAL run; a scope past a clause this walker does not model.
+/// `None` when nothing moves.
+fn push_topk_below_grouping(q: &SingleQuery) -> Option<SingleQuery> {
+    use engram_cypher::stmt::{OrderItem, ProjItem, Projection};
+    const MULT: &str = "\u{0}mult";
+    const DUP: &str = "\u{0}dup";
+    let n = q.clauses.len();
+    if n < 4 {
+        return None;
+    }
+    let Clause::Return { proj: ret } = &q.clauses[n - 1] else {
+        return None;
+    };
+    if ret.distinct || ret.star || ret.limit.is_none() || ret.order.is_empty() {
+        return None;
+    }
+    let Clause::With {
+        proj: grp,
+        where_: None,
+    } = &q.clauses[n - 2]
+    else {
+        return None;
+    };
+    if grp.distinct
+        || grp.star
+        || !grp.order.is_empty()
+        || grp.skip.is_some()
+        || grp.limit.is_some()
+    {
+        return None;
+    }
+    let optional_clause = |c: &Clause| {
+        matches!(c, Clause::Match { optional: true, pattern, .. }
+            if pattern.paths.iter().all(|p| p.var.is_none() && p.shortest.is_none()))
+    };
+    let mut first_opt = n - 2;
+    while first_opt > 0 && optional_clause(&q.clauses[first_opt - 1]) {
+        first_opt -= 1;
+    }
+    if first_opt == n - 2 || first_opt == 0 {
+        return None;
+    }
+    // The scope the OPTIONAL run starts from.
+    let mut scope: Vec<String> = Vec::new();
+    for c in &q.clauses[..first_opt] {
+        match c {
+            Clause::Match { pattern, .. } => {
+                for p in &pattern.paths {
+                    scope.extend(path_vars(p));
+                }
+            }
+            Clause::Unwind { alias, .. } => scope.push(alias.clone()),
+            Clause::With { proj, .. } => {
+                let mut next: Vec<String> = if proj.star { scope.clone() } else { Vec::new() };
+                for it in &proj.items {
+                    match (&it.alias, &it.expr) {
+                        (Some(a), _) => next.push(a.clone()),
+                        (None, Expr::Var(v)) => next.push(v.clone()),
+                        _ => {}
+                    }
+                }
+                scope = next;
+            }
+            _ => return None,
+        }
+    }
+    // The keys: the grouping's non-aggregate items, bare scope variables
+    // under their own name; at least one aggregate.
+    let mut keys: Vec<String> = Vec::new();
+    let mut aggregates = 0usize;
+    for it in &grp.items {
+        if contains_aggregate(&it.expr) {
+            aggregates += 1;
+            continue;
+        }
+        match &it.expr {
+            Expr::Var(v) if scope.contains(v) && it.alias.as_ref().is_none_or(|a| a == v) => {
+                keys.push(v.clone())
+            }
+            _ => return None,
+        }
+    }
+    if aggregates == 0 || keys.is_empty() {
+        return None;
+    }
+    let reads_only_keys = |e: &Expr| -> bool {
+        let mut fv = Vec::new();
+        free_vars_of(e, &mut fv);
+        fv.iter().all(|v| !scope.contains(v) || keys.contains(v))
+    };
+    // The OPTIONAL run binds and reads nothing of the scope but the keys.
+    for c in &q.clauses[first_opt..n - 2] {
+        let Clause::Match {
+            pattern, where_, ..
+        } = c
+        else {
+            return None;
+        };
+        for p in &pattern.paths {
+            if path_vars(p)
+                .iter()
+                .any(|v| scope.contains(v) && !keys.contains(v))
+            {
+                return None;
+            }
+            let props = std::iter::once(&p.start.props)
+                .chain(p.hops.iter().flat_map(|(r, nd)| [&r.props, &nd.props]));
+            for pr in props.flatten() {
+                if !reads_only_keys(pr) {
+                    return None;
+                }
+            }
+        }
+        if let Some(w) = where_ {
+            if !reads_only_keys(w) {
+                return None;
+            }
+        }
+    }
+    if !grp.items.iter().all(|it| reads_only_keys(&it.expr)) {
+        return None;
+    }
+    // A RETURN alias that shadows a key would change what its ORDER BY reads.
+    if ret.items.iter().any(|it| {
+        it.alias
+            .as_ref()
+            .is_some_and(|a| scope.contains(a) && !matches!(&it.expr, Expr::Var(v) if v == a))
+    }) {
+        return None;
+    }
+    if !ret.items.iter().all(|it| reads_only_keys(&it.expr)) {
+        return None;
+    }
+    // A key read WHOLE by the RETURN (`RETURN p, ids`) stays: that shape is
+    // fix 62's late-full carry, which binds the key lean and hydrates the
+    // page's survivors — the pushed grouping would bind every key in full.
+    let mut prop_reads = BTreeSet::new();
+    if !ret.items.iter().all(|it| {
+        keys.iter()
+            .all(|k| group_key_prop_only(&it.expr, k, &mut prop_reads))
+    }) {
+        return None;
+    }
+    // The RETURN's ORDER BY reads the keys alone — through an alias of a
+    // key-only RETURN item if need be — and by property.
+    let mut order = Vec::with_capacity(ret.order.len());
+    for o in &ret.order {
+        let expr = match &o.expr {
+            Expr::Var(v) if !scope.contains(v) => match ret
+                .items
+                .iter()
+                .find(|it| it.alias.as_deref() == Some(v.as_str()))
+            {
+                Some(it) => it.expr.clone(),
+                None => return None,
+            },
+            e => e.clone(),
+        };
+        if contains_aggregate(&expr) || expr.has_subquery() {
+            return None;
+        }
+        let mut fv = Vec::new();
+        free_vars_of(&expr, &mut fv);
+        if fv.is_empty() || !fv.iter().all(|v| keys.contains(v)) {
+            return None;
+        }
+        if !keys
+            .iter()
+            .all(|k| group_key_prop_only(&expr, k, &mut prop_reads))
+        {
+            return None;
+        }
+        order.push(OrderItem { expr, desc: o.desc });
+    }
+    let mut out: Vec<Clause> = Vec::with_capacity(n + 2);
+    out.extend(q.clauses[..first_opt].iter().cloned());
+    let mut items: Vec<ProjItem> = keys
+        .iter()
+        .map(|k| ProjItem::synthetic(Expr::Var(k.clone()), None))
+        .collect();
+    items.push(ProjItem::synthetic(
+        Expr::Call {
+            name: "count".to_string(),
+            distinct: false,
+            star: true,
+            args: Vec::new(),
+        },
+        Some(MULT.to_string()),
+    ));
+    out.push(Clause::With {
+        proj: Projection {
+            distinct: false,
+            star: false,
+            items,
+            order,
+            skip: ret.skip.clone(),
+            limit: ret.limit.clone(),
+        },
+        where_: None,
+    });
+    out.push(Clause::Unwind {
+        expr: Expr::Call {
+            name: "range".to_string(),
+            distinct: false,
+            star: false,
+            args: vec![Expr::Int(1), Expr::Var(MULT.to_string())],
+        },
+        alias: DUP.to_string(),
+    });
+    out.extend(q.clauses[first_opt..n - 1].iter().cloned());
+    let mut paged = ret.clone();
+    paged.skip = None;
+    paged.limit = None;
+    out.push(Clause::Return { proj: paged });
+    counted!("interp.top-k pushed below its grouping stage");
+    Some(SingleQuery { clauses: out })
+}
+
+/// RELATIONSHIP UNIQUENESS SPANS EVERY PATH OF ONE MATCH.
+///
+/// openCypher's relationship isomorphism is scoped to the MATCH clause: no
+/// relationship binds twice anywhere in `MATCH p1, p2, …`. Every matcher here
+/// scopes it to ONE PATH (`Partial.used` starts empty per path, the pipeline's
+/// `reset_rels` at each comma path), which is the rule for SEPARATE clauses —
+/// `MATCH p1 MATCH p2` may reuse a relationship — and not for comma paths.
+///
+/// SNB BI bi17 depends on the difference, and says so in LDBC's own text:
+/// `(forum1)<-[:HAS_MEMBER]->(person2)…, (forum1)<-[:HAS_MEMBER]->(person3)…`
+/// in one MATCH makes person2 and person3 DIFFERENT people, because their
+/// HAS_MEMBER edges must differ (PostgreSQL's SQL writes `person2 <> person3`
+/// out). Engram counted each person replying to their own message as well:
+/// at SF0.1, on the most-tagged tag, person 306 scored 148 where the rule
+/// gives 138, and the top ten reordered. The benchmark compares row counts,
+/// and LIMIT 10 made those equal, so nothing flagged it.
+///
+/// The rule is restored the way a planner states it, as predicates the WHERE
+/// already knows how to run: every pair of relationship patterns in DIFFERENT
+/// paths whose types can coincide is named (anonymous ones get a hidden
+/// `__iso<n>` name) and kept apart — `a <> b` for two single hops, `NOT a IN
+/// b` against a variable-length list, `none(x IN a WHERE x IN b)` for two
+/// lists. Relationships compare by identity (`Value::eq3`), so each predicate
+/// is exactly "not the same relationship", and every matcher, recogniser and
+/// pushdown below sees an ordinary conjunct over bound variables. Pairs whose
+/// types cannot meet add nothing, so a MATCH whose paths use different
+/// relationship types is untouched. Nor does a pair whose ends are provably
+/// different nodes, in the orientation the directions allow: a WHERE that says
+/// so (`WHERE NOT t = tag`, SNB Interactive IC6), or inline maps that pin one
+/// key to two different constants (`{name: $country1}` against `{name:
+/// $country2}`, SNB BI bi14). Two relationships are one only if their ends are.
+///
+/// A relationship variable NAMED in two paths is one relationship joined, not
+/// two, and is left alone. A statement that projects `*` is declined — the
+/// hidden names would surface in its columns — and counted, so the old
+/// per-path answer is visible where it remains.
+fn enforce_clause_rel_uniqueness(
+    q: &SingleQuery,
+    params: &BTreeMap<String, Value>,
+) -> Option<SingleQuery> {
+    // CHEAP REFUSAL FIRST: this runs on every statement, and almost none has
+    // two paths in one MATCH.
+    if !q
+        .clauses
+        .iter()
+        .any(|c| matches!(c, Clause::Match { pattern, .. } if pattern.paths.len() > 1))
+    {
+        return None;
+    }
+    let overlaps = |a: &RelPattern, b: &RelPattern| {
+        a.types.is_empty() || b.types.is_empty() || a.types.iter().any(|t| b.types.contains(t))
+    };
+    // `x <> y` or `NOT x = y`, either way round, as a top-level conjunct
+    fn states_unequal(w: Option<&Expr>, x: &str, y: &str) -> bool {
+        let Some(w) = w else { return false };
+        let mut conj = Vec::new();
+        conjuncts_of(w, &mut conj);
+        let is = |e: &Expr, a: &str| matches!(e, Expr::Var(v) if v == a);
+        conj.iter().any(|c| {
+            let (l, r) = match c {
+                Expr::Bin(BinOp::Neq, l, r) => (l.as_ref(), r.as_ref()),
+                Expr::Not(inner) => match inner.as_ref() {
+                    Expr::Bin(BinOp::Eq, l, r) => (l.as_ref(), r.as_ref()),
+                    _ => return false,
+                },
+                _ => return false,
+            };
+            (is(l, x) && is(r, y)) || (is(l, y) && is(r, x))
+        })
+    }
+    // A relationship joins exactly two nodes, so two SINGLE hops can bind the
+    // same one only where their end nodes coincide, in some orientation the
+    // directions allow. Where the WHERE already keeps an aligned pair of ends
+    // apart, the pair cannot meet and the predicate would be redundant — and
+    // not free: a named relationship and a conjunct over it turn recognisers
+    // away. SNB Interactive IC6 is that case: `(post)-[:HAS_TAG]->(t), (post)
+    // -[:HAS_TAG]->(tag) WHERE NOT t = tag`.
+    // A constant a node's inline map pins a key to: a literal or a parameter.
+    let pinned = |e: &Expr| -> Option<Value> {
+        match e {
+            Expr::Int(i) => Some(Value::Int(*i)),
+            Expr::Float(f) => Some(Value::Float(*f)),
+            Expr::Str(s) => Some(Value::Str(s.clone())),
+            Expr::Bool(b) => Some(Value::Bool(*b)),
+            Expr::Param(name) => params.get(name).cloned(),
+            _ => None,
+        }
+    };
+    // Two node patterns no one node can satisfy: one key pinned to two
+    // different constants (`{name: $country1}` against `{name: $country2}`, SNB
+    // BI bi14's two countries, whose parameters always differ).
+    let maps_conflict = |a: &NodePattern, b: &NodePattern| -> bool {
+        let (Some(Expr::Map(ma)), Some(Expr::Map(mb))) = (&a.props, &b.props) else {
+            return false;
+        };
+        ma.iter().any(|(ka, ea)| {
+            mb.iter().any(|(kb, eb)| {
+                ka == kb
+                    && matches!(
+                        (pinned(ea), pinned(eb)),
+                        (Some(x), Some(y)) if !matches!(x, Value::Null) && !matches!(y, Value::Null)
+                            && x.eq3(&y) == Truth::False
+                    )
+            })
+        })
+    };
+    let kept_apart = |pattern: &Pattern, w: Option<&Expr>, (pi, hi): (usize, usize), (pj, hj): (usize, usize)| {
+        type Ends<'p> = (RelDir, &'p NodePattern, &'p NodePattern);
+        let ends = |p: usize, h: usize| -> Option<Ends<'_>> {
+            let path = &pattern.paths[p];
+            let (rel, right) = &path.hops[h];
+            if rel.length.is_some() {
+                return None;
+            }
+            let left = if h == 0 { &path.start } else { &path.hops[h - 1].1 };
+            // as (source, target) for a directed hop
+            Some(match rel.dir {
+                RelDir::In => (rel.dir, right, left),
+                _ => (rel.dir, left, right),
+            })
+        };
+        let (Some((da, a0, a1)), Some((db, b0, b1))) = (ends(pi, hi), ends(pj, hj)) else {
+            return false;
+        };
+        // Two end nodes that cannot be one node: a WHERE says so, or their
+        // inline maps pin one key to two different constants.
+        let apart = |x: &NodePattern, y: &NodePattern| {
+            if maps_conflict(x, y) {
+                return true;
+            }
+            match (x.var.as_ref(), y.var.as_ref()) {
+                (Some(x), Some(y)) => x != y && states_unequal(w, x, y),
+                _ => false,
+            }
+        };
+        let same_way = apart(a0, b0) || apart(a1, b1);
+        let crossed = apart(a0, b1) || apart(a1, b0);
+        let undirected = matches!(da, RelDir::Undirected) || matches!(db, RelDir::Undirected);
+        if undirected { same_way && crossed } else { same_way }
+    };
+    let mut out = q.clone();
+    let mut changed = false;
+    let mut hidden = 0usize;
+    for c in out.clauses.iter_mut() {
+        let Clause::Match { pattern, where_, .. } = c else {
+            continue;
+        };
+        if pattern.paths.len() < 2 {
+            continue;
+        }
+        // (path, hop) of every relationship pattern the clause has
+        let slots: Vec<(usize, usize)> = pattern
+            .paths
+            .iter()
+            .enumerate()
+            .flat_map(|(pi, p)| (0..p.hops.len()).map(move |hi| (pi, hi)))
+            .collect();
+        let mut pairs: Vec<((usize, usize), (usize, usize))> = Vec::new();
+        for (i, &(pi, hi)) in slots.iter().enumerate() {
+            for &(pj, hj) in &slots[i + 1..] {
+                if pi == pj {
+                    continue; // one path: the matchers already keep these apart
+                }
+                let (a, b) = (&pattern.paths[pi].hops[hi].0, &pattern.paths[pj].hops[hj].0);
+                if !overlaps(a, b) || (a.var.is_some() && a.var == b.var) {
+                    continue;
+                }
+                if kept_apart(pattern, where_.as_ref(), (pi, hi), (pj, hj)) {
+                    counted!("interp.MATCH relationship pair already kept apart by the WHERE");
+                    continue;
+                }
+                pairs.push(((pi, hi), (pj, hj)));
+            }
+        }
+        if pairs.is_empty() {
+            continue;
+        }
+        if q.clauses.iter().any(|c| match c {
+            Clause::With { proj, .. } | Clause::Return { proj } => proj.star,
+            _ => false,
+        }) {
+            counted!("interp.MATCH relationship uniqueness across paths declined: a `*` projection");
+            return None;
+        }
+        for &(x, y) in &pairs {
+            for (p, h) in [x, y] {
+                let rel = &mut pattern.paths[p].hops[h].0;
+                if rel.var.is_none() {
+                    rel.var = Some(format!("__iso{hidden}"));
+                    hidden += 1;
+                }
+            }
+        }
+        let mut conj: Option<Expr> = None;
+        for &((pi, hi), (pj, hj)) in &pairs {
+            let (a, b) = (&pattern.paths[pi].hops[hi].0, &pattern.paths[pj].hops[hj].0);
+            let var = |r: &RelPattern| Box::new(Expr::Var(r.var.clone().expect("named above")));
+            let pred = match (a.length.is_some(), b.length.is_some()) {
+                (false, false) => Expr::Bin(BinOp::Neq, var(a), var(b)),
+                (false, true) => Expr::Not(Box::new(Expr::In(var(a), var(b)))),
+                (true, false) => Expr::Not(Box::new(Expr::In(var(b), var(a)))),
+                (true, true) => Expr::ListPredicate {
+                    kind: engram_cypher::ast::ListPredicateKind::None,
+                    var: "__isox".to_string(),
+                    source: var(a),
+                    filter: Box::new(Expr::In(Box::new(Expr::Var("__isox".to_string())), var(b))),
+                },
+            };
+            conj = Some(match conj {
+                Some(c) => Expr::And(Box::new(c), Box::new(pred)),
+                None => pred,
+            });
+        }
+        let conj = conj.expect("pairs is not empty");
+        *where_ = Some(match where_.take() {
+            Some(w) => Expr::And(Box::new(w), Box::new(conj)),
+            None => conj,
+        });
+        counted!("interp.MATCH relationships kept distinct across its paths");
+        changed = true;
+    }
+    changed.then_some(out)
 }
 
 /// Fix 45: a top-level `type(r) IN <constant list of strings>` (or `type(r)
@@ -2432,9 +3183,15 @@ fn fold_type_filters(q: &SingleQuery) -> Option<SingleQuery> {
         }
         let foldable = |name: &str| {
             bound.get(name) == Some(&1)
-                && pattern.paths.iter().flat_map(|p| p.hops.iter()).any(|(rel, _)| {
-                    rel.var.as_deref() == Some(name) && rel.types.is_empty() && rel.length.is_none()
-                })
+                && pattern
+                    .paths
+                    .iter()
+                    .flat_map(|p| p.hops.iter())
+                    .any(|(rel, _)| {
+                        rel.var.as_deref() == Some(name)
+                            && rel.types.is_empty()
+                            && rel.length.is_none()
+                    })
         };
         let mut conjuncts: Vec<&Expr> = Vec::new();
         split_and(w, &mut conjuncts);
@@ -2601,12 +3358,21 @@ pub(crate) fn run_single(
             )));
         }
     }
+    // Looked up on the arm AS GIVEN: every rewrite below builds a copy at a
+    // new address, which the lookup would not recognise. The rewrites keep
+    // the concluding RETURN's columns, so the demand holds for their result.
+    let call_out = call_output_demand_for(q);
     // Fix 45: a `type(r) IN [...]` / `type(r) = '…'` conjunct over an
     // untyped hop folds into the hop's types before ANY path sees the
     // statement — the recognisers, the fused pass and the general path
     // alike expand only the named types.
     let folded = fold_type_filters(q);
     let q: &SingleQuery = folded.as_ref().unwrap_or(q);
+    // One MATCH's comma paths never share a relationship (openCypher), which
+    // every matcher below checks per path only: state it as WHERE conjuncts
+    // before any of them reads the statement.
+    let distinct_rels = enforce_clause_rel_uniqueness(q, params);
+    let q: &SingleQuery = distinct_rels.as_ref().unwrap_or(q);
     // Fix 69: every var-free WHERE conjunct is evaluated ONCE here — a
     // True one leaves the WHERE, a False/Null one empties it — before any
     // recogniser reads the statement.
@@ -2616,11 +3382,33 @@ pub(crate) fn run_single(
     // for every path below alike.
     let ordered = subqueries_last(q);
     let q: &SingleQuery = ordered.as_ref().unwrap_or(q);
+    // Fix 101: a non-OPTIONAL MATCH requiring a hop over a relationship type
+    // with no live relationship drops every row — no recogniser seeds for
+    // it, and the general path below answers over no row (an aggregate over
+    // none still yields its one row).
+    // A statement that WRITES decides per clause instead (the materialising
+    // loop re-asks with its own creates folded in): `CREATE (a)-[:T]->(b)
+    // WITH a MATCH (a)-[:T]->(x)` over a dead `T` matches its own edge.
+    let read_only = q.clauses.iter().all(|c| {
+        matches!(
+            c,
+            Clause::Match { .. }
+                | Clause::Unwind { .. }
+                | Clause::With { .. }
+                | Clause::Return { .. }
+        )
+    });
+    let dead = read_only && clauses_require_dead_hop(graph, &q.clauses);
+    if dead {
+        counted!("interp.match over a relationship type with no live relationship matched nothing");
+    }
     // FIRST PASS: every recogniser sees the ORIGINAL clauses — the
     // multi-MATCH operators (the IC5 hash join and friends) keep every
     // shape they already claim, untouched.
-    if let Some(r) = try_recognisers(graph, q, params)? {
-        return Ok(r);
+    if !dead {
+        if let Some(r) = try_recognisers(graph, q, params)? {
+            return Ok(r);
+        }
     }
     // SECOND PASS — CLAUSE FUSION (W3): when everything declined, a run of
     // consecutive plain MATCH clauses is re-offered as ONE multi-path MATCH
@@ -2636,12 +3424,21 @@ pub(crate) fn run_single(
     // included); the WHEREs are ANDed, unobservable wherever the
     // recognisers admit them (pure predicates only). A decline here falls
     // to the general path with the ORIGINAL clauses.
-    if let Some(f) = fuse_consecutive_matches(q) {
-        counted!("interp.consecutive matches fused for the recognisers");
-        if let Some(r) = try_recognisers(graph, &f, params)? {
-            return Ok(r);
+    if !dead {
+        if let Some(f) = fuse_consecutive_matches(q) {
+            counted!("interp.consecutive matches fused for the recognisers");
+            if let Some(r) = try_recognisers(graph, &f, params)? {
+                return Ok(r);
+            }
         }
     }
+    // Fix 92: every recogniser declined — a RETURN's ORDER BY / SKIP /
+    // LIMIT over a grouping's keys alone moves below the grouping, so the
+    // OPTIONAL run and the aggregates run for the page's key tuples only.
+    // Behind the recognisers with fix 72, and before it: the pushed
+    // statement's chain still folds.
+    let pushed = push_topk_below_grouping(q);
+    let q: &SingleQuery = pushed.as_ref().unwrap_or(q);
     // Fix 72: every recogniser declined — on the general path a
     // `count(<chain var>)` over the chain a MATCH binds folds into its
     // projection as `sum(COUNT { <chain> })`, so the clause never expands a
@@ -2655,16 +3452,63 @@ pub(crate) fn run_single(
     };
     let q: &SingleQuery = chain_folded.as_ref().unwrap_or(q);
     if streamable(q) {
-        return run_streaming(graph, q, params, rows);
+        return run_streaming(graph, q, params, rows, call_out.as_deref());
+    }
+    // A STREAMABLE PREFIX, RUN AS ONE.
+    //
+    // `streamable` answers for the WHOLE statement, and a procedure `CALL` in
+    // the middle answered no for all of it — so every clause, the expensive
+    // prefix included, fell to the materialising loop below: one core, every
+    // clause's rows held at once. SNB BI bi15 joins every KNOWS pair to the
+    // replies between them and hands the weighted pairs to
+    // `engram.algo.project`; at SF10 the statement ran at load 1.0 and passed
+    // 80 GB within a minute, where that join streamed on its own splits across
+    // the executor.
+    //
+    // So the statement is cut at its LAST `WITH` before the first clause the
+    // pipeline cannot run. The clauses up to it run as their own statement,
+    // closed by that WITH's projection written as a RETURN — the rows the WITH
+    // would have passed on, and nothing else in scope, exactly as after a WITH
+    // — and the loop below starts after it. The WITH's own WHERE runs on those
+    // rows first, as it would have. Only a statement that writes nothing is
+    // cut: a writer's reads build its transaction's read-set, and the pipeline
+    // is not where that is kept.
+    let mut start = 0;
+    let mut head_columns: Option<Vec<String>> = None;
+    let cut = graph
+        .prefix_streaming_enabled()
+        .then(|| streamable_prefix_end(q))
+        .flatten();
+    if let Some(cut) = cut {
+        if let Clause::With { proj, where_ } = &q.clauses[cut] {
+            let mut clauses = q.clauses[..cut].to_vec();
+            clauses.push(Clause::Return { proj: proj.clone() });
+            let prefix = SingleQuery { clauses };
+            counted!("interp.statement streamed its prefix before a clause the pipeline cannot run");
+            let head = run_single(graph, &prefix, params, std::mem::take(&mut rows))?;
+            head_columns = Some(head.columns.clone());
+            rows = Projected {
+                columns: head.columns,
+                rows: head.rows,
+            }
+            .into_rows()?;
+            if let Some(w) = where_ {
+                rows = filter_rows(graph, rows, w, params)?;
+            }
+            start = cut + 1;
+        }
     }
     let mut result: Option<QueryResult> = None;
     // The current column names — tracked so `*` can still expand when a clause
     // leaves ZERO rows (its schema is known from the query structure regardless).
-    let mut schema: Vec<String> = rows
-        .first()
-        .map(|r| r.keys().cloned().collect())
-        .unwrap_or_default();
-    for (i, clause) in q.clauses.iter().enumerate() {
+    let mut schema: Vec<String> = match head_columns {
+        Some(c) => c,
+        None => rows
+            .first()
+            .map(|r| r.keys().cloned().collect())
+            .unwrap_or_default(),
+    };
+    for (i, clause) in q.clauses.iter().enumerate().skip(start) {
         if result.is_some() {
             return Err(RunError::Semantic("RETURN must be the final clause".into()));
         }
@@ -2681,7 +3525,20 @@ pub(crate) fn run_single(
                 // variable this MATCH binds — the matcher binds its hop
                 // ends to that demand instead of in full.
                 let demand = demands_after(&q.clauses[i + 1..]);
-                rows = exec_match(graph, pattern, where_.as_ref(), *optional, rows, params, &demand)?;
+                // Fix 101: a required hop over a dead type — no row, no seed.
+                rows = if !*optional && pattern_has_dead_hop(graph, pattern) {
+                    Vec::new()
+                } else {
+                    exec_match(
+                        graph,
+                        pattern,
+                        where_.as_ref(),
+                        *optional,
+                        rows,
+                        params,
+                        &demand,
+                    )?
+                };
             }
             Clause::Unwind { expr, alias } => {
                 schema.push(alias.clone());
@@ -2690,7 +3547,7 @@ pub(crate) fn run_single(
                     match eval_expr(graph, expr, &row, params)? {
                         Value::Null => {}
                         Value::List(items) => {
-                            for item in items {
+                            for item in (items).iter().cloned() {
                                 let mut r = row.clone();
                                 r.insert(alias.clone(), item);
                                 out.push(r);
@@ -2810,8 +3667,11 @@ pub(crate) fn run_single(
                                 let mut now: Vec<Row> = Vec::new();
                                 if let (Some((false, id)), true) = (refused, path.hops.is_empty()) {
                                     if let Some(node) = graph.node(id)? {
-                                        if node_satisfies(graph, &node, &path.start, &row, params)? {
-                                            counted!("interp.merge converged on the refusing node by id");
+                                        if node_satisfies(graph, &node, &path.start, &row, params)?
+                                        {
+                                            counted!(
+                                                "interp.merge converged on the refusing node by id"
+                                            );
                                             let mut r = row.clone();
                                             if let Some(v) = &path.start.var {
                                                 r.insert(v.clone(), node);
@@ -2825,11 +3685,14 @@ pub(crate) fn run_single(
                                     now = match_path(graph, path, &row, params, true)?;
                                 }
                                 if now.is_empty() {
-                                    return Err(RunError::Graph(
-                                        GraphError::ConstraintViolation(why),
-                                    ));
+                                    return Err(RunError::Graph(GraphError::ConstraintViolation(
+                                        why,
+                                    )));
                                 }
-                                sometimes!("interp.merge converged after losing a create race", true);
+                                sometimes!(
+                                    "interp.merge converged after losing a create race",
+                                    true
+                                );
                                 counted!("interp.merge races converged");
                                 for mut r in now {
                                     apply_set_items(graph, on_match, &mut r, params)?;
@@ -2910,7 +3773,9 @@ pub(crate) fn run_single(
                                 // A PATH deletes every node and relationship it
                                 // holds (DETACH DELETE of a whole path); its trail
                                 // recurses exactly like a list.
-                                Value::List(inner) | Value::Path(inner) => stack.extend(inner),
+                                Value::List(inner) | Value::Path(inner) => {
+                                    stack.extend((inner).iter().cloned())
+                                }
                                 Value::Map(m) => stack.extend(m.into_values()),
                                 other => {
                                     return Err(RunError::Semantic(format!(
@@ -2940,7 +3805,7 @@ pub(crate) fn run_single(
             } => {
                 for row in &rows {
                     let list = match eval_expr(graph, source, row, params)? {
-                        Value::Null => Vec::new(),
+                        Value::Null => Vec::new().into(),
                         Value::List(items) => items,
                         other => {
                             return Err(RunError::Semantic(format!(
@@ -2949,9 +3814,9 @@ pub(crate) fn run_single(
                             )));
                         }
                     };
-                    for item in list {
+                    for item in list.iter() {
                         let mut inner = row.clone();
-                        inner.insert(var.clone(), item);
+                        inner.insert(var.clone(), item.clone());
                         let sub = SingleQuery {
                             clauses: updates.clone(),
                         };
@@ -2964,6 +3829,10 @@ pub(crate) fn run_single(
                 in_transactions: _,
                 imports: _,
             } => {
+                // What the clauses after this CALL read of each column the
+                // body returns: the body's concluding RETURN binds a returned
+                // node to that rather than in full (`plan_stage`).
+                let _out = CallOutputDemand::set(query, demands_after(&q.clauses[i + 1..]));
                 let mut out = Vec::new();
                 for row in rows {
                     let sub = run_query_seeded(graph, query, params, row.clone())?;
@@ -2987,18 +3856,97 @@ pub(crate) fn run_single(
                 yields,
                 where_,
             } => {
-                for (field, alias) in yields {
-                    schema.push(alias.clone().unwrap_or_else(|| field.clone()));
+                // A CALL that ENDS the query is itself the result. Cypher's
+                // rule is that `YIELD` may be omitted only in that position,
+                // and then the procedure's declared output columns are the
+                // result columns — which is why a bare `CALL dbms.components()`
+                // now answers instead of returning nothing at all.
+                //
+                // Binding those columns into SCOPE without a YIELD is a
+                // different thing and is deliberately NOT done: it would let a
+                // later clause capture a variable the user never named. That is
+                // why `all_bound` and `in_scope` are untouched, and why
+                // `CALL db.labels() RETURN label` is refused rather than
+                // silently working.
+                let is_last = i + 1 == q.clauses.len();
+                let cols = procedure_result_columns(name, yields, is_last)?;
+                for c in &cols {
+                    schema.push(c.clone());
                 }
                 rows = call_procedure(graph, name, args, yields, where_.as_ref(), rows, params)?;
+                if is_last {
+                    sometimes!(
+                        "interp.a standalone CALL produced its default columns",
+                        true
+                    );
+                    let out_rows = rows
+                        .iter()
+                        .map(|r| {
+                            cols.iter()
+                                .map(|c| r.get(c).cloned().unwrap_or(Value::Null))
+                                .collect::<Vec<Value>>()
+                        })
+                        .collect();
+                    result = Some(QueryResult {
+                        columns: cols,
+                        rows: out_rows,
+                    });
+                }
             }
         }
-        let _ = i;
     }
     Ok(result.unwrap_or(QueryResult {
         columns: Vec::new(),
         rows: Vec::new(),
     }))
+}
+
+/// A CALL body's output demand and the body queries it applies to.
+type CallOut = (Vec<usize>, std::rc::Rc<BTreeMap<String, VarDemand>>);
+
+thread_local! {
+    /// What the clauses AFTER a `CALL {}` read of each column its body
+    /// returns, with the addresses of the body's OWN top-level queries (one
+    /// per UNION arm) it applies to — see [`call_output_demand_for`]. `None`
+    /// outside a body.
+    static CALL_OUTPUT_DEMAND: std::cell::RefCell<Option<CallOut>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Sets the output demand for one `CALL {}` body's execution and restores the
+/// enclosing one on drop — a CALL nested in the body sets its own.
+struct CallOutputDemand(Option<CallOut>);
+
+impl CallOutputDemand {
+    fn set(query: &Query, demand: BTreeMap<String, VarDemand>) -> Self {
+        let arms: Vec<usize> = match query {
+            Query::Single(q) => vec![std::ptr::from_ref(q) as usize],
+            Query::Union { arms, .. } => arms.iter().map(|q| std::ptr::from_ref(q) as usize).collect(),
+        };
+        let prev = CALL_OUTPUT_DEMAND.with(|c| c.replace(Some((arms, std::rc::Rc::new(demand)))));
+        CallOutputDemand(prev)
+    }
+}
+
+impl Drop for CallOutputDemand {
+    fn drop(&mut self) {
+        let prev = self.0.take();
+        CALL_OUTPUT_DEMAND.with(|c| *c.borrow_mut() = prev);
+    }
+}
+
+/// What the clauses after a `CALL {}` read of the columns `q` returns —
+/// `Some` only when `q` IS one of that body's own top-level queries, matched
+/// by address. A subquery nested anywhere inside the body (an EXISTS body) is
+/// a different query and never matches, so it keeps its own RETURN's full
+/// demand. A rewritten copy of the arm does not match either, which is why
+/// `run_single` looks the demand up before rewriting and carries it down.
+fn call_output_demand_for(q: &SingleQuery) -> Option<std::rc::Rc<BTreeMap<String, VarDemand>>> {
+    let addr = std::ptr::from_ref(q) as usize;
+    CALL_OUTPUT_DEMAND.with(|c| match &*c.borrow() {
+        Some((arms, demand)) if arms.contains(&addr) => Some(std::rc::Rc::clone(demand)),
+        _ => None,
+    })
 }
 
 fn run_query_seeded(
@@ -3009,7 +3957,46 @@ fn run_query_seeded(
 ) -> Result<QueryResult, RunError> {
     match query {
         Query::Single(q) => run_single(graph, q, params, vec![seed]),
-        Query::Union { .. } => Err(RunError::Unsupported("UNION inside CALL {}".into())),
+        // Each arm runs against the SAME seed row, and the arms are
+        // concatenated in order — the top-level UNION rule applied at subquery
+        // scope. SNB BI's bi4 is the shape that wanted it: the two arms count
+        // messages per person and then add back the top-forum members who have
+        // none, and `UNION ALL` between them is the only way to say that in one
+        // subquery.
+        //
+        // The validator already expected this case — it reads `arms.first()`
+        // for a subquery's yielded names — so only execution was missing.
+        Query::Union { all, arms } => {
+            let mut columns: Option<Vec<String>> = None;
+            let mut rows = Vec::new();
+            for arm in arms {
+                let r = run_single(graph, arm, params, vec![seed.clone()])?;
+                match &columns {
+                    None => columns = Some(r.columns),
+                    Some(c) if *c != r.columns => {
+                        // Same refusal as top level, and it matters MORE here:
+                        // the caller binds the subquery's columns back into the
+                        // outer row by NAME, so arms that disagree would bind
+                        // different names per row rather than fail.
+                        return Err(RunError::Semantic(format!(
+                            "UNION arms must project the same columns: {:?} vs {:?}",
+                            c, r.columns
+                        )));
+                    }
+                    Some(_) => {}
+                }
+                rows.extend(r.rows);
+            }
+            if !*all {
+                let mut nonce = 0u64;
+                let mut seen = std::collections::BTreeSet::new();
+                rows.retain(|r| seen.insert(agg_key_of(r, &mut nonce)));
+            }
+            Ok(QueryResult {
+                columns: columns.unwrap_or_default(),
+                rows,
+            })
+        }
     }
 }
 
@@ -3036,7 +4023,7 @@ fn exists_probe_fast(
         return Ok(None);
     }
     let path = &pattern.paths[0];
-    if path.shortest || path.var.is_some() || path.hops.len() != 1 {
+    if path.shortest.is_some() || path.var.is_some() || path.hops.len() != 1 {
         return Ok(None);
     }
     let (rel, end) = &path.hops[0];
@@ -3096,7 +4083,7 @@ fn count_probe_fast(graph: &Graph, pattern: &Pattern, row: &Row) -> Result<Optio
         return Ok(None);
     }
     let path = &pattern.paths[0];
-    if path.shortest || path.var.is_some() || path.hops.len() != 1 {
+    if path.shortest.is_some() || path.var.is_some() || path.hops.len() != 1 {
         return Ok(None);
     }
     let (rel, end) = &path.hops[0];
@@ -3182,7 +4169,7 @@ fn count_chain_fast(
     // A one-hop chain reaches here only with a labelled end (the bare
     // degree is `count_probe_fast`'s): its count is a membership test per
     // neighbour, columnar or not.
-    if path.shortest || path.var.is_some() || path.hops.is_empty() {
+    if path.shortest.is_some() || path.var.is_some() || path.hops.is_empty() {
         return Ok(None);
     }
     if !path.start.labels.is_empty() || path.start.props.is_some() {
@@ -3320,7 +4307,7 @@ pub(crate) fn reversed_path(
     path: &PathPattern,
     bound: &[String],
 ) -> Result<Option<PathPattern>, RunError> {
-    if path.var.is_some() || path.shortest || path.hops.is_empty() {
+    if path.var.is_some() || path.shortest.is_some() || path.hops.is_empty() {
         return Ok(None);
     }
     let is_bound = |n: &engram_cypher::stmt::NodePattern| -> bool {
@@ -3367,7 +4354,7 @@ pub(crate) fn reversed_path(
     counted!("interp.subquery path reversed to its constant end");
     Ok(Some(PathPattern {
         var: None,
-        shortest: false,
+        shortest: None,
         start: end.clone(),
         hops,
     }))
@@ -3409,6 +4396,159 @@ fn reverse_subquery_paths<'q>(
 }
 
 /// [`reversed_path`] over a bare pattern body (`EXISTS { (a)-[…]-(b {…}) }`).
+/// Fix 89: an EXISTS body that is a CHAIN from its bound start — `EXISTS {
+/// (w)-[:BELONGS_TO_PROJECT]->(p:KMProject)<-[m:MEMBER_OF]-(:User {userId:
+/// $viewerId}) WHERE coalesce(m.state, 'active') = 'active' }` — whose
+/// remainder past the first hop reads nothing of the start, is a function
+/// of the first hop's END: the visibility test of every one of a project's
+/// work items is the project's. The KMWorkItem visibility listing on the
+/// mirror evaluated its two such bodies once per item (31k seeds, 77k hop
+/// ends bound, 183 ms against Neo4j's 121) for 77 projects' worth of
+/// answers. Now the start's first-hop peers are read from the adjacency and
+/// the remainder is evaluated once per DISTINCT peer per statement
+/// (`EXISTS_REMAINDER_MEMO`, keyed by the body and the peer), the body
+/// answering true at the first true peer. Declined — `None`, the matcher as
+/// before — for anything the memo cannot key: a single hop, a path
+/// variable or shortestPath, an undirected, untyped, variable-length,
+/// propertied or named first hop, a first-hop end with a map or no name, a
+/// remainder that reads the start or another bound variable, or a
+/// remainder hop sharing a type with the first (its path could re-use the
+/// first hop's relationship, which the whole-path matcher forbids).
+fn exists_by_first_hop_memo(
+    graph: &Graph,
+    pattern: &Pattern,
+    where_: Option<&Expr>,
+    row: &Row,
+    params: &BTreeMap<String, Value>,
+    demand: &BTreeMap<String, VarDemand>,
+) -> Result<Option<bool>, RunError> {
+    let [path] = pattern.paths.as_slice() else {
+        return Ok(None);
+    };
+    if path.var.is_some() || path.shortest.is_some() || path.hops.len() < 2 {
+        return Ok(None);
+    }
+    let Some(start_var) = path.start.var.as_deref() else {
+        return Ok(None);
+    };
+    let Some(Value::Node { id: start_id, .. }) = row.get(start_var) else {
+        return Ok(None);
+    };
+    let start_id = *start_id;
+    let (first_rel, first_end) = &path.hops[0];
+    if first_rel.var.is_some()
+        || first_rel.props.is_some()
+        || first_rel.length.is_some()
+        || first_rel.types.is_empty()
+        || first_rel.dir == RelDir::Undirected
+        || first_end.props.is_some()
+    {
+        return Ok(None);
+    }
+    // The first hop's end names the remainder's start; an ANONYMOUS end (the
+    // production bodies' `(:KMProject)`) is given a name no statement can
+    // spell, so the remainder can be seeded from it.
+    let x_var: String = match first_end.var.as_deref() {
+        Some(v) => {
+            if v == start_var || row.contains_key(v) {
+                return Ok(None);
+            }
+            v.to_string()
+        }
+        None => "\u{0}memo_end".to_string(),
+    };
+    let x_var = x_var.as_str();
+    // Only the start may be bound in the seed: any other bound variable the
+    // body reads would have to be part of the key.
+    if row.keys().any(|k| k != start_var) {
+        return Ok(None);
+    }
+    let mut mentions: Vec<String> = Vec::new();
+    if let Some(w) = where_ {
+        free_vars_of(w, &mut mentions);
+    }
+    for (rel, node) in &path.hops[1..] {
+        if rel.types.is_empty() || rel.types.iter().any(|t| first_rel.types.contains(t)) {
+            return Ok(None);
+        }
+        if rel.var.as_deref() == Some(start_var) || node.var.as_deref() == Some(start_var) {
+            return Ok(None);
+        }
+        if let Some(p) = &rel.props {
+            free_vars_of(p, &mut mentions);
+        }
+        if let Some(p) = &node.props {
+            free_vars_of(p, &mut mentions);
+        }
+    }
+    if mentions.iter().any(|v| v == start_var) {
+        return Ok(None);
+    }
+    let Some(tokens) = graph.type_tokens_peek(&first_rel.types) else {
+        return Ok(None);
+    };
+    if tokens.is_empty() {
+        return Ok(Some(false)); // a named type never minted: no first hop
+    }
+    let tokens = Some(tokens);
+    let dir = if first_rel.dir == RelDir::Out {
+        Dir::Out
+    } else {
+        Dir::In
+    };
+    let mut peers: Vec<u64> = Vec::new();
+    graph.adjacent_slim_for_each(start_id, dir, &tokens, |e| peers.push(e.peer));
+    peers.sort_unstable();
+    peers.dedup();
+    let empty: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let x_props: Option<&std::collections::BTreeSet<String>> = match demand.get(x_var) {
+        Some(VarDemand::Props(p)) => Some(p),
+        Some(VarDemand::Full) => None,
+        None => Some(&empty),
+    };
+    let key_base = pattern as *const Pattern as usize;
+    let rest = Pattern {
+        paths: vec![PathPattern {
+            var: None,
+            shortest: None,
+            start: NodePattern {
+                var: Some(x_var.to_string()),
+                labels: first_end.labels.clone(),
+                props: None,
+            },
+            hops: path.hops[1..].to_vec(),
+        }],
+    };
+    for peer in peers {
+        let memo = EXISTS_REMAINDER_MEMO.with(|m| m.borrow().get(&(key_base, peer)).copied());
+        let hit = match memo {
+            Some(h) => {
+                counted!("interp.exists remainder answered from its first-hop memo");
+                h
+            }
+            None => {
+                let h = match mat_end(graph, peer, x_props, first_end)? {
+                    Some(node) if node_satisfies(graph, &node, first_end, row, params)? => {
+                        let mut seed = Row::new();
+                        seed.insert(x_var.to_string(), node);
+                        let rest = reverse_pattern_paths(graph, &rest, &seed)?;
+                        !match_pattern_rows(graph, &rest, where_, vec![seed], params, Some(demand))?
+                            .is_empty()
+                    }
+                    _ => false,
+                };
+                counted!("interp.exists remainder evaluated for its first-hop memo");
+                EXISTS_REMAINDER_MEMO.with(|m| m.borrow_mut().insert((key_base, peer), h));
+                h
+            }
+        };
+        if hit {
+            return Ok(Some(true));
+        }
+    }
+    Ok(Some(false))
+}
+
 fn reverse_pattern_paths<'p>(
     graph: &Graph,
     pattern: &'p Pattern,
@@ -3456,8 +4596,8 @@ impl GraphHooks for Hooks<'_> {
                     }
                     // Fix 72: a multi-hop chain is a walk of ids, stopped
                     // at its first path.
-                    if let Some(n) = count_chain_fast(self.graph, pattern, &row, true)
-                        .map_err(run_to_eval)?
+                    if let Some(n) =
+                        count_chain_fast(self.graph, pattern, &row, true).map_err(run_to_eval)?
                     {
                         return Ok(Value::Bool(n > 0));
                     }
@@ -3476,11 +4616,33 @@ impl GraphHooks for Hooks<'_> {
                 {
                     return Ok(Value::Bool(n > 0));
                 }
+                // Fix 89: a body that is a chain from the bound start whose
+                // remainder reads only the first hop's end is answered per
+                // that end, once per statement.
+                if let Some(hit) = exists_by_first_hop_memo(
+                    self.graph,
+                    pattern,
+                    where_,
+                    &row,
+                    self.params,
+                    &demand,
+                )
+                .map_err(run_to_eval)?
+                {
+                    return Ok(Value::Bool(hit));
+                }
                 let pattern =
                     reverse_pattern_paths(self.graph, pattern, &row).map_err(run_to_eval)?;
-                !match_pattern_rows(self.graph, &pattern, where_, vec![row], self.params, Some(&demand))
-                    .map_err(run_to_eval)?
-                    .is_empty()
+                !match_pattern_rows(
+                    self.graph,
+                    &pattern,
+                    where_,
+                    vec![row],
+                    self.params,
+                    Some(&demand),
+                )
+                .map_err(run_to_eval)?
+                .is_empty()
             }
             None => {
                 let SubqueryBody::Query(q) = body else {
@@ -3517,8 +4679,8 @@ impl GraphHooks for Hooks<'_> {
                     }
                     // Fix 72: a multi-hop chain is a walk of ids whose last
                     // hop is a degree, never a row per path.
-                    if let Some(n) = count_chain_fast(self.graph, pattern, &row, false)
-                        .map_err(run_to_eval)?
+                    if let Some(n) =
+                        count_chain_fast(self.graph, pattern, &row, false).map_err(run_to_eval)?
                     {
                         return Ok(Value::Int(n));
                     }
@@ -3539,9 +4701,16 @@ impl GraphHooks for Hooks<'_> {
                 }
                 let pattern =
                     reverse_pattern_paths(self.graph, pattern, &row).map_err(run_to_eval)?;
-                match_pattern_rows(self.graph, &pattern, where_, vec![row], self.params, Some(&demand))
-                    .map_err(run_to_eval)?
-                    .len()
+                match_pattern_rows(
+                    self.graph,
+                    &pattern,
+                    where_,
+                    vec![row],
+                    self.params,
+                    Some(&demand),
+                )
+                .map_err(run_to_eval)?
+                .len()
             }
             None => {
                 let SubqueryBody::Query(q) = body else {
@@ -3578,6 +4747,27 @@ impl GraphHooks for Hooks<'_> {
         map: &Expr,
         scope: &Scope<'_>,
     ) -> Result<Value, EvalError> {
+        // THE SAME COMPREHENSION, ON THE SAME NODES, ANSWERS THE SAME THING.
+        //
+        // A pattern comprehension is evaluated once per ROW, and a scoring
+        // term is usually correlated to one node — so a row set that mentions
+        // a node many times walks the same pattern many times for an answer
+        // it already had. SNB BI8 scores every person and then every FRIEND
+        // of every person: 1,221,142 expression evaluations against 27,406
+        // store reads, 141 s of CPU with no I/O problem to speak of, where
+        // the same scores computed once for all 3,442 people take under a
+        // second.
+        //
+        // The result depends only on the graph and on the outer bindings the
+        // pattern, filter and map actually read — which `lean_seed` below
+        // already narrows to. So those bindings ARE the key, and identical
+        // keys may share an answer.
+        //
+        // Held only for one read snapshot (`read_stamp`), never across a
+        // write, and never while a transaction has buffered writes: a memo
+        // that outlived its snapshot would answer from a graph that no longer
+        // exists. It caches a VALUE the engine would have computed anyway,
+        // so a miss costs a lookup and a hit costs a clone.
         // Fix 51: the comprehension reads its vars in its filter and map
         // only. Fix 76: the pattern's inline maps join that demand, and the
         // seed row carries the bound nodes trimmed to it — the KM work-item
@@ -3589,20 +4779,727 @@ impl GraphHooks for Hooks<'_> {
         let mut keep_full = Vec::new();
         pattern_seed_demand(std::slice::from_ref(path), &mut demand, &mut keep_full);
         let row: Row = lean_seed(self.graph, scope, &demand, &keep_full);
-        let matches = match_path_with(self.graph, path, &row, self.params, false, Some(&demand))
-            .map_err(run_to_eval)?;
+        // ONLY WHERE IT CAN PAY. Building a key clones the variable names it
+        // covers and sorts them, and a comprehension evaluated once per
+        // statement can never hit — so the key is not built until this site
+        // has been seen often enough for a repeat to be plausible. The count
+        // is keyed on the site alone, which costs one integer lookup.
+        let seen = comprehension_site_seen(path);
+        let memo_key = if seen >= COMP_MEMO_AFTER {
+            comprehension_memo_key(self.graph, path, &row, &demand, &keep_full)
+        } else {
+            None
+        };
+        // DECORRELATION. Once a site has been evaluated enough times to show
+        // which of its outer bindings actually move, the whole comprehension
+        // can be answered ONCE for every value of the one that does, and each
+        // row served by a lookup. This is what Postgres does when it turns a
+        // correlated subquery into a join and an aggregate.
+        //
+        // Memoising alone cannot get here: it removes repeats, but BI8 still
+        // walks once per distinct friend. Grouped, the same scores take under
+        // a second against 141 s.
+        if let Some(key) = &memo_key {
+            match decorrelated_answer(self, path, filter, map, &row, &demand, &keep_full, key) {
+                Ok(Some(v)) => {
+                    counted!("interp.comprehension answered from its grouped form");
+                    return Ok(v);
+                }
+                Ok(None) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if let Some(key) = &memo_key {
+            if let Some(v) = comprehension_memo_get(key) {
+                counted!("interp.comprehension answered from an identical earlier row");
+                decorr_note_repeat(key.0, key.1);
+                return Ok(v);
+            }
+        }
+        // The comprehension's own address, before any reversal below builds a
+        // temporary copy of its pattern.
+        let site = path as *const PathPattern as usize;
+        // Both ends bound: walk from whichever has the smaller adjacency. The
+        // same variables bind to the same nodes either way — only the order
+        // they are discovered in changes — so this cannot alter the answer.
+        let reversed = reverse_both_bound_path(self.graph, path, &row);
+        let path: &PathPattern = reversed.as_ref().unwrap_or(path);
+        // THE FILTER'S OWN id-EQUALITY SEEDS THE PATTERN.
+        //
+        // When every branch of the comprehension's `WHERE` pins the start's
+        // key, the start can only be one of a few nodes — so run the pattern
+        // once per candidate with the start BOUND, instead of walking the
+        // whole space and testing afterwards. IC14's weight term does exactly
+        // that and is the reason it exceeds 300 s at SF3.
+        //
+        // The filter is STILL applied to every row below, so this only has to
+        // be a SUPERSET of the possible starts: too wide costs time and
+        // changes nothing, too narrow would lose matches, and
+        // `comprehension_start_ids` declines rather than narrow.
+        let pinned = comprehension_start_ids(self.graph, path, filter, scope, &row, Some(self));
+        let matches = match (pinned, path.start.var.as_ref()) {
+            (Some(ids), Some(var)) => {
+                // ONE START'S WALK, WALKED ONCE PER STATEMENT.
+                //
+                // A pinned walk reads nothing of the row: no variable the
+                // pattern mentions is bound there (`comprehension_start_ids`
+                // declines otherwise), and `pinned_walk_own_vars` refuses an
+                // inline map that reads one. So its matches are a function of
+                // the pattern and the start alone, and a later row pinned to
+                // the same start takes them back — the filter still runs per
+                // row below, over what it reads of that row. SNB Interactive
+                // IC14 pins its weight terms to both ends of each relationship
+                // on each shortest path: the two people the paths join start
+                // one walk per relationship they touch (84 each at SF3 on 42
+                // two-hop paths), and the memo above, keyed on the
+                // relationship, never repeats.
+                let own = (reversed.is_none() && !self.graph.in_txn_with_writes())
+                    .then(|| pinned_walk_own_vars(path, &row))
+                    .flatten();
+                // THE PINNED START BINDS TO THE COMPREHENSION'S DEMAND, as
+                // every other node of the walk does (and as the seed row's
+                // nodes do, `lean_seed`). Bound whole, it was cloned into
+                // every row of every hop and into every row a reused walk
+                // hands back: IC14's weight terms carried a whole Person
+                // through ~30k rows a walk for the one `a.id` the filter
+                // reads — 49 us a match against 7 for the same walk from a
+                // lean start, ~5 s of the statement's 5.4 serial.
+                let start_props = if self.graph.lean_subquery_seed_enabled() {
+                    demand_props_for(Some(&demand), Some(var), &path.start.props, None)
+                } else {
+                    None
+                };
+                let mut all = Vec::new();
+                for id in ids {
+                    let key: PinnedKey = (current_statement(), site, id);
+                    if own.is_some() {
+                        if let Some(walked) = pinned_walk_get(&key) {
+                            counted!("interp.comprehension reused the walk of a start it was pinned to before");
+                            for binds in walked.iter() {
+                                let mut r = row.clone();
+                                for (k, v) in binds {
+                                    r.insert(k.clone(), v.clone());
+                                }
+                                all.push(r);
+                            }
+                            continue;
+                        }
+                    }
+                    let Some(node) = mat_end(self.graph, id, start_props.as_ref(), &path.start)
+                        .map_err(run_to_eval)?
+                    else {
+                        continue;
+                    };
+                    let mut seeded = row.clone();
+                    seeded.insert(var.clone(), node);
+                    let walked = match_path_with(
+                        self.graph,
+                        path,
+                        &seeded,
+                        self.params,
+                        false,
+                        Some(&demand),
+                    )
+                    .map_err(run_to_eval)?;
+                    if let Some(own) = &own {
+                        pinned_walk_put(
+                            key,
+                            walked
+                                .iter()
+                                .map(|m| {
+                                    own.iter()
+                                        .filter_map(|k| m.get(k).map(|v| (k.clone(), v.clone())))
+                                        .collect()
+                                })
+                                .collect(),
+                        );
+                    }
+                    all.extend(walked);
+                }
+                all
+            }
+            _ => match_path_with(self.graph, path, &row, self.params, false, Some(&demand))
+                .map_err(run_to_eval)?,
+        };
+        // Terms of the filter that read nothing the pattern binds are the same
+        // on every match: evaluate them once (`hoist_row_invariants`). One
+        // match gains nothing from it, so it is not attempted.
+        let hoisted = match filter {
+            Some(f) if matches.len() > 1 => {
+                let mut inner: Vec<String> = Vec::new();
+                inner.extend(path.var.iter().cloned());
+                inner.extend(path.start.var.iter().cloned());
+                for (rel, node) in &path.hops {
+                    inner.extend(rel.var.iter().cloned());
+                    inner.extend(node.var.iter().cloned());
+                }
+                hoist_row_invariants(self.graph, f, &inner, &row, self.params)
+            }
+            _ => None,
+        };
+        let (filter, filter_params) = match &hoisted {
+            Some((f, p)) => (Some(f), p),
+            None => (filter, self.params),
+        };
         let mut out = Vec::new();
         for m in matches {
             if let Some(f) = filter {
-                let v = eval_expr(self.graph, f, &m, self.params).map_err(run_to_eval)?;
+                let v = eval_expr(self.graph, f, &m, filter_params).map_err(run_to_eval)?;
                 if v.truth() != Some(Truth::True) {
                     continue;
                 }
             }
             out.push(eval_expr(self.graph, map, &m, self.params).map_err(run_to_eval)?);
         }
-        Ok(Value::List(out))
+        let value = Value::List((out).into());
+        if let Some(key) = memo_key {
+            comprehension_memo_put(key, &value);
+        }
+        Ok(value)
     }
+}
+
+/// Answer this row from the comprehension evaluated once for EVERY value of
+/// its correlated variable, building that grouped form on first use.
+///
+/// `Ok(None)` means this site is not decorrelated &mdash; not yet, or not ever
+/// &mdash; and the caller should walk as usual. The conditions are deliberately
+/// narrow, because each one is a way for a grouped answer to differ from a
+/// per-row one:
+///
+/// * exactly ONE outer binding varies across rows, and it is a node the
+///   pattern itself mentions &mdash; that is what the answer can be grouped by;
+/// * the filter and the map must not READ that variable. Grouped, it is bound
+///   to the node the pattern reached rather than to the row's own value, and
+///   those can carry different properties;
+/// * the grouped walk must stay within a budget, since it materialises every
+///   match at once where the per-row form holds one row's worth.
+#[allow(clippy::too_many_arguments)]
+fn decorrelated_answer(
+    hooks: &Hooks<'_>,
+    path: &PathPattern,
+    filter: Option<&Expr>,
+    map: &Expr,
+    row: &Row,
+    demand: &BTreeMap<String, VarDemand>,
+    keep_full: &[String],
+    key: &CompKey,
+) -> Result<Option<Value>, EvalError> {
+    let site = key.1;
+    let statement = key.0;
+    // already grouped: serve the row
+    if let Some(v) = decorr_lookup(statement, site, row) {
+        return Ok(Some(v));
+    }
+    let Some(var) = decorr_candidate(statement, site, key, path, filter, map) else {
+        return Ok(None);
+    };
+    // Group it: the correlated variable is left UNBOUND so the pattern
+    // enumerates every value it can take, and each match is filed under the
+    // node it reached.
+    let mut seed = row.clone();
+    seed.remove(&var);
+    let mut groups: BTreeMap<u64, Vec<Value>> = BTreeMap::new();
+    let matches = match_path_with(hooks.graph, path, &seed, hooks.params, false, Some(demand))
+        .map_err(run_to_eval)?;
+    if matches.len() > DECORR_MAX {
+        counted!("interp.comprehension declined to group: too many matches");
+        decorr_decline(statement, site);
+        return Ok(None);
+    }
+    let _ = keep_full;
+    for m in matches {
+        if let Some(f) = filter {
+            let v = eval_expr(hooks.graph, f, &m, hooks.params).map_err(run_to_eval)?;
+            if v.truth() != Some(Truth::True) {
+                continue;
+            }
+        }
+        let Some(Value::Node { id, .. }) = m.get(&var) else {
+            // the pattern did not bind it to a node on this match: the group
+            // is not well defined, so this site keeps walking per row
+            counted!("interp.comprehension declined to group: the key is not a node");
+            decorr_decline(statement, site);
+            return Ok(None);
+        };
+        let id = *id;
+        let value = eval_expr(hooks.graph, map, &m, hooks.params).map_err(run_to_eval)?;
+        groups.entry(id).or_default().push(value);
+    }
+    counted!("interp.comprehension evaluated once for every correlated value");
+    decorr_store(statement, site, var, groups);
+    Ok(decorr_lookup(statement, site, row))
+}
+
+/// The one outer binding that moves, once a site has shown enough rows to
+/// tell &mdash; and `None` when more than one moves, when nothing does, or when
+/// the filter or map would read it.
+fn decorr_candidate(
+    statement: u64,
+    site: usize,
+    key: &CompKey,
+    path: &PathPattern,
+    filter: Option<&Expr>,
+    map: &Expr,
+) -> Option<String> {
+    if decorr_repeats(statement, site) < DECORR_MIN_REPEATS {
+        return None;
+    }
+    let varying = decorr_profile(statement, site, &key.2)?;
+    // the pattern must mention it, or there is nothing to group by
+    let mentioned = std::iter::once(&path.start)
+        .chain(path.hops.iter().map(|(_, n)| n))
+        .any(|n| n.var.as_deref() == Some(varying.as_str()));
+    if !mentioned {
+        return None;
+    }
+    let mut reads = Vec::new();
+    if let Some(f) = filter {
+        free_vars_of(f, &mut reads);
+    }
+    free_vars_of(map, &mut reads);
+    if reads.contains(&varying) {
+        counted!("interp.comprehension declined to group: its result reads the key");
+        return None;
+    }
+    Some(varying)
+}
+
+const DECORR_AFTER: u32 = 8;
+
+/// How many REPEATED bindings a site must show before its comprehension is
+/// grouped.
+///
+/// Grouping enumerates the whole inner pattern once, which is a win only when
+/// rows ask for the same values again and again — BI8 scores the same friends
+/// for person after person. Where every row asks about something different,
+/// the per-row walk is already the better plan: it binds ends from the
+/// label's cached columns after a few misses, and grouping replaces that with
+/// a full enumeration. One of this engine's own tests measures exactly that
+/// shape (fifty projects, each asked once), which is how the cost showed up.
+const DECORR_MIN_REPEATS: u32 = 4;
+const DECORR_MAX: usize = 4_000_000;
+
+/// The statement, and per site: how many rows have been seen, the bindings
+/// the first one had, and which of them have moved since.
+type DecorrProfile = (
+    u64,
+    std::collections::BTreeMap<usize, (u32, Vec<(String, CompBind)>, std::collections::BTreeSet<String>, bool)>,
+);
+
+/// The statement, and per site: the grouped answer and the variable it is
+/// keyed by.
+type DecorrGroups = (u64, std::collections::BTreeMap<usize, (String, BTreeMap<u64, Vec<Value>>)>);
+
+thread_local! {
+    static DECORR_PROFILE: std::cell::RefCell<DecorrProfile> =
+        const { std::cell::RefCell::new((0, std::collections::BTreeMap::new())) };
+    static DECORR_GROUPS: std::cell::RefCell<DecorrGroups> =
+        const { std::cell::RefCell::new((0, std::collections::BTreeMap::new())) };
+}
+
+fn decorr_profile(statement: u64, site: usize, binds: &[(String, CompBind)]) -> Option<String> {
+    DECORR_PROFILE.with(|p| {
+        let mut p = p.borrow_mut();
+        if p.0 != statement {
+            p.0 = statement;
+            p.1.clear();
+        }
+        let e =
+            p.1.entry(site)
+                .or_insert_with(|| (0, binds.to_vec(), std::collections::BTreeSet::new(), false));
+        if e.3 {
+            return None; // declined earlier in this statement
+        }
+        e.0 = e.0.saturating_add(1);
+        for (var, val) in binds {
+            if e.1.iter().any(|(v, first)| v == var && first != val) {
+                e.2.insert(var.clone());
+            }
+        }
+        if e.0 < DECORR_AFTER || e.2.len() != 1 {
+            return None;
+        }
+        e.2.iter().next().cloned()
+    })
+}
+
+thread_local! {
+    /// How often a site has been answered from the memo — a direct count of
+    /// the repetition that makes grouping worth its enumeration.
+    static DECORR_REPEATS: std::cell::RefCell<(u64, std::collections::BTreeMap<usize, u32>)> =
+        const { std::cell::RefCell::new((0, std::collections::BTreeMap::new())) };
+}
+
+fn decorr_note_repeat(statement: u64, site: usize) {
+    DECORR_REPEATS.with(|r| {
+        let mut r = r.borrow_mut();
+        if r.0 != statement {
+            r.0 = statement;
+            r.1.clear();
+        }
+        let n = r.1.entry(site).or_insert(0);
+        *n = n.saturating_add(1);
+    });
+}
+
+fn decorr_repeats(statement: u64, site: usize) -> u32 {
+    DECORR_REPEATS.with(|r| {
+        let r = r.borrow();
+        if r.0 != statement {
+            0
+        } else {
+            r.1.get(&site).copied().unwrap_or(0)
+        }
+    })
+}
+
+fn decorr_decline(statement: u64, site: usize) {
+    DECORR_PROFILE.with(|p| {
+        let mut p = p.borrow_mut();
+        if p.0 == statement {
+            if let Some(e) = p.1.get_mut(&site) {
+                e.3 = true;
+            }
+        }
+    });
+    DECORR_GROUPS.with(|g| {
+        let mut g = g.borrow_mut();
+        if g.0 == statement {
+            g.1.remove(&site);
+        }
+    });
+}
+
+fn decorr_store(statement: u64, site: usize, var: String, groups: BTreeMap<u64, Vec<Value>>) {
+    DECORR_GROUPS.with(|g| {
+        let mut g = g.borrow_mut();
+        if g.0 != statement {
+            g.0 = statement;
+            g.1.clear();
+        }
+        g.1.insert(site, (var, groups));
+    });
+}
+
+fn decorr_lookup(statement: u64, site: usize, row: &Row) -> Option<Value> {
+    DECORR_GROUPS.with(|g| {
+        let g = g.borrow();
+        if g.0 != statement {
+            return None;
+        }
+        let (var, groups) = g.1.get(&site)?;
+        let Some(Value::Node { id, .. }) = row.get(var) else {
+            return None;
+        };
+        Some(Value::List(
+            groups.get(id).cloned().unwrap_or_default().into(),
+        ))
+    })
+}
+
+/// What a pattern comprehension's answer depends on, besides the graph:
+/// the outer bindings it reads. `None` declines to remember this one.
+///
+/// The key is the comprehension's own address together with those bindings,
+/// so two different comprehensions cannot share an entry, and it carries the
+/// read snapshot so an answer cannot outlive the graph that produced it.
+///
+/// Declines when a binding is not a node or a simple scalar — a list or map
+/// would have to be compared by value, which is the cost the memo exists to
+/// avoid — and declines outright inside a transaction holding writes, where
+/// two evaluations legitimately differ.
+fn comprehension_memo_key(
+    graph: &Graph,
+    path: &PathPattern,
+    row: &Row,
+    demand: &BTreeMap<String, VarDemand>,
+    keep_full: &[String],
+) -> Option<CompKey> {
+    if graph.in_txn_with_writes() {
+        return None;
+    }
+    // ONLY WHAT THIS COMPREHENSION READS. `lean_seed` hands over every
+    // variable in scope, trimmed — including the ones the comprehension never
+    // looks at, whose identity changes on every row. Keying on all of them is
+    // a key that never repeats, which is a memo that never hits: BI8's friend
+    // score depends on the friend, and carrying the person into the key hides
+    // that completely.
+    // EVERY OUTER VARIABLE THE COMPREHENSION MENTIONS, which is the pattern's
+    // own endpoints as well as whatever the filter and map read. `demand`
+    // carries the second group only: keying on it alone leaves the pattern's
+    // bound ends out, and a comprehension correlated ONLY through its pattern
+    // — `[(tag)<-[:HAS_TAG]-(m)-[:HAS_CREATOR]->(f) | m]`, which is BI8's
+    // shape — then produces an EMPTY key that every row matches. The first
+    // row's answer is handed to all of them. A test caught it only because
+    // its second corpus scored the first pair zero; a corpus where every
+    // score happens to be equal passes while the memo is wrong.
+    let mut mentioned: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    if let Some(v) = path.start.var.as_deref() {
+        mentioned.insert(v);
+    }
+    for (rel, node) in &path.hops {
+        if let Some(v) = rel.var.as_deref() {
+            mentioned.insert(v);
+        }
+        if let Some(v) = node.var.as_deref() {
+            mentioned.insert(v);
+        }
+    }
+    let mut binds = Vec::with_capacity(demand.len() + keep_full.len() + mentioned.len());
+    for (var, val) in row {
+        if !demand.contains_key(var)
+            && !keep_full.iter().any(|k| k == var)
+            && !mentioned.contains(var.as_str())
+        {
+            continue;
+        }
+        let b = match val {
+            Value::Node { id, .. } => CompBind::Node(*id),
+            Value::Int(i) => CompBind::Int(*i),
+            Value::Bool(b) => CompBind::Bool(*b),
+            Value::Str(s) => CompBind::Str(s.to_string()),
+            Value::Null => CompBind::Null,
+            _ => return None,
+        };
+        binds.push((var.clone(), b));
+    }
+    binds.sort();
+    // The address is only a key because the AST outlives the statement it
+    // belongs to and the generation makes entries from any other statement
+    // unmatchable — a pointer alone repeats across statements and across
+    // graphs, which a test caught by answering one graph from another's cache.
+    Some((
+        current_statement(),
+        path as *const PathPattern as usize,
+        binds,
+    ))
+}
+
+/// One outer binding, in a form that can be compared and hashed.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum CompBind {
+    Node(u64),
+    Int(i64),
+    Bool(bool),
+    Str(String),
+    Null,
+}
+
+type CompKey = (u64, usize, Vec<(String, CompBind)>);
+
+/// Identifies the statement THIS thread is running, for the caches that must
+/// not outlive one.
+///
+/// Per thread, not global: statements run concurrently, and a global counter
+/// bumped by another thread's statement resets the profile of one already in
+/// flight. That cannot return a wrong answer — a generation that no longer
+/// matches only forces a recomputation — but it makes the caches useless at
+/// random and their counters unrepeatable, which a suite running tests in
+/// parallel shows up immediately.
+///
+/// A thread with no statement of its own answers 0, and 0 never caches: a
+/// worker evaluating part of someone else's statement has no way to know when
+/// that statement ended, so it walks instead of remembering.
+static STATEMENT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+thread_local! {
+    static STATEMENT: std::cell::RefCell<(u64, u32)> = const { std::cell::RefCell::new((0, 0)) };
+}
+
+/// This thread's current statement generation, or 0 outside a statement.
+///
+/// The key a per-statement memo hangs on. Nested `CALL {}` subqueries share
+/// the outermost statement's generation, so a memo keyed by it survives them.
+pub(crate) fn statement_gen() -> u64 {
+    STATEMENT.with(|s| s.borrow().0)
+}
+
+/// Marks a statement running on this thread; nested statements (a `CALL {}`
+/// subquery) share the outermost one's identity rather than starting a new
+/// generation and throwing away the caches mid-flight.
+pub(crate) struct StatementScope;
+
+impl StatementScope {
+    pub(crate) fn enter() -> Self {
+        // Only the OUTERMOST statement on this thread advances the generation:
+        // a nested `CALL {}` that bumped it would throw away the caches of the
+        // statement it belongs to, halfway through.
+        STATEMENT.with(|s| {
+            let mut s = s.borrow_mut();
+            if s.1 == 0 {
+                s.0 = STATEMENT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            }
+            s.1 = s.1.saturating_add(1);
+        });
+        StatementScope
+    }
+}
+
+impl Drop for StatementScope {
+    fn drop(&mut self) {
+        let ended = STATEMENT.with(|s| {
+            let mut s = s.borrow_mut();
+            s.1 = s.1.saturating_sub(1);
+            (s.1 == 0).then_some(s.0)
+        });
+        // The OUTERMOST scope ending is the statement ending, and the
+        // projections it built from rows (`engram.algo.project`) end with it.
+        if let Some(generation) = ended {
+            crate::algo::graph::release_named_projections(generation);
+        }
+    }
+}
+
+/// The statement whose caches are current, as every thread sees it.
+///
+/// GLOBAL, NOT PER THREAD, because the work is not: a comprehension inside a
+/// parallel stage is evaluated on worker threads that never entered a
+/// statement of their own, and a per-thread identity reads 0 there and
+/// disables the caches exactly where the rows are. Measured on BI8: 87 s with
+/// the workers caching, 137 s without — the whole of the win.
+///
+/// What a global costs is effectiveness under concurrency, never correctness.
+/// A second statement starting mid-flight bumps this, so the first one's
+/// later lookups miss and recompute; they cannot read the second's entries,
+/// because the key also carries the comprehension's own address and two live
+/// statements never share one.
+fn current_statement() -> u64 {
+    STATEMENT_SEQ.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+thread_local! {
+    /// Answers for this read snapshot. Cleared when the snapshot moves, and
+    /// capped so a statement over millions of distinct bindings cannot turn a
+    /// cache into a leak — at the cap it is emptied rather than evicted one
+    /// at a time, because the cheap case is the one worth keeping cheap.
+    static COMP_MEMO: std::cell::RefCell<(u64, std::collections::BTreeMap<CompKey, Value>)> =
+        const { std::cell::RefCell::new((0, std::collections::BTreeMap::new())) };
+}
+
+const COMP_MEMO_MAX: usize = 200_000;
+
+/// How many times a comprehension site is evaluated before its answers are
+/// remembered. A site evaluated once or twice cannot benefit, and would pay
+/// for a key it never looks up again.
+const COMP_MEMO_AFTER: u32 = 4;
+
+/// How often this statement has reached this comprehension, by site.
+fn comprehension_site_seen(path: &PathPattern) -> u32 {
+    thread_local! {
+        static SEEN: std::cell::RefCell<(u64, std::collections::BTreeMap<usize, u32>)> =
+            const { std::cell::RefCell::new((0, std::collections::BTreeMap::new())) };
+    }
+    let statement = current_statement();
+    let addr = path as *const PathPattern as usize;
+    SEEN.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.0 != statement {
+            s.0 = statement;
+            s.1.clear();
+        }
+        let n = s.1.entry(addr).or_insert(0);
+        *n = n.saturating_add(1);
+        *n
+    })
+}
+
+fn comprehension_memo_get(key: &CompKey) -> Option<Value> {
+    COMP_MEMO.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.0 != key.0 {
+            m.0 = key.0;
+            m.1.clear();
+            return None;
+        }
+        m.1.get(key).cloned()
+    })
+}
+
+fn comprehension_memo_put(key: CompKey, value: &Value) {
+    COMP_MEMO.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.0 != key.0 {
+            m.0 = key.0;
+            m.1.clear();
+        }
+        if m.1.len() >= COMP_MEMO_MAX {
+            counted!("interp.comprehension memo cleared at its cap");
+            m.1.clear();
+        }
+        m.1.insert(key, value.clone());
+    });
+}
+
+/// One pinned walk of a pattern comprehension: the statement, the
+/// comprehension's own address, and the node its start was pinned to.
+type PinnedKey = (u64, usize, u64);
+
+/// The bindings of one pinned walk — per match, in match order, the variables
+/// the PATTERN binds (`pinned_walk_own_vars`); the row supplies the rest.
+type PinnedWalk = std::rc::Rc<Vec<Vec<(String, Value)>>>;
+
+thread_local! {
+    /// This statement's pinned walks, and the matches they hold between them.
+    static PINNED_WALKS: std::cell::RefCell<(u64, BTreeMap<PinnedKey, PinnedWalk>, usize)> =
+        const { std::cell::RefCell::new((0, BTreeMap::new(), 0)) };
+}
+
+/// The matches the pinned walks may hold between them; at the cap the cache is
+/// emptied, as `COMP_MEMO` is.
+const PINNED_WALK_MAX_MATCHES: usize = 500_000;
+
+fn pinned_walk_get(key: &PinnedKey) -> Option<PinnedWalk> {
+    PINNED_WALKS.with(|m| {
+        let m = m.borrow();
+        (m.0 == key.0).then(|| m.1.get(key).cloned()).flatten()
+    })
+}
+
+fn pinned_walk_put(key: PinnedKey, walk: Vec<Vec<(String, Value)>>) {
+    PINNED_WALKS.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.0 != key.0 {
+            *m = (key.0, BTreeMap::new(), 0);
+        }
+        if m.2 + walk.len() > PINNED_WALK_MAX_MATCHES {
+            counted!("interp.comprehension pinned walks cleared at their cap");
+            m.1.clear();
+            m.2 = 0;
+        }
+        m.2 += walk.len();
+        m.1.insert(key, std::rc::Rc::new(walk));
+    });
+}
+
+/// The variables a pinned walk binds — its path variable and every node and
+/// relationship variable of the pattern — or `None` when the walk could read
+/// the row: a relationship variable bound there, or an inline map reading
+/// anything but the pattern's own variables.
+fn pinned_walk_own_vars(path: &PathPattern, row: &Row) -> Option<Vec<String>> {
+    let mut own: Vec<String> = Vec::new();
+    own.extend(path.var.iter().cloned());
+    own.extend(path.start.var.iter().cloned());
+    for (rel, node) in &path.hops {
+        if rel.var.as_ref().is_some_and(|v| row.contains_key(v)) {
+            return None;
+        }
+        own.extend(rel.var.iter().cloned());
+        own.extend(node.var.iter().cloned());
+    }
+    let maps = std::iter::once(&path.start.props)
+        .chain(path.hops.iter().flat_map(|(r, n)| [&r.props, &n.props]))
+        .flatten();
+    for m in maps {
+        let mut reads = Vec::new();
+        free_vars_of(m, &mut reads);
+        if reads.iter().any(|v| !own.contains(v)) {
+            return None;
+        }
+    }
+    own.sort();
+    own.dedup();
+    Some(own)
 }
 
 /// Fix 76: what a pattern's INLINE MAPS read of the outer row (`(p:KMProject
@@ -3710,7 +5607,7 @@ fn run_to_eval(e: RunError) -> EvalError {
     }
 }
 
-fn eval_expr(
+pub(crate) fn eval_expr(
     graph: &Graph,
     expr: &Expr,
     row: &Row,
@@ -3729,19 +5626,30 @@ fn filter_rows(
 ) -> Result<Vec<Row>, RunError> {
     let mut out = Vec::new();
     for row in rows {
-        let v = eval_expr(graph, predicate, &row, params)?;
-        match v.truth() {
-            Some(Truth::True) => out.push(row),
-            Some(_) => {}
-            None => {
-                return Err(RunError::Semantic(format!(
-                    "WHERE takes a boolean, got {}",
-                    v.type_name()
-                )));
-            }
+        if where_keeps(graph, predicate, &row, params)? {
+            out.push(row);
         }
     }
     Ok(out)
+}
+
+/// Whether a WHERE keeps `row`: only TRUE keeps (FALSE and NULL drop), and a
+/// value that is not a boolean is an error.
+fn where_keeps(
+    graph: &Graph,
+    predicate: &Expr,
+    row: &Row,
+    params: &BTreeMap<String, Value>,
+) -> Result<bool, RunError> {
+    let v = eval_expr(graph, predicate, row, params)?;
+    match v.truth() {
+        Some(Truth::True) => Ok(true),
+        Some(_) => Ok(false),
+        None => Err(RunError::Semantic(format!(
+            "WHERE takes a boolean, got {}",
+            v.type_name()
+        ))),
+    }
 }
 
 // ─── MATCH ──────────────────────────────────────────────────────────────────
@@ -3766,8 +5674,14 @@ fn exec_match(
     }
     let mut out = Vec::new();
     for row in rows {
-        let matched =
-            match_pattern_rows(graph, pattern, where_, vec![row.clone()], params, Some(&demand))?;
+        let matched = match_pattern_rows(
+            graph,
+            pattern,
+            where_,
+            vec![row.clone()],
+            params,
+            Some(&demand),
+        )?;
         if matched.is_empty() && optional {
             // Every variable the pattern would have introduced binds to null
             // — a row that SAYS the match found nothing, distinct from no
@@ -3797,18 +5711,131 @@ fn match_pattern_rows(
     params: &BTreeMap<String, Value>,
     demand: Option<&BTreeMap<String, VarDemand>>,
 ) -> Result<Vec<Row>, RunError> {
-    for path in &pattern.paths {
+    // THE WHERE FILTERS AS THE LAST PATH EMITS.
+    //
+    // Every row the last path finishes is a final row, so testing each one as
+    // it is emitted is the same test, on the same rows, in the same order, as
+    // filtering the collected set afterwards — and a row the WHERE drops is
+    // never held. Collecting first held every candidate of a label scan at
+    // once: see `MATCH_START_CHUNK` for the SF10 reset that the OOM killer
+    // ended. A match start chunk of 0 (the A/B arm) keeps the old order of
+    // work: collect every row, then filter.
+    let last = pattern.paths.len().checked_sub(1);
+    let filter_as_emitted = where_.is_some() && graph.match_start_chunk() > 0;
+    for (pi, path) in pattern.paths.iter().enumerate() {
+        let keep = if filter_as_emitted && Some(pi) == last {
+            where_
+        } else {
+            None
+        };
+        // THE WHERE'S IDENTITY EQUALITY SEEDS AN UNBOUND START HERE TOO.
+        //
+        // The streaming planner turns `WHERE id(a) = <expr>` into a one-get
+        // `Seed::ById`; this per-row matcher — the one every WRITING statement
+        // takes — applied the WHERE only after enumerating the start's label,
+        // once per input row. `UNWIND <2,000 pairs> AS t MATCH (a:Person)
+        // WHERE id(a) = t[0] … SET …` materialised 48.9M Person records
+        // (2,000 × the label) and took 577 s at SF3; the same statement
+        // without its SET took 2.3 s. The WHERE still runs over every row
+        // below, so a seeded start can only skip candidates it would reject.
+        // Every node of the path the WHERE pins by identity — the start, and
+        // any hop end (`MATCH (a)-[k]-(b) WHERE id(b) = t[1]`), whose bound
+        // value then confines its hop to the edges reaching it.
+        // Gated by a by-reference look first: this matcher runs once per
+        // subquery row, and `id_seek_expr` clones the WHERE's conjuncts —
+        // SNB BI16, which has no identity equality at all, ran 4% slower
+        // paying for that clone on every call.
+        let seeks: Vec<(&String, Expr)> = if where_.is_some_and(has_identity_eq) {
+            let mut node_vars: Vec<&String> = path.start.var.iter().collect();
+            node_vars.extend(path.hops.iter().filter_map(|(_, n)| n.var.as_ref()));
+            node_vars
+                .into_iter()
+                .filter_map(|v| id_seek_expr(where_, v).map(|e| (v, e)))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut next = Vec::new();
-        for row in rows {
-            next.extend(match_path_with(graph, path, &row, params, false, demand)?);
+        'rows: for row in rows {
+            let mut seeded: Option<Row> = None;
+            for (var, e) in &seeks {
+                let current = seeded.as_ref().unwrap_or(&row);
+                if current.contains_key(var) {
+                    continue;
+                }
+                let Some(id) = row_id_seek(graph, e, current, params) else {
+                    continue;
+                };
+                counted!("interp.matcher seeded its start from an id equality");
+                match mat_node(graph, id, None)? {
+                    Some(node) => {
+                        seeded
+                            .get_or_insert_with(|| row.clone())
+                            .insert((*var).clone(), node);
+                    }
+                    // the WHERE names a node that does not exist: no match
+                    None => continue 'rows,
+                }
+            }
+            let start = seeded.as_ref().unwrap_or(&row);
+            match keep {
+                Some(w) => match_path_into(graph, path, start, params, false, demand, &mut |r| {
+                    if where_keeps(graph, w, &r, params)? {
+                        next.push(r);
+                        budget_check(graph, next.len())?;
+                    }
+                    Ok(())
+                })?,
+                None => next.extend(match_path_with(graph, path, start, params, false, demand)?),
+            }
             budget_check(graph, next.len())?;
         }
         rows = next;
     }
     if let Some(w) = where_ {
-        rows = filter_rows(graph, rows, w, params)?;
+        // A pattern with no path leaves nothing for the last one to filter.
+        if !filter_as_emitted || last.is_none() {
+            rows = filter_rows(graph, rows, w, params)?;
+        }
     }
     Ok(rows)
+}
+
+/// Whether a WHERE has a top-level `id(x) = …` / `elementId(x) = …`
+/// conjunct — the shape `id_seek_expr` extracts — without cloning anything.
+fn has_identity_eq(e: &Expr) -> bool {
+    match e {
+        Expr::And(a, b) => has_identity_eq(a) || has_identity_eq(b),
+        Expr::Bin(engram_cypher::BinOp::Eq, a, b) => [a, b].iter().any(|side| {
+            matches!(side.as_ref(), Expr::Call { name, args, .. }
+                if args.len() == 1
+                    && (name.eq_ignore_ascii_case("id") || name.eq_ignore_ascii_case("elementid")))
+        }),
+        _ => false,
+    }
+}
+
+/// The node id an identity-equality's other side names for this row, when
+/// every variable it reads is already bound and it evaluates to an id.
+/// `None` declines — the caller then enumerates as it always did, so an
+/// expression over a later path's variable, or one that errors, changes
+/// nothing.
+fn row_id_seek(
+    graph: &Graph,
+    e: &Expr,
+    row: &Row,
+    params: &BTreeMap<String, Value>,
+) -> Option<u64> {
+    let mut vars = Vec::new();
+    free_vars_of(e, &mut vars);
+    if !vars.iter().all(|v| row.contains_key(v)) {
+        return None;
+    }
+    match eval_expr(graph, e, row, params).ok()? {
+        Value::Int(i) if i >= 0 => Some(i as u64),
+        Value::Str(t) => t.strip_prefix("n:").and_then(|d| d.parse::<u64>().ok()),
+        _ => None,
+    }
 }
 
 /// Fix 51: the property demand the clauses AFTER a MATCH raise on each
@@ -3856,9 +5883,9 @@ pub(crate) fn demands_after(clauses: &[Clause]) -> BTreeMap<String, VarDemand> {
                     }
                     for node in nodes {
                         if let Some(v) = &node.var {
-                            demands
-                                .entry(v.clone())
-                                .or_insert_with(|| VarDemand::Props(std::collections::BTreeSet::new()));
+                            demands.entry(v.clone()).or_insert_with(|| {
+                                VarDemand::Props(std::collections::BTreeSet::new())
+                            });
                         }
                         if let Some(p) = &node.props {
                             walk(p, &mut demands);
@@ -3884,6 +5911,58 @@ pub(crate) fn demands_after(clauses: &[Clause]) -> BTreeMap<String, VarDemand> {
                     note_full(&mut demands, DEMAND_EVERYTHING);
                 }
                 break;
+            }
+            Clause::Set { items } => {
+                for item in items {
+                    match item {
+                        SetItem::Prop { base, value, .. } => {
+                            walk(value, &mut demands);
+                            match base {
+                                Expr::Var(v) => {
+                                    demands.entry(v.clone()).or_insert_with(|| {
+                                        VarDemand::Props(std::collections::BTreeSet::new())
+                                    });
+                                }
+                                other => walk(other, &mut demands),
+                            }
+                        }
+                        SetItem::Replace { var, value } => {
+                            walk(value, &mut demands);
+                            note_full(&mut demands, var);
+                        }
+                        SetItem::Merge { var, value } => {
+                            walk(value, &mut demands);
+                            demands.entry(var.clone()).or_insert_with(|| {
+                                VarDemand::Props(std::collections::BTreeSet::new())
+                            });
+                        }
+                        SetItem::Labels { var, .. } => {
+                            demands.entry(var.clone()).or_insert_with(|| {
+                                VarDemand::Props(std::collections::BTreeSet::new())
+                            });
+                        }
+                    }
+                }
+            }
+            // A DELETE needs only the IDENTITY of what it removes: the DELETE
+            // clause collects ids from the values it is given, and the delete
+            // path re-reads each record itself (`delete_rel` / `delete_node`).
+            // It used to fall to the catch-all below and demand EVERY variable
+            // in full, so `MATCH ()-[r:T]->() DELETE r` decoded every node its
+            // unlabelled start seeded — 9.28M at SF3, 417 s on 2026-09-27
+            // (~45 us a node) to delete ~90,000 relationships, where Neo4j and
+            // PostgreSQL took 2-12 s. The clauses after it are still read.
+            Clause::Delete { exprs, .. } => {
+                for e in exprs {
+                    match e {
+                        Expr::Var(v) => {
+                            demands.entry(v.clone()).or_insert_with(|| {
+                                VarDemand::Props(std::collections::BTreeSet::new())
+                            });
+                        }
+                        other => walk(other, &mut demands),
+                    }
+                }
             }
             _ => {
                 note_full(&mut demands, DEMAND_EVERYTHING);
@@ -4056,11 +6135,31 @@ fn try_shortest_path_bfs(
     seed: &Row,
     params: &BTreeMap<String, Value>,
 ) -> Result<Option<Vec<Row>>, RunError> {
-    if !path.shortest || path.hops.len() != 1 {
+    // `Shortest::All` DECLINES HERE, and the distinction is load-bearing.
+    //
+    // This path answers with ONE shortest route — a bidirectional BFS that
+    // stops at the first meeting and reconstructs a single trail — which is
+    // the whole of `shortestPath`'s contract and none of
+    // `allShortestPaths`'. Left ungated it would fire whenever BOTH endpoints
+    // are already bound in the row, silently returning one route where the
+    // query asked for every tied one, and it would not fire when they are
+    // matched by property in the pattern. So the answer would depend on
+    // whether an earlier clause happened to bind the endpoints — the same
+    // query, the same graph, two different results.
+    if path.shortest != Some(Shortest::One) || path.hops.len() != 1 {
         return Ok(None);
     }
     let (rel_pat, node_pat) = &path.hops[0];
-    if rel_pat.var.is_some() || rel_pat.props.is_some() {
+    // A rel PROPERTY pattern still declines: it filters which edges may be
+    // walked, and this BFS walks the adjacency without consulting it.
+    //
+    // A rel VARIABLE no longer does. The trail reconstruction below already
+    // builds `[start, rel, node, ...]` with real relationship values, so the
+    // list the variable binds is available at no extra cost -- it was simply
+    // never collected. Declining on it sent FinBench TCR3 to the enumerating
+    // fallback at `*1..16`, where it did not finish: measured 41 s against 0 s
+    // for the identical query without the variable.
+    if rel_pat.props.is_some() {
         return Ok(None);
     }
     let (min, max) = match rel_pat.length {
@@ -4070,14 +6169,98 @@ fn try_shortest_path_bfs(
     if min > 1 {
         return Ok(None); // the BFS distance floors at 1; min>1 falls back
     }
-    // START and END must both be bound to nodes in the seed (IC1/IC13 carry both).
-    let start_id = match path.start.var.as_ref().and_then(|v| seed.get(v)) {
-        Some(Value::Node { id, .. }) => *id,
-        _ => return Ok(None),
+    // START and END must resolve to ONE node each -- from the seed (IC1/IC13
+    // carry both bound), or, failing that, from a property equality written
+    // INLINE in the pattern.
+    //
+    // The inline case is why this is not just a seed lookup. FinBench TCR3 is
+    //
+    //   shortestPath((:Account {id: $a})-[:transfer*1..16]->(:Account {id: $b}))
+    //
+    // with both endpoints ANONYMOUS and matched by property, and the comment
+    // above anticipated it: "it would not fire when they are matched by
+    // property in the pattern". It declined, the enumeration ran to depth 16,
+    // and the query did not finish. Measured on SF0.01: 40 s unbound against
+    // 0 s with the endpoints bound by a preceding MATCH -- the SAME query and
+    // the same answer, differing only in whether this BFS was reachable.
+    //
+    // Resolution is exact-equality only and takes a UNIQUE answer. A property
+    // matching several nodes is not one endpoint, and a shortest path from
+    // "any of these" is a different question, so that declines to the
+    // enumeration exactly as before.
+    let resolve = |pat: &NodePattern| -> Result<Option<u64>, RunError> {
+        if let Some(Value::Node { id, .. }) = pat.var.as_ref().and_then(|v| seed.get(v)) {
+            return Ok(Some(*id));
+        }
+        let Some(Expr::Map(entries)) = &pat.props else {
+            return Ok(None);
+        };
+        for (k, e) in entries {
+            let Ok(v) = eval_expr(graph, e, seed, params) else {
+                continue;
+            };
+            if !matches!(v, Value::Int(_) | Value::Float(_) | Value::Str(_)) {
+                continue;
+            }
+            let label = pat.labels.first().map(String::as_str);
+            // The INDEX first, when one is declared.
+            if let Ok(Some(ids)) =
+                graph.index_probe_in_scoped(k, std::slice::from_ref(&v), Some(2), label)
+            {
+                if ids.len() == 1 {
+                    return Ok(Some(ids[0]));
+                }
+                if ids.len() > 1 {
+                    return Ok(None); // not one endpoint; the enumeration answers
+                }
+            }
+            // NO INDEX: scan the label, bounded.
+            //
+            // A linear scan looks expensive until it is compared with what it
+            // replaces. The alternative here is the general path enumeration at
+            // this pattern's depth -- TCR3 is `*1..16` over a graph of average
+            // degree 4, which is 4^16 paths -- so one pass over a label is
+            // cheaper by orders of magnitude, and the cap keeps it from being a
+            // new cost of its own on a large label.
+            //
+            // Only reached for a shortestPath whose endpoint is written as an
+            // inline property match. Anything else has already returned.
+            const SHORTEST_PATH_ENDPOINT_SCAN_MAX: usize = 1 << 20;
+            let Some(l) = label else { continue };
+            let Ok(members) = graph.members(Some(l)) else {
+                continue;
+            };
+            if members.len() > SHORTEST_PATH_ENDPOINT_SCAN_MAX {
+                counted!("interp.shortest path endpoint scan declined: label too large");
+                continue;
+            }
+            let mut found: Option<u64> = None;
+            for id in members.iter() {
+                let Ok(Some(node)) = graph.node(id) else {
+                    continue;
+                };
+                let Value::Node { props, .. } = &node else {
+                    continue;
+                };
+                if props.get(k).map(|have| have.eq3(&v)) == Some(Truth::True) {
+                    if found.is_some() {
+                        return Ok(None); // several match: not one endpoint
+                    }
+                    found = Some(id);
+                }
+            }
+            if found.is_some() {
+                counted!("interp.shortest path endpoint resolved by scan");
+                return Ok(found);
+            }
+        }
+        Ok(None)
     };
-    let end_id = match node_pat.var.as_ref().and_then(|v| seed.get(v)) {
-        Some(Value::Node { id, .. }) => *id,
-        _ => return Ok(None),
+    let Some(start_id) = resolve(&path.start)? else {
+        return Ok(None);
+    };
+    let Some(end_id) = resolve(node_pat)? else {
+        return Ok(None);
     };
     // start == end at length >= 1 would revisit the start, which a node-simple
     // shortest path never does — fall back so the enumeration's exact cycle
@@ -4149,8 +6332,14 @@ fn try_shortest_path_bfs(
             trail.push(node);
         }
         let mut row = seed.clone();
+        // The rel variable binds the trail's RELATIONSHIPS, in walk order --
+        // the odd positions of `[start, rel, node, rel, node, ...]`.
+        if let Some(rv) = &rel_pat.var {
+            let rels: Vec<Value> = trail.iter().skip(1).step_by(2).cloned().collect();
+            row.insert(rv.clone(), Value::List((rels).into()));
+        }
         if let Some(v) = &path.var {
-            row.insert(v.clone(), Value::Path(trail));
+            row.insert(v.clone(), Value::Path((trail).into()));
         }
         return Ok(Some(vec![row]));
     }
@@ -4291,7 +6480,7 @@ fn try_shortest_path_bfs(
     }
     let mut row = seed.clone();
     if let Some(v) = &path.var {
-        row.insert(v.clone(), Value::Path(trail));
+        row.insert(v.clone(), Value::Path((trail).into()));
     }
     Ok(Some(vec![row]))
 }
@@ -4407,8 +6596,56 @@ pub(crate) fn best_declared_seek(
     candidates: &[(String, Vec<Value>)],
     cap: usize,
 ) -> Result<Option<(usize, Vec<u64>)>, RunError> {
+    // Fix 95: a start requiring a label with NO live node seeks nothing —
+    // no index probe, no index read. The Part feature-extraction pick,
+    // `MATCH (p:Part {orgId: $orgId}) WHERE p.featuresExtractedAt IS NULL OR
+    // … RETURN properties(p) AS p LIMIT …`, probed its declared index twice
+    // (13 store gets) for a label that has never held a node: 2.4 ms
+    // against Neo4j's 1.1 for zero rows. The count is the maintained
+    // statistic with the transaction's own creates folded in.
+    if !labels.is_empty() && labels.iter().any(|l| graph.count_label_nodes(l) == 0) {
+        counted!("interp.seed answered empty from a label with no member");
+        return Ok(Some((0, Vec::new())));
+    }
+    // Fix 115: the declared COMPOSITE the candidates cover (one string each)
+    // is probed as ONE tuple and is the winner outright — its answer is the
+    // exact population of those keys, never wider than any one of them, and
+    // it is what Neo4j's composite answers. Rule 3 holds: which composite
+    // fits is a property of the catalogue and the keys.
+    let mut covered: Vec<usize> = Vec::new();
     let mut best: Option<(usize, Vec<u64>)> = None;
+    {
+        let single: Vec<&str> = candidates
+            .iter()
+            .filter(|(_, vs)| vs.len() == 1)
+            .map(|(k, _)| k.as_str())
+            .collect();
+        if let Some((label, props)) = graph.declared_composite_for(labels, &single)? {
+            let mut vals: Vec<Value> = Vec::with_capacity(props.len());
+            for p in &props {
+                if let Some(i) = candidates
+                    .iter()
+                    .position(|(k, vs)| k == p && vs.len() == 1)
+                {
+                    covered.push(i);
+                    vals.push(candidates[i].1[0].clone());
+                }
+            }
+            if vals.len() == props.len() {
+                if let Some(ids) = graph.index_probe_composite(&label, &props, &vals, Some(cap))? {
+                    counted!("interp.seed probed a declared composite");
+                    best = Some((covered[0], ids));
+                }
+            }
+            if best.is_none() {
+                covered.clear();
+            }
+        }
+    }
     for (i, (key, values)) in candidates.iter().enumerate() {
+        if best.is_some() && !covered.is_empty() {
+            break; // the composite answered: nothing narrower to look for
+        }
         let scoped_to = graph.declared_scope_for(labels, key)?;
         if scoped_to.is_none() && i > 0 {
             continue;
@@ -4443,14 +6680,18 @@ pub(crate) fn best_declared_seek(
         if let Some((wi, ids)) = best.as_mut() {
             if !ids.is_empty() && ids.is_sorted() {
                 for (i, (key, values)) in candidates.iter().enumerate() {
-                    if i == *wi {
-                        continue;
+                    if i == *wi || covered.contains(&i) {
+                        continue; // the composite already applied this key
                     }
                     let Some(l) = graph.declared_scope_for(labels, key)? else {
                         continue;
                     };
-                    let Some(other) =
-                        graph.index_probe_in_scoped(key, values, Some(INTERSECT_PROBE_CAP), Some(&l))?
+                    let Some(other) = graph.index_probe_in_scoped(
+                        key,
+                        values,
+                        Some(INTERSECT_PROBE_CAP),
+                        Some(&l),
+                    )?
                     else {
                         continue;
                     };
@@ -4545,10 +6786,7 @@ fn anchored_start_candidate_ids(
                     if label_n.is_none_or(|n| ids.len() as u64 <= n) {
                         seed_chose_later(winner);
                         counted!("interp.pattern map seeks");
-                        sometimes!(
-                            "interp.match_path sought a multi-key pattern map",
-                            true
-                        );
+                        sometimes!("interp.match_path sought a multi-key pattern map", true);
                         return Ok(ids);
                     }
                 }
@@ -4620,10 +6858,19 @@ fn demand_props_for(
     demand: Option<&BTreeMap<String, VarDemand>>,
     var: Option<&String>,
     pat_props: &Option<Expr>,
+    // `Some` for a HOP END, whose bind may skip the record and carry only
+    // these labels; `None` for a start, whose projected read carries all.
+    pat_labels: Option<&[String]>,
 ) -> Option<std::collections::BTreeSet<String>> {
     let d = demand?;
     if d.contains_key(DEMAND_EVERYTHING) {
         return None;
+    }
+    if let (Some(v), Some(labels)) = (var, pat_labels) {
+        if labels_beyond_pattern(d, v, labels) {
+            counted!("interp.label test outside the pattern bound its end from the record");
+            return None;
+        }
     }
     let mut set = std::collections::BTreeSet::new();
     if let Some(v) = var {
@@ -4647,6 +6894,186 @@ fn demand_props_for(
 /// (MERGE, a path variable's trail). The match is byte-identical: labels
 /// ride on every projection, the inline map's keys are always part of the
 /// set, and a value nothing reads is never observed.
+/// `reversed` prices the path walked END TO START **without building it**.
+/// `reverse_path` clones every node and relationship pattern, and this runs
+/// per partial, so the clone is paid only when the reversal is taken.
+///
+/// The bound end's own fan-out is MEASURED, from the resident adjacency table:
+/// `adjacent_slim_len_hint` declines rather than building one, because a
+/// memoised degree probe would build a whole-store degree table for a cold
+/// type — a real cost paid to guess at one. `tail` is the rest of the path,
+/// cached per shape by [`shape_tails`].
+fn drive_estimate(
+    graph: &Graph,
+    path: &PathPattern,
+    row: &Row,
+    reversed: bool,
+    tail: u128,
+) -> Option<u128> {
+    let k = path.hops.len();
+    let first = if reversed {
+        &path.hops[k - 1].1
+    } else {
+        &path.start
+    };
+    let start_id = match first.var.as_ref().and_then(|v| row.get(v)) {
+        Some(Value::Node { id, .. }) => *id,
+        _ => return None,
+    };
+    let (rel, _) = if reversed {
+        &path.hops[k - 1]
+    } else {
+        &path.hops[0]
+    };
+    let dir = match (rel.dir, reversed) {
+        (RelDir::Out, false) | (RelDir::In, true) => Dir::Out,
+        (RelDir::In, false) | (RelDir::Out, true) => Dir::In,
+        (RelDir::Undirected, _) => Dir::Both,
+    };
+    let mut toks = Vec::with_capacity(rel.types.len());
+    for t in &rel.types {
+        toks.push(graph.type_token_peek(t)?);
+    }
+    let tokens = (!toks.is_empty()).then_some(toks);
+    let first_hop = graph.adjacent_slim_len_hint(start_id, dir, &tokens)? as u128;
+    Some(first_hop.max(1).saturating_mul(tail))
+}
+
+/// The shape-only half of the estimate: the product of the expected fan-outs
+/// of every hop PAST the first, forward and reversed. `None` where it cannot
+/// be priced.
+///
+/// It stops at the first hop because AN AVERAGE CANNOT SEE THIS NODE'S OWN
+/// DEGREE, and the bound end's degree is exactly what decides. Pricing the
+/// first hop from the counts too — 40 tagged messages against an average of
+/// 20 messages per person, where THIS person has one — loses a reversal the
+/// measured probe gets right, which an existing test holds. So the first hop
+/// is measured per row, and only the tail, which is genuinely shape-only, is
+/// cached.
+///
+/// A HOP THAT LANDS ON THE OPPOSITE BOUND END COUNTS 1, not its fan-out: the
+/// far node is already known, so the hop is an edge-existence test. Get that
+/// wrong and the decision inverts — BI16's last hop from `Message` to `Tag`
+/// averages 3.6 at SF3, which prices the runaway direction BELOW the cheap
+/// one.
+///
+/// What an average CANNOT see is this node's own degree, which on a
+/// single-hop closure is the whole cost (bi11's hub of 40 against a leaf of
+/// 1). That case never reaches here: the caller measures it.
+///
+/// The cache key carries the pattern's address together with its length and a
+/// signature of its types and labels, so a reused address cannot silently hand
+/// back another shape's answer.
+fn shape_tails(graph: &Graph, path: &PathPattern) -> (Option<u128>, Option<u128>) {
+    // KEYED BY STATEMENT AND BY CONTENT, not by address alone. A pattern's
+    // address is unique only while its statement is alive; the next statement
+    // on this thread can allocate a different pattern at the same address.
+    // The signature beside it used to be each hop's COUNT of types and labels,
+    // which SNB BI bi16's optional leg shares with its own hand-reversed
+    // spelling — (1 type, 1 label) (1, 1) (1, 0) both ways round — so the
+    // second statement was priced with the first one's tails and turned
+    // around onto the 28,800-probe end. Harmless to answers (either end
+    // matches the same rows), not to cost: any earlier statement could steer
+    // a later one's join order.
+    /// (pattern address, statement, shape signature, (forward, reversed) tails)
+    type TailCache = Vec<(usize, u64, u64, (Option<u128>, Option<u128>))>;
+    thread_local! {
+        static CACHE: std::cell::RefCell<TailCache> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let k = path.hops.len();
+    let addr = path as *const PathPattern as usize;
+    let generation = statement_gen();
+    let sig = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        path.start.labels.hash(&mut h);
+        for (rel, n) in &path.hops {
+            (rel.dir as u8).hash(&mut h);
+            rel.types.hash(&mut h);
+            n.labels.hash(&mut h);
+        }
+        h.finish()
+    };
+    if let Some(hit) = CACHE.with(|c| {
+        c.borrow()
+            .iter()
+            .find(|(a, g, s, _)| *a == addr && *g == generation && *s == sig)
+            .map(|(_, _, _, v)| *v)
+    }) {
+        counted!("interp.pattern reused its shape's join order");
+        return hit;
+    }
+    let one = |reversed: bool| -> Option<u128> {
+        let node_at = |i: usize| -> &NodePattern {
+            if i == 0 {
+                &path.start
+            } else {
+                &path.hops[i - 1].1
+            }
+        };
+        let mut from_label: Option<&String> = if reversed {
+            path.hops[k - 1].1.labels.first()
+        } else {
+            path.start.labels.first()
+        };
+        let mut tail: u128 = 1;
+        for i in 0..k {
+            let (rel, node) = if reversed {
+                (&path.hops[k - 1 - i].0, node_at(k - 1 - i))
+            } else {
+                (&path.hops[i].0, &path.hops[i].1)
+            };
+            if i > 0 {
+                // the LAST hop of a both-ends-bound path reaches the other
+                // bound end: an existence test, not an expansion
+                let fan = if i == k - 1 {
+                    1
+                } else {
+                    let mut toks = Vec::with_capacity(rel.types.len());
+                    for t in &rel.types {
+                        toks.push(graph.type_token_peek(t)?);
+                    }
+                    let tokens = (!toks.is_empty()).then_some(toks);
+                    let rels = graph.type_edge_count(&tokens) as u128;
+                    // An UNLABELLED node divides by the whole graph, not by
+                    // nothing: a pattern names a label at most once, and BI16
+                    // writes the tag bare at its hop.
+                    let from = match from_label {
+                        Some(l) => graph.committed_label_count(l),
+                        None => graph.count_all_nodes(),
+                    } as u128;
+                    if from == 0 {
+                        return None;
+                    }
+                    (rels / from).max(1)
+                };
+                tail = tail.saturating_mul(fan.max(1));
+            }
+            from_label = node.labels.first();
+        }
+        Some(tail)
+    };
+    // The MISS: this is the work the cache exists to make rare, so it is
+    // counted separately from the decision the caller then takes.
+    counted!("interp.pattern estimated a new shape's join order");
+    let v = (one(false), one(true));
+    CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() >= 16 {
+            c.clear(); // a plain cap: this is a hint, never an answer
+        }
+        c.push((addr, generation, sig, v));
+    });
+    v
+}
+
+/// How much cheaper the far end must look before a both-ends-bound path is
+/// turned around. Past the first hop `drive_estimate` is averages, so a 4x
+/// gap is the smallest one that is about the SHAPE rather than about the
+/// estimate's error. BI16's gap is ~1,000x (13,512 against 14,293,280), so
+/// the margin costs it nothing and keeps a near-tie on the written plan.
+const DRIVE_END_MARGIN: u128 = 4;
+
 fn match_path_with(
     graph: &Graph,
     path: &PathPattern,
@@ -4655,6 +7082,122 @@ fn match_path_with(
     for_merge: bool,
     demand: Option<&BTreeMap<String, VarDemand>>,
 ) -> Result<Vec<Row>, RunError> {
+    let mut out = Vec::new();
+    match_path_into(graph, path, seed, params, for_merge, demand, &mut |row| {
+        out.push(row);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// How many start candidates [`match_path_into`] carries through a path's
+/// hops at once, unless `Graph::set_match_start_chunk` says otherwise.
+///
+/// # Why the starts are chunked
+///
+/// This matcher is the one every WRITING statement takes, and it was
+/// breadth-first over the whole start set: it bound EVERY start candidate,
+/// built a partial row for each, expanded all of them a hop at a time, and
+/// handed the finished rows back for the caller's WHERE to filter. On a label
+/// scan the first two steps hold the whole label, twice, before one row can be
+/// dropped.
+///
+/// On 2026-09-27 the stress protocol's reset,
+/// `MATCH (m:Message) WHERE m.id >= $base DETACH DELETE m` — which deleted
+/// NOTHING, after a read-only workload — took the SF10 server from 49 to
+/// 131 GB of resident set in under three minutes, ~0.55 GB/s, all of it
+/// outside every structure the server accounts for, and the kernel OOM-killed
+/// the pod: ~29M messages, a candidate value and a partial row each. At SF3
+/// the same statement fit (47-98 s a reset), which is how it went unseen.
+///
+/// Carrying a chunk of starts through every hop and emitting its rows before
+/// the next chunk is bound changes nothing a caller can observe. A partial's
+/// completions are pushed contiguously, so the finished rows are grouped by
+/// start in candidate order whichever way the work is cut, and the sequence
+/// is the same; every candidate is still read, so the read set is the same;
+/// and `match_pattern_rows` tests its WHERE on the same rows in the same
+/// order, as the last path emits them. What changes is that a row the WHERE
+/// drops, or a start with no route, is gone before the next chunk exists.
+///
+/// Shortest paths keep one chunk: they are grouped by the row, which need not
+/// carry the start, so two starts can meet in one group.
+pub(crate) const MATCH_START_CHUNK: usize = 4096;
+
+/// `Graph::set_match_start_chunk`'s overrides, kept OUTSIDE `Graph` and keyed
+/// by its `graph_id`. A field would move `Graph`'s layout, and one field once
+/// cost SNB BI bi2 ~22% while it touched nothing bi2 runs (see
+/// `algo::graph::KEPT`). A graph's entry goes when it does (`Drop for Graph`).
+static MATCH_START_CHUNKS: std::sync::RwLock<Vec<(u64, usize)>> =
+    std::sync::RwLock::new(Vec::new());
+
+/// How many overrides exist, so a graph with none — every server started
+/// without `--match-start-chunk` — reads one atomic, never the lock.
+static MATCH_START_CHUNKS_LIVE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Set graph `graph_id`'s match start chunk.
+pub(crate) fn set_match_start_chunk(graph_id: u64, n: usize) {
+    let mut all = MATCH_START_CHUNKS
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    all.retain(|(g, _)| *g != graph_id);
+    all.push((graph_id, n));
+    MATCH_START_CHUNKS_LIVE.store(all.len(), std::sync::atomic::Ordering::Release);
+}
+
+/// Graph `graph_id`'s match start chunk: its override, else [`MATCH_START_CHUNK`].
+pub(crate) fn match_start_chunk(graph_id: u64) -> usize {
+    if MATCH_START_CHUNKS_LIVE.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return MATCH_START_CHUNK;
+    }
+    MATCH_START_CHUNKS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(g, _)| *g == graph_id)
+        .map_or(MATCH_START_CHUNK, |&(_, n)| n)
+}
+
+/// Forget graph `graph_id`'s override: its `Drop`.
+pub(crate) fn forget_match_start_chunk(graph_id: u64) {
+    if MATCH_START_CHUNKS_LIVE.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return;
+    }
+    let mut all = MATCH_START_CHUNKS
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    all.retain(|(g, _)| *g != graph_id);
+    MATCH_START_CHUNKS_LIVE.store(all.len(), std::sync::atomic::Ordering::Release);
+}
+
+/// One hop of a path, planned once per [`match_path_into`] call: everything
+/// its expansion needs that does not depend on the partial it expands.
+struct HopPlan<'p> {
+    rel_pat: &'p RelPattern,
+    node_pat: &'p NodePattern,
+    dir: Dir,
+    types: Option<Vec<String>>,
+    min: u64,
+    max: Option<u64>,
+    to_end: Option<std::sync::Arc<crate::BfsTree>>,
+    peer_props: Option<BTreeSet<String>>,
+    rel_lean: Option<BTreeSet<String>>,
+    end_set: Option<std::sync::Arc<Vec<u64>>>,
+    end_props: Option<BTreeSet<String>>,
+}
+
+/// [`match_path_with`], handing each finished row to `emit` instead of
+/// collecting them, its starts carried through the hops a chunk at a time —
+/// see [`MATCH_START_CHUNK`].
+fn match_path_into(
+    graph: &Graph,
+    path: &PathPattern,
+    seed: &Row,
+    params: &BTreeMap<String, Value>,
+    for_merge: bool,
+    demand: Option<&BTreeMap<String, VarDemand>>,
+    emit: &mut dyn FnMut(Row) -> Result<(), RunError>,
+) -> Result<(), RunError> {
     // A path variable exposes every trail node in full.
     let demand = if for_merge || path.var.is_some() {
         None
@@ -4664,9 +7207,12 @@ fn match_path_with(
     // SHORTEST-PATH BFS fast path — a single var-length hop between two bound
     // endpoints (IC1/IC13). BFS is O(reachable nodes); the enumerating fallback
     // below is O(rel-distinct walks) and exhausts memory on an unbounded `*`.
-    if path.shortest {
+    if path.shortest.is_some() {
         if let Some(rows) = try_shortest_path_bfs(graph, path, seed, params)? {
-            return Ok(rows);
+            for row in rows {
+                emit(row)?;
+            }
+            return Ok(());
         }
     }
 
@@ -4691,28 +7237,34 @@ fn match_path_with(
         if !start_pre_bound {
             if let Some(rev) = reverse_bound_end_path(path, seed) {
                 counted!("interp.path driven from its bound end");
-                return match_path_with(graph, &rev, seed, params, for_merge, demand);
+                let restore = reversal_needs_restore(path);
+                return match_path_into(graph, &rev, seed, params, for_merge, demand, &mut |mut row| {
+                    if restore {
+                        restore_reversed_bindings(&mut row, path);
+                    }
+                    emit(row)
+                });
             }
         }
     }
-    let start_props = demand_props_for(demand, path.start.var.as_ref(), &path.start.props);
+    let start_props = demand_props_for(demand, path.start.var.as_ref(), &path.start.props, None);
 
-    // Start candidates.
-    let mut partials: Vec<Partial> = Vec::new();
+    // Start candidates: a bound start first, so a NULL or non-node binding
+    // leaves before any hop is planned (the allShortestPaths plan runs a BFS).
     let start_bound = path.start.var.as_ref().and_then(|v| seed.get(v)).cloned();
-    let candidates: Vec<Value> = match start_bound {
+    let bound = match start_bound {
         // Fix 51: a bound start with no inline map to test is the row's
         // own value — its labels ride on every projection, so nothing is
         // re-read; a map re-materialises under the demand (the map's keys
         // are in it).
         Some(node @ Value::Node { .. }) if path.start.props.is_none() && demand.is_some() => {
             counted!("interp.matcher reused the bound start");
-            vec![node]
+            Some(node)
         }
-        Some(Value::Node { id, .. }) => {
-            vec![mat_node(graph, id, start_props.as_ref())?.ok_or(GraphError::Missing("node", id))?]
-        }
-        Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Node { id, .. }) => Some(
+            mat_node(graph, id, start_props.as_ref())?.ok_or(GraphError::Missing("node", id))?,
+        ),
+        Some(Value::Null) => return Ok(()),
         Some(other) => {
             return Err(RunError::Semantic(format!(
                 "`{}` is bound to a {}, not a node",
@@ -4720,6 +7272,17 @@ fn match_path_with(
                 other.type_name()
             )));
         }
+        None => None,
+    };
+    let hops = plan_hops(graph, path, seed, params, demand)?;
+    // The trail is read by a path variable and by the shortest-
+    // path pick below; nothing else walks it, and without it an
+    // anonymous hop reads adjacency keys alone.
+    let want_trail = path.var.is_some() || path.shortest.is_some() || demand.is_none();
+    let narrow = graph.read_set_bindings_only() && !for_merge;
+    let (hops, flags) = (hops.as_slice(), (want_trail, narrow));
+    match bound {
+        Some(node) => finish_path(graph, path, seed, params, hops, flags, vec![node], emit),
         None => {
             // NARROWING (default off): a candidate that `node_satisfies` will
             // reject contributes nothing but its ABSENCE, so recording it in
@@ -4729,23 +7292,238 @@ fn match_path_with(
             //
             // MERGE is excluded unconditionally: it is the "write on the basis
             // of absence" shape, so for it the absence IS the data flow.
-            let narrow = graph.read_set_bindings_only() && !for_merge;
             let ids = anchored_start_candidate_ids(graph, path, seed, params)?;
-            let mut out = Vec::with_capacity(ids.len());
-            for id in ids {
-                let got = if narrow {
-                    graph.node_unrecorded(id)?
-                } else {
-                    mat_node(graph, id, start_props.as_ref())?
-                };
-                if let Some(n) = got {
-                    out.push(n);
-                }
+            let chunk = match graph.match_start_chunk() {
+                0 => ids.len(),
+                _ if path.shortest.is_some() => ids.len(),
+                n => n,
+            };
+            // No candidate still finishes once, with none: an empty match
+            // runs the same tail it always did.
+            if ids.is_empty() {
+                return finish_path(graph, path, seed, params, hops, flags, Vec::new(), emit);
             }
-            out
+            let parts = ids.chunks(chunk.max(1));
+            if parts.len() > 1 {
+                counted!("interp.matcher carried its starts in chunks", parts.len() as u64);
+            }
+            for part in parts {
+                let mut candidates = Vec::with_capacity(part.len());
+                for &id in part {
+                    let got = if narrow {
+                        graph.node_unrecorded(id)?
+                    } else {
+                        mat_node(graph, id, start_props.as_ref())?
+                    };
+                    if let Some(n) = got {
+                        candidates.push(n);
+                    }
+                }
+                finish_path(graph, path, seed, params, hops, flags, candidates, &mut *emit)?;
+            }
+            Ok(())
         }
-    };
-    let narrow = graph.read_set_bindings_only() && !for_merge;
+    }
+}
+
+/// Plan every hop of `path` once — see [`HopPlan`].
+fn plan_hops<'p>(
+    graph: &Graph,
+    path: &'p PathPattern,
+    seed: &Row,
+    params: &BTreeMap<String, Value>,
+    demand: Option<&BTreeMap<String, VarDemand>>,
+) -> Result<Vec<HopPlan<'p>>, RunError> {
+    let mut plans = Vec::with_capacity(path.hops.len());
+    for (rel_pat, node_pat) in &path.hops {
+        let dir = match rel_pat.dir {
+            RelDir::Out => Dir::Out,
+            RelDir::In => Dir::In,
+            RelDir::Undirected => Dir::Both,
+        };
+        let types = if rel_pat.types.is_empty() {
+            None
+        } else {
+            Some(rel_pat.types.clone())
+        };
+        let (min, max) = match rel_pat.length {
+            None => (1, Some(1)),
+            Some(vl) => (vl.min.unwrap_or(1), vl.max),
+        };
+        // `allShortestPaths` OVER AN UNBOUNDED LENGTH IS BOUNDED BY ITS OWN
+        // ANSWER.
+        //
+        // `try_shortest_path_bfs` above answers `shortestPath` and DECLINES
+        // `allShortestPaths`, so an `allShortestPaths((a)-[:KNOWS*0..]-(b))`
+        // arrives here with `max = None` and enumerates the whole reachable
+        // space before the filter below throws away everything longer than the
+        // shortest. On SNB that space is every path between two people across
+        // 565,247 KNOWS edges: SNB Interactive IC14 OOM-killed a 160 GiB pod at
+        // SF3 and a 1 GiB pod at SF0.1, while Neo4j answers it in 1 s at SF10.
+        //
+        // The shortest distance is cheap to learn — the bidirectional BFS
+        // already implemented for `shortestPath` finds it — and NO SHORTEST
+        // PATH IS LONGER THAN IT. So ask for one route, take its length, and
+        // enumerate only that deep. The existing per-group "keep the shortest"
+        // filter then yields exactly the set `allShortestPaths` must return.
+        //
+        // Two bounds, not one: if the BFS finds NO route the answer is empty
+        // and the enumeration is skipped entirely, which is the other way this
+        // query used to run forever.
+        //
+        // A WRITTEN BOUND GETS THE SAME CLAMP, and excluding it was a mistake
+        // the instrument caught. Measured at SF3 between two people two hops
+        // apart: `allShortestPaths(*0..)` 0 s once clamped, but the explicitly
+        // bounded `allShortestPaths(*0..3)` 62 s — the query that says LESS
+        // about its own depth ran faster than the one that says more, purely
+        // because the clamp declined to touch a bound the author wrote.
+        //
+        // The correctness argument never depended on where the bound came
+        // from: no shortest path is longer than the shortest path. And the
+        // probe searches the SAME pattern, written bounds included, so the
+        // distance it reports is already within any max the author gave —
+        // there is no case where clamping to it discards a route the bound
+        // would have admitted. If no route exists within the written bound the
+        // probe finds none, and the answer is empty either way.
+        // ...AND WALKED ONLY WHERE A SHORTEST ROUTE CAN STILL GO.
+        //
+        // The clamp stopped the enumeration at the right DEPTH and still let
+        // it go everywhere within it: IC14 between two people two hops apart
+        // walked every person within two hops of the first — 84,044
+        // relationships and 166,808 people decoded whole, for trails, to keep
+        // the routes through the handful of friends the two share. A frame at
+        // `v` after `k` hops completes a shortest route only if `v` is at most
+        // `d - k` from the far end, and no longer route survives the clamp
+        // anyway: every frame at `v` has `dist(v) >= d - k` (it reached `v`
+        // in `k`), so the frames kept are exactly those on a shortest route,
+        // and the routes they complete — and the order the walk finds them
+        // in — are the enumeration's own. The distances are one BFS from the
+        // far end to depth `d - 1`, over the reversed hop. The far end is the
+        // probe's, which it resolved to ONE node or declined; `None` keeps
+        // the unpruned walk.
+        let mut to_end: Option<std::sync::Arc<crate::BfsTree>> = None;
+        let max =
+            if path.shortest == Some(Shortest::All) {
+                let mut probe = path.clone();
+                probe.shortest = Some(Shortest::One);
+                // suppressed: the probe is an internal sub-evaluation, and its
+                // BFS counters belong to no query the caller wrote
+                match engram_observe::with_suppressed_trace(|| {
+                    try_shortest_path_bfs(graph, &probe, seed, params)
+                })? {
+                    Some(rows) => {
+                        // (length, far end) of the shortest route the probe found
+                        let d = rows
+                            .iter()
+                            .filter_map(|r| {
+                                probe.var.as_ref().and_then(|v| r.get(v)).and_then(
+                                    |v| match v {
+                                        Value::Path(t) => Some((
+                                            t.len() / 2,
+                                            match t.last() {
+                                                Some(Value::Node { id, .. }) => Some(*id),
+                                                _ => None,
+                                            },
+                                        )),
+                                        _ => None,
+                                    },
+                                )
+                            })
+                            .min();
+                        match d {
+                            Some((d, end)) => {
+                                counted!("interp.allShortestPaths bounded by its own BFS distance");
+                                if let (Some(end), true) = (end, d >= 1) {
+                                    let tokens = if rel_pat.types.is_empty() {
+                                        None
+                                    } else {
+                                        graph.type_tokens_peek(&rel_pat.types)
+                                    };
+                                    to_end = Some(graph.forward_bfs_tree(
+                                        end,
+                                        dir.flipped(),
+                                        &tokens,
+                                        d as u64 - 1,
+                                    ));
+                                }
+                                Some(d as u64)
+                            }
+                            // the BFS answered but carried no path (no path
+                            // variable to read a length from): leave it unbounded
+                            // rather than guess a depth and lose routes
+                            None => max,
+                        }
+                    }
+                    // declined, or no route: `None` means it declined, so keep the
+                    // old behaviour rather than wrongly returning empty
+                    None => max,
+                }
+            } else {
+                max
+            };
+        // Fix 51: the far end binds to its demand; the trail (a path
+        // variable) keeps every node full, decided above.
+        let peer_props = demand_props_for(
+            demand,
+            node_pat.var.as_ref(),
+            &node_pat.props,
+            Some(&node_pat.labels),
+        );
+        if peer_props.is_some() {
+            counted!("interp.matcher bound a hop end to its demand");
+        }
+        // Fix 73: a presence-only relationship variable binds lean; a
+        // var-free one-key map on a declared key resolves once.
+        // Fix 103: a relationship read BY PROPERTY binds lean as well, its
+        // properties by a projected record read per edge.
+        let rel_lean: Option<std::collections::BTreeSet<String>> = if rel_pat.var.is_some() {
+            demand_props_for(demand, rel_pat.var.as_ref(), &rel_pat.props, None)
+        } else {
+            None
+        };
+        let end_set =
+            if demand.is_some() && node_pat.var.as_ref().is_none_or(|v| !seed.contains_key(v)) {
+                resolve_constant_end(graph, node_pat, params)?
+            } else {
+                None
+            };
+        let end_props = if end_set.is_some() {
+            demand_props_for(demand, node_pat.var.as_ref(), &None, Some(&node_pat.labels))
+        } else {
+            None
+        };
+        plans.push(HopPlan {
+            rel_pat,
+            node_pat,
+            dir,
+            types,
+            min,
+            max,
+            to_end,
+            peer_props,
+            rel_lean,
+            end_set,
+            end_props,
+        });
+    }
+    Ok(plans)
+}
+
+/// Bind `candidates` as the path's start, carry them through `hops`, and emit
+/// the finished rows: one chunk of [`match_path_into`]'s starts. `flags` is
+/// `(want_trail, narrow)` as [`match_path_into`] decided them.
+#[allow(clippy::too_many_arguments)]
+fn finish_path(
+    graph: &Graph,
+    path: &PathPattern,
+    seed: &Row,
+    params: &BTreeMap<String, Value>,
+    hops: &[HopPlan<'_>],
+    (want_trail, narrow): (bool, bool),
+    candidates: Vec<Value>,
+    emit: &mut dyn FnMut(Row) -> Result<(), RunError>,
+) -> Result<(), RunError> {
+    let mut partials: Vec<Partial> = Vec::new();
     for cand in candidates {
         if !node_satisfies(graph, &cand, &path.start, seed, params)? {
             if narrow {
@@ -4776,66 +7554,26 @@ fn match_path_with(
     }
 
     // Hops.
-    for (rel_pat, node_pat) in &path.hops {
-        let dir = match rel_pat.dir {
-            RelDir::Out => Dir::Out,
-            RelDir::In => Dir::In,
-            RelDir::Undirected => Dir::Both,
-        };
-        let types = if rel_pat.types.is_empty() {
-            None
-        } else {
-            Some(rel_pat.types.clone())
-        };
-        let (min, max) = match rel_pat.length {
-            None => (1, Some(1)),
-            Some(vl) => (vl.min.unwrap_or(1), vl.max),
-        };
-        // Fix 51: the far end binds to its demand; the trail (a path
-        // variable) keeps every node full, decided above.
-        let peer_props = demand_props_for(demand, node_pat.var.as_ref(), &node_pat.props);
-        if peer_props.is_some() {
-            counted!("interp.matcher bound a hop end to its demand");
-        }
-        // Fix 73: a presence-only relationship variable binds lean; a
-        // var-free one-key map on a declared key resolves once.
-        let rel_lean = rel_pat.var.is_some()
-            && matches!(
-                demand_props_for(demand, rel_pat.var.as_ref(), &rel_pat.props),
-                Some(ref s) if s.is_empty()
-            );
-        let end_set = if demand.is_some()
-            && node_pat.var.as_ref().is_none_or(|v| !seed.contains_key(v))
-        {
-            resolve_constant_end(graph, node_pat, params)?
-        } else {
-            None
-        };
-        let end_props = if end_set.is_some() {
-            demand_props_for(demand, node_pat.var.as_ref(), &None)
-        } else {
-            None
-        };
+    for hop in hops {
         let mut next: Vec<Partial> = Vec::new();
         for p in partials {
             expand_var_length(
                 graph,
                 &p,
-                dir,
-                types.as_deref(),
-                rel_pat,
-                node_pat,
-                min,
-                max,
+                hop.dir,
+                hop.types.as_deref(),
+                hop.rel_pat,
+                hop.node_pat,
+                hop.min,
+                hop.max,
                 params,
-                // The trail is read by a path variable and by the shortest-
-                // path pick below; nothing else walks it, and without it an
-                // anonymous hop reads adjacency keys alone.
-                path.var.is_some() || path.shortest || demand.is_none(),
-                peer_props.as_ref(),
-                rel_lean,
-                end_set.as_deref().map(|v| v.as_slice()),
-                end_props.as_ref(),
+                want_trail,
+                false,
+                hop.peer_props.as_ref(),
+                hop.rel_lean.as_ref(),
+                hop.end_set.as_deref().map(|v| v.as_slice()),
+                hop.end_props.as_ref(),
+                hop.to_end.as_deref().map(|t| &t.dist),
                 &mut |p2| {
                     next.push(p2);
                     Ok(())
@@ -4843,36 +7581,89 @@ fn match_path_with(
             )?;
         }
         partials = next;
-        if path.shortest && !partials.is_empty() {
-            // shortestPath: the expansion below already explores shorter
-            // depths first, so the FIRST completion per start row wins.
-            // (Handled inside expand for var-length; single-hop is trivially
-            // shortest.)
+        // shortestPath: the expansion below already explores shorter
+        // depths first, so the FIRST completion per start row wins.
+        // (Handled inside expand for var-length; single-hop is trivially
+        // shortest.)
+    }
+
+    let Some(kind) = path.shortest else {
+        for p in partials {
+            let mut row = p.row;
+            if let Some(v) = &path.var {
+                row.insert(v.clone(), Value::Path((p.trail.clone()).into()));
+            }
+            emit(row)?;
+        }
+        return Ok(());
+    };
+
+    // SHORTEST IS PER ENDPOINT PAIR, NOT PER SEED ROW.
+    //
+    // This function runs once per seed, so a single minimum over all of its
+    // partials looked per-pair and is not: one seed's expansion reaches MANY
+    // end nodes, and taking one minimum across them keeps the closest end and
+    // silently drops every other pair. Measured on three ends at distances
+    // 1, 1 and 2, `shortestPath` with an unbound end returned ONE row where
+    // Neo4j returns three — a wrong answer, not a slow one, and invisible
+    // whenever the end happens to be bound (which is how every existing test
+    // and the whole IC/LSQB suite exercise it).
+    //
+    // The group key is the row's own bindings, which already carry the end
+    // node: two partials sharing a row are two routes between the same pair,
+    // which is exactly the set `allShortestPaths` must return in full and
+    // `shortestPath` must return one of. First-seen group order is preserved
+    // so the output order stays a function of the expansion order rather than
+    // of a map's iteration.
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: BTreeMap<String, (usize, Vec<Partial>)> = BTreeMap::new();
+    for p in partials {
+        let key = format!("{:?}", p.row);
+        let len = p.trail.len();
+        match groups.get_mut(&key) {
+            None => {
+                order.push(key.clone());
+                groups.insert(key, (len, vec![p]));
+            }
+            Some((best, kept)) => match len.cmp(best) {
+                std::cmp::Ordering::Less => {
+                    *best = len;
+                    kept.clear();
+                    kept.push(p);
+                }
+                std::cmp::Ordering::Equal => kept.push(p),
+                std::cmp::Ordering::Greater => {}
+            },
         }
     }
 
-    let mut out = Vec::new();
-    let mut shortest_len: Option<usize> = None;
-    for p in partials {
-        if path.shortest {
-            let len = p.trail.len();
-            match shortest_len {
-                None => shortest_len = Some(len),
-                Some(s) if len < s => {
-                    shortest_len = Some(len);
-                    out.clear();
-                }
-                Some(s) if len > s => continue,
-                Some(_) => continue, // one shortest path, as Neo4j returns
+    for key in order {
+        let Some((_, kept)) = groups.remove(&key) else {
+            continue;
+        };
+        // `One` takes the FIRST of the tied routes rather than an arbitrary
+        // one: the expansion order is deterministic, so the choice is a
+        // function of the graph and the pattern, and two runs agree. Neo4j
+        // does not promise WHICH shortest path it returns; this promises the
+        // same one every time, which is strictly more than the standard asks
+        // and is what the simulation lane needs.
+        let take = match kind {
+            Shortest::One => 1,
+            Shortest::All => kept.len(),
+        };
+        if kind == Shortest::All && kept.len() > 1 {
+            sometimes!("interp.allShortestPaths returned more than one route", true);
+        }
+        for p in kept.into_iter().take(take) {
+            let mut row = p.row;
+            if let Some(v) = &path.var {
+                row.insert(v.clone(), Value::Path((p.trail.clone()).into()));
             }
+            emit(row)?;
         }
-        let mut row = p.row;
-        if let Some(v) = &path.var {
-            row.insert(v.clone(), Value::Path(p.trail.clone()));
-        }
-        out.push(row);
     }
-    Ok(out)
+    counted!("interp.shortest path grouped by endpoint");
+    Ok(())
 }
 
 /// Fix 73: a hop end with a VAR-FREE one-key map on a DECLARED key of its
@@ -4920,6 +7711,77 @@ fn resolve_constant_end(
     Ok(graph.constant_end_ids(label, key, &v, crate::CONSTANT_END_CAP)?)
 }
 
+/// The expansion's lean relationships this many or more read their demanded
+/// properties as one batch (`lean_rel_props`).
+const LEAN_REL_BATCH: usize = 64;
+
+/// The demanded properties of the relationships one expansion bound lean,
+/// in `deferred`'s order (`(frame index, relationship id)`, one per frame).
+///
+/// A few are read as fix 103 reads them: a projected record read each. From
+/// [`LEAN_REL_BATCH`] up, outside a transaction, they are read as ONE batch per
+/// property through [`Graph::rel_prop_aligned`]: values an earlier statement
+/// read are served without a read, and the rest are gathered in id order
+/// through a shared block cursor, where a projected read per edge searched
+/// the store from its root each time. SNB Interactive IS3 binds 1,190 KNOWS
+/// relationships to read `r.creationDate`. Inside a transaction the per-edge
+/// read stays: it sees the transaction's own writes, and each read is a read
+/// at the transaction's snapshot. Either way every relationship is registered
+/// in the read set when it binds (`note_rel_read`).
+///
+/// The same values either way: a property the relationship does not carry is
+/// absent from its map (the batch reads it as `Null`, which a stored property
+/// never is), and a relationship with no record binds with no properties.
+fn lean_rel_props(
+    graph: &Graph,
+    set: &std::collections::BTreeSet<String>,
+    deferred: &[(usize, u64)],
+) -> Result<Vec<BTreeMap<String, Value>>, RunError> {
+    if deferred.len() >= LEAN_REL_BATCH && !graph.in_txn() {
+        let mut ids: Vec<u64> = deferred.iter().map(|&(_, id)| id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let mut cols: Vec<(&String, Vec<Value>)> = Vec::with_capacity(set.len());
+        for prop in set {
+            match graph.rel_prop_aligned(prop, &ids)? {
+                Some(vals) => cols.push((prop, vals)),
+                None => {
+                    cols.clear();
+                    break;
+                }
+            }
+        }
+        if cols.len() == set.len() {
+            counted!(
+                "interp.matcher bound a hop's relationships by a batched property read",
+                deferred.len() as u64
+            );
+            return Ok(deferred
+                .iter()
+                .map(|&(_, id)| {
+                    let at = ids
+                        .binary_search(&id)
+                        .expect("every deferred relationship is in the batch");
+                    cols.iter()
+                        .filter(|(_, vals)| !matches!(vals[at], Value::Null))
+                        .map(|(prop, vals)| ((*prop).clone(), vals[at].clone()))
+                        .collect()
+                })
+                .collect());
+        }
+    }
+    deferred
+        .iter()
+        .map(|&(_, id)| match graph.rel_projected(id, set)? {
+            Some(r) => {
+                counted!("interp.matcher bound a relationship by a projected read");
+                Ok(r.props)
+            }
+            None => Ok(BTreeMap::new()),
+        })
+        .collect()
+}
+
 /// Fix 73: the far end of a hop, bound from its RESOLVED end set — the set
 /// already proves the label and the map, so a demand of nothing beyond
 /// the map is the id with its pattern label and no record; any other
@@ -4944,6 +7806,43 @@ fn bind_resolved_end(
     mat_end(graph, id, end_props, node_pat)?.ok_or_else(|| GraphError::Missing("node", id).into())
 }
 
+/// Fix 101: whether a hop can match NOTHING because every type it names
+/// holds no live relationship — an untyped hop never (whatever the graph
+/// holds), a hop of minimum length zero never (`*0..` matches its start
+/// without an edge). The production thread-depth aggregate seeded a user's
+/// 38k emails and probed 18k of them for a type with no relationship:
+/// 68–110 ms against Neo4j's 1.3, which reads the same fact from its count
+/// store and is done.
+fn dead_hop(graph: &Graph, rel: &engram_cypher::stmt::RelPattern) -> bool {
+    if rel.types.is_empty() {
+        return false;
+    }
+    let min = match rel.length {
+        None => 1,
+        Some(l) => l.min.unwrap_or(1),
+    };
+    min > 0 && graph.rel_types_have_no_live_rels(&rel.types)
+}
+
+/// Whether any path of `pattern` carries a dead hop — the pattern then
+/// matches nothing (a comma path with no match empties the product).
+fn pattern_has_dead_hop(graph: &Graph, pattern: &Pattern) -> bool {
+    pattern
+        .paths
+        .iter()
+        .any(|p| p.hops.iter().any(|(r, _)| dead_hop(graph, r)))
+}
+
+/// Whether a NON-OPTIONAL MATCH among `clauses` requires a dead hop: every
+/// row is then dropped by that clause, so nothing before it need be seeded
+/// and nothing after it sees a row. An OPTIONAL MATCH keeps its rows and
+/// is skipped per row instead (`expand_var_length`).
+fn clauses_require_dead_hop(graph: &Graph, clauses: &[Clause]) -> bool {
+    clauses.iter().any(|c| {
+        matches!(c, Clause::Match { optional: false, pattern, .. } if pattern_has_dead_hop(graph, pattern))
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn expand_var_length(
     graph: &Graph,
@@ -4956,14 +7855,23 @@ fn expand_var_length(
     max: Option<u64>,
     params: &BTreeMap<String, Value>,
     want_trail: bool,
+    // The trail's nodes are bound bare: nothing reads them
+    // (`bare_trail_paths`).
+    bare_trail: bool,
     peer_props: Option<&std::collections::BTreeSet<String>>,
     // Fix 73: the relationship variable's every read is presence-only
-    // (`r IS NOT NULL`, `count(r)`): bind it LEAN from the adjacency entry.
-    rel_lean: bool,
+    // (`r IS NOT NULL`, `count(r)`): bind it LEAN from the adjacency entry
+    // (`Some(empty)`). Fix 103: read by PROPERTY (`Some(props)`), the
+    // same, plus a projected record read per edge. `None`: the full walk.
+    rel_lean: Option<&std::collections::BTreeSet<String>>,
     // Fix 73: the hop end's resolved id set (sorted) and the demand on it
     // beyond the map, when `resolve_constant_end` answered.
     end_set: Option<&[u64]>,
     end_props: Option<&std::collections::BTreeSet<String>>,
+    // `allShortestPaths`: each node's distance to the one far end the walk
+    // can complete at (absent: farther than `max`). A frame is pushed only
+    // at a peer that can still reach it within `max` — see `match_path_with`.
+    to_end: Option<&BTreeMap<u64, u64>>,
     emit: &mut dyn FnMut(Partial) -> Result<(), RunError>,
 ) -> Result<(), RunError> {
     // Depth-first over rel-distinct walks; min..=max depths that satisfy the
@@ -4975,8 +7883,22 @@ fn expand_var_length(
         rels: Vec<Value>,
         trail: Vec<Value>,
         depth: u64,
+        // The last of `rels` was bound lean and its demanded properties are
+        // not read yet: they are read when the frame completes, and only if
+        // its end passes (`lean_rel_props_at_completion`).
+        rel_props_pending: bool,
     }
     let is_var_length = rel_pat.length.is_some();
+    // Fix 101: a hop over types with no live relationship completes nowhere
+    // (its minimum length is above zero): no adjacency is read, and an
+    // OPTIONAL hop's row stays null — the thread-depth aggregate's OPTIONAL
+    // form probed one adjacency per email for a type with none.
+    if min > 0 && types.is_some_and(|ts| graph.rel_types_have_no_live_rels(ts)) {
+        counted!(
+            "interp.expansion skipped a hop over a relationship type with no live relationship"
+        );
+        return Ok(());
+    }
     // If the relationship variable is ALREADY bound (carried in from a prior
     // clause — e.g. `WITH r AS r2 MATCH ()-[r2]->()`), this single hop is
     // CONSTRAINED to that exact relationship; it must not re-enumerate every
@@ -5020,15 +7942,133 @@ fn expand_var_length(
         Some(seq) => (seq.len() as u64, Some(seq.len() as u64)),
         None => (min, max),
     };
+    // THE LIFTED PER-RELATIONSHIP PREDICATE (see `lift_rel_predicates`). An
+    // edge that fails it cannot lie on a path that survives the WHERE, so the
+    // walk stops there instead of enumerating everything it leads to.
+    //
+    // The properties the predicate reads are collected once, so a candidate
+    // costs ONE projected record read rather than a full decode — the same
+    // trade fix 103 makes for lean rel binding just below. A predicate that
+    // wants the whole value (`WHERE all(e IN r WHERE e IS NOT NULL)`) asks for
+    // the full record instead; it is rare and reading it is still cheaper than
+    // walking past it.
+    // TRUNCATION (LDBC FinBench): follow only the highest-ranked
+    // `truncationLimit` edges out of each node on this hop.
+    //
+    // The benchmark defines this and every official implementation carries a
+    // vendor extension for it. Driving it from the benchmark's OWN parameters
+    // means a FinBench query needs no rewriting, and gating it on the server
+    // as well means a stray parameter cannot quietly change an answer — this
+    // is the one thing here that is meant to drop rows.
+    //
+    // It applies per EXPANDING NODE, per step, which is what "maximum edges
+    // traversed at each step" says; a whole-walk cap would be a different
+    // benchmark. Ordering needs the property, which adjacency does not carry,
+    // so a truncated hop pays one projected read per candidate before it can
+    // rank them — worth it exactly when it removes more branching than it
+    // costs, which is the case the parameter exists for.
+    let truncate: Option<(String, usize, bool)> =
+        if is_var_length && graph.expand_truncation_enabled() {
+            let lim = match params.get("truncationLimit") {
+                Some(Value::Int(n)) if *n > 0 => Some(*n as usize),
+                _ => None,
+            };
+            lim.map(|lim| {
+                let prop = match params.get("truncationProperty") {
+                    Some(Value::Str(p)) => p.clone(),
+                    _ => "timestamp".to_string(),
+                };
+                // TIMESTAMP_DESCENDING keeps the most recent, which is the order
+                // the spec's own example uses; anything naming ASCENDING flips it.
+                let asc = matches!(params.get("truncationOrder"), Some(Value::Str(o))
+                if o.to_ascii_uppercase().contains("ASC"));
+                (prop, lim, asc)
+            })
+        } else {
+            None
+        };
+    // A bound relationship list sets its own length, which the distances
+    // (known only to the clamp's depth) cannot speak for.
+    let to_end = match (to_end, max) {
+        (Some(dist), Some(m)) if truncate.is_none() && bound_rel_seq.is_none() => Some((dist, m)),
+        _ => None,
+    };
+    // Whether a frame at `peer` after `depth` hops can still complete.
+    let reaches = |peer: u64, depth: u64| match to_end {
+        Some((dist, m)) => dist.get(&peer).is_some_and(|&k| k + depth <= m),
+        None => true,
+    };
+    let each = rel_pat.each.as_ref();
+    let (each_props, each_full) = match each {
+        Some((local, pred)) => {
+            let mut d: BTreeMap<String, VarDemand> = BTreeMap::new();
+            collect_demand(pred, &mut Vec::new(), &mut d);
+            match d.get(local) {
+                Some(VarDemand::Props(set)) => (set.clone(), false),
+                Some(VarDemand::Full) => (std::collections::BTreeSet::new(), true),
+                None => (std::collections::BTreeSet::new(), false),
+            }
+        }
+        None => (std::collections::BTreeSet::new(), false),
+    };
+    // `Ok(false)` means "this edge cannot be on a surviving path". A record
+    // that will not read is NOT pruned — the WHERE still runs on the finished
+    // rows, so letting it through can only cost work, while dropping it on a
+    // read error would drop a row the statement should have returned.
+    let each_admits_row = |rec: &crate::RelRow| -> Result<bool, RunError> {
+        let Some((local, pred)) = each else {
+            return Ok(true);
+        };
+        let mut row = Row::new();
+        row.insert(local.clone(), rec.to_value());
+        let v = eval_expr(graph, pred, &row, params)?;
+        if v.truth() == Some(Truth::True) {
+            Ok(true)
+        } else {
+            counted!("interp.expansion skipped an edge its own predicate refuses");
+            Ok(false)
+        }
+    };
+    // The slim walk has only key bytes, so it pays one projected read to ask.
+    // The full walk below already holds the decoded record and asks for free.
+    let each_admits = |rel_id: u64| -> Result<bool, RunError> {
+        if each.is_none() {
+            return Ok(true);
+        }
+        let rec = if each_full {
+            graph.rel(rel_id)?
+        } else {
+            graph.rel_projected(rel_id, &each_props)?
+        };
+        let Some(rec) = rec else { return Ok(true) };
+        each_admits_row(&rec)
+    };
     let mut stack = vec![State {
         at: from.at,
         used: from.used.clone(),
         rels: Vec::new(),
         trail: from.trail.clone(),
         depth: 0,
+        rel_props_pending: false,
     }];
     let mut emitted = 0usize;
-    while let Some(s) = stack.pop() {
+    // The columns this walk's ends bind from, fetched at its first end.
+    let mut end_cols = EndColumns::default();
+    // A completing frame's pending relationship properties (see `State`):
+    // one projected read, as fix 103 made it at the push.
+    let complete_rel = |s: &mut State| -> Result<(), RunError> {
+        if !std::mem::take(&mut s.rel_props_pending) {
+            return Ok(());
+        }
+        if let (Some(set), Some(Value::Rel { id, props, .. })) = (rel_lean, s.rels.last_mut()) {
+            if let Some(r) = graph.rel_projected(*id, set)? {
+                counted!("interp.matcher bound a relationship by a projected read");
+                *props = r.props;
+            }
+        }
+        Ok(())
+    };
+    while let Some(mut s) = stack.pop() {
         // The stack IS the frontier memory; completions stream to the caller, so
         // only legacy Vec callers re-accumulate them. Each frame carries a `used`
         // (and, when a trail is wanted, `trail`) vector of length ~its depth, so
@@ -5049,15 +8089,58 @@ fn expand_var_length(
         // the map by a binary search — a peer outside it never completes,
         // one inside binds without the record test.
         let in_end_set = end_set.map(|set| set.binary_search(&s.at).is_ok());
-        if s.depth >= min && in_end_set != Some(false) {
+        // A HOP END THE ROW ALREADY BINDS IS DECIDED BY ITS ID FIRST, and when
+        // the pattern tests nothing further on it, it is NEVER READ AGAIN.
+        //
+        // The end was materialised (under the variable's whole demand) BEFORE
+        // the check that it is the node the row already holds — so a mismatch
+        // was read in full only to be refused, and a match was read in full to
+        // replace a binding identical in identity. SNB BI bi15's interaction
+        // leg `(pA)<-…-(m1)-[:REPLY_OF]-(m2)-…->(pB)`, with `pB` a bare
+        // grouping key (demanded in full), read one whole Person per
+        // interaction: 26,591 full reads at SF0.1, which is exactly its
+        // interaction count, and the same per interaction at SF10.
+        let bound_end = node_pat.var.as_ref().and_then(|v| from.row.get(v));
+        let bound_elsewhere = match bound_end {
+            Some(Value::Node { id, .. }) => *id != s.at,
+            Some(_) => true, // bound to null or a non-node: never this node
+            None => false,
+        };
+        let reuse_binding = matches!(bound_end, Some(Value::Node { id, .. }) if *id == s.at)
+            && node_pat.labels.is_empty()
+            && node_pat.props.is_none();
+        if s.depth >= min && in_end_set != Some(false) && bound_elsewhere {
+            counted!("interp.hop end refused by the row's own binding before any read");
+        } else if s.depth >= min && in_end_set != Some(false) && reuse_binding {
+            counted!("interp.hop end reused the row's own binding");
+            complete_rel(&mut s)?;
+            let mut probe_row = from.row.clone();
+            if let Some(v) = &rel_pat.var {
+                let bound = if is_var_length {
+                    Value::List((s.rels.clone()).into())
+                } else {
+                    s.rels.first().cloned().unwrap_or(Value::Null)
+                };
+                probe_row.insert(v.clone(), bound);
+            }
+            emitted += 1;
+            emit(Partial {
+                row: probe_row,
+                at: s.at,
+                used: s.used.clone(),
+                trail: s.trail.clone(),
+            })?;
+        } else if s.depth >= min && in_end_set != Some(false) {
             let node = if in_end_set.is_some() {
                 bind_resolved_end(graph, s.at, end_props, node_pat)?
             } else {
-                mat_end(graph, s.at, peer_props, node_pat)?
+                mat_end_with(graph, s.at, peer_props, node_pat, &mut end_cols)?
                     .ok_or(GraphError::Missing("node", s.at))?
             };
-            let mut probe_row = from.row.clone();
-            if in_end_set.is_some() || node_satisfies(graph, &node, node_pat, &probe_row, params)? {
+            // Fix 96: the row is cloned for a peer that PASSES — the test
+            // reads the incoming bindings, which the clone would only copy.
+            if in_end_set.is_some() || node_satisfies(graph, &node, node_pat, &from.row, params)? {
+                let mut probe_row = from.row.clone();
                 // Bound-target check: if the target var is already bound, the
                 // frontier must BE that node.
                 let target_ok = match node_pat.var.as_ref().and_then(|v| from.row.get(v)) {
@@ -5067,12 +8150,13 @@ fn expand_var_length(
                     None => true,
                 };
                 if target_ok {
+                    complete_rel(&mut s)?;
                     if let Some(v) = &node_pat.var {
                         probe_row.insert(v.clone(), node.clone());
                     }
                     if let Some(v) = &rel_pat.var {
                         let bound = if is_var_length {
-                            Value::List(s.rels.clone())
+                            Value::List((s.rels.clone()).into())
                         } else {
                             s.rels.first().cloned().unwrap_or(Value::Null)
                         };
@@ -5097,15 +8181,15 @@ fn expand_var_length(
             // production port that was every anonymous `-[:T]->` hop.
             // Fix 73: a relationship VARIABLE nothing reads beyond its
             // presence takes the same slim expansion, bound LEAN — id, ends
-            // and type from the adjacency entry, no record. A directed hop
-            // only (an undirected visit does not say which side an entry
-            // came from), fixed length, not pinned to a bound relationship.
+            // and type from the adjacency entry, no record. Fixed length, not
+            // pinned to a bound relationship. An undirected hop visits its
+            // two sides one after the other (`legs` below), so each entry
+            // knows which end it leaves from.
             let lean_rel = rel_pat.var.is_some()
-                && rel_lean
+                && rel_lean.is_some()
                 && !is_var_length
                 && bound_rel_id.is_none()
-                && bound_rel_seq.is_none()
-                && !matches!(dir, Dir::Both);
+                && bound_rel_seq.is_none();
             if rel_pat.props.is_none() && (rel_pat.var.is_none() || lean_rel) && !want_trail {
                 let tokens = match types {
                     Some(ts) => graph.type_tokens_peek(ts),
@@ -5113,62 +8197,401 @@ fn expand_var_length(
                 };
                 if !matches!(&tokens, Some(v) if v.is_empty()) {
                     sometimes!("interp.expansion read only adjacency keys", true);
+                    // Fix 83: a start that fans out to a large share of the
+                    // far end's label warms that label's demanded columns
+                    // before its ends are bound one by one.
+                    if s.depth == 0 {
+                        warm_hop_end_columns(
+                            graph, node_pat, peer_props, s.at, dir, &tokens, params,
+                        )?;
+                    }
+                    // Fix 96: a hop completing at this depth under ONE
+                    // pattern label with a lean demand never binds a peer
+                    // outside the label — `mat_end` hands back the labelless
+                    // sentinel and `node_satisfies` rejects it — and never
+                    // walks on from it. Such a peer is skipped HERE, before
+                    // its frame (a `used` clone, a `rels` clone, a `trail`
+                    // clone, the pop, the sentinel, the row clone): the
+                    // story match's reverse MENTIONS hop from an entity
+                    // reached 901 peers of which 718 were emails under a
+                    // `(a:NewsArticle)` end, ~3 µs each on the mirror. Same
+                    // guards as `mat_end`'s membership test; the resolved
+                    // end set keeps its own rule.
+                    let skip_non_members = !is_var_length
+                        && end_set.is_none()
+                        && peer_props.is_some()
+                        && node_pat.labels.len() == 1
+                        && max == Some(s.depth + 1)
+                        && s.depth + 1 >= min
+                        && graph.columnar_scans_enabled()
+                        && !graph.in_txn_with_writes();
+                    // BORROWED for the length of this expansion — an owned
+                    // view per expansion start is sixteen shared refcount
+                    // writes, and bi15's second hop starts once per message.
+                    let members = if skip_non_members {
+                        Some(graph.members_ref(&node_pat.labels[0])?)
+                    } else {
+                        None
+                    };
                     let mut type_names: BTreeMap<u32, String> = BTreeMap::new();
                     let mut name_err: Option<GraphError> = None;
-                    // Zero-copy forward adjacency straight from the cached CSR
-                    // slice — the enumerating oracle pushes each peer as a new
-                    // stack frame; no per-node Vec is materialised.
-                    graph.adjacent_slim_for_each(s.at, dir, &tokens, |e| {
-                        if s.used.contains(&e.rel) {
-                            return; // relationship isomorphism
+                    let mut each_err: Option<RunError> = None;
+                    // A FIXED HOP WHOSE FAR END IS A KNOWN ID READS ONLY THE
+                    // EDGES TO IT.
+                    //
+                    // `edges_to_peer_slim` takes the same sorted CSR row and
+                    // cuts it with two `partition_point`s, so a hop that can
+                    // only complete at one peer stops reading the other ~47.
+                    // SNB BI bi11 closes its triangle with
+                    // `(c)-[k3:KNOWS]-(a)`, both Persons of comparable degree,
+                    // so the cheaper-END reversal declines — there is no
+                    // cheaper direction — and the walk happened anyway. Split
+                    // at SF3, that closure costs MORE THAN 120 s where the
+                    // `WITH DISTINCT` before it costs ~24 s, against Neo4j's
+                    // 6 s for all of bi11.
+                    //
+                    // Only the SOURCE of the entries changes. Every guard
+                    // below — isomorphism, membership, the resolved end set,
+                    // lean binding, the demand — runs exactly as it did, so
+                    // there is no second path to diverge. A COUNT probe was
+                    // tried first and bought nothing: a count cannot be
+                    // filtered, so it only preceded the walk it was meant to
+                    // replace.
+                    // ... or the end the row already binds -- the full walk's
+                    // `pinned_peer`, for this branch: an undirected hop that
+                    // binds its relationship lean now comes this way, and a
+                    // writing `MATCH (a)-[r:R]-(b) WHERE id(b) = t[1]` read
+                    // every edge of `a` to keep the ones to `b`. A self-loop
+                    // keeps the whole row, as it keeps the full walk there.
+                    let row_peer = match node_pat.var.as_ref().and_then(|v| from.row.get(v)) {
+                        Some(Value::Node { id, .. }) if *id != s.at => Some(*id),
+                        _ => None,
+                    };
+                    let one_peer = (!is_var_length)
+                        .then(|| {
+                            end_set
+                                .filter(|set| set.len() == 1)
+                                .map(|set| set[0])
+                                .or(row_peer)
+                        })
+                        .flatten();
+                    // A truncated hop cannot stream: it has to see the whole
+                    // candidate set, rank it by the property, and keep the top
+                    // `limit`. Everything downstream is unchanged — the same
+                    // guards run over a shorter list.
+                    let truncated: Option<Vec<crate::SlimAdj>> = truncate
+                        .as_ref()
+                        .map(|(prop, lim, asc)| {
+                            let mut all: Vec<crate::SlimAdj> = Vec::new();
+                            match one_peer {
+                                Some(to) => graph
+                                    .edges_to_peer_slim(s.at, dir, &tokens, to, |e| all.push(*e)),
+                                None => graph.adjacent_slim_for_each(s.at, dir, &tokens, |e| {
+                                    all.push(*e)
+                                }),
+                            }
+                            if all.len() <= *lim {
+                                counted!("interp.expansion under the truncation limit, kept whole");
+                                return all;
+                            }
+                            let want: std::collections::BTreeSet<String> =
+                                std::iter::once(prop.clone()).collect();
+                            let mut keyed: Vec<(Option<i64>, crate::SlimAdj)> = all
+                                .into_iter()
+                                .map(|e| {
+                                    let k = graph
+                                        .rel_projected(e.rel, &want)
+                                        .ok()
+                                        .flatten()
+                                        .and_then(|r| truncation_key(r.props.get(prop)));
+                                    (k, e)
+                                })
+                                .collect();
+                            // Nothing to rank on means any cut is arbitrary,
+                            // and an arbitrary cut is a wrong answer, not a
+                            // fast one. Keep the lot and say so.
+                            if keyed.iter().all(|(k, _)| k.is_none()) {
+                                counted!("interp.expansion declined to truncate on a property nothing carries");
+                                return keyed.into_iter().map(|(_, e)| e).collect();
+                            }
+                            // An edge with no value to rank on sorts LAST in
+                            // either direction, so truncation drops the
+                            // unrankable before the rankable rather than
+                            // letting a missing property win a place.
+                            keyed.sort_by(|a, b| match (a.0, b.0) {
+                                (Some(x), Some(y)) => {
+                                    if *asc { x.cmp(&y) } else { y.cmp(&x) }
+                                }
+                                (Some(_), None) => std::cmp::Ordering::Less,
+                                (None, Some(_)) => std::cmp::Ordering::Greater,
+                                (None, None) => std::cmp::Ordering::Equal,
+                            });
+                            keyed.truncate(*lim);
+                            counted!("interp.expansion truncated to the step's edge limit");
+                            keyed.into_iter().map(|(_, e)| e).collect()
+                        });
+                    let visit = |leg: Dir, f: &mut dyn FnMut(&crate::SlimAdj)| match (&truncated, one_peer) {
+                        (Some(list), _) => {
+                            for e in list {
+                                f(e);
+                            }
                         }
-                        let mut used = s.used.clone();
-                        used.push(e.rel);
-                        let mut rels = s.rels.clone();
-                        if lean_rel {
-                            let rel_type = match type_names.get(&e.type_token) {
-                                Some(n) => n.clone(),
-                                None => match graph.rel_type_name(e.type_token) {
-                                    Ok(n) => {
-                                        type_names.insert(e.type_token, n.clone());
-                                        n
-                                    }
+                        (None, Some(to)) => {
+                            counted!("interp.expansion read only the edges to a known peer");
+                            graph.edges_to_peer_slim(s.at, leg, &tokens, to, |e| f(e));
+                        }
+                        // Zero-copy forward adjacency straight from the cached
+                        // CSR slice — the enumerating oracle pushes each peer
+                        // as a new stack frame; no per-node Vec is
+                        // materialised.
+                        (None, None) => graph.adjacent_slim_for_each(s.at, leg, &tokens, |e| f(e)),
+                    };
+                    // AN UNDIRECTED HOP THAT BINDS ITS RELATIONSHIP VISITS ITS
+                    // SIDES ONE AFTER THE OTHER, O then I — the order a `Both`
+                    // visit delivers — skipping on the I side the self-loop the
+                    // O side offered, as that visit does. The entries and their
+                    // order are the `Both` visit's; each now knows its side, so
+                    // the relationship binds lean with its ends the right way
+                    // round. SNB Interactive IS3, `(n:Person)-[r:KNOWS]-(friend)`
+                    // reading `r.creationDate`, took the full walk instead: the
+                    // start's adjacency bodies read from the store and 1,190
+                    // relationship records decoded in full.
+                    let split_legs = lean_rel && matches!(dir, Dir::Both);
+                    let legs: &[Dir] = if split_legs {
+                        &[Dir::Out, Dir::In]
+                    } else {
+                        std::slice::from_ref(&dir)
+                    };
+                    // Fix 103's per-edge projected reads, deferred until the
+                    // hop's frames are pushed: a hop with many of them reads
+                    // their properties in one batch instead (`lean_rel_props`).
+                    let defer_props = lean_rel && rel_lean.is_some_and(|set| !set.is_empty());
+                    let mut deferred: Vec<(usize, u64)> = Vec::new();
+                    for &leg in legs {
+                        visit(leg, &mut |e| {
+                            if split_legs && matches!(leg, Dir::In) && e.peer == s.at {
+                                return; // the O side offered this self-loop
+                            }
+                            if s.used.contains(&e.rel) {
+                                return; // relationship isomorphism
+                            }
+                            if !reaches(e.peer, s.depth + 1) {
+                                counted!("interp.expansion skipped a peer no shortest route passes");
+                                return;
+                            }
+                            if let Some(m) = &members {
+                                if !graph.members_contains(m.view(), e.peer) {
+                                    counted!(
+                                        "interp.expansion skipped a non-member peer before its frame"
+                                    );
+                                    return;
+                                }
+                            }
+                            // Fix 103: a fixed hop whose end resolved to a
+                            // constant set (fix 73) never completes at a peer
+                            // outside it — skipped before its frame, like a
+                            // non-member (fix 96): the dashboard's membership
+                            // hop saw every user's membership of a project to
+                            // keep the one user's.
+                            if let Some(set) = end_set {
+                                if !is_var_length && set.binary_search(&e.peer).is_err() {
+                                    counted!(
+                                        "interp.expansion skipped a peer outside the resolved end set before its frame"
+                                    );
+                                    return;
+                                }
+                            }
+                            // Before its frame, like the two guards above.
+                            if each.is_some() {
+                                match each_admits(e.rel) {
+                                    Ok(true) => {}
+                                    Ok(false) => return,
                                     Err(err) => {
-                                        if name_err.is_none() {
-                                            name_err = Some(err);
+                                        if each_err.is_none() {
+                                            each_err = Some(err);
                                         }
                                         return;
                                     }
-                                },
-                            };
-                            let (src, dst) = match dir {
-                                Dir::Out => (s.at, e.peer),
-                                _ => (e.peer, s.at),
-                            };
-                            counted!("interp.matcher bound a lean relationship");
-                            rels.push(Value::Rel {
-                                id: e.rel,
-                                src,
-                                dst,
-                                rel_type,
-                                props: BTreeMap::new(),
+                                }
+                            }
+                            let mut used = s.used.clone();
+                            used.push(e.rel);
+                            let mut rels = s.rels.clone();
+                            if lean_rel {
+                                let rel_type = match type_names.get(&e.type_token) {
+                                    Some(n) => n.clone(),
+                                    None => match graph.rel_type_name(e.type_token) {
+                                        Ok(n) => {
+                                            type_names.insert(e.type_token, n.clone());
+                                            n
+                                        }
+                                        Err(err) => {
+                                            if name_err.is_none() {
+                                                name_err = Some(err);
+                                            }
+                                            return;
+                                        }
+                                    },
+                                };
+                                let (src, dst) = match leg {
+                                    Dir::Out => (s.at, e.peer),
+                                    _ => (e.peer, s.at),
+                                };
+                                // Fix 103: the demanded properties by a projected
+                                // read of the relationship record — `rels_of`
+                                // walked the start's adjacency prefix and decoded
+                                // every record in full for them. Read once the
+                                // hop's frames are pushed (`lean_rel_props`).
+                                if defer_props {
+                                    deferred.push((stack.len(), e.rel));
+                                }
+                                counted!("interp.matcher bound a lean relationship");
+                                graph.note_rel_read(e.rel);
+                                rels.push(Value::Rel {
+                                    id: e.rel,
+                                    src,
+                                    dst,
+                                    rel_type,
+                                    props: BTreeMap::new(),
+                                });
+                            }
+                            stack.push(State {
+                                at: e.peer,
+                                used,
+                                rels,
+                                trail: s.trail.clone(),
+                                depth: s.depth + 1,
+                                rel_props_pending: false,
                             });
-                        }
-                        stack.push(State {
-                            at: e.peer,
-                            used,
-                            rels,
-                            trail: s.trail.clone(),
-                            depth: s.depth + 1,
                         });
-                    });
+                    }
                     if let Some(err) = name_err {
                         return Err(RunError::Graph(err));
+                    }
+                    if let Some(err) = each_err {
+                        return Err(err);
+                    }
+                    if let Some(set) = rel_lean.filter(|_| !deferred.is_empty()) {
+                        // A FEW ARE READ WHEN THEIR FRAME COMPLETES, AND ONLY IF
+                        // ITS END PASSES. Read here, every edge paid its
+                        // projected read before its end was tested. FinBench
+                        // tcr1's `(other)<-[signIn:signIn]-(medium:Medium
+                        // {isBlocked: true})` runs once per path, ~1.1 edges
+                        // each: at SF10 it read 25,993 signIn records one by
+                        // one for their timestamps, and only 8% of media are
+                        // blocked (78,225 of 978,000). A frame whose end fails
+                        // is never emitted, so its properties were never looked
+                        // at. A batch keeps its read here: it is one gather,
+                        // largely from the memo. Inside a transaction the read
+                        // stays at the push, where fix 103 made it.
+                        if deferred.len() < LEAN_REL_BATCH && !graph.in_txn() {
+                            counted!(
+                                "interp.matcher deferred a lean relationship's properties until its end passed",
+                                deferred.len() as u64
+                            );
+                            for (at, _) in &deferred {
+                                stack[*at].rel_props_pending = true;
+                            }
+                        } else {
+                            let props = lean_rel_props(graph, set, &deferred)?;
+                            for ((at, _), p) in deferred.iter().zip(props) {
+                                if let Some(Value::Rel { props, .. }) = stack[*at].rels.last_mut() {
+                                    *props = p;
+                                }
+                            }
+                        }
                     }
                 }
                 continue;
             }
-            for rel in graph.rels_of(s.at, dir, types)? {
+            // A FIXED HOP WHOSE FAR END IS ALREADY BOUND DECODES ONLY THE
+            // EDGES TO IT.
+            //
+            // The full walk decoded every incident relationship and then, one
+            // frame later, every peer — to keep the one the row already
+            // names. A writing `MATCH (a)-[k:KNOWS]-(b) WHERE id(b) = t[1]`
+            // (b bound by its id seek) decoded 705k relationships and 714k
+            // Persons for 4,000 pairs at SNB SF3: ~3.5 ms a pair. The entries
+            // come from the same adjacency `edges_to_peer_slim` cuts for the
+            // slim path, and everything after — isomorphism, the bound-rel
+            // pins, the property test, the target check — is unchanged. A
+            // self-loop keeps the full walk, whose two legs it relies on.
+            let pinned_peer = if !is_var_length
+                && bound_rel_id.is_none()
+                && bound_rel_seq.is_none()
+                && max == Some(s.depth + 1)
+            {
+                match node_pat.var.as_ref().and_then(|v| from.row.get(v)) {
+                    Some(Value::Node { id, .. }) if *id != s.at => Some(*id),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let incident = match pinned_peer {
+                Some(to) => {
+                    counted!("interp.full walk read only the edges to a bound peer");
+                    let tokens = match types {
+                        Some(ts) => graph.type_tokens_peek(ts),
+                        None => None,
+                    };
+                    let mut ids = Vec::new();
+                    if !matches!(&tokens, Some(v) if v.is_empty()) {
+                        graph.edges_to_peer_slim(s.at, dir, &tokens, to, |e| ids.push(e.rel));
+                    }
+                    ids.sort_unstable();
+                    ids.dedup();
+                    let mut out = Vec::with_capacity(ids.len());
+                    for id in ids {
+                        if let Some(r) = graph.rel(id)? {
+                            out.push(r);
+                        }
+                    }
+                    out
+                }
+                None if to_end.is_some() => {
+                    counted!("interp.full walk read only the edges on a shortest route");
+                    graph.rels_of_where(s.at, dir, types, &|peer| reaches(peer, s.depth + 1))?
+                }
+                None => graph.rels_of(s.at, dir, types)?,
+            };
+            // The full walk already holds each record, so ranking is free
+            // here — no second read, unlike the slim branch above.
+            let incident = match truncate.as_ref() {
+                Some((prop, lim, asc)) if incident.len() > *lim => {
+                    let mut keyed: Vec<(Option<i64>, crate::RelRow)> = incident
+                        .into_iter()
+                        .map(|r| {
+                            let k = truncation_key(r.props.get(prop));
+                            (k, r)
+                        })
+                        .collect();
+                    if keyed.iter().all(|(k, _)| k.is_none()) {
+                        counted!(
+                            "interp.expansion declined to truncate on a property nothing carries"
+                        );
+                        keyed.into_iter().map(|(_, r)| r).collect()
+                    } else {
+                        keyed.sort_by(|a, b| match (a.0, b.0) {
+                            (Some(x), Some(y)) => {
+                                if *asc {
+                                    x.cmp(&y)
+                                } else {
+                                    y.cmp(&x)
+                                }
+                            }
+                            (Some(_), None) => std::cmp::Ordering::Less,
+                            (None, Some(_)) => std::cmp::Ordering::Greater,
+                            (None, None) => std::cmp::Ordering::Equal,
+                        });
+                        keyed.truncate(*lim);
+                        counted!("interp.expansion truncated to the step's edge limit");
+                        keyed.into_iter().map(|(_, r)| r).collect()
+                    }
+                }
+                _ => incident,
+            };
+            for rel in incident {
                 if s.used.contains(&rel.id) {
                     continue; // relationship isomorphism
                 }
@@ -5187,6 +8610,11 @@ fn expand_var_length(
                 if !rel_satisfies(graph, &rel, &rel_pat.props, &from.row, params)? {
                     continue;
                 }
+                // Before the trail's node read, so an edge the predicate
+                // refuses costs neither a frame nor a materialised peer.
+                if each.is_some() && !each_admits_row(&rel)? {
+                    continue;
+                }
                 let peer = if rel.src == s.at { rel.dst } else { rel.src };
                 // Directional legs of an undirected walk are both offered by
                 // rels_of(Both); for Out/In the scan already filtered.
@@ -5194,7 +8622,18 @@ fn expand_var_length(
                 // walk nobody paths over never materialises what it passes.
                 let mut trail = s.trail.clone();
                 if want_trail {
-                    let peer_node = graph.node(peer)?.ok_or(GraphError::Missing("node", peer))?;
+                    // A bare trail's node is its id: no clause reads it
+                    // (`bare_trail_paths`), and reading its record was one
+                    // full read per edge walked.
+                    let peer_node = if bare_trail {
+                        Value::Node {
+                            id: peer,
+                            labels: Vec::new(),
+                            props: BTreeMap::new(),
+                        }
+                    } else {
+                        graph.node(peer)?.ok_or(GraphError::Missing("node", peer))?
+                    };
                     trail.push(rel.to_value());
                     trail.push(peer_node);
                 }
@@ -5208,11 +8647,88 @@ fn expand_var_length(
                     rels,
                     trail,
                     depth: s.depth + 1,
+                    rel_props_pending: false,
                 });
             }
         }
     }
     Ok(())
+}
+
+/// The length of the shortest cycle through `start` over UNDIRECTED edges of
+/// the types — each relationship used once, as a walk must — when one of at
+/// most `max` relationships exists.
+///
+/// A frontier walk over an undirected hop reaches its start again through the
+/// very edge it left by, at depth 2, and emitted it: `MATCH (p)-[:KNOWS*1..2]
+/// -(f) RETURN count(DISTINCT f)` counted `p` among its own friends (2 where
+/// the answer is 1). The LDBC queries hide it behind `NOT friend = person`; a
+/// query without one did not. The start genuinely returns only along a cycle:
+/// a self-loop (1), two parallel edges (2), or two tree paths from different
+/// neighbours of the start joined by an edge between them — the BFS below
+/// labels each node with the neighbour its tree path leaves the start by, and
+/// an edge between two labels closes a cycle through the start.
+pub(crate) fn shortest_cycle_through(
+    graph: &Graph,
+    start: u64,
+    tokens: &Option<Vec<u32>>,
+    max: u64,
+) -> Option<u64> {
+    let mut best: Option<u64> = None;
+    let note = |len: u64, best: &mut Option<u64>| {
+        if len <= max && best.is_none_or(|b| len < b) {
+            *best = Some(len);
+        }
+    };
+    // Per reached node: its depth, the start's neighbour its tree path leaves
+    // by, and the relationship it was reached through.
+    let mut info: BTreeMap<u64, (u64, u64, u64)> = BTreeMap::new();
+    let mut frontier: Vec<u64> = Vec::new();
+    graph.adjacent_slim_for_each(start, Dir::Both, tokens, |e| {
+        if e.peer == start {
+            note(1, &mut best);
+            return;
+        }
+        match info.entry(e.peer) {
+            std::collections::btree_map::Entry::Occupied(_) => {
+                note(2, &mut best); // a second edge to the same neighbour
+            }
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert((1, e.peer, e.rel));
+                frontier.push(e.peer);
+            }
+        }
+    });
+    // An edge examined from depth d closes a cycle of at least 2d + 1 (the
+    // parallel edges back to the start were counted above), so the levels
+    // past `max` cannot shorten it.
+    let mut depth = 1u64;
+    while !frontier.is_empty() && 2 * depth < max {
+        let mut next: Vec<u64> = Vec::new();
+        for &u in &frontier {
+            let (_, branch, tree_rel) = info[&u];
+            graph.adjacent_slim_for_each(u, Dir::Both, tokens, |e| {
+                if e.rel == tree_rel || e.peer == start {
+                    return; // the tree edge back, or a parallel one counted above
+                }
+                match info.entry(e.peer) {
+                    std::collections::btree_map::Entry::Occupied(seen) => {
+                        let &(dv, bv, _) = seen.get();
+                        if bv != branch {
+                            note(depth + 1 + dv, &mut best);
+                        }
+                    }
+                    std::collections::btree_map::Entry::Vacant(slot) => {
+                        slot.insert((depth + 1, branch, e.rel));
+                        next.push(e.peer);
+                    }
+                }
+            });
+        }
+        frontier = next;
+        depth += 1;
+    }
+    best
 }
 
 /// Frontier-BFS variable-length expansion — the set-at-a-time counterpart of
@@ -5222,10 +8738,13 @@ fn expand_var_length(
 /// builds and then collapses at the DISTINCT never exist. The caller enforces
 /// the soundness conditions before choosing this path: min == 1 (a reachable
 /// node's shortest depth then always lands in `1..=max`), no relationship or
-/// path variable, and no relationship-property test (adjacency alone drives
-/// it). The clause WHERE (e.g. `NOT a = b`) is applied by the sink downstream
-/// exactly as for the enumerating path, so the start is NOT pre-excluded: it is
-/// produced if genuinely re-reached and the downstream filter removes it.
+/// path variable, no relationship-property test (adjacency alone drives it),
+/// and a breaker that cannot count the rows (`proj_is_set_semantic`). The
+/// clause WHERE (e.g. `NOT a = b`) is applied by the sink downstream exactly as
+/// for the enumerating path. The START is emitted exactly when a walk returns
+/// to it: a directed walk that reaches it again has closed a real cycle; an
+/// undirected one would reach it through the edge it left by, so it is
+/// emitted only along a real cycle (`shortest_cycle_through`).
 #[allow(clippy::too_many_arguments)]
 fn expand_var_length_bfs(
     graph: &Graph,
@@ -5257,6 +8776,36 @@ fn expand_var_length_bfs(
     // `seen` is the visited set — a node enters it the first time it is reached,
     // which fixes both its shortest depth and its single emission.
     let mut seen: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    // An UNDIRECTED walk never re-reaches its start through the edge it left
+    // by: the start is seen from the outset, and is emitted — after the walk —
+    // only when a real cycle of at most `max` relationships runs through it
+    // (`shortest_cycle_through`). A directed walk that reaches its start again
+    // has closed a real cycle already, so it keeps the plain rule.
+    let returns = matches!(dir, Dir::Both) && {
+        seen.insert(from.at);
+        shortest_cycle_through(graph, from.at, &tokens, max).is_some()
+    };
+    let mut emit_node = |v: u64, emitted: &mut usize| -> Result<(), RunError> {
+        if bound_target.is_some_and(|t| v != t) {
+            return Ok(());
+        }
+        let node =
+            mat_end(graph, v, peer_props, node_pat)?.ok_or(GraphError::Missing("node", v))?;
+        if !node_satisfies(graph, &node, node_pat, &from.row, params)? {
+            return Ok(());
+        }
+        let mut row = from.row.clone();
+        if let Some(vn) = &node_pat.var {
+            row.insert(vn.clone(), node);
+        }
+        *emitted += 1;
+        emit(Partial {
+            row,
+            at: v,
+            used: Vec::new(),
+            trail: Vec::new(),
+        })
+    };
     let mut frontier: Vec<u64> = vec![from.at];
     let mut emitted = 0usize;
     let mut depth = 0u64;
@@ -5273,30 +8822,14 @@ fn expand_var_length_bfs(
                 if depth < max {
                     next.push(v); // room for a further hop
                 }
-                if let Some(t) = bound_target {
-                    if v != t {
-                        continue;
-                    }
-                }
-                let node = mat_end(graph, v, peer_props, node_pat)?
-                    .ok_or(GraphError::Missing("node", v))?;
-                if !node_satisfies(graph, &node, node_pat, &from.row, params)? {
-                    continue;
-                }
-                let mut row = from.row.clone();
-                if let Some(vn) = &node_pat.var {
-                    row.insert(vn.clone(), node);
-                }
-                emitted += 1;
-                emit(Partial {
-                    row,
-                    at: v,
-                    used: Vec::new(),
-                    trail: Vec::new(),
-                })?;
+                emit_node(v, &mut emitted)?;
             }
         }
         frontier = next;
+    }
+    if returns {
+        counted!("interp.undirected frontier walk returned to its start along a cycle");
+        emit_node(from.at, &mut emitted)?;
     }
     Ok(())
 }
@@ -5363,6 +8896,40 @@ fn note_full(demands: &mut BTreeMap<String, VarDemand>, var: &str) {
 /// a star reads names no analysis here can enumerate.
 const DEMAND_EVERYTHING: &str = "*";
 
+/// The demand-map key under which the labels `var:L` tests read are noted —
+/// not a property name, and not a name any variable can have.
+fn label_demand_key(var: &str) -> String {
+    format!("\u{1}labels\u{1}{var}")
+}
+
+/// Note `labels` as tested of `var`, under `label_demand_key` — where
+/// `labels_beyond_pattern` and the lean seed bind look for them.
+fn note_tested_labels(demands: &mut BTreeMap<String, VarDemand>, var: &str, labels: &[String]) {
+    if let VarDemand::Props(set) = demands
+        .entry(label_demand_key(var))
+        .or_insert_with(|| VarDemand::Props(std::collections::BTreeSet::new()))
+    {
+        set.extend(labels.iter().cloned());
+    }
+}
+
+/// Whether the statement tests `var` for a label its pattern does not
+/// require. Such a node must be bound from its record: a bind that skips the
+/// record carries the pattern's labels only, and `msg:Post` on a
+/// `(msg:Message)` bound that way read false for every post — SNB BI15's
+/// weights came out 35 where PostgreSQL and Neo4j compute 55.
+fn labels_beyond_pattern(
+    demand: &BTreeMap<String, VarDemand>,
+    var: &str,
+    pat_labels: &[String],
+) -> bool {
+    match demand.get(&label_demand_key(var)) {
+        Some(VarDemand::Props(tested)) => tested.iter().any(|l| !pat_labels.contains(l)),
+        Some(VarDemand::Full) => true,
+        None => false,
+    }
+}
+
 /// Walk an expression recording property-only versus full-value uses of
 /// each variable. Comprehension locals are excluded; subquery bodies own
 /// their scopes and are treated as FULL uses of every outer variable they
@@ -5393,6 +8960,42 @@ pub(crate) fn collect_demand(
                 }
             }
         },
+        // `id(v)` over a BARE variable reads the value's identity and nothing
+        // else — the presence demand `count(v)` takes. The generic call rule
+        // below demanded it in FULL: SNB BI bi15's `id(c1) < id(c2)` over its
+        // interaction rows read every creator's record per row, and at SF10
+        // those reads went to disk.
+        Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("id") => match args.as_slice() {
+            [Expr::Var(v)] if !locals.contains(v) => {
+                demands
+                    .entry(v.clone())
+                    .or_insert_with(|| VarDemand::Props(std::collections::BTreeSet::new()));
+            }
+            _ => {
+                for a in args {
+                    collect_demand(a, locals, demands);
+                }
+            }
+        },
+        // `a = b` / `a <> b` with a BARE variable side compares nodes and
+        // relationships by IDENTITY — `eq3` reads the id, as the `IN` rule
+        // below records — so that side needs its presence, not its record. A
+        // demand is consulted only where a pattern binds a node or a
+        // relationship, so a scalar or map operand loses nothing by it.
+        // bi15's `c1 <> c2` and `post = m2` read two records per row without
+        // this.
+        Expr::Bin(engram_cypher::BinOp::Eq | engram_cypher::BinOp::Neq, a, b) => {
+            for side in [a, b] {
+                match side.as_ref() {
+                    Expr::Var(v) if !locals.contains(v) => {
+                        demands
+                            .entry(v.clone())
+                            .or_insert_with(|| VarDemand::Props(std::collections::BTreeSet::new()));
+                    }
+                    other => collect_demand(other, locals, demands),
+                }
+            }
+        }
         Expr::Prop(inner, key) => {
             if let Expr::Var(v) = inner.as_ref() {
                 if !locals.contains(v) {
@@ -5528,11 +9131,16 @@ pub(crate) fn collect_demand(
         // property for a label test (measured: the label-OR count(m)
         // statement stayed at 132 s after the aggregate-demand fix because
         // this arm re-widened it).
-        Expr::HasLabels { of, .. } => match of.as_ref() {
+        Expr::HasLabels { of, labels } => match of.as_ref() {
             Expr::Var(v) if !locals.contains(v) => {
                 demands
                     .entry(v.clone())
                     .or_insert_with(|| VarDemand::Props(std::collections::BTreeSet::new()));
+                // ...but only the PATTERN'S labels ride on a node bound
+                // without its record (`mat_end`'s bare and column-served
+                // binds). A test of any other label must see the record, so
+                // the labels read are noted under a key no variable can have.
+                note_tested_labels(demands, v, labels);
             }
             other => collect_demand(other, locals, demands),
         },
@@ -5663,6 +9271,17 @@ fn demand_pattern_endpoints(
             if locals.contains(v) {
                 continue;
             }
+            // The pattern TESTS a bound endpoint's labels, and the subquery
+            // matcher decides them from the bound VALUE's own label list
+            // (`node_satisfies`) — unlike a MATCH, whose bound start is re-read
+            // when a pattern label is missing (fix 64). A lean bind carries
+            // only its own pattern's labels, so `WHERE (a:Odd)-[:NEXT]->()`,
+            // `EXISTS { MATCH (a:Odd)… }`, `[(a:Odd)… | …]` and `COUNT {}`
+            // each answered 0 of 30 over a bare-bound `a`. Noted as tested,
+            // exactly as `a:Odd` in an expression is.
+            if !node.labels.is_empty() {
+                note_tested_labels(demands, v, &node.labels);
+            }
             match &node.props {
                 None => {
                     demands
@@ -5712,6 +9331,23 @@ enum Seed {
     /// a label scan. `WHERE c.primaryCountry = 'USA'` scanned every Company
     /// (the dominant per-statement gap vs Neo4j, which seeks a BTREE index).
     /// The label scan is the always-correct fallback and WINS when smaller.
+    /// A TEXT seek: the WHERE says `n.prop =~ '…'`, `CONTAINS`, `STARTS WITH`
+    /// or `ENDS WITH`, and a TRIGRAM index is declared over that property.
+    ///
+    /// The index answers a CANDIDATE set — every id it returns is re-checked
+    /// against the real predicate by the WHERE that follows, exactly as the
+    /// property seek's candidates are. `CONTAINS` and `ENDS WITH` had no index
+    /// path at all before this: both scanned the label every time, because
+    /// neither is a contiguous span of any sort order.
+    TextMatch {
+        /// The property the predicate reads.
+        prop: String,
+        /// The trigram condition derived from the pattern.
+        query: engram_store::trigram::TrigramQuery,
+        /// The label whose declared index answers, and the fallback scan.
+        label: String,
+        label_fallback: Option<usize>,
+    },
     PropEq {
         prop: String,
         /// One value for `= x`, several for `IN [a, b, ...]`; the seek unions
@@ -5770,14 +9406,15 @@ fn exists_seed_path(
             _ => continue,
         };
         if path.var.is_some()
-            || path.shortest
+            || path.shortest.is_some()
             || path.hops.is_empty()
             || path.start.var.as_deref() != Some(var)
             || !path.start.labels.is_empty()
             || path.start.props.is_some()
-            || path.hops.iter().any(|(rel, node)| {
-                rel.length.is_some() || node.var.as_deref() == Some(var)
-            })
+            || path
+                .hops
+                .iter()
+                .any(|(rel, node)| rel.length.is_some() || node.var.as_deref() == Some(var))
         {
             continue;
         }
@@ -5873,6 +9510,74 @@ pub(crate) fn prop_eq_candidates(where_: Option<&Expr>, var: &str) -> Vec<(Strin
 /// `[prefix, next(prefix))` (`Graph::index_probe_prefix_scoped`). The
 /// production `g.eventId STARTS WITH 'edgar-8k-'` walked 44k events per
 /// statement while Neo4j seeked its index.
+/// Top-level conjuncts of the shape `<var>.<prop> <op> '<literal>'` for the
+/// four string predicates, paired with the trigram condition each implies.
+///
+/// The columnar lane's equivalent of [`text_seek_candidate`], which serves the
+/// interpreter's seed. Both are needed: a plain `MATCH … WHERE … RETURN` takes
+/// the columnar path, and wiring only the interpreter left the index built,
+/// declared, and never consulted — which the counter test caught.
+///
+/// A pattern carrying a variable is skipped: the condition would have to be
+/// derived per row, and a seek is chosen once for the clause.
+pub(crate) fn prop_text_candidates(
+    where_: Option<&Expr>,
+    var: &str,
+) -> Vec<(String, BinOp, String)> {
+    let mut out = Vec::new();
+    let Some(w) = where_ else { return out };
+    let mut parts = Vec::new();
+    conjuncts_of(w, &mut parts);
+    for c in &parts {
+        let Expr::Bin(op, lhs, rhs) = c else { continue };
+        if !matches!(
+            op,
+            BinOp::Regex | BinOp::Contains | BinOp::StartsWith | BinOp::EndsWith
+        ) {
+            continue;
+        }
+        let Expr::Prop(base, prop) = &**lhs else {
+            continue;
+        };
+        if !matches!(&**base, Expr::Var(v) if v == var) {
+            continue;
+        }
+        let Expr::Str(text) = &**rhs else { continue };
+        out.push((prop.clone(), *op, text.clone()));
+    }
+    out
+}
+
+/// Turn one recognised text predicate into the trigram condition it implies.
+///
+/// **DELIBERATELY SEPARATE FROM THE RECOGNISER.** Deriving a condition costs a
+/// pattern parse and a tree analysis, and the recogniser runs on every plan
+/// whether or not any trigram index exists. So the recogniser records only
+/// what it saw — property, operator, literal — and this is called later, from
+/// the seek, once the declared-index lookup has already said an index could
+/// serve it. A database with no trigram index pays one cached emptiness test
+/// and nothing else.
+///
+/// `None` when the condition constrains nothing, which is a decline rather
+/// than an empty answer.
+pub(crate) fn text_query_for(op: BinOp, text: &str) -> Option<engram_store::trigram::TrigramQuery> {
+    let q = match op {
+        BinOp::Regex => {
+            let hir = engram_cypher::regex::prefilter::hir_of(text).ok()?;
+            engram_cypher::regex::prefilter::query_for_regex(&hir)
+        }
+        BinOp::Contains => engram_cypher::regex::prefilter::query_for_contains(text),
+        BinOp::StartsWith => engram_cypher::regex::prefilter::query_for_starts_with(text),
+        BinOp::EndsWith => engram_cypher::regex::prefilter::query_for_ends_with(text),
+        _ => return None,
+    };
+    if q.is_all() {
+        sometimes!("trigram.query analysis returned match-all", true);
+        return None;
+    }
+    Some(to_store_query(&q))
+}
+
 pub(crate) fn prop_prefix_candidates(where_: Option<&Expr>, var: &str) -> Vec<(String, Expr)> {
     let Some(w) = where_ else {
         return Vec::new();
@@ -6038,12 +9743,29 @@ struct StagePlan {
     /// 15,494 work items in full before its WHERE ran (2.7 s against Neo4j's
     /// 116 ms) for the 200 it paged.
     late_full: std::collections::BTreeSet<String>,
+    /// Per prefix `CALL {}` (by clause index): what the clauses after it in
+    /// this stage, and the concluding RETURN, read of each column its body
+    /// returns — the body binds a returned node to that. Only when the stage
+    /// ENDS the statement: past a WITH the next stage's reads are out of
+    /// sight here, and a demand that missed one would be a wrong answer.
+    call_out: BTreeMap<usize, BTreeMap<String, VarDemand>>,
+    /// A plain projection's HEAVY items (`heavy_projection`), each under the
+    /// hidden column its breaker reads it from instead: evaluated on every
+    /// row the stage produces, by the worker that produced it.
+    pre_eval: Vec<(String, Expr)>,
+    /// Path variables of this stage whose trail nodes nothing reads
+    /// (`bare_trail_paths`): their walks bind the trail's nodes bare.
+    bare_trails: std::collections::BTreeSet<String>,
 }
 
 impl StagePlan {
     /// Fix 52: the plain cap on the seed, evaluated with the statement's
     /// parameters — `None` when the stage has none.
-    fn seed_cap(&self, graph: &Graph, params: &BTreeMap<String, Value>) -> Result<Option<usize>, RunError> {
+    fn seed_cap(
+        &self,
+        graph: &Graph,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<Option<usize>, RunError> {
         let Some((skip, limit)) = &self.seed_cap else {
             return Ok(None);
         };
@@ -6058,10 +9780,18 @@ impl StagePlan {
         &self,
         var: Option<&String>,
         pat_props: &Option<Expr>,
+        // As `demand_props_for`: `Some` for a hop end, `None` for a start.
+        pat_labels: Option<&[String]>,
     ) -> Option<std::collections::BTreeSet<String>> {
         let mut set = std::collections::BTreeSet::new();
         if self.demands.contains_key(DEMAND_EVERYTHING) {
             return None;
+        }
+        if let (Some(v), Some(labels)) = (var, pat_labels) {
+            if labels_beyond_pattern(&self.demands, v, labels) {
+                counted!("interp.label test outside the pattern bound its end from the record");
+                return None;
+            }
         }
         if let Some(v) = var {
             match self.demands.get(v) {
@@ -6089,6 +9819,24 @@ pub(crate) fn contains_opaque(e: &Expr) -> bool {
     // One definition of "opaque", owned by the AST (the evaluator's lazy
     // connectives read the same one): a shape both sides classify alike.
     e.has_subquery()
+}
+
+/// Whether an expression contains an `all(x IN xs WHERE p)` anywhere — the
+/// cheap half of `lift_rel_predicates`' refusal, allocating nothing.
+fn mentions_all_quantifier(e: &Expr) -> bool {
+    let mut found = false;
+    walk_expr(e, &mut |x| {
+        if matches!(
+            x,
+            Expr::ListPredicate {
+                kind: engram_cypher::ast::ListPredicateKind::All,
+                ..
+            }
+        ) {
+            found = true;
+        }
+    });
+    found
 }
 
 /// Flatten an AND tree into conjuncts.
@@ -6375,13 +10123,34 @@ fn late_deferred(
         Clause::Return { proj } | Clause::With { proj, .. } => proj,
         _ => return empty,
     };
-    if proj.star
-        || proj.distinct
-        || proj.items.iter().any(|it| contains_aggregate(&it.expr))
-    {
+    if proj.star || proj.distinct {
         return empty;
     }
     let topk = !proj.order.is_empty() && proj.limit.is_some();
+    // Fix 99: an AGGREGATING top-k breaker whose every key is a bare
+    // match-bound variable under its own name — the grouping fix 92 pushes
+    // a listing's page below (`WITH c, count(*) AS mult ORDER BY
+    // c.updatedAt DESC SKIP … LIMIT …`) — defers the key's output-only
+    // properties too: the group carries the lean key, and the projector
+    // hydrates the page's groups alone. The conversation listing bound
+    // four properties of each of 1,122 conversations to page fifty by one
+    // of them (12.3 ms against Neo4j's 4.1 on the mirror). The aggregates'
+    // arguments are per-row reads and stay in the key (walked below).
+    let aggregating = proj.items.iter().any(|it| contains_aggregate(&it.expr));
+    if aggregating {
+        if !topk {
+            return empty;
+        }
+        for it in &proj.items {
+            if contains_aggregate(&it.expr) {
+                continue;
+            }
+            match &it.expr {
+                Expr::Var(v) if it.alias.as_deref().is_none_or(|a| a == v) => {}
+                _ => return empty,
+            }
+        }
+    }
     // A whole-node output is hydrated by the RETURN's projector; a WITH
     // breaker hands its rows to a later stage that would read the lean node.
     let concluding = matches!(breaker, Clause::Return { .. });
@@ -6486,6 +10255,13 @@ fn late_deferred(
                 if name != fv {
                     continue;
                 }
+                // Fix 99: an aggregating breaker's bare key under its own
+                // name (`WITH c, count(*) … ORDER BY c.updatedAt`) reads
+                // only what the ORDER BY expression reads of it — walked
+                // above; the group carries the lean binding on.
+                if aggregating && matches!(&it.expr, Expr::Var(v) if *v == name) {
+                    continue;
+                }
                 // Fix 56: an ORDER BY through an alias of `properties(var)`
                 // reads the SAME properties the variable would — `RETURN
                 // properties(w) AS w … ORDER BY w.updatedAt` reads
@@ -6522,6 +10298,15 @@ fn late_deferred(
             }
         }
     }
+    if aggregating {
+        // Fix 99: an aggregate's argument is read of every row as it
+        // arrives — never deferred.
+        for it in &proj.items {
+            if contains_aggregate(&it.expr) {
+                walk(&it.expr, &mut key);
+            }
+        }
+    }
     let mut deferred: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
     let mut late_full: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
     for var in &match_bound {
@@ -6547,8 +10332,13 @@ fn late_deferred(
             // properties, hydrate the survivors. Fix 65: without a top-k
             // the same holds for a residual-tested single start — the
             // projector hydrates each survivor as it arrives.
+            // Fix 99: never for an aggregating breaker — its finish hydrates
+            // DEFERRED properties, not a whole-node carry, and a bare key
+            // output (`RETURN p, count(*) … LIMIT 5`) must leave in full.
             Some(VarDemand::Full)
-                if concluding && (topk || residual_single_start(prefix, input_names, var)) =>
+                if concluding
+                    && !aggregating
+                    && (topk || residual_single_start(prefix, input_names, var)) =>
             {
                 if !topk {
                     counted!("interp.stage bound a whole-node output lean for its residual");
@@ -6596,15 +10386,17 @@ fn residual_single_start(prefix: &[Clause], input_names: &[String], var: &str) -
                 continue;
             }
             let prop_eq_const = match e {
-                Expr::Bin(engram_cypher::BinOp::Eq, a, b) => [(a, b), (b, a)].iter().any(|(side, rest)| {
-                    let on_var = matches!(
-                        side.as_ref(),
-                        Expr::Prop(base, _) if matches!(base.as_ref(), Expr::Var(v) if v == var)
-                    );
-                    let mut rest_vars = Vec::new();
-                    free_vars_of(rest, &mut rest_vars);
-                    on_var && rest_vars.is_empty()
-                }),
+                Expr::Bin(engram_cypher::BinOp::Eq, a, b) => {
+                    [(a, b), (b, a)].iter().any(|(side, rest)| {
+                        let on_var = matches!(
+                            side.as_ref(),
+                            Expr::Prop(base, _) if matches!(base.as_ref(), Expr::Var(v) if v == var)
+                        );
+                        let mut rest_vars = Vec::new();
+                        free_vars_of(rest, &mut rest_vars);
+                        on_var && rest_vars.is_empty()
+                    })
+                }
                 _ => false,
             };
             if prop_eq_const {
@@ -6642,11 +10434,72 @@ fn residual_single_start(prefix: &[Clause], input_names: &[String], var: &str) -
                 }
             }
             Clause::Unwind { .. } => return false,
-            Clause::With { where_: Some(w), .. } => note_where(w, var, &mut equalities, &mut other),
+            Clause::With {
+                where_: Some(w), ..
+            } => note_where(w, var, &mut equalities, &mut other),
             _ => {}
         }
     }
     paths == 1 && (other || equalities >= 2)
+}
+
+/// Walk a WITH's OWN `WHERE` and `ORDER BY` — which read the projection's
+/// OUTPUT names — and credit what they read to the variables those names
+/// carry.
+///
+/// `WITH m AS mm WHERE mm.n > 5` reads `n` of the node `m` binds. Walked as it
+/// stands the demand landed on `mm`, which no pattern binds, while the item's
+/// liveness looked only AFTER the WITH — so whenever nothing later read `mm`,
+/// `m` was bound with no properties and the WITH read nulls:
+/// `MATCH (m:Message) WITH m AS mm WHERE mm.n > 5 RETURN count(*)` answered 0
+/// for 5, and `… WITH m AS mm ORDER BY mm.n DESC LIMIT 3` sorted nulls and
+/// returned the wrong three. A bare carry (`WITH m WHERE m.n > 5`) was right
+/// only because its output and input names coincide.
+///
+/// An output name wins over an input of the same spelling, as it does in the
+/// WITH's own scope (`WITH x AS m, m AS x ORDER BY m.v` orders by `x.v`); a
+/// name no bare item carries — an input the ORDER BY may still read, or an
+/// expression's alias — keeps its own key.
+fn walk_with_own_reads(
+    proj: &Projection,
+    where_: Option<&Expr>,
+    demands: &mut BTreeMap<String, VarDemand>,
+) {
+    let mut own: BTreeMap<String, VarDemand> = BTreeMap::new();
+    for o in &proj.order {
+        collect_demand(&o.expr, &mut Vec::new(), &mut own);
+    }
+    if let Some(w) = where_ {
+        collect_demand(w, &mut Vec::new(), &mut own);
+    }
+    let mut carried: BTreeMap<String, String> = BTreeMap::new();
+    for (i, it) in proj.items.iter().enumerate() {
+        if let Expr::Var(v) = &it.expr {
+            let out = it
+                .alias
+                .clone()
+                .or_else(|| it.text.clone())
+                .unwrap_or_else(|| column_name(&it.expr, i));
+            carried.insert(out, v.clone());
+        }
+    }
+    for (key, demand) in own {
+        let target = match key.strip_prefix("\u{1}labels\u{1}") {
+            Some(var) => carried.get(var).map_or(key.clone(), |v| label_demand_key(v)),
+            None => carried.get(&key).cloned().unwrap_or(key),
+        };
+        match demand {
+            VarDemand::Full => note_full(demands, &target),
+            VarDemand::Props(set) => {
+                if let VarDemand::Props(have) = demands
+                    .entry(target)
+                    .or_insert_with(|| VarDemand::Props(std::collections::BTreeSet::new()))
+                {
+                    have.extend(set);
+                }
+            }
+        }
+    }
 }
 
 fn plan_stage(
@@ -6656,6 +10509,9 @@ fn plan_stage(
     input_names: &[String],
     live_after: Option<&[String]>,
     props_after: Option<&BTreeMap<String, std::collections::BTreeSet<String>>>,
+    // A `CALL {}` body's concluding RETURN: what the clauses after the CALL
+    // read of each column (`call_output_demand_for`). `None` elsewhere.
+    out_demand: Option<&BTreeMap<String, VarDemand>>,
 ) -> StagePlan {
     let mut demands: BTreeMap<String, VarDemand> = BTreeMap::new();
     let walk = |e: &Expr, demands: &mut BTreeMap<String, VarDemand>| {
@@ -6679,7 +10535,9 @@ fn plan_stage(
     };
     let with_items = |proj: &Projection,
                       live: Option<&[String]>,
-                      props_after: Option<&BTreeMap<String, std::collections::BTreeSet<String>>>,
+                      props_after: Option<
+        &BTreeMap<String, std::collections::BTreeSet<String>>,
+    >,
                       demands: &mut BTreeMap<String, VarDemand>| {
         for (i, it) in proj.items.iter().enumerate() {
             if let (Expr::Var(v), Some(live)) = (&it.expr, live) {
@@ -6741,6 +10599,20 @@ fn plan_stage(
                     walk(w, &mut demands);
                 }
             }
+            // A `CALL {}` BODY DEMANDS EVERYTHING THE STAGE CAN SEE.
+            //
+            // The demand walk summarises what each clause reads so a node can
+            // be bound LEAN — only the properties something will ask for. It
+            // cannot see inside a subquery, and a clause it cannot see through
+            // must therefore demand everything rather than nothing.
+            //
+            // Getting this wrong does NOT produce an error or a missing row.
+            // `MATCH (n:N) CALL { WITH n RETURN n.v AS y UNION ALL … }`
+            // returned the right FOUR rows with `y` = null in every one,
+            // because `n` was bound without `v` and `n.v` read null off it.
+            // A wrong answer of the correct shape is the worst kind, and the
+            // only reason it was caught is that a test asserted the VALUES.
+            Clause::CallSubquery { .. } => note_full(&mut demands, DEMAND_EVERYTHING),
             Clause::Unwind { expr, .. } => walk(expr, &mut demands),
             Clause::With { proj, where_ } => {
                 let live = mentions_after(ci + 1, live_after);
@@ -6778,38 +10650,69 @@ fn plan_stage(
                         m
                     });
                 with_items(proj, live.as_deref(), props_map.as_ref(), &mut demands);
-                for o in &proj.order {
-                    walk(&o.expr, &mut demands);
-                }
-                if let Some(w) = where_ {
-                    walk(w, &mut demands);
-                }
+                walk_with_own_reads(proj, where_.as_ref(), &mut demands);
             }
             _ => {}
         }
     }
     match breaker {
         Clause::Return { proj } => {
-            for it in &proj.items {
+            for (i, it) in proj.items.iter().enumerate() {
+                // A `CALL {}` body's concluding RETURN hands its columns to the
+                // clauses after the CALL, and `out_demand` is what THEY read of
+                // each: a returned node is bound to that, not in full. SNB BI
+                // bi4's second arm returns `person` once per membership of the
+                // top forums — ~5M rows at SF3, each a full Person read — to a
+                // RETURN that reads four of its properties. A column read
+                // whole there (or a clause the walk cannot see through) keeps
+                // the full demand below.
+                if let (Some(out), Expr::Var(v)) = (out_demand, &it.expr) {
+                    let col = it
+                        .alias
+                        .clone()
+                        .or_else(|| it.text.clone())
+                        .unwrap_or_else(|| column_name(&it.expr, i));
+                    let read = out.get(&col);
+                    if !out.contains_key(DEMAND_EVERYTHING) && !matches!(read, Some(VarDemand::Full)) {
+                        if let VarDemand::Props(have) = demands
+                            .entry(v.clone())
+                            .or_insert_with(|| VarDemand::Props(std::collections::BTreeSet::new()))
+                        {
+                            if let Some(VarDemand::Props(set)) = read {
+                                have.extend(set.iter().cloned());
+                            }
+                        }
+                        if let Some(VarDemand::Props(labels)) = out.get(&label_demand_key(&col)) {
+                            let labels: Vec<String> = labels.iter().cloned().collect();
+                            note_tested_labels(&mut demands, v, &labels);
+                        }
+                        counted!("interp.call body returned a node bound to what the clauses after the call read");
+                        continue;
+                    }
+                }
                 walk(&it.expr, &mut demands);
             }
             for o in &proj.order {
                 walk(&o.expr, &mut demands);
             }
         }
-        Clause::With { proj, .. } => {
+        Clause::With { proj, where_ } => {
             with_items(proj, live_after, props_after, &mut demands);
-            for o in &proj.order {
-                walk(&o.expr, &mut demands);
-            }
+            walk_with_own_reads(proj, where_.as_ref(), &mut demands);
         }
         _ => {}
     }
-    if let Clause::With {
-        where_: Some(w), ..
-    } = breaker
-    {
-        walk(w, &mut demands);
+    // What the clauses after each prefix CALL read of its columns — only for
+    // a stage that ends the statement (see `StagePlan::call_out`).
+    let mut call_out: BTreeMap<usize, BTreeMap<String, VarDemand>> = BTreeMap::new();
+    if matches!(breaker, Clause::Return { .. }) {
+        for (ci, c) in prefix.iter().enumerate() {
+            if matches!(c, Clause::CallSubquery { .. }) {
+                let mut after: Vec<Clause> = prefix[ci + 1..].to_vec();
+                after.push(breaker.clone());
+                call_out.insert(ci, demands_after(&after));
+            }
+        }
     }
 
     // Late projection: defer output-only properties of MATCH-bound variables
@@ -6863,7 +10766,8 @@ fn plan_stage(
                     };
                     // Fix 49: a positive top-level existence conjunct toward a
                     // constant-seekable end seeds the start from that end.
-                    let exists_probe: Option<(PathPattern, Expr)> = match path.start.var.as_deref() {
+                    let exists_probe: Option<(PathPattern, Expr)> = match path.start.var.as_deref()
+                    {
                         Some(v) if !start_bound && graph.hop_reversal_enabled() => {
                             exists_seed_path(graph, where_.as_ref(), v)
                         }
@@ -6922,6 +10826,15 @@ fn plan_stage(
                             label_fallback: smallest_label(),
                             conjunct,
                         }
+                    } else if let Some((prop, query, label)) =
+                        text_seek_candidate(graph, path, where_.as_ref())
+                    {
+                        Seed::TextMatch {
+                            prop,
+                            query,
+                            label,
+                            label_fallback: smallest_label(),
+                        }
                     } else if let Some((prop, values)) = prop_eq {
                         Seed::PropEq {
                             prop,
@@ -6960,18 +10873,19 @@ fn plan_stage(
                 // probe has that conjunct satisfied for every start the
                 // probe names — the clause WHERE (and the prefilters pushed
                 // out of it) run without it.
-                let pruned_where: Option<Option<Expr>> = match (seeds.last().and_then(|s| s.first()), c) {
-                    (
-                        Some(Seed::ExistsProbe { conjunct, .. }),
-                        Clause::Match {
-                            where_: Some(w), ..
-                        },
-                    ) => {
-                        counted!("interp.seed probe's conjunct pruned from the WHERE");
-                        Some(strip_conjunct(w, conjunct))
-                    }
-                    _ => None,
-                };
+                let pruned_where: Option<Option<Expr>> =
+                    match (seeds.last().and_then(|s| s.first()), c) {
+                        (
+                            Some(Seed::ExistsProbe { conjunct, .. }),
+                            Clause::Match {
+                                where_: Some(w), ..
+                            },
+                        ) => {
+                            counted!("interp.seed probe's conjunct pruned from the WHERE");
+                            Some(strip_conjunct(w, conjunct))
+                        }
+                        _ => None,
+                    };
                 let effective_where: Option<&Expr> = match (&pruned_where, c) {
                     (Some(p), _) => p.as_ref(),
                     (None, Clause::Match { where_, .. }) => where_.as_ref(),
@@ -6982,7 +10896,8 @@ fn plan_stage(
                 // earliest position its variables exist. `bound` already
                 // includes this pattern's variables; reconstruct the
                 // per-position sets from the entry scope forward.
-                let pushed = if let (Some(w), Clause::Match { pattern, .. }) = (effective_where, c) {
+                let pushed = if let (Some(w), Clause::Match { pattern, .. }) = (effective_where, c)
+                {
                     let entry_names: Vec<String> = {
                         let mut n = bound.clone();
                         for path in &pattern.paths {
@@ -7037,6 +10952,15 @@ fn plan_stage(
                 };
                 filters.push(pushed);
             }
+            // A tail `CALL {}` seeds nothing and pushes no filter, but it
+            // MUST take a slot: `drive` indexes these vectors by clause
+            // position, so a missing entry silently shifts every later
+            // clause's seed onto the wrong clause.
+            Clause::CallSubquery { .. } => {
+                seeds.push(Vec::new());
+                filters.push(None);
+                probe_where.push(None);
+            }
             Clause::Unwind { alias, .. } => {
                 bound.push(alias.clone());
                 seeds.push(Vec::new());
@@ -7081,16 +11005,18 @@ fn plan_stage(
     // starts (see `StagePlan::seed_cap`).
     let seed_cap: Option<(Option<Expr>, Option<Expr>)> = match (prefix, breaker) {
         (
-            [Clause::Match {
-                optional: false,
-                pattern,
-                where_: None,
-            }],
+            [
+                Clause::Match {
+                    optional: false,
+                    pattern,
+                    where_: None,
+                },
+            ],
             Clause::With { proj, .. } | Clause::Return { proj, .. },
         ) if input_names.is_empty()
             && pattern.paths.len() == 1
             && pattern.paths[0].hops.is_empty()
-            && !pattern.paths[0].shortest
+            && pattern.paths[0].shortest.is_none()
             && pattern.paths[0].start.props.is_none()
             && pattern.paths[0].start.labels.len() == 1
             && !proj.star
@@ -7113,10 +11039,212 @@ fn plan_stage(
         frontier_vars: breaker_distinct_vars(breaker),
         seed_cap,
         late_full,
+        call_out,
+        pre_eval: Vec::new(),
+        bare_trails: Default::default(),
     }
 }
 
-/// The variables a breaker consumes DISTINCT-only — a node bound to one can be
+/// The path variables bound in `prefix` whose trail NODES nothing in
+/// `clauses` (this stage and every clause after it) can see: each mention is
+/// `length(p)` or `relationships(p)`, or a bare carry `WITH p`. Such a walk
+/// binds its trail nodes bare, id only, instead of reading each one's record
+/// in full (`expand_var_length`). LDBC FinBench tcr1 walks
+/// `p=(account)-[transfer:transfer*1..3]->(other)` and reads `length(p)` and
+/// the relationships' timestamps: at SF10 that read 23,146 Account records
+/// in full, one per trail node, which no clause ever looked at.
+///
+/// Conservative by construction: a name that is used any other way, rebound,
+/// shadowed by a comprehension, mentioned inside a subquery or a `*`
+/// projection, or used by a clause this walk does not model keeps the full
+/// trail.
+fn bare_trail_paths(prefix: &[Clause], clauses: &[Clause]) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for c in prefix {
+        let Clause::Match { pattern, .. } = c else { continue };
+        for path in &pattern.paths {
+            let Some(p) = path.var.as_deref() else { continue };
+            if path.shortest.is_none() && trail_nodes_unread(clauses, p) {
+                out.insert(p.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Whether every mention of the path variable `p` in `clauses` leaves its
+/// trail nodes unread (see `bare_trail_paths`), with exactly one pattern
+/// binding it.
+fn trail_nodes_unread(clauses: &[Clause], p: &str) -> bool {
+    let mut bindings = 0usize;
+    for c in clauses {
+        match c {
+            Clause::Match { pattern, where_, .. } => {
+                for path in &pattern.paths {
+                    if path.var.as_deref() == Some(p) {
+                        bindings += 1;
+                    }
+                    let nodes = std::iter::once(&path.start).chain(path.hops.iter().map(|(_, n)| n));
+                    for n in nodes {
+                        if n.var.as_deref() == Some(p) {
+                            return false;
+                        }
+                        if n.props.as_ref().is_some_and(|m| !trail_nodes_unread_in(m, p)) {
+                            return false;
+                        }
+                    }
+                    for (rel, _) in &path.hops {
+                        if rel.var.as_deref() == Some(p) {
+                            return false;
+                        }
+                        if rel.props.as_ref().is_some_and(|m| !trail_nodes_unread_in(m, p)) {
+                            return false;
+                        }
+                        if rel.each.as_ref().is_some_and(|(local, e)| local == p || !trail_nodes_unread_in(e, p)) {
+                            return false;
+                        }
+                    }
+                }
+                if where_.as_ref().is_some_and(|w| !trail_nodes_unread_in(w, p)) {
+                    return false;
+                }
+            }
+            Clause::Unwind { expr, alias } => {
+                if alias == p || !trail_nodes_unread_in(expr, p) {
+                    return false;
+                }
+            }
+            Clause::With { proj, where_ } => {
+                if !projection_leaves_trail_unread(proj, p, true) {
+                    return false;
+                }
+                if where_.as_ref().is_some_and(|w| !trail_nodes_unread_in(w, p)) {
+                    return false;
+                }
+            }
+            Clause::Return { proj } => {
+                if !projection_leaves_trail_unread(proj, p, false) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    bindings == 1
+}
+
+/// A projection's part in `trail_nodes_unread`: no `*`, no item renaming
+/// anything to `p` or `p` to anything, every expression leaving the trail's
+/// nodes unread. A WITH may carry `p` on bare (`WITH p`, `p AS p`): the
+/// clauses after it are walked in turn under the same name.
+fn projection_leaves_trail_unread(proj: &Projection, p: &str, carries: bool) -> bool {
+    if proj.star {
+        return false;
+    }
+    for it in &proj.items {
+        let bare = matches!(&it.expr, Expr::Var(v) if v == p);
+        let renames_to_p = it.alias.as_deref() == Some(p);
+        if bare && carries && it.alias.as_deref().is_none_or(|a| a == p) {
+            continue;
+        }
+        if renames_to_p || !trail_nodes_unread_in(&it.expr, p) {
+            return false;
+        }
+    }
+    proj.order.iter().all(|o| trail_nodes_unread_in(&o.expr, p))
+        && proj.skip.as_ref().is_none_or(|e| trail_nodes_unread_in(e, p))
+        && proj.limit.as_ref().is_none_or(|e| trail_nodes_unread_in(e, p))
+}
+
+/// Whether every mention of the path variable `p` in `e` is `length(p)` or
+/// `relationships(p)` — the two readers that never see a trail node. Every
+/// variant is named, so a new one must decide; a binder that shadows `p` and
+/// a subquery (whose mentions this cannot see) both answer no.
+fn trail_nodes_unread_in(e: &Expr, p: &str) -> bool {
+    match e {
+        Expr::Null
+        | Expr::Bool(_)
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Str(_)
+        | Expr::Param(_) => true,
+        Expr::Var(v) => v != p,
+        Expr::Call { name, args, .. }
+            if (name.eq_ignore_ascii_case("length") || name.eq_ignore_ascii_case("relationships"))
+                && matches!(args.as_slice(), [Expr::Var(v)] if v == p) =>
+        {
+            true
+        }
+        Expr::Call { args, .. } | Expr::List(args) => args.iter().all(|x| trail_nodes_unread_in(x, p)),
+        Expr::Map(kvs) => kvs.iter().all(|(_, v)| trail_nodes_unread_in(v, p)),
+        Expr::Prop(b, _) | Expr::Not(b) | Expr::Neg(b) => trail_nodes_unread_in(b, p),
+        Expr::IsNull { of, .. } => trail_nodes_unread_in(of, p),
+        Expr::Index(a, b)
+        | Expr::Bin(_, a, b)
+        | Expr::And(a, b)
+        | Expr::Or(a, b)
+        | Expr::Xor(a, b)
+        | Expr::In(a, b) => trail_nodes_unread_in(a, p) && trail_nodes_unread_in(b, p),
+        Expr::Slice { of, from, to } => {
+            trail_nodes_unread_in(of, p)
+                && from.as_deref().is_none_or(|x| trail_nodes_unread_in(x, p))
+                && to.as_deref().is_none_or(|x| trail_nodes_unread_in(x, p))
+        }
+        Expr::Case {
+            subject,
+            arms,
+            otherwise,
+        } => {
+            subject.as_deref().is_none_or(|x| trail_nodes_unread_in(x, p))
+                && arms
+                    .iter()
+                    .all(|(w, t)| trail_nodes_unread_in(w, p) && trail_nodes_unread_in(t, p))
+                && otherwise.as_deref().is_none_or(|x| trail_nodes_unread_in(x, p))
+        }
+        Expr::ListComp {
+            var,
+            source,
+            filter,
+            map,
+        } => {
+            var != p
+                && trail_nodes_unread_in(source, p)
+                && filter.as_deref().is_none_or(|x| trail_nodes_unread_in(x, p))
+                && map.as_deref().is_none_or(|x| trail_nodes_unread_in(x, p))
+        }
+        Expr::Reduce {
+            acc,
+            init,
+            var,
+            source,
+            step,
+        } => {
+            acc != p
+                && var != p
+                && trail_nodes_unread_in(init, p)
+                && trail_nodes_unread_in(source, p)
+                && trail_nodes_unread_in(step, p)
+        }
+        Expr::ListPredicate {
+            var, source, filter, ..
+        } => var != p && trail_nodes_unread_in(source, p) && trail_nodes_unread_in(filter, p),
+        Expr::HasLabels { of, .. } => trail_nodes_unread_in(of, p),
+        Expr::MapProjection { of, items } => {
+            trail_nodes_unread_in(of, p)
+                && items.iter().all(|it| match it {
+                    engram_cypher::ast::MapProjectionItem::Entry(_, x) => trail_nodes_unread_in(x, p),
+                    engram_cypher::ast::MapProjectionItem::Variable(v) => v != p,
+                    engram_cypher::ast::MapProjectionItem::Property(_)
+                    | engram_cypher::ast::MapProjectionItem::AllProperties => true,
+                })
+        }
+        Expr::PatternPredicate(_)
+        | Expr::ExistsSub(_)
+        | Expr::CountSub(_)
+        | Expr::PatternComp { .. } => false,
+    }
+}
+
 /// produced once (frontier BFS) instead of once per path. Two SOUND cases are
 /// recognised. Case one: `WITH/RETURN DISTINCT <items>` with NO aggregate
 /// anywhere in the projection, where the whole row is de-duplicated so any
@@ -7129,7 +11257,11 @@ fn plan_stage(
 /// drop rows.
 fn breaker_distinct_vars(breaker: &Clause) -> std::collections::BTreeSet<String> {
     match breaker {
-        Clause::With { proj, .. } | Clause::Return { proj } => distinct_vars_of_proj(proj),
+        // A frontier walk changes how many rows the breaker sees, so it may
+        // consume the walk only when it cannot count them.
+        Clause::With { proj, .. } | Clause::Return { proj } if proj_is_set_semantic(proj, true) => {
+            distinct_vars_of_proj(proj)
+        }
         _ => std::collections::BTreeSet::new(),
     }
 }
@@ -7168,6 +11300,51 @@ pub(crate) fn distinct_vars_of_proj(proj: &Projection) -> std::collections::BTre
         }
     }
     out
+}
+
+/// Whether a projection's result depends only on the SET of rows it consumes,
+/// not on how often each occurs: a DISTINCT projection with no aggregate, or
+/// one whose every aggregate (in its items and its ORDER BY) is a
+/// `count(DISTINCT x)`, a `min` or a `max` — and, with `lists`, a
+/// `collect(DISTINCT x)`, whose SET is the walk's but whose ORDER is the order
+/// the rows arrive in. A frontier walk yields one row per REACHED node where
+/// enumeration yields one per WALK — the same set, other multiplicities — so
+/// only such a projection answers alike over both.
+///
+/// Until this held, the frontier gate asked only how the walk's END was
+/// consumed: `MATCH (a)-[:T*1..2]->(n) RETURN count(DISTINCT n), count(*)`
+/// answered 3, 3 where two walks reach one node and the answer is 3, 4.
+pub(crate) fn proj_is_set_semantic(proj: &Projection, lists: bool) -> bool {
+    let exprs = || proj.items.iter().map(|it| &it.expr).chain(proj.order.iter().map(|o| &o.expr));
+    if proj.star || !exprs().all(expr_analyzable) {
+        return false;
+    }
+    let mut aggregates = 0usize;
+    let mut insensitive = true;
+    for e in exprs() {
+        walk_expr(e, &mut |x| {
+            if let Expr::Call {
+                name,
+                distinct,
+                star,
+                ..
+            } = x
+            {
+                if *star || *distinct || is_aggregate_name(name) {
+                    aggregates += 1;
+                    let counts_a_set = *distinct && !*star && name.eq_ignore_ascii_case("count");
+                    let lists_a_set =
+                        lists && *distinct && !*star && name.eq_ignore_ascii_case("collect");
+                    let extreme = !*star
+                        && (name.eq_ignore_ascii_case("min") || name.eq_ignore_ascii_case("max"));
+                    if !(counts_a_set || lists_a_set || extreme) {
+                        insensitive = false;
+                    }
+                }
+            }
+        });
+    }
+    insensitive && (aggregates > 0 || proj.distinct)
 }
 
 /// Whether an expression contains an aggregate function call (a `DISTINCT`
@@ -7396,6 +11573,64 @@ fn mat_end(
     peer_props: Option<&std::collections::BTreeSet<String>>,
     node_pat: &NodePattern,
 ) -> Result<Option<Value>, RunError> {
+    mat_end_with(graph, id, peer_props, node_pat, &mut EndColumns::default())
+}
+
+/// A cached value column: `(member id, value)`, ascending by id.
+type ValueColumn = std::sync::Arc<Vec<(u64, Value)>>;
+
+/// The value columns a walk fetched for its hop ends' demand, each `None`
+/// until the walk's first end asks.
+#[derive(Default)]
+struct EndColumns {
+    /// A labelled end: one column per demanded property, in the set's
+    /// order, `None` where the column is not cached.
+    one: Option<Vec<Option<ValueColumn>>>,
+    /// An UNLABELLED end: every label that holds all of them cached.
+    any: Option<Vec<(String, Vec<ValueColumn>)>>,
+}
+
+/// The labels whose cached value columns hold EVERY property in `set`, with
+/// those columns in the set's order — sorted by label, so the first holding
+/// a node is always the same one (and any of them holds its values).
+fn label_columns_holding(
+    graph: &Graph,
+    set: &std::collections::BTreeSet<String>,
+) -> Vec<(String, Vec<ValueColumn>)> {
+    let cached = graph.cached_prop_columns();
+    let mut labels: Vec<&String> = cached
+        .iter()
+        .filter(|(_, p, presence)| !*presence && set.contains(p))
+        .map(|(l, _, _)| l)
+        .collect();
+    labels.sort();
+    labels.dedup();
+    let mut out = Vec::new();
+    for label in labels {
+        let cols: Option<Vec<ValueColumn>> = set
+            .iter()
+            .map(|p| match graph.prop_column(label, p, false) {
+                Some(crate::PropColumn::Values(col)) => Some(col),
+                _ => None,
+            })
+            .collect();
+        if let Some(cols) = cols {
+            out.push((label.clone(), cols));
+        }
+    }
+    out
+}
+
+/// [`mat_end`] for a WALK: its ends share one pattern node and one demand,
+/// so the cached columns they bind from are fetched once (`cols`) and each
+/// end is a binary search.
+fn mat_end_with(
+    graph: &Graph,
+    id: u64,
+    peer_props: Option<&std::collections::BTreeSet<String>>,
+    node_pat: &NodePattern,
+    cols: &mut EndColumns,
+) -> Result<Option<Value>, RunError> {
     // Fix 74: with ONE pattern label, the label's membership decides a
     // NON-member's fate before any record is read. Every caller tests the
     // node it gets back with `node_satisfies`, whose first check is the
@@ -7409,10 +11644,14 @@ fn mat_end(
     // rejects it on the label test exactly as it rejected the decoded
     // record. Same guards as the member branches: the columnar paths on,
     // no writing transaction (its buffered labels must win).
+    //
+    // ONE membership test per end, borrowed (`label_contains`). The blocks
+    // below asked again under guards this one implies — a per-end owned view
+    // each time, 16 shared refcount writes apiece.
+    let mut member = false;
     if let [label] = node_pat.labels.as_slice() {
         if peer_props.is_some() && graph.columnar_scans_enabled() && !graph.in_txn_with_writes() {
-            let members = graph.members(Some(label))?;
-            if !graph.members_contains(&members, id) {
+            if !graph.label_contains(label, id)? {
                 counted!("interp.matcher rejected a non-member hop end from membership");
                 return Ok(Some(Value::Node {
                     id,
@@ -7420,6 +11659,7 @@ fn mat_end(
                     props: BTreeMap::new(),
                 }));
             }
+            member = true;
         }
     }
     // Fix 68: an end NOTHING reads — an empty demand: no map, no property,
@@ -7432,67 +11672,296 @@ fn mat_end(
             match node_pat.labels.as_slice() {
                 [] => {
                     counted!("interp.matcher bound a hop end bare");
+                    graph.note_node_read(id);
                     return Ok(Some(Value::Node {
                         id,
                         labels: Vec::new(),
                         props: BTreeMap::new(),
                     }));
                 }
-                [label] if graph.columnar_scans_enabled() => {
-                    let members = graph.members(Some(label))?;
-                    if graph.members_contains(&members, id) {
-                        counted!("interp.matcher bound a hop end bare");
-                        return Ok(Some(Value::Node {
-                            id,
-                            labels: vec![label.clone()],
-                            props: BTreeMap::new(),
-                        }));
-                    }
+                [label]
+                    if graph.columnar_scans_enabled()
+                        && (member || graph.label_contains(label, id)?) =>
+                {
+                    counted!("interp.matcher bound a hop end bare");
+                    graph.note_node_read(id);
+                    return Ok(Some(Value::Node {
+                        id,
+                        labels: vec![label.clone()],
+                        props: BTreeMap::new(),
+                    }));
                 }
                 _ => {}
             }
         }
     }
     if let (Some(set), [label]) = (peer_props, node_pat.labels.as_slice()) {
-        if !set.is_empty() && graph.columnar_scans_enabled() && !graph.in_txn_with_writes() {
-            let members = graph.members(Some(label))?;
-            if graph.members_contains(&members, id) {
-                let mut props = BTreeMap::new();
-                let mut served = true;
+        if !set.is_empty()
+            && graph.columnar_scans_enabled()
+            && !graph.in_txn_with_writes()
+            && (member || graph.label_contains(label, id)?)
+        {
+            // FETCHED ONCE PER WALK. `prop_column` takes the column cache's
+            // global lock and bumps the column's shared refcount, and it
+            // was asked once per END per demanded property: SNB BI bi4's
+            // grouping stage binds 4.98M forum ends, two fetches each, from
+            // forty workers on one lock — 14 s at width 40 against 20
+            // serial. A walk's ends share this label and this demand.
+            //
+            // The FIRST uncached column ends the asking, as the per-end loop
+            // before this did: an end that cannot bind from columns pays one
+            // lookup, not one per demanded property. SNB BI bi12 demands a
+            // message's `content` — too large to cache, and first in the set
+            // — beside two cached columns; asking for all three at every one
+            // of 9M messages took it from 8.4 s to 18.3 s.
+            let fetched = cols.one.get_or_insert_with(|| {
+                let mut got = Vec::with_capacity(set.len());
                 for p in set {
                     match graph.prop_column(label, p, false) {
-                        Some(crate::PropColumn::Values(col)) => {
-                            if let Ok(at) = col.binary_search_by_key(&id, |(i, _)| *i) {
-                                let v = col[at].1.clone();
-                                if !matches!(v, Value::Null) {
-                                    props.insert(p.clone(), v);
-                                }
-                            }
-                        }
+                        Some(crate::PropColumn::Values(col)) => got.push(Some(col)),
                         _ => {
-                            served = false;
+                            got.push(None);
                             break;
                         }
                     }
                 }
-                if served {
-                    counted!("interp.matcher bound a hop end from the label's cached columns");
-                    return Ok(Some(Value::Node {
-                        id,
-                        labels: vec![label.clone()],
-                        props,
-                    }));
+                got
+            });
+            if fetched.len() == set.len() && fetched.iter().all(Option::is_some) {
+                let mut props = BTreeMap::new();
+                for (p, col) in set.iter().zip(fetched.iter().flatten()) {
+                    if let Ok(at) = col.binary_search_by_key(&id, |(i, _)| *i) {
+                        let v = col[at].1.clone();
+                        if !matches!(v, Value::Null) {
+                            props.insert(p.clone(), v);
+                        }
+                    }
                 }
+                counted!("interp.matcher bound a hop end from the label's cached columns");
+                graph.note_node_read(id);
+                return Ok(Some(Value::Node {
+                    id,
+                    labels: vec![label.clone()],
+                    props,
+                }));
+            }
+            // Fix 87: a column was not cached — this end is a projected
+            // record read. Count the miss against the label; at the
+            // batch floor the label's columns are read whole and kept,
+            // and the statement's later ends bind from them above — so
+            // the walk asks again at its next end.
+            cols.one = None;
+            warm_label_columns_after_misses(graph, label, set)?;
+        }
+    }
+    // AN UNLABELLED END, FROM THE COLUMNS OF A LABEL IT CARRIES. The column
+    // cache is keyed by label, so an end the pattern names no label for read
+    // its demand by a projected record read however warm the columns of the
+    // labels it has: SNB Interactive IS2's `(:Person {id})<-[:HAS_CREATOR]-
+    // (message)` read 5,916 messages' dates and ids from the store, 30 ms
+    // against Neo4j's 9, with every Message column cached. A membership test
+    // places the node in a label whose columns hold the whole demand. Its
+    // labels are not observed here — a statement that reads them demands the
+    // node whole — so it binds with none, as the bare branch above does.
+    if let (Some(set), []) = (peer_props, node_pat.labels.as_slice()) {
+        if !set.is_empty() && graph.columnar_scans_enabled() && !graph.in_txn_with_writes() {
+            let holding = cols.any.get_or_insert_with(|| label_columns_holding(graph, set));
+            for (label, columns) in holding.iter() {
+                if !graph.label_contains(label, id)? {
+                    continue;
+                }
+                let mut props = BTreeMap::new();
+                for (p, col) in set.iter().zip(columns) {
+                    if let Ok(at) = col.binary_search_by_key(&id, |(i, _)| *i) {
+                        let v = col[at].1.clone();
+                        if !matches!(v, Value::Null) {
+                            props.insert(p.clone(), v);
+                        }
+                    }
+                }
+                counted!("interp.matcher bound an unlabelled hop end from a label's cached columns");
+                graph.note_node_read(id);
+                return Ok(Some(Value::Node {
+                    id,
+                    labels: Vec::new(),
+                    props,
+                }));
             }
         }
     }
-    mat_node(graph, id, peer_props)
+    let node = mat_node(graph, id, peer_props)?;
+    // AN UNLABELLED END READ FROM ITS RECORD counts the miss against the
+    // labels the read found on it, as a labelled end counts its own (fix 87):
+    // at the batch floor a label's demanded columns are read whole and kept,
+    // and the ends of the next statement bind from them above. Without it no
+    // column an unlabelled end demands was ever kept by the ends themselves:
+    // SNB Interactive IS3's `(:Person {id})-[r:KNOWS]-(friend)` read 1,193
+    // friends' names by projected record reads on every run, 12 ms of engine
+    // against Neo4j's 10, with Person's 27k members well under the ceiling.
+    if let (Some(set), [], Some(Value::Node { labels, .. })) =
+        (peer_props, node_pat.labels.as_slice(), &node)
+    {
+        if !set.is_empty() && graph.columnar_scans_enabled() && !graph.in_txn_with_writes() {
+            for label in labels {
+                warm_label_columns_after_misses(graph, label, set)?;
+            }
+        }
+    }
+    Ok(node)
+}
+
+/// Fix 87: the dashboard's work items — `MATCH (p:KMProject) OPTIONAL MATCH
+/// (w:KMWorkItem)-[:BELONGS_TO_PROJECT]->(p) WITH p, max(w.updatedAt) …` —
+/// reach 1,338 items through 77 starts of ~17 ends each: no single start's
+/// fan-out is worth a whole-label column (fix 83's rule), yet the STATEMENT
+/// reads a tenth of the label's `updatedAt` by projected record reads (1,338
+/// gets, ~11 ms of the dashboard's 36 against Neo4j's 23 on the mirror).
+/// Every projected read of a labelled end whose demanded columns are not
+/// cached is a MISS against its label; at `LEAN_COLUMN_BATCH` misses in one
+/// statement the label's uncached demanded columns are read whole and kept
+/// (fix 78's bound: at most `WHOLE_LABEL_READ_MAX` members), so the ends
+/// after the sixty-fourth bind from the columns, this statement and the
+/// next. A statement that touches fewer ends keeps its projected reads.
+fn warm_label_columns_after_misses(
+    graph: &Graph,
+    label: &str,
+    set: &std::collections::BTreeSet<String>,
+) -> Result<(), RunError> {
+    let misses = HOP_END_MISSES.with(|m| {
+        let mut m = m.borrow_mut();
+        match m.iter_mut().find(|(l, _)| l == label) {
+            Some((_, n)) => {
+                *n += 1;
+                *n
+            }
+            None => {
+                m.push((label.to_string(), 1));
+                1
+            }
+        }
+    });
+    if misses != LEAN_COLUMN_BATCH as u32 {
+        return Ok(());
+    }
+    if graph.count_label_nodes(label) > graph.whole_label_read_max() {
+        // The first of the two MINT sites that refuse on the same constant as
+        // the read site. Between them they are why the decline never lifts.
+        //
+        // MEASURED AND REJECTED (SF3, 2026-09-18): admitting the mint when the
+        // column's BYTES fit the budget worked — bi12's record reads would
+        // have fallen 18.0M -> 24k — but on the current build they are ALREADY
+        // 24k with this decline in place, and the admission only added 9.0M
+        // column serves and 1.4 GB resident for no time (bi1/bi6/bi9/bi12 all
+        // flat). The 18.0M figure came from an older binary. Do not re-derive
+        // this from counters alone; bi12's cost is its 20.1M expansions.
+        counted!("interp.warm after misses declined: label over the whole-read ceiling");
+        return Ok(());
+    }
+    let missing: Vec<String> = set
+        .iter()
+        .filter(|p| {
+            graph.prop_token_peek(p).is_some() && graph.prop_column(label, p, false).is_none()
+        })
+        .cloned()
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    if crate::batch::label_value_columns(graph, label, &missing, &BTreeMap::new())?.is_some() {
+        counted!("interp.matcher warmed a hop end label's columns after repeated misses");
+    }
+    Ok(())
 }
 
 /// A seed population below which the per-id projected read is used as is:
 /// the column read has a fixed cost (a membership view, a cache lookup per
 /// property) that a handful of ids never repays.
-const LEAN_COLUMN_BATCH: usize = 64;
+pub(crate) const LEAN_COLUMN_BATCH: usize = 64;
+
+/// Fix 83: a hop whose start fans out to a large share of the far end's
+/// label bound every end from a projected record read whenever the label's
+/// columns were not cached — `mat_end` binds from the label's CACHED
+/// columns (fix 60) and nothing had read the label whole. The conversation
+/// listing (`MATCH (u:User {userId: $userId})-[:HAS_CONVERSATION]->(c)
+/// OPTIONAL MATCH (c)-[:HAS_BRANCH]->()-[:HAS_MESSAGE]->(m) WITH c,
+/// count(m) … RETURN c.conversationId, c.title, … ORDER BY c.updatedAt
+/// DESC`) paid 1,123 projected gets for one user's 1,122 conversations of
+/// the label's ~1,300 (20.8 ms on the mirror against Neo4j's 4.8). Before
+/// such a start's adjacency is expanded, the far end's demanded columns
+/// are read whole and kept (`label_value_columns` — a whole-label walk
+/// keeps what it reads), and every end binds from them, this run and the
+/// next. The bounds are the columnar population read's (fix 78): the
+/// fan-out at least an eighth of the label, the label at most
+/// `WHOLE_LABEL_READ_MAX` members — and at least `LEAN_COLUMN_BATCH` ends,
+/// below which the projected reads are cheaper than a column's fixed cost.
+/// Only properties with a token are read: a never-minted one would decline
+/// every run and warm nothing.
+fn warm_hop_end_columns(
+    graph: &Graph,
+    node_pat: &NodePattern,
+    peer_props: Option<&std::collections::BTreeSet<String>>,
+    start: u64,
+    dir: Dir,
+    tokens: &Option<Vec<u32>>,
+    params: &BTreeMap<String, Value>,
+) -> Result<(), RunError> {
+    let (Some(set), [label]) = (peer_props, node_pat.labels.as_slice()) else {
+        return Ok(());
+    };
+    if set.is_empty() || !graph.columnar_scans_enabled() || graph.in_txn_with_writes() {
+        return Ok(());
+    }
+    // Fix 113: the cheap questions FIRST. This ran before EVERY start's
+    // expansion and began with a DIRECT count of the start's adjacency — a
+    // prefix walk of the store, on the paged mirror a block read — even
+    // when the end's columns were already cached and there was nothing to
+    // warm: the six-entity story overlap (2,702 article starts, one story
+    // each) paid 2,702 walks and 1,508 block reads per execution, 173 ms
+    // against Neo4j's 26, to warm a column it had been reading all along.
+    let total = graph.count_label_nodes(label);
+    if total > graph.whole_label_read_max() {
+        // The second MINT site, refusing on the same constant. This is the
+        // shape's OWN warm path — the fan-out probe fix 113 added — so a
+        // label past the ceiling can never warm itself from the very code
+        // written to warm it.
+        counted!("interp.fan-out warm declined: label over the whole-read ceiling");
+        return Ok(());
+    }
+    let missing: Vec<String> = set
+        .iter()
+        .filter(|p| {
+            graph.prop_token_peek(p).is_some() && graph.prop_column(label, p, false).is_none()
+        })
+        .cloned()
+        .collect();
+    if missing.is_empty() {
+        counted!("interp.matcher skipped the fan-out probe: the end's columns are cached");
+        return Ok(());
+    }
+    // The fan-out of this one start — from the type's adjacency table when
+    // one is served (the expansion that follows reads the same slice), else
+    // the DIRECT count of its prefix: never the memoised one, which builds
+    // a whole-store DEGREE TABLE for the type after its probe gate — on the
+    // mirror's paged store a 111k-block scan (6 s on the first Workspace
+    // listing after v148) whose churn through the block cache the
+    // allocator never returns (+842 MB of resident set per cold type).
+    let fanout = match graph.adjacency_fanout_from_table(start, dir, tokens) {
+        Some(n) => {
+            counted!("interp.matcher fan-out read from the adjacency table");
+            n
+        }
+        None => graph.count_adjacent(start, dir, tokens),
+    };
+    if fanout < LEAN_COLUMN_BATCH as u64
+        || fanout.saturating_mul(crate::batch::WHOLE_LABEL_SHARE) < total
+    {
+        return Ok(());
+    }
+    if crate::batch::label_value_columns(graph, label, &missing, params)?.is_some() {
+        counted!("interp.matcher warmed a hop end label's columns for a wide fan-out");
+    }
+    Ok(())
+}
 
 /// Fix 41: the LEAN start population bound from the label's COLUMNS in one
 /// read — `Some(nodes)` carrying exactly the demanded properties (plus the
@@ -7512,12 +11981,16 @@ const LEAN_COLUMN_BATCH: usize = 64;
 /// small population, or a column read that declined): the caller's per-id
 /// path stands. Only ids that carry the pattern's labels are bound — an
 /// unscoped probe may answer ids under other labels, and the fabricated
-/// label list must be true of every node it is put on.
+/// label list must be true of every node it is put on. `extra_labels` are
+/// the labels beyond the pattern a later clause TESTS (`WITH a:Odd`): each
+/// start carries those its membership says it has, so the test answers what
+/// the record would have said without the record being read.
 fn lean_starts_from_columns(
     graph: &Graph,
     ids: &[u64],
     start: &NodePattern,
     start_set: Option<&std::collections::BTreeSet<String>>,
+    extra_labels: &[String],
     params: &BTreeMap<String, Value>,
 ) -> Result<Option<Vec<Value>>, RunError> {
     let Some(set) = start_set else {
@@ -7526,15 +11999,73 @@ fn lean_starts_from_columns(
     if !graph.columnar_scans_enabled() || start.labels.is_empty() || ids.len() < LEAN_COLUMN_BATCH {
         return Ok(None);
     }
-    let mut props: std::collections::BTreeSet<String> =
-        set.iter().filter(|p| !p.starts_with("__")).cloned().collect();
+    // A writing transaction's buffered labels are invisible to the committed
+    // membership the tested labels are read from; its starts read records.
+    if !extra_labels.is_empty() && graph.in_txn_with_writes() {
+        counted!("interp.seed start read from its record: a tested label may be buffered");
+        return Ok(None);
+    }
+    let tested: Vec<(&String, crate::MembersRef)> = extra_labels
+        .iter()
+        .map(|l| Ok((l, graph.members_ref(l)?)))
+        .collect::<Result<_, GraphError>>()?;
+    if !tested.is_empty() {
+        counted!("interp.seed starts carry the labels a later clause tests, from membership");
+    }
+    let labels_of = |id: u64| -> Vec<String> {
+        let mut labels = start.labels.clone();
+        for (l, m) in &tested {
+            if graph.members_contains(m.view(), id) {
+                labels.push((*l).clone());
+            }
+        }
+        labels
+    };
+    let mut props: std::collections::BTreeSet<String> = set
+        .iter()
+        .filter(|p| !p.starts_with("__"))
+        .cloned()
+        .collect();
     if let Some(Expr::Map(entries)) = &start.props {
         for (k, _) in entries {
             props.insert(k.clone());
         }
     }
     if props.is_empty() {
-        return Ok(None);
+        // NOTHING IS DEMANDED OF THE START: it is used for its identity
+        // alone. The population already carries the pattern's labels
+        // (membership, below) and every predicate its source answered, so a
+        // projected read per seed decoded a record only to hand back what the
+        // seed source already knew. SNB BI bi15's edge-centric weights seed
+        // `(m1:Comment)` — 6.4M comments at SF3, ~22M at SF10, where the
+        // records no longer fit the page cache and each seed became a disk
+        // read. The same rule fix 68 applies to a hop end nothing reads. Not
+        // with an inline map to test, nor in a writing transaction, whose
+        // buffered labels the committed membership cannot see.
+        if start.props.is_some() || graph.in_txn_with_writes() {
+            return Ok(None);
+        }
+        let members = graph.members_all(&start.labels)?;
+        let mut bare: Vec<u64> = ids
+            .iter()
+            .copied()
+            .filter(|id| graph.members_contains(&members, *id))
+            .collect();
+        bare.sort_unstable();
+        bare.dedup();
+        counted!("interp.seed starts bound bare: nothing reads them");
+        return Ok(Some(
+            bare.into_iter()
+                .map(|id| {
+                    graph.note_node_read(id);
+                    Value::Node {
+                        id,
+                        labels: labels_of(id),
+                        props: BTreeMap::new(),
+                    }
+                })
+                .collect(),
+        ));
     }
     let members = graph.members_all(&start.labels)?;
     let mut distinct: Vec<u64> = ids
@@ -7571,7 +12102,7 @@ fn lean_starts_from_columns(
         }
         out.push(Value::Node {
             id,
-            labels: start.labels.clone(),
+            labels: labels_of(id),
             props: m,
         });
     }
@@ -7634,7 +12165,7 @@ fn fuse_consecutive_matches(q: &SingleQuery) -> Option<SingleQuery> {
                 optional: false,
                 pattern,
                 ..
-            } if pattern.paths.iter().all(|p| !p.shortest)
+            } if pattern.paths.iter().all(|p| p.shortest.is_none())
         )
     }
     if !q
@@ -7672,16 +12203,68 @@ fn fuse_consecutive_matches(q: &SingleQuery) -> Option<SingleQuery> {
 }
 
 fn streamable(q: &SingleQuery) -> bool {
-    let read_only = q.clauses.iter().all(|c| match c {
-        Clause::Match { pattern, .. } => pattern.paths.iter().all(|p| !p.shortest),
-        Clause::Unwind { .. } | Clause::With { .. } | Clause::Return { .. } => true,
+    // A READ-ONLY `CALL {}` IMMEDIATELY BEFORE THE FINAL `RETURN` DOES NOT
+    // COST THE WHOLE QUERY ITS STREAMING.
+    //
+    // Refusing `CallSubquery` here did not merely leave the subquery
+    // unstreamed — it dropped the ENTIRE query, prefix included, onto the
+    // materialising clause-by-clause interpreter. Measured at SF3 on SNB BI
+    // bi4's prefix: 96 s on its own, and OVER 300 s with
+    // `CALL { WITH topForums RETURN 1 AS x }` appended. That subquery reads
+    // nothing and returns one constant row, so nothing but the loss of
+    // streaming can account for it.
+    //
+    // Restricted to the position DIRECTLY BEFORE the final `RETURN`, which is
+    // bi4's shape and keeps the change honest: a `CALL` in the middle binds
+    // names that later clauses plan against, and the stage planner would have
+    // to learn the subquery's output columns to seed those clauses correctly.
+    // Allowing only the tail position needs none of that, because nothing
+    // plans after it.
+    let call_ok = |i: usize, c: &Clause| match c {
+        Clause::CallSubquery {
+            query,
+            in_transactions,
+            ..
+        } => {
+            // a writing body, or `IN TRANSACTIONS` (its own commit
+            // semantics), stays on the interpreter loop
+            !*in_transactions && !query.may_write() && i + 2 == q.clauses.len()
+        }
         _ => false,
+    };
+    let read_only = q.clauses.iter().enumerate().all(|(i, c)| match c {
+        Clause::Match { pattern, .. } => pattern.paths.iter().all(|p| p.shortest.is_none()),
+        Clause::Unwind { .. } | Clause::With { .. } | Clause::Return { .. } => true,
+        _ => call_ok(i, c),
     });
     // A final `RETURN *` needs its column schema even over ZERO rows, which the
     // streaming projector cannot supply — keep it on the interpreter loop, which
     // tracks the schema across clauses.
     let star_return = matches!(q.clauses.last(), Some(Clause::Return { proj }) if proj.star);
     read_only && matches!(q.clauses.last(), Some(Clause::Return { .. })) && !star_return
+}
+
+/// Where `run_single` may cut a statement [`streamable`] refuses: the index of
+/// its LAST `WITH` before the first clause the pipeline cannot run, provided
+/// every clause before that WITH is one it can and at least one is a MATCH —
+/// which is what makes the prefix worth streaming. `None` for a statement that
+/// may write, and for a `WITH *`, whose columns come from the loop's schema.
+fn streamable_prefix_end(q: &SingleQuery) -> Option<usize> {
+    if q.may_write() {
+        return None;
+    }
+    let first_other = q.clauses.iter().position(|c| match c {
+        Clause::Match { pattern, .. } => pattern.paths.iter().any(|p| p.shortest.is_some()),
+        Clause::Unwind { .. } | Clause::With { .. } => false,
+        _ => true,
+    })?;
+    let cut = q.clauses[..first_other]
+        .iter()
+        .rposition(|c| matches!(c, Clause::With { proj, .. } if !proj.star))?;
+    q.clauses[..cut]
+        .iter()
+        .any(|c| matches!(c, Clause::Match { .. }))
+        .then_some(cut)
 }
 
 fn with_is_breaker(proj: &Projection) -> bool {
@@ -7701,8 +12284,303 @@ fn with_is_breaker(proj: &Projection) -> bool {
 /// per outer row. OPTIONAL MATCH is never split: its null row covers the
 /// whole pattern at once, and two OPTIONAL clauses would emit different
 /// rows when only the second fails.
+/// Order the paths of ONE `MATCH` so each shares a variable with those already
+/// planned, instead of building a product and joining last.
+///
+/// The paths of a `MATCH` are conjunctive, so their ORDER changes cost and not
+/// the result set — the same argument `normalize_cartesian_matches` makes to
+/// justify splitting a cartesian `MATCH` into clauses. That function only
+/// handles paths that are BARE SINGLE NODES; this one handles paths with hops,
+/// which is where the cost actually is.
+///
+/// SNB BI bi14 opens with three paths: every China person, every India person,
+/// and `(person1)-[:KNOWS]-(person2)` joining them. Planned in written order
+/// the first two build the full PRODUCT of China x India persons and the join
+/// that would have made it selective runs last. Measured at SF3, that ONE
+/// CLAUSE exceeds the 300 s ceiling on its own — against Neo4j's 166 s for the
+/// entire query, four `OPTIONAL MATCH`es included.
+///
+/// Greedy and deliberately so: take the first path as written, then repeatedly
+/// take a remaining path that shares a bound variable, and only fall back to
+/// the earliest remaining path when NOTHING connects (a genuine cartesian the
+/// query asked for). Among the paths that connect, the one that ADDS THE
+/// FEWEST ROWS goes first (`bound_drive_estimate`); written order breaks
+/// ties, so a query whose paths already connect in the cheapest order is
+/// untouched — the rewrite reports `None` and nothing downstream sees a new
+/// plan — and a second pass over the rewritten order picks the same order.
+///
+/// # Why the cheapest, and not the earliest, connected path
+///
+/// SNB BI bi17 binds `forum1` and `comment` by its fourth path, and its fifth
+/// and sixth are `(forum1)<-[:HAS_MEMBER]->(person3)<-[:HAS_CREATOR]-(message2)`
+/// and `(comment)-[:REPLY_OF]->(message2)-…`. Both connect. Written order
+/// takes the fifth: every member of the forum, every message each of them
+/// wrote, per row — and only then the sixth, whose REPLY_OF names the ONE
+/// message the comment replies to. At SF0.1 that held 82 GB after seven
+/// minutes. The sixth first binds `message2` in one step and leaves the fifth
+/// a closing check between two bound ends, which the matcher walks from the
+/// cheaper one (`reverse_both_bound_path`).
+fn order_connected_paths(graph: &Graph, q: &SingleQuery) -> Option<SingleQuery> {
+    let mut out: Vec<Clause> = q.clauses.clone();
+    let mut changed = false;
+    // names bound by earlier CLAUSES are already available, so a path that
+    // shares one of those is connected too
+    let mut bound: Vec<String> = Vec::new();
+    for c in out.iter_mut() {
+        match c {
+            Clause::Match {
+                optional: false,
+                pattern,
+                ..
+            } if pattern.paths.len() > 2 => {
+                let paths = &pattern.paths;
+                let vars: Vec<Vec<String>> = paths.iter().map(path_vars).collect();
+                let mut taken = vec![false; paths.len()];
+                let mut order: Vec<usize> = Vec::with_capacity(paths.len());
+                let mut have: Vec<String> = bound.clone();
+                for _ in 0..paths.len() {
+                    // the connected path adding the fewest rows; ties keep
+                    // written order (a strict improvement displaces)
+                    let mut best: Option<(f64, usize)> = None;
+                    let mut earliest: Option<usize> = None;
+                    if !order.is_empty() {
+                        for i in 0..paths.len() {
+                            if taken[i] || !vars[i].iter().any(|v| have.contains(v)) {
+                                continue;
+                            }
+                            earliest.get_or_insert(i);
+                            let cost = bound_drive_estimate(graph, &paths[i], &have)
+                                .unwrap_or(f64::INFINITY);
+                            if best.is_none_or(|(c, _)| cost < c) {
+                                best = Some((cost, i));
+                            }
+                        }
+                    }
+                    if best.map(|(_, i)| i) != earliest {
+                        counted!("interp.MATCH path ordered by the rows it adds");
+                    }
+                    // nothing connects (or this is the first): earliest
+                    // remaining, which keeps written order
+                    let pick = best
+                        .map(|(_, i)| i)
+                        .or_else(|| (0..paths.len()).find(|&i| !taken[i]));
+                    let Some(i) = pick else { break };
+                    taken[i] = true;
+                    order.push(i);
+                    have.extend(vars[i].iter().cloned());
+                }
+                if order.iter().enumerate().any(|(k, &i)| k != i) {
+                    counted!("interp.MATCH paths ordered to follow their joins");
+                    pattern.paths = order.iter().map(|&i| paths[i].clone()).collect();
+                    changed = true;
+                }
+                for vs in &vars {
+                    bound.extend(vs.iter().cloned());
+                }
+            }
+            other => {
+                if let Some(names) = clause_mentions(other) {
+                    bound.extend(names);
+                }
+            }
+        }
+    }
+    changed.then_some(SingleQuery { clauses: out })
+}
+
+/// How far a variable-length hop is summed for [`bound_drive_estimate`], as
+/// the cardinality model sums one (`VARLEN_EST_SPAN`): enough to price an
+/// unbounded `*` as expensive without summing to infinity.
+const ORDER_VARLEN_SPAN: u64 = 3;
+
+/// The rows `path` adds when walked outward from its best-placed BOUND node,
+/// both ways: the product of the average fan-outs of the hops walked
+/// (`Graph::hop_fanout`), a hop that reaches another bound node counting as a
+/// filter (its fan-out capped at 1). The minimum over the path's bound nodes,
+/// since the matcher turns a walk round to its bound end; `None` when no node
+/// of the path is bound (it connects through a relationship or path variable
+/// only). An estimate for ORDERING, from averages: skew is not modelled.
+fn bound_drive_estimate(graph: &Graph, path: &PathPattern, have: &[String]) -> Option<f64> {
+    let nodes: Vec<&NodePattern> = std::iter::once(&path.start)
+        .chain(path.hops.iter().map(|(_, n)| n))
+        .collect();
+    let is_bound = |n: &NodePattern| n.var.as_ref().is_some_and(|v| have.contains(v));
+    let fan = |from: &NodePattern, rel: &RelPattern, to: &NodePattern, forward: bool| -> f64 {
+        let dir = match (rel.dir, forward) {
+            (RelDir::Out, true) | (RelDir::In, false) => Dir::Out,
+            (RelDir::In, true) | (RelDir::Out, false) => Dir::In,
+            (RelDir::Undirected, _) => Dir::Both,
+        };
+        let f = graph.hop_fanout(&from.labels, dir, &rel.types, &to.labels);
+        let f = match &rel.length {
+            None => f,
+            Some(vl) => {
+                let min = vl.min.unwrap_or(1);
+                let max = vl.max.unwrap_or(min + ORDER_VARLEN_SPAN).min(min + ORDER_VARLEN_SPAN);
+                (min..=max).map(|k| f.powi(i32::try_from(k).unwrap_or(i32::MAX))).sum()
+            }
+        };
+        if is_bound(to) { f.min(1.0) } else { f }
+    };
+    let mut best: Option<f64> = None;
+    for (b, node) in nodes.iter().enumerate() {
+        if !is_bound(node) {
+            continue;
+        }
+        let mut cost = 1.0f64;
+        for j in b + 1..nodes.len() {
+            cost *= fan(nodes[j - 1], &path.hops[j - 1].0, nodes[j], true);
+        }
+        for j in (0..b).rev() {
+            cost *= fan(nodes[j + 1], &path.hops[j].0, nodes[j], false);
+        }
+        best = Some(best.map_or(cost, |c| c.min(cost)));
+    }
+    best
+}
+
+/// The ranking key truncation sorts on. A timestamp is an integer in every
+/// FinBench corpus, but a property is not guaranteed to be one, and a key that
+/// only understood `Int` would answer `None` for every candidate on a corpus
+/// that stored it otherwise — leaving the cut to pick arbitrarily, which for
+/// the one feature whose job is DROPPING ROWS is a silent wrong answer rather
+/// than a slow one.
+fn truncation_key(v: Option<&Value>) -> Option<i64> {
+    match v {
+        Some(Value::Int(n)) => Some(*n),
+        // A float timestamp still orders; the cast keeps the ordering it has.
+        Some(Value::Float(f)) if f.is_finite() => Some(*f as i64),
+        _ => None,
+    }
+}
+
+/// Lift `all(x IN <var-length rels> WHERE p)` out of a MATCH's WHERE and onto
+/// the relationship pattern it quantifies, so the expansion can stop walking
+/// through an edge that already fails it.
+///
+/// THE COST THIS EXISTS FOR. A variable-length pattern is enumerated first and
+/// filtered afterwards, so a predicate that is false of the very first edge
+/// still pays for every path that edge leads to. On LDBC FinBench at SF10 the
+/// difference is total: `(:Account {id: <the busiest account>})-[:transfer*1..3]->()`
+/// is 815 edges at one hop and 265,860 paths at two, and counting the
+/// three-hop paths does not finish in 600 s — while `count(DISTINCT other)`
+/// over the same pattern answers 43 in under a second, because that shape is
+/// reachability rather than enumeration. Adding a predicate no edge can
+/// satisfy (`e.timestamp` after the last timestamp in the corpus) changed
+/// nothing: still killed at 300 s, in all of `all(e IN r …)`,
+/// `all(e IN relationships(p) …)`, and the `startNode(e)…` form LDBC's own
+/// portable truncation rewrite uses. The predicate was being applied to
+/// finished rows, and the rows were what could not be produced.
+///
+/// WHY IT CANNOT CHANGE AN ANSWER. `all` over a path's relationships holds
+/// only if it holds of every one of them, so an edge that fails the predicate
+/// cannot lie on any path that survives the WHERE. Declining to walk through
+/// it removes paths the WHERE would have removed. The lift COPIES rather than
+/// moves — the WHERE is left exactly as written and still runs on the finished
+/// rows — so a matcher that ignores `each` and one that honours it return the
+/// same rows. That is what lets this be applied in the enumerating matcher
+/// alone without the engines disagreeing.
+///
+/// Deliberately narrow, because each of these is a way to be wrong:
+/// - `All` only. `any`/`none`/`single` are false of a path for reasons that
+///   are not true of its individual edges, so pruning one would drop rows.
+/// - Variable-length hops only. A fixed hop's variable is one relationship,
+///   not a list, so the quantifier cannot refer to it.
+/// - The predicate may mention the bound name and nothing else. One that reads
+///   another variable depends on a binding the expansion does not have yet.
+/// - `relationships(p)` only where the path has exactly one hop, so "the
+///   relationships of p" and "the relationships of that hop" are the same set.
+fn lift_rel_predicates(q: &SingleQuery) -> Option<SingleQuery> {
+    // CHEAP REFUSAL FIRST. This runs on every statement, and the work below
+    // clones a pattern per MATCH before it can discover there was nothing to
+    // lift. Almost no statement has both halves, so the scan that proves it
+    // must not allocate: a read-only concurrency profile is thousands of tiny
+    // statements a second, and a per-statement clone shows up as throughput.
+    let liftable = q.clauses.iter().any(|c| {
+        let Clause::Match {
+            pattern,
+            where_: Some(w),
+            ..
+        } = c
+        else {
+            return false;
+        };
+        let has_varlen = pattern
+            .paths
+            .iter()
+            .any(|p| p.hops.iter().any(|(r, _)| r.length.is_some()));
+        has_varlen && mentions_all_quantifier(w)
+    });
+    if !liftable {
+        return None;
+    }
+    let mut changed = false;
+    let mut out: Vec<Clause> = Vec::with_capacity(q.clauses.len());
+    for c in &q.clauses {
+        let Clause::Match {
+            optional,
+            pattern,
+            where_: Some(w),
+        } = c
+        else {
+            out.push(c.clone());
+            continue;
+        };
+        let mut pattern = pattern.clone();
+        let mut conjs: Vec<Expr> = Vec::new();
+        conjuncts_of(w, &mut conjs);
+        for conj in &conjs {
+            let Expr::ListPredicate {
+                kind: engram_cypher::ast::ListPredicateKind::All,
+                var,
+                source,
+                filter,
+            } = conj
+            else {
+                continue;
+            };
+            // the predicate must stand on its own, reading only the element
+            let mut free = Vec::new();
+            free_vars_of(filter, &mut free);
+            if free.iter().any(|v| v.as_str() != var.as_str()) {
+                continue;
+            }
+            for path in &mut pattern.paths {
+                // `all(x IN r …)` names the hop's own variable; the
+                // `relationships(p)` spelling names the path, and is only the
+                // same set of edges when the path is that one hop.
+                let by_rel_var = |r: &RelPattern| match source.as_ref() {
+                    Expr::Var(v) => r.var.as_deref() == Some(v.as_str()),
+                    _ => false,
+                };
+                let whole_path = matches!(source.as_ref(), Expr::Call { name, args, .. }
+                    if name == "relationships"
+                        && matches!(args.as_slice(), [Expr::Var(pv)]
+                            if path.var.as_deref() == Some(pv.as_str()))
+                        && path.hops.len() == 1);
+                for (rel, _) in &mut path.hops {
+                    if rel.length.is_none() || rel.each.is_some() {
+                        continue;
+                    }
+                    if by_rel_var(rel) || whole_path {
+                        rel.each = Some((var.clone(), filter.as_ref().clone()));
+                        changed = true;
+                    }
+                }
+            }
+        }
+        out.push(Clause::Match {
+            optional: *optional,
+            pattern,
+            where_: Some(w.clone()),
+        });
+    }
+    changed.then_some(SingleQuery { clauses: out })
+}
+
 fn normalize_cartesian_matches(q: &SingleQuery) -> Option<SingleQuery> {
-    let single_node = |p: &PathPattern| p.hops.is_empty() && p.var.is_none() && !p.shortest;
+    let single_node =
+        |p: &PathPattern| p.hops.is_empty() && p.var.is_none() && p.shortest.is_none();
     let mut changed = false;
     let mut out: Vec<Clause> = Vec::with_capacity(q.clauses.len());
     for c in &q.clauses {
@@ -7737,18 +12615,139 @@ fn normalize_cartesian_matches(q: &SingleQuery) -> Option<SingleQuery> {
     }
 }
 
+/// A `WITH`'s `WHERE` runs BEFORE the projection when it can, so the rows it
+/// discards are never materialised.
+///
+/// `WITH person, message, topForum2 WHERE topForum2 IN topForums` — SNB BI
+/// bi4 — is a stage boundary, and a stage boundary MATERIALISES its input. The
+/// predicate then throws most of those rows away. Decomposed at SF3, the
+/// boundary alone (b4h, the same `WITH` with NO predicate) took the query from
+/// 234 s past the 300 s ceiling; the rows it has to build are the cost, and
+/// every row the predicate would reject is one that did not need building.
+///
+/// Moving the filter earlier is only sound under conditions that are easy to
+/// get wrong, so each is checked rather than assumed:
+///
+/// - **No aggregate in the projection.** A `WHERE` over an aggregating `WITH`
+///   is a HAVING: it reads the aggregate, which does not exist yet.
+/// - **No SKIP, LIMIT or ORDER BY.** Filtering before a LIMIT changes WHICH
+///   rows survive it — a different answer, not a faster one.
+/// - **No DISTINCT**, for the same class of reason.
+/// - **No name the projection INVENTS.** `WITH a + 1 AS z WHERE z > 5` cannot
+///   move: before the projection `z` is either absent or something else. A
+///   free variable of the predicate may only be one the projection passes
+///   through unchanged (`x AS x`), or one it does not bind at all — which is
+///   the case for the list in bi4's `IN`, still in scope earlier and simply
+///   dropped by the projection.
+/// - **The clause it merges into is a non-OPTIONAL `MATCH`.** Pushing a
+///   predicate into an `OPTIONAL MATCH` makes it part of the pattern instead
+///   of a filter on the result, which turns non-matching rows into nulls
+///   rather than removing them.
+fn push_with_filter_before_projection(q: &SingleQuery) -> Option<SingleQuery> {
+    let mut out: Vec<Clause> = q.clauses.clone();
+    let mut changed = false;
+    for i in 1..out.len() {
+        let Clause::With { proj, where_ } = &out[i] else {
+            continue;
+        };
+        let Some(pred) = where_.clone() else { continue };
+        if proj.distinct
+            || proj.star
+            || proj.skip.is_some()
+            || proj.limit.is_some()
+            || !proj.order.is_empty()
+            || proj.items.iter().any(|it| contains_aggregate(&it.expr))
+        {
+            continue;
+        }
+        // a name this projection INVENTS cannot be read before it exists — but
+        // that is a property of each CONJUNCT, not of the whole WHERE. FinBench
+        // tcr8 is `WITH …, [e IN relationships(p) | e.amount] AS amts WHERE
+        // all(e IN edge WHERE <window>) AND reduce(… amts …) <> -1`: refusing
+        // the whole predicate over `amts` also kept the `all(…)` half out of
+        // the MATCH, where `lift_rel_predicates` would have pruned the walk
+        // with it. A row survives `a AND b` only if both are TRUE, so testing
+        // `a` before the projection and `b` after it keeps the same rows.
+        let invents = |n: &String| {
+            proj.items.iter().any(|it| {
+                it.alias.as_ref() == Some(n) && !matches!(&it.expr, Expr::Var(v) if v == n)
+            })
+        };
+        let mut conjs = Vec::new();
+        conjuncts_of(&pred, &mut conjs);
+        let (movable, stays): (Vec<Expr>, Vec<Expr>) = conjs.into_iter().partition(|c| {
+            let mut free = Vec::new();
+            free_vars_of(c, &mut free);
+            !free.iter().any(invents)
+        });
+        let conjoin = |cs: Vec<Expr>| {
+            cs.into_iter()
+                .reduce(|a, b| Expr::And(Box::new(a), Box::new(b)))
+        };
+        let Some(pred) = conjoin(movable) else {
+            continue;
+        };
+        let stays = conjoin(stays);
+        // merge into the preceding non-OPTIONAL MATCH, which is where the rows
+        // are produced
+        let Clause::Match {
+            optional: false,
+            pattern,
+            where_: mw,
+        } = &out[i - 1]
+        else {
+            continue;
+        };
+        let merged = match mw.clone() {
+            Some(existing) => Expr::And(Box::new(existing), Box::new(pred)),
+            None => pred,
+        };
+        let new_match = Clause::Match {
+            optional: false,
+            pattern: pattern.clone(),
+            where_: Some(merged),
+        };
+        if stays.is_some() {
+            counted!("interp.WITH filter split: part pushed before its projection");
+        }
+        let new_with = Clause::With {
+            proj: proj.clone(),
+            where_: stays,
+        };
+        out[i - 1] = new_match;
+        out[i] = new_with;
+        changed = true;
+        sometimes!("interp.WITH filter pushed before its projection", true);
+    }
+    changed.then_some(SingleQuery { clauses: out })
+}
+
 fn run_streaming(
     graph: &Graph,
     q: &SingleQuery,
     params: &BTreeMap<String, Value>,
     input: Vec<Row>,
+    // What the clauses after an enclosing `CALL {}` read of this arm's
+    // columns (`call_output_demand_for`), looked up before any rewrite.
+    out_demand: Option<&BTreeMap<String, VarDemand>>,
 ) -> Result<QueryResult, RunError> {
     if let Some(q2) = normalize_cartesian_matches(q) {
-        return run_streaming(graph, &q2, params, input);
+        return run_streaming(graph, &q2, params, input, out_demand);
+    }
+    if graph.rel_predicate_pushdown_enabled() {
+        if let Some(q2) = lift_rel_predicates(q) {
+            return run_streaming(graph, &q2, params, input, out_demand);
+        }
+    }
+    if let Some(q2) = push_with_filter_before_projection(q) {
+        return run_streaming(graph, &q2, params, input, out_demand);
+    }
+    if let Some(q2) = order_connected_paths(graph, q) {
+        return run_streaming(graph, &q2, params, input, out_demand);
     }
     sometimes!("interp.streamed a read-only chain", true);
     counted!("interp.statements run");
-    stream_stage(graph, &q.clauses, input, params, &Default::default())
+    stream_stage(graph, &q.clauses, input, params, &Default::default(), &[], out_demand)
 }
 
 /// Whether a RETURN is the top-k shape `StreamProjector::new` bounds: ordered
@@ -7783,10 +12782,7 @@ fn late_full_after_aggregation_shape(proj: &Projection) -> bool {
 /// reads need. `None` when any use is a whole-entity one (a function over
 /// the node, a subquery, an ORDER BY on the node itself) or the name is not
 /// output bare at all.
-fn late_full_reads(
-    proj: &Projection,
-    name: &str,
-) -> Option<std::collections::BTreeSet<String>> {
+fn late_full_reads(proj: &Projection, name: &str) -> Option<std::collections::BTreeSet<String>> {
     let mut props = std::collections::BTreeSet::new();
     let mut aliases: Vec<String> = Vec::new();
     for (i, it) in proj.items.iter().enumerate() {
@@ -7837,13 +12833,883 @@ fn late_full_reads(
 /// recurse on whatever follows the breaker. `late_full` names the input-row
 /// variables the previous stage bound LEAN for this stage's top-k RETURN to
 /// hydrate in full for its survivors (empty everywhere else).
+/// Input rows per worker in one parallel drive pass. Bounds the buffered
+/// output: a stage that AGGREGATES streams in O(1) memory serially, and
+/// buffering its entire output to win a core would trade one resource for
+/// another. A chunk at a time keeps the peak proportional to the chunk.
+const PARALLEL_DRIVE_CHUNK: usize = 64;
+
+/// Morsels per worker within one window of a row or continuation drive — see
+/// `drive_rows_parallel`. More than one so a skewed row cost can be balanced by
+/// the executor's shared cursor.
+const MORSELS_PER_WORKER: usize = 8;
+
+/// The most input a window may grow to, per worker — see [`DriveWindow`].
+const PARALLEL_DRIVE_CHUNK_MAX: usize = 1024;
+
+/// A window grows while each one produces at most this many rows per input…
+const WINDOW_GROW_RATIO: usize = 4;
+
+/// …and shrinks back when one produces more than this many.
+const WINDOW_SHRINK_RATIO: usize = 64;
+
+/// How much input the next parallel window takes, per worker.
+///
+/// A window is a round trip through the executor — its threads are spawned
+/// for it and joined after it — and `PARALLEL_DRIVE_CHUNK` rows per worker
+/// was sized for rows that EXPAND. Over rows that do not, the round trips are
+/// the cost: SNB BI bi15's edge-centric weights seed 22M comments at SF10,
+/// each yielding one reply row, and 64 per worker made ~8,600 seed windows and
+/// as many continuation windows — the head alone ran 71 s on 2.7 cores with
+/// 83 of its 191 CPU-seconds in the kernel, spawning threads.
+///
+/// So a window DOUBLES after one that produced at most `WINDOW_GROW_RATIO`
+/// rows per input, up to `PARALLEL_DRIVE_CHUNK_MAX`, and HALVES after one that
+/// produced more than `WINDOW_SHRINK_RATIO`. Growth is earned by the output
+/// actually seen, so the memory bound the fixed chunk exists for (bi17's
+/// unwindowed seed split was OOM-killed) still holds for the shapes that
+/// expand: they never grow.
+struct DriveWindow {
+    per_worker: usize,
+}
+
+impl DriveWindow {
+    fn new() -> Self {
+        DriveWindow {
+            per_worker: PARALLEL_DRIVE_CHUNK,
+        }
+    }
+
+    fn size(&self, width: usize) -> usize {
+        (width * self.per_worker).max(width)
+    }
+
+    /// Size the next window from what this one consumed and produced;
+    /// whether it GREW.
+    fn observe(&mut self, consumed: usize, produced: usize) -> bool {
+        let was = self.per_worker;
+        if produced <= consumed.saturating_mul(WINDOW_GROW_RATIO) {
+            self.per_worker = (self.per_worker * 2).min(PARALLEL_DRIVE_CHUNK_MAX);
+        } else if produced > consumed.saturating_mul(WINDOW_SHRINK_RATIO) {
+            self.per_worker = (self.per_worker / 2).max(PARALLEL_DRIVE_CHUNK);
+        }
+        self.per_worker > was
+    }
+}
+
+/// Drive a stage's input rows through `drive`, in parallel when it pays, and
+/// push every produced row into `sink` IN MORSEL ORDER.
+///
+/// The morsel executor is consulted in `pipeline.rs` and nowhere else, so every
+/// query the vectorised pipeline declines ran on ONE CORE however wide
+/// `ENGRAM_QUERY_PARALLELISM` was set. Measured at SF3 on SNB BI bi11's
+/// expansion — same query, store and binary at three widths: 271 s at 44,
+/// 268 s at 8, 273 s at 1, 4,472,653 rows each, on a 48-CPU node.
+/// `pipeline.rs` records the same pathology being found once already: "the
+/// entire benchmark ran on one core of 44 while `query parallelism ON: width
+/// 44` sat in the log above it".
+///
+/// THE COLLECTOR IS NOT PARALLELISED, deliberately. `StreamProjector` carries
+/// top-k heaps, late projection, aggregation sites, group indices and DISTINCT
+/// state, and merging two of those correctly in every mode is its own feature
+/// whose failure mode is a silently different answer. Each morsel drives into a
+/// LOCAL buffer and the buffers reach the one collector in morsel order, so it
+/// sees the rows it would have seen, in the order it would have seen them.
+///
+/// SHARED BY BOTH DRIVING LOOPS. `stream_stage` has two — one for a stage
+/// ending in `RETURN`, one for a stage ending in a `WITH` breaker — and the
+/// first version of this change touched only the first. bi11's stages are
+/// mostly `WITH`-terminated, so exactly ONE stage per query parallelised and
+/// the rest stayed serial: a local probe read `parallel=1` on a query with
+/// three eligible stages. One helper, both callers, no third place to forget.
+/// A PLAIN projection's heavy items — a pattern comprehension, an
+/// `EXISTS {}` / `COUNT {}` body, a pattern predicate: a walk per row — and
+/// the projection that reads each from a hidden column instead.
+///
+/// The breaker's projector runs in the ONE thread that drains the stage, so
+/// its items were evaluated serially however the stage's rows were produced.
+/// SNB Interactive IC14 weighs each shortest path with four comprehensions
+/// per relationship: 42 rows at SF3, each a handful of pinned walks of ~20 ms,
+/// serial on a 40-core server (~1.8 s against Neo4j's 1.3). Evaluated where
+/// each row is produced (`pre_evaluate`), they run on the workers.
+///
+/// Declined — the items stay where they were — for an aggregating or `*`
+/// projection, one with SKIP / LIMIT (a top-k projects its survivors alone,
+/// where this would evaluate every row), an item calling anything
+/// nondeterministic, an item with no name to keep (neither alias nor source
+/// text), and an item reading a variable the projector re-materialises
+/// before it projects (`lean`: the late-full carries), which a worker would
+/// see still lean.
+fn heavy_projection(
+    proj: &Projection,
+    lean: &std::collections::BTreeSet<String>,
+) -> Option<(Projection, Vec<(String, Expr)>)> {
+    if proj.star
+        || proj.skip.is_some()
+        || proj.limit.is_some()
+        || proj.items.iter().any(|it| contains_aggregate(&it.expr))
+    {
+        return None;
+    }
+    let mut rewritten = proj.clone();
+    let mut pre = Vec::new();
+    for (i, it) in rewritten.items.iter_mut().enumerate() {
+        if !it.expr.has_subquery()
+            || calls_nondeterministic(&it.expr)
+            || (it.alias.is_none() && it.text.is_none())
+        {
+            continue;
+        }
+        let mut fv = Vec::new();
+        free_vars_of(&it.expr, &mut fv);
+        if fv.iter().any(|v| lean.contains(v)) {
+            continue;
+        }
+        let hidden = format!("\u{0}pre{i}");
+        let expr = std::mem::replace(&mut it.expr, Expr::Var(hidden.clone()));
+        pre.push((hidden, expr));
+    }
+    (!pre.is_empty()).then_some((rewritten, pre))
+}
+
+/// Whether a clause inside a stage evaluates a pattern comprehension or a
+/// subquery for every row that reaches it: a walk per row.
+fn clause_walks_per_row(c: &Clause) -> bool {
+    match c {
+        Clause::With { proj, where_ } => {
+            proj.items.iter().any(|it| it.expr.has_subquery())
+                || where_.as_ref().is_some_and(Expr::has_subquery)
+        }
+        Clause::Unwind { expr, .. } => expr.has_subquery(),
+        _ => false,
+    }
+}
+
+/// Evaluate `pre` into its hidden columns — once: a row a worker already
+/// evaluated passes the drain untouched.
+fn pre_evaluate(
+    graph: &Graph,
+    pre: &[(String, Expr)],
+    row: &mut Row,
+    params: &BTreeMap<String, Value>,
+) -> Result<(), RunError> {
+    for (hidden, e) in pre {
+        if !row.contains_key(hidden) {
+            let v = eval_expr(graph, e, row, params)?;
+            row.insert(hidden.clone(), v);
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drive_stage_rows(
+    graph: &Graph,
+    prefix: &[Clause],
+    plan: &StagePlan,
+    input: Vec<Row>,
+    params: &BTreeMap<String, Value>,
+    sink: &mut dyn FnMut(Row) -> Result<(), RunError>,
+) -> Result<(), RunError> {
+    // Rows produced serially (or by a seed split, whose workers do not
+    // evaluate them) take their heavy items here, on the way to the sink.
+    let mut drained = |mut r: Row| -> Result<(), RunError> {
+        pre_evaluate(graph, &plan.pre_eval, &mut r, params)?;
+        sink(r)
+    };
+    let sink: &mut dyn FnMut(Row) -> Result<(), RunError> = &mut drained;
+    let heavy = heavy_rows(prefix, plan, input.len());
+    if let Some(exec) = rows_exec(graph, prefix, plan, input.len()) {
+        counted!("interp.stage drove its input in parallel");
+        if heavy && input.len() < graph.parallel_min_rows() {
+            counted!("interp.stage split a heavy projection's rows below the floor");
+        }
+        let mut sizer = DriveWindow::new();
+        drive_rows_parallel(
+            graph,
+            prefix,
+            &plan.seeds,
+            prefix.len(),
+            plan,
+            input,
+            params,
+            &*exec,
+            &mut sizer,
+            sink,
+        )?;
+        return Ok(());
+    }
+    if let Some(exec) = continuation_exec(graph, prefix, plan, input.len()) {
+        counted!("interp.stage drove its continuation in parallel");
+        return drive_continuation_parallel(graph, prefix, plan, input, params, &*exec, sink);
+    }
+    let caches: Vec<std::cell::RefCell<MemoSlot>> = (0..prefix.len())
+        .map(|_| std::cell::RefCell::new(MemoSlot::Untouched))
+        .collect();
+    for row in input {
+        match drive(graph, prefix, &plan.seeds, plan, &caches, row, params, sink) {
+            Err(RunError::Saturated) => break, // the LIMIT is full
+            other => other?,
+        }
+    }
+    Ok(())
+}
+
+/// A row whose projection walks a pattern is worth a worker on its own:
+/// IC14's 42 rows sat under the floor that keeps cheap row sets serial. The
+/// walk is the breaker's (`pre_eval`), or a plain WITH's inside the stage,
+/// which `drive` evaluates per row wherever the row is driven.
+fn heavy_rows(prefix: &[Clause], plan: &StagePlan, n_input: usize) -> bool {
+    n_input >= 2 && (!plan.pre_eval.is_empty() || prefix.iter().any(clause_walks_per_row))
+}
+
+/// The executor a stage's INPUT ROWS are split across (`drive_stage_rows`),
+/// when they are.
+fn rows_exec(
+    graph: &Graph,
+    prefix: &[Clause],
+    plan: &StagePlan,
+    n_input: usize,
+) -> Option<std::sync::Arc<dyn crate::scoped_exec::ScopedExec>> {
+    graph
+        .exec()
+        .filter(|e| e.width() > 1)
+        .filter(|_| n_input >= graph.parallel_min_rows() || heavy_rows(prefix, plan, n_input))
+        .filter(|_| !graph.in_txn())
+        // A `LIMIT` can end the drive EARLY: it raises `Saturated` mid-drive,
+        // and a worker cannot see that a different morsel has already filled
+        // it — so those stages keep the serial loop rather than racing to
+        // produce rows nobody reads.
+        //
+        // `seed_cap` is set only for a plain-limit breaker with NO `ORDER BY`
+        // (see its construction), which is the narrow case where the drive
+        // really can stop early. A `ORDER BY ... LIMIT` must see every row to
+        // rank it, so it is not excluded here and is free to parallelise.
+        .filter(|_| plan.seed_cap.is_none())
+}
+
+/// Where a stage's rows are driven in parallel — its input rows split, or
+/// its first clause's rows split for the rest of it — the route its
+/// aggregating breaker folds by (`drive_stage_folding`).
+enum FoldRoute {
+    /// The input rows split (`drive_rows_parallel`'s route).
+    Rows(std::sync::Arc<dyn crate::scoped_exec::ScopedExec>),
+    /// The first clause's rows split for the rest of the stage
+    /// (`drive_continuation_parallel`'s route).
+    Continuation(std::sync::Arc<dyn crate::scoped_exec::ScopedExec>),
+}
+
+/// Whether a stage ending in `collector` folds where its rows are produced,
+/// and by which route: `drive_stage_rows` would drive the rows in parallel
+/// (decided as it decides it, in the same order), and the projector takes
+/// partials exactly (`StreamProjector::merge_ready_rows`).
+fn fold_stage_route(
+    graph: &Graph,
+    prefix: &[Clause],
+    plan: &StagePlan,
+    n_input: usize,
+    collector: &mut StreamProjector<'_>,
+) -> Result<Option<FoldRoute>, RunError> {
+    if let Some(exec) = rows_exec(graph, prefix, plan, n_input) {
+        return Ok(collector.merge_ready_rows()?.then_some(FoldRoute::Rows(exec)));
+    }
+    match continuation_exec(graph, prefix, plan, n_input) {
+        Some(exec) => Ok(collector.merge_ready_rows()?.then_some(FoldRoute::Continuation(exec))),
+        None => Ok(None),
+    }
+}
+
+/// The partial projectors a folding drive makes and merges: how to make one,
+/// the projector they merge into, and how many were made so far — each
+/// numbers its NaNs from a range of its own.
+struct PartialFolder<'f, 'a> {
+    make: &'f (dyn Fn() -> Result<StreamProjector<'a>, RunError> + Sync),
+    collector: &'f mut StreamProjector<'a>,
+    made: u64,
+}
+
+/// A morsel's slot in a folding window (`fold_rows_parallel`).
+enum MorselFold<'a> {
+    /// Not folded yet.
+    Pending,
+    /// Folded: a partial holding this morsel's rows — and those of the run of
+    /// morsels before it that it continued — and how many rows it folded.
+    Done(Box<StreamProjector<'a>>, usize),
+    /// Continued by the next morsel, which holds its partial now.
+    Moved,
+    /// What stopped it.
+    Failed(RunError),
+}
+
+/// A STAGE ENDING IN AN AGGREGATING BREAKER, FOLDED WHERE ITS ROWS ARE MADE.
+///
+/// `drive_stage_rows` drives such a stage's rows on the workers and pushes
+/// every one of them into the breaker's projector on THIS thread. SNB BI bi6
+/// makes 8,318,446 rows at SF3 from ~14k first-clause rows, split across
+/// forty workers (`drive_continuation_parallel`), and folded them into its
+/// `count(DISTINCT like)` groups one at a time: most of its 15.4 s, against
+/// Neo4j's 14.9.
+///
+/// Here each morsel folds its own rows into a partial projector, on the
+/// worker that made them, and the partials merge into `folder.collector` in
+/// morsel order (`StreamProjector::merge_partial`) — so every group is first
+/// seen, and every value a fold keeps in arrival order is kept, where the
+/// serial fold sees and keeps it; DISTINCT seen sets merge by union. Memory
+/// stays one window's: a window's partials are merged before the next is
+/// driven.
+#[allow(clippy::too_many_arguments)]
+fn drive_stage_folding<'a>(
+    graph: &'a Graph,
+    prefix: &[Clause],
+    plan: &StagePlan,
+    input: Vec<Row>,
+    params: &'a BTreeMap<String, Value>,
+    route: FoldRoute,
+    collector: &mut StreamProjector<'a>,
+    make: &(dyn Fn() -> Result<StreamProjector<'a>, RunError> + Sync),
+) -> Result<(), RunError> {
+    counted!("interp.stage folded its rows where the workers made them");
+    let mut folder = PartialFolder {
+        make,
+        collector,
+        made: 0,
+    };
+    let mut sizer = DriveWindow::new();
+    match route {
+        FoldRoute::Rows(exec) => {
+            counted!("interp.stage drove its input in parallel");
+            fold_rows_parallel(
+                graph,
+                prefix,
+                &plan.seeds,
+                prefix.len(),
+                plan,
+                input,
+                params,
+                &*exec,
+                &mut sizer,
+                &mut folder,
+            )
+        }
+        FoldRoute::Continuation(exec) => {
+            counted!("interp.stage drove its continuation in parallel");
+            // As `drive_continuation_parallel`: the first clause here, a
+            // window of its rows at a time folded on the workers.
+            let width = exec.width();
+            let head_caches: Vec<std::cell::RefCell<MemoSlot>> = (0..prefix.len())
+                .map(|_| std::cell::RefCell::new(MemoSlot::Untouched))
+                .collect();
+            let tail = &prefix[1..];
+            let tail_seeds = &plan.seeds[1..];
+            let mut window: Vec<Row> = Vec::with_capacity(sizer.size(width));
+            for row in input {
+                drive(
+                    graph,
+                    &prefix[..1],
+                    &plan.seeds,
+                    plan,
+                    &head_caches,
+                    row,
+                    params,
+                    &mut |r| {
+                        window.push(r);
+                        if window.len() >= sizer.size(width) {
+                            let rows = std::mem::take(&mut window);
+                            fold_rows_parallel(
+                                graph,
+                                tail,
+                                tail_seeds,
+                                prefix.len(),
+                                plan,
+                                rows,
+                                params,
+                                &*exec,
+                                &mut sizer,
+                                &mut folder,
+                            )?;
+                        }
+                        Ok(())
+                    },
+                )?;
+            }
+            if !window.is_empty() {
+                fold_rows_parallel(
+                    graph,
+                    tail,
+                    tail_seeds,
+                    prefix.len(),
+                    plan,
+                    window,
+                    params,
+                    &*exec,
+                    &mut sizer,
+                    &mut folder,
+                )?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `drive_rows_parallel`, folding: each morsel's rows into a partial
+/// projector on its worker, the partials merged in morsel order. A morsel
+/// whose predecessor has already folded CONTINUES the predecessor's partial —
+/// its rows follow those in the serial order — so a window the calling thread
+/// works through alone folds into one partial, not one per morsel: a partial
+/// projector per morsel of a few cheap rows cost more than the rows (bi5).
+#[allow(clippy::too_many_arguments)]
+fn fold_rows_parallel<'a>(
+    graph: &'a Graph,
+    clauses: &[Clause],
+    seeds: &[Vec<Seed>],
+    n_caches: usize,
+    plan: &StagePlan,
+    rows: Vec<Row>,
+    params: &'a BTreeMap<String, Value>,
+    exec: &dyn crate::scoped_exec::ScopedExec,
+    sizer: &mut DriveWindow,
+    folder: &mut PartialFolder<'_, 'a>,
+) -> Result<(), RunError> {
+    let width = exec.width();
+    let make = folder.make;
+    let mut rest = rows.into_iter().peekable();
+    while rest.peek().is_some() {
+        let window: Vec<Row> = rest.by_ref().take(sizer.size(width)).collect();
+        let window_len = window.len();
+        let per = window_len.div_ceil(width * MORSELS_PER_WORKER).max(1);
+        let morsels = morsels_of(window, per);
+        let first = folder.made;
+        folder.made += morsels.len() as u64;
+        let slots: Vec<std::sync::Mutex<MorselFold<'a>>> = morsels
+            .iter()
+            .map(|_| std::sync::Mutex::new(MorselFold::Pending))
+            .collect();
+        exec.for_each(morsels.len(), &|i| {
+            let run = || -> Result<(StreamProjector<'a>, usize), RunError> {
+                // the predecessor's partial, when it has folded
+                let carried = match i.checked_sub(1) {
+                    Some(prev) => {
+                        let mut slot = slots[prev].lock().unwrap_or_else(|e| e.into_inner());
+                        match std::mem::replace(&mut *slot, MorselFold::Pending) {
+                            MorselFold::Done(part, n) => {
+                                *slot = MorselFold::Moved;
+                                Some((*part, n))
+                            }
+                            other => {
+                                *slot = other;
+                                None
+                            }
+                        }
+                    }
+                    None => None,
+                };
+                let (mut part, mut produced) = match carried {
+                    Some(carried) => carried,
+                    None => {
+                        let mut part = make()?;
+                        // NaNs never equal: each partial numbers its own apart
+                        let base = (first + i as u64 + 1) << 40;
+                        part.nan_nonce = base;
+                        part.seen_base = base;
+                        (part, 0)
+                    }
+                };
+                // each morsel gets its OWN clause memo, as a row drive's does
+                let local: Vec<std::cell::RefCell<MemoSlot>> = (0..n_caches)
+                    .map(|_| std::cell::RefCell::new(MemoSlot::Untouched))
+                    .collect();
+                for row in take_morsel(&morsels[i]) {
+                    drive(
+                        graph,
+                        clauses,
+                        seeds,
+                        plan,
+                        &local,
+                        row,
+                        params,
+                        &mut |mut r| {
+                            pre_evaluate(graph, &plan.pre_eval, &mut r, params)?;
+                            produced += 1;
+                            part.push(r)
+                        },
+                    )?;
+                }
+                Ok((part, produced))
+            };
+            let out = match run() {
+                Ok((part, n)) => MorselFold::Done(Box::new(part), n),
+                Err(e) => MorselFold::Failed(e),
+            };
+            *slots[i].lock().unwrap_or_else(|e| e.into_inner()) = out;
+        });
+        let mut produced = 0usize;
+        for slot in slots {
+            match slot.into_inner().unwrap_or_else(|e| e.into_inner()) {
+                MorselFold::Done(part, n) => {
+                    produced += n;
+                    folder.collector.merge_partial(*part)?;
+                }
+                MorselFold::Moved => {}
+                MorselFold::Failed(e) => return Err(e),
+                MorselFold::Pending => {
+                    return Err(RunError::Semantic("a morsel the executor never ran".into()));
+                }
+            }
+        }
+        if sizer.observe(window_len, produced) {
+            counted!("interp.row window grew: its rows were cheap");
+        }
+    }
+    Ok(())
+}
+
+/// Drive `rows` through `clauses` on the morsel executor, windowed, and push
+/// what they produce into `sink` IN MORSEL ORDER — so in row order, exactly as
+/// the serial loop would. `seeds` is the seed-plan slice ALIGNED with
+/// `clauses` (a tail of the stage needs the tail of the seeds: `drive` reads a
+/// clause's index from how many seed plans remain), and `n_caches` the whole
+/// stage's clause count, because the clause memos are indexed by that
+/// absolute index. `sizer` decides each window's size and learns from what it
+/// produced (see [`DriveWindow`]). Returns whether the sink saturated.
+#[allow(clippy::too_many_arguments)]
+fn drive_rows_parallel(
+    graph: &Graph,
+    clauses: &[Clause],
+    seeds: &[Vec<Seed>],
+    n_caches: usize,
+    plan: &StagePlan,
+    rows: Vec<Row>,
+    params: &BTreeMap<String, Value>,
+    exec: &dyn crate::scoped_exec::ScopedExec,
+    sizer: &mut DriveWindow,
+    sink: &mut dyn FnMut(Row) -> Result<(), RunError>,
+) -> Result<bool, RunError> {
+    let width = exec.width();
+    // bound the buffer: an AGGREGATING stage streams in O(1) memory
+    // serially, and buffering its whole output to win a core would trade
+    // one resource for another
+    let mut rest = rows.into_iter().peekable();
+    while rest.peek().is_some() {
+        let window: Vec<Row> = rest.by_ref().take(sizer.size(width)).collect();
+        let window_len = window.len();
+        // MORE MORSELS THAN WORKERS. One morsel per worker made every window
+        // wait on its slowest: a row's cost is not uniform — bi15's weighting
+        // join costs a person's message count per pair — so a window ran at
+        // the pace of its heaviest morsel while the rest of the workers sat
+        // idle (1/20 of SF3's pairs averaged 14 cores of 40). The executor
+        // hands morsels out from a shared cursor, so smaller morsels let a
+        // worker that finishes early take the next one. The merge is still in
+        // morsel order, so the output order is unchanged.
+        let per = window_len.div_ceil(width * MORSELS_PER_WORKER).max(1);
+        let morsels = morsels_of(window, per);
+        let slots: Vec<std::sync::Mutex<Result<Vec<Row>, RunError>>> = morsels
+            .iter()
+            .map(|_| std::sync::Mutex::new(Ok(Vec::new())))
+            .collect();
+        exec.for_each(morsels.len(), &|i| {
+            // each morsel gets its OWN clause memo: those are per-drive
+            // state, not shared results
+            let local: Vec<std::cell::RefCell<MemoSlot>> = (0..n_caches)
+                .map(|_| std::cell::RefCell::new(MemoSlot::Untouched))
+                .collect();
+            let mut out: Vec<Row> = Vec::new();
+            let mut err: Option<RunError> = None;
+            for row in take_morsel(&morsels[i]) {
+                match drive(
+                    graph,
+                    clauses,
+                    seeds,
+                    plan,
+                    &local,
+                    row,
+                    params,
+                    &mut |mut r| {
+                        pre_evaluate(graph, &plan.pre_eval, &mut r, params)?;
+                        out.push(r);
+                        Ok(())
+                    },
+                ) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        err = Some(e);
+                        break;
+                    }
+                }
+            }
+            let mut slot = slots[i].lock().unwrap_or_else(|e| e.into_inner());
+            *slot = match err {
+                Some(e) => Err(e),
+                None => Ok(out),
+            };
+        });
+        let mut produced = 0usize;
+        for slot in slots {
+            let part = slot.into_inner().unwrap_or_else(|e| e.into_inner())?;
+            produced += part.len();
+            for r in part {
+                match sink(r) {
+                    Err(RunError::Saturated) => return Ok(true),
+                    other => other?,
+                }
+            }
+        }
+        if sizer.observe(window_len, produced) {
+            counted!("interp.row window grew: its rows were cheap");
+        }
+    }
+    Ok(false)
+}
+
+/// A window's rows MOVED into morsels of `per` for the workers to take
+/// (`take_morsel`) — never cloned. A row is a sorted vector of named values:
+/// cloning one allocates every name and every node's labels and properties,
+/// and the drives cloned each input row before driving it, where the serial
+/// loop moves it. SNB BI bi5's three stages of ~4,250 cheap rows each ran
+/// slower at width 40 than at width 1 with every one of those rows on the
+/// calling thread.
+fn morsels_of(window: Vec<Row>, per: usize) -> Vec<std::sync::Mutex<Option<Vec<Row>>>> {
+    let per = per.max(1);
+    let mut out = Vec::with_capacity(window.len().div_ceil(per));
+    let mut rows = window.into_iter().peekable();
+    while rows.peek().is_some() {
+        out.push(std::sync::Mutex::new(Some(rows.by_ref().take(per).collect())));
+    }
+    out
+}
+
+/// A morsel's rows, taken by the one worker the executor hands its index to.
+fn take_morsel(morsel: &std::sync::Mutex<Option<Vec<Row>>>) -> Vec<Row> {
+    morsel
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .unwrap_or_default()
+}
+
+/// Whether a stage too THIN to split by its input rows should split the
+/// CONTINUATION of its first clause instead.
+///
+/// A first stage's input is the one empty seed row, so `drive_stage_rows`
+/// declines it by construction, and `drive_seeds` splits only the FIRST
+/// clause's seed scan: each morsel's rows are drained into the sink — the rest
+/// of the stage — on the CALLING thread. That is enough when the first clause
+/// is the work (bi17's single long MATCH). It is not when the work is a later
+/// clause. SNB BI bi15's weighting join is `MATCH (pA)-[:KNOWS]-(pB) … OPTIONAL
+/// MATCH (pA)<-…-(m1)-[:REPLY_OF]-(m2)-…->(pB)`: the seed scan was driven in
+/// parallel and the OPTIONAL MATCH — ~1,300 adjacency probes per pair — ran on
+/// one core, 120 s for 1/20 of SF3's pairs and past 1,800 s for SF10's.
+///
+/// Narrow on purpose:
+/// - the stage is too thin for the row split (else that path already runs);
+/// - its first clause is a non-optional MATCH, and a LATER clause is a MATCH
+///   or OPTIONAL MATCH — a continuation that expands, which is what is worth a
+///   worker; a continuation of projections is not;
+/// - READING clauses only (MATCH, non-breaking WITH, UNWIND): a write is
+///   serial by construction, and nothing here may change that;
+/// - the row split's own gates: a real executor, no open transaction, no
+///   plain-LIMIT early stop.
+fn continuation_exec(
+    graph: &Graph,
+    prefix: &[Clause],
+    plan: &StagePlan,
+    n_input: usize,
+) -> Option<std::sync::Arc<dyn crate::scoped_exec::ScopedExec>> {
+    if prefix.len() < 2 || n_input >= graph.parallel_min_rows() {
+        return None;
+    }
+    // The tail is driven with the tail of the seed plans, and `drive` reads a
+    // clause's index from how many remain: that holds only with one seed plan
+    // per clause. Anything else declines rather than misindex.
+    if plan.seeds.len() != prefix.len() || plan.filters.len() != prefix.len() {
+        return None;
+    }
+    if !matches!(prefix[0], Clause::Match { optional: false, .. }) {
+        return None;
+    }
+    if !prefix[1..].iter().any(|c| matches!(c, Clause::Match { .. })) {
+        return None;
+    }
+    if !prefix
+        .iter()
+        .all(|c| matches!(c, Clause::Match { .. } | Clause::With { .. } | Clause::Unwind { .. }))
+    {
+        return None;
+    }
+    graph
+        .exec()
+        .filter(|e| e.width() > 1)
+        .filter(|_| !graph.in_txn())
+        .filter(|_| plan.seed_cap.is_none())
+}
+
+/// Run a stage's FIRST clause on this thread (its own seed split still
+/// applies), buffer the rows it produces a window at a time, and drive the
+/// REST of the stage over each window in parallel (`drive_rows_parallel`).
+///
+/// THE ORDER IS THE SERIAL ORDER: first-clause rows in the order they are
+/// produced, and each window's continuation merged in morsel order, which is
+/// row order. The buffer is one window, so memory stays proportional to it.
+fn drive_continuation_parallel(
+    graph: &Graph,
+    prefix: &[Clause],
+    plan: &StagePlan,
+    input: Vec<Row>,
+    params: &BTreeMap<String, Value>,
+    exec: &dyn crate::scoped_exec::ScopedExec,
+    sink: &mut dyn FnMut(Row) -> Result<(), RunError>,
+) -> Result<(), RunError> {
+    let width = exec.width();
+    // the buffer of first-clause rows waits for ONE window of the
+    // continuation, and grows with it (`DriveWindow`)
+    let mut sizer = DriveWindow::new();
+    let head_caches: Vec<std::cell::RefCell<MemoSlot>> = (0..prefix.len())
+        .map(|_| std::cell::RefCell::new(MemoSlot::Untouched))
+        .collect();
+    let tail = &prefix[1..];
+    let tail_seeds = &plan.seeds[1..];
+    let mut window: Vec<Row> = Vec::with_capacity(sizer.size(width));
+    let mut saturated = false;
+    for row in input {
+        // `&prefix[..1]` with the FULL seed list: `drive` takes its clause
+        // index from the seed plans remaining, so this runs clause 0 at index
+        // 0, and its empty remainder hands every produced row to us.
+        let r = drive(
+            graph,
+            &prefix[..1],
+            &plan.seeds,
+            plan,
+            &head_caches,
+            row,
+            params,
+            &mut |r| {
+                window.push(r);
+                if window.len() >= sizer.size(width) {
+                    let rows = std::mem::take(&mut window);
+                    if drive_rows_parallel(
+                        graph,
+                        tail,
+                        tail_seeds,
+                        prefix.len(),
+                        plan,
+                        rows,
+                        params,
+                        exec,
+                        &mut sizer,
+                        sink,
+                    )? {
+                        return Err(RunError::Saturated);
+                    }
+                }
+                Ok(())
+            },
+        );
+        match r {
+            Err(RunError::Saturated) => {
+                saturated = true;
+                break;
+            }
+            other => other?,
+        }
+    }
+    if !saturated && !window.is_empty() {
+        drive_rows_parallel(
+            graph,
+            tail,
+            tail_seeds,
+            prefix.len(),
+            plan,
+            window,
+            params,
+            exec,
+            &mut sizer,
+            sink,
+        )?;
+    }
+    Ok(())
+}
+
 fn stream_stage(
     graph: &Graph,
     clauses: &[Clause],
     input: Vec<Row>,
     params: &BTreeMap<String, Value>,
     late_full: &std::collections::BTreeSet<String>,
+    // Names an EARLIER stage proved constant (see `constant_names_at`). The
+    // stage splitter cuts at the first breaker WITH, so the aggregation that
+    // establishes constancy is usually in the previous stage.
+    consts_in: &[String],
+    // For the statement's concluding RETURN: what the clauses after an
+    // enclosing `CALL {}` read of its columns. Every stage passes it on
+    // unchanged — the concluding RETURN is the same clause throughout.
+    out_demand: Option<&BTreeMap<String, VarDemand>>,
 ) -> Result<QueryResult, RunError> {
+    // DROP CARRIED VALUES THIS STAGE NEVER READS, BEFORE ANYTHING MULTIPLIES
+    // THE ROWS.
+    //
+    // A row is cloned per output row when a MATCH fans one row into many, and
+    // cloning a `Value::List` deep-copies its whole `Vec<Value>` — every
+    // element a Node with a labels Vec and a props BTreeMap. A carried list
+    // that nothing downstream reads is therefore copied once per output row
+    // for nothing.
+    //
+    // Measured at SF3 on 2026-09-15, `WITH collect(a) AS near MATCH (b:Person)
+    // WITH collect(b) AS far` — where `near` is never read again — against the
+    // size of the carried list, with the 24,328 output rows held constant:
+    //
+    //     carried ~100    3 s
+    //     carried ~1000  19 s
+    //     carried ~5000  >100 s
+    //
+    // while the same query WITHOUT the carried list answers in 1 s. SNB BI's
+    // bi10 carries a 17,743-node list across 22,842 rows and did not finish in
+    // 300 s; Neo4j answers it in 0 s, because a list there is one heap object
+    // and a row copy copies a reference.
+    //
+    // The real fix is value identity (a shared, cheaply-cloned list), which is
+    // a change to `Value` itself. This is the part that can be done without
+    // one: if no clause in this stage mentions the name, and nothing projects
+    // `*` (which would output it), the value cannot affect the result and is
+    // dropped here.
+    let mut input = input;
+    if !input.is_empty() {
+        let projects_star = clauses.iter().any(|c| match c {
+            Clause::With { proj, .. } | Clause::Return { proj, .. } => proj.star,
+            _ => false,
+        });
+        if !projects_star {
+            let mut reads: Option<Vec<String>> = Some(Vec::new());
+            for c in clauses {
+                // A subquery hides its reads from `clause_mentions`, so a name
+                // used only inside one would look dead. Keep everything.
+                if clause_may_hide_reads(c) {
+                    reads = None;
+                    break;
+                }
+                match (reads.as_mut(), clause_mentions(c)) {
+                    (Some(acc), Some(names)) => acc.extend(names),
+                    // a clause this walk cannot see through: keep everything
+                    _ => {
+                        reads = None;
+                        break;
+                    }
+                }
+            }
+            if let Some(reads) = reads {
+                let carried: Vec<String> = input[0].keys().cloned().collect();
+                let dead: Vec<String> =
+                    carried.into_iter().filter(|k| !reads.contains(k)).collect();
+                if !dead.is_empty() {
+                    counted!("interp.dead carried value dropped before the stage");
+                    for row in &mut input {
+                        for k in &dead {
+                            row.remove(k);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let mut split = clauses.len();
     for (i, c) in clauses.iter().enumerate() {
         match c {
@@ -7859,6 +13725,10 @@ fn stream_stage(
         }
     }
     let (prefix, rest) = clauses.split_at(split);
+    // Fix 101: a stage whose prefix requires a hop over a relationship type
+    // with no live relationship yields no row — its answers and its drive
+    // are skipped, and the collector finishes over none.
+    let stage_dead = clauses_require_dead_hop(graph, prefix);
     // Unbound-WHERE refusal, statically, before any scan — the same check
     // the materialising path runs per MATCH, over the same name scope.
     let mut bound: Vec<String> = input
@@ -7911,7 +13781,7 @@ fn stream_stage(
             let hydrates = !late_full.is_empty();
             // A constant-count stage concluding the statement: `… RETURN
             // threads, count(r) AS edges`.
-            if let Some(rows) = (!hydrates)
+            if let Some(rows) = (!hydrates && !stage_dead)
                 .then(|| {
                     constant_count_stage(graph, prefix, proj, None, &input, &input_names, params)
                 })
@@ -7941,7 +13811,7 @@ fn stream_stage(
                     .collect();
                 return Ok(QueryResult { columns, rows: out });
             }
-            if let Some((rows, _)) = (!hydrates)
+            if let Some((rows, _)) = (!hydrates && !stage_dead)
                 .then(|| {
                     crate::batch::try_columnar_stage(graph, prefix, &rest[0], &[], &input, params)
                 })
@@ -7971,72 +13841,128 @@ fn stream_stage(
                     .collect();
                 return Ok(QueryResult { columns, rows: out });
             }
-            let plan = plan_stage(graph, prefix, &rest[0], &input_names, Some(&[]), None);
-            let mut collector = StreamProjector::new(graph, proj, params, plan.deferred.clone())?;
+            let mut plan = plan_stage(
+                graph,
+                prefix,
+                &rest[0],
+                &input_names,
+                Some(&[]),
+                None,
+                out_demand,
+            );
+            plan.bare_trails = bare_trail_paths(prefix, clauses);
+            let mut collector = StreamProjector::new(
+                graph,
+                proj,
+                params,
+                plan.deferred.clone(),
+                // `split` is the index of the PROJECTING clause, so the
+                // window is exactly the clauses that ran before it.
+                constant_names_at(clauses, split, consts_in),
+            )?;
             // The previous stage's lean carries AND (fix 56) this stage's
             // own lean-bound whole-node outputs are hydrated for the
             // survivors alike.
             let mut hydrate = late_full.clone();
             hydrate.extend(plan.late_full.iter().cloned());
             collector.late_full = hydrate;
-            let caches: Vec<std::cell::RefCell<MemoSlot>> = (0..prefix.len())
-                .map(|_| std::cell::RefCell::new(MemoSlot::Untouched))
-                .collect();
-            for row in input {
-                match drive(
+            // Folded where the workers make its rows, when they make them.
+            let route = if stage_dead {
+                None
+            } else {
+                fold_stage_route(graph, prefix, &plan, input.len(), &mut collector)?
+            };
+            match route {
+                Some(route) => {
+                    let consts = constant_names_at(clauses, split, consts_in);
+                    let make = || {
+                        StreamProjector::new(graph, proj, params, plan.deferred.clone(), consts.clone())
+                    };
+                    drive_stage_folding(graph, prefix, &plan, input, params, route, &mut collector, &make)?;
+                }
+                None => drive_stage_rows(
                     graph,
                     prefix,
-                    &plan.seeds,
                     &plan,
-                    &caches,
-                    row,
+                    if stage_dead { Vec::new() } else { input },
                     params,
                     &mut |r| collector.push(r),
-                ) {
-                    Err(RunError::Saturated) => break, // the LIMIT is full
-                    other => other?,
-                }
+                )?,
             }
             Ok(collector.finish()?.into_result())
         }
         Some(Clause::With { proj, where_ }) => {
+            // The input carries nodes the previous stage bound LEAN for this
+            // breaker to hydrate for its survivors (see the lean-then-hydrate
+            // lever below): only this collector knows who survives, so the
+            // shortcuts that answer a stage without it are not taken.
+            let hydrate_in = late_full.clone();
             // A BARE-COUNT stage — `[OPTIONAL] MATCH (v:L…) WITH <carried>,
             // count(v) AS c` — answers from the count store. Chains of these
             // (`OPTIONAL MATCH (s:Bio:Species) WITH count(s) AS a OPTIONAL
             // MATCH (d:Med:Disease) WITH a, count(d) AS b …`) each streamed a
             // full label per stage (5 s on the production port) for a
             // number the store keeps current.
-            if let Some(rows) = constant_count_stage(
-                graph,
-                prefix,
-                proj,
-                where_.as_ref(),
-                &input,
-                &input_names,
-                params,
-            )? {
+            if let Some(rows) = hydrate_in
+                .is_empty()
+                .then(|| {
+                    constant_count_stage(
+                        graph,
+                        prefix,
+                        proj,
+                        where_.as_ref(),
+                        &input,
+                        &input_names,
+                        params,
+                    )
+                })
+                .transpose()?
+                .flatten()
+            {
                 sometimes!(
                     "interp.bare count stage answered from the count store",
                     true
                 );
-                return stream_stage(graph, &rest[1..], rows, params, &Default::default());
+                let next = constants_established_by(&rest[0]);
+                return stream_stage(
+                    graph,
+                    &rest[1..],
+                    rows,
+                    params,
+                    &Default::default(),
+                    &next,
+                    out_demand,
+                );
             }
             // The stage head as a column walk (a WITH chain over one scanned
             // variable, ordered and paged at this breaker).
-            if let Some((rows, consumed)) = crate::batch::try_columnar_stage(
-                graph,
-                prefix,
-                &rest[0],
-                &rest[1..],
-                &input,
-                params,
-            )? {
+            if let Some((rows, consumed)) = hydrate_in
+                .is_empty()
+                .then(|| {
+                    crate::batch::try_columnar_stage(
+                        graph,
+                        prefix,
+                        &rest[0],
+                        &rest[1..],
+                        &input,
+                        params,
+                    )
+                })
+                .transpose()?
+                .flatten()
+            {
+                // No constants carried: this path consumes a VARIABLE number
+                // of clauses (`1 + consumed`), so which of them established
+                // what is not known here. Passing none only forgoes the
+                // optimisation; claiming one wrongly would merge groups.
                 return stream_stage(
                     graph,
                     &rest[1 + consumed..],
                     rows,
                     params,
                     &Default::default(),
+                    &[],
+                    out_demand,
                 );
             }
             // Liveness past this breaker: what the remaining clauses read.
@@ -8078,15 +14004,38 @@ fn stream_stage(
             // (7.2 ms on the mirror against Neo4j's 2.1).
             let mut late_full: std::collections::BTreeSet<String> = Default::default();
             if graph.late_projection_enabled() {
-                if let (Some(names), Some(m), [Clause::Return { proj: rp }]) =
-                    (after.as_deref(), props_after.as_mut(), &rest[1..])
+                // THE COLLECTOR THAT HYDRATES A LEAN CARRY FOR ITS SURVIVORS.
+                // A concluding RETURN (fix 27; fix 80: after an AGGREGATING
+                // breaker it need not be a top-k — every output row is a
+                // group), or a next WITH that is itself a LIMITed breaker and
+                // aggregates nothing — the one kind of WITH collector that
+                // hydrates (`hydrate_in` below). SNB BI bi4's prefix groups
+                // `WITH country, forum, count(person) … ORDER BY …` over one
+                // row per membership of a recent forum and hands every group
+                // to `WITH DISTINCT forum AS topForum LIMIT 100`: `forum` was
+                // bound WHOLE on each of those rows — 4,982,242 full reads at
+                // SF3 — to keep a hundred forums.
+                let hydrator: Option<(&Projection, bool)> = match &rest[1..] {
+                    [Clause::Return { proj: rp }] => {
+                        let aggregating =
+                            proj.items.iter().any(|it| contains_aggregate(&it.expr));
+                        (topk_return_shape(rp)
+                            || (aggregating && late_full_after_aggregation_shape(rp)))
+                        .then_some((rp, false))
+                    }
+                    [Clause::With { proj: np, .. }, ..]
+                        if !np.star
+                            && np.limit.is_some()
+                            && !np.items.iter().any(|it| contains_aggregate(&it.expr)) =>
+                    {
+                        Some((np, true))
+                    }
+                    _ => None,
+                };
+                if let (Some(names), Some(m), Some((rp, next_with))) =
+                    (after.as_deref(), props_after.as_mut(), hydrator)
                 {
-                    // Fix 80: after an AGGREGATING breaker the RETURN need
-                    // not be a top-k — every output row is a group.
-                    let aggregating = proj.items.iter().any(|it| contains_aggregate(&it.expr));
-                    let admits = topk_return_shape(rp)
-                        || (aggregating && late_full_after_aggregation_shape(rp));
-                    if admits {
+                    {
                         // Only a NODE variable this breaker carries bare
                         // (`WITH p …`, any alias) qualifies: one bound by a
                         // pattern of this stage, or an input the previous
@@ -8094,15 +14043,13 @@ fn stream_stage(
                         // relationship is never hydrated.
                         let node_var = |v: &str| -> bool {
                             prefix.iter().any(|c| match c {
-                                Clause::Match { pattern, .. } => {
-                                    pattern.paths.iter().any(|path| {
-                                        path.start.var.as_deref() == Some(v)
-                                            || path
-                                                .hops
-                                                .iter()
-                                                .any(|(_, n)| n.var.as_deref() == Some(v))
-                                    })
-                                }
+                                Clause::Match { pattern, .. } => pattern.paths.iter().any(|path| {
+                                    path.start.var.as_deref() == Some(v)
+                                        || path
+                                            .hops
+                                            .iter()
+                                            .any(|(_, n)| n.var.as_deref() == Some(v))
+                                }),
                                 _ => false,
                             }) || matches!(
                                 input.first().and_then(|r| r.get(v)),
@@ -8131,7 +14078,11 @@ fn stream_stage(
                                 continue;
                             }
                             if let Some(props) = late_full_reads(rp, name) {
-                                if topk_return_shape(rp) {
+                                if next_with {
+                                    counted!(
+                                        "interp.breaker bound a bare carry lean for the next WITH to hydrate"
+                                    );
+                                } else if topk_return_shape(rp) {
                                     counted!(
                                         "interp.breaker bound a bare carry lean for the RETURN's top-k"
                                     );
@@ -8147,41 +14098,173 @@ fn stream_stage(
                     }
                 }
             }
-            let plan = plan_stage(
+            let mut plan = plan_stage(
                 graph,
                 prefix,
                 &rest[0],
                 &input_names,
                 after.as_deref(),
                 props_after.as_ref(),
+                None,
             );
-            let mut collector = StreamProjector::new(graph, proj, params, plan.deferred.clone())?;
-            let caches: Vec<std::cell::RefCell<MemoSlot>> = (0..prefix.len())
-                .map(|_| std::cell::RefCell::new(MemoSlot::Untouched))
-                .collect();
-            for row in input {
-                match drive(
+            plan.bare_trails = bare_trail_paths(prefix, clauses);
+            // The breaker's heavy items evaluated by the workers that produce
+            // its rows (`heavy_projection`). Not what the projector hydrates
+            // or defers first: a worker would read those still lean.
+            let heavy = graph
+                .exec()
+                .is_some_and(|e| e.width() > 1)
+                .then(|| {
+                    let mut lean = hydrate_in.clone();
+                    lean.extend(plan.late_full.iter().cloned());
+                    lean.extend(plan.deferred.keys().cloned());
+                    heavy_projection(proj, &lean)
+                })
+                .flatten();
+            if let Some((_, pre)) = &heavy {
+                counted!("interp.breaker's heavy items evaluated where its rows are produced");
+                plan.pre_eval = pre.clone();
+            }
+            let mut collector = StreamProjector::new(
+                graph,
+                heavy.as_ref().map_or(proj, |(p, _)| p),
+                params,
+                plan.deferred.clone(),
+                // `split` is the index of the PROJECTING clause, so the
+                // window is exactly the clauses that ran before it.
+                constant_names_at(clauses, split, consts_in),
+            )?;
+            // The previous stage's lean carries, hydrated for THIS breaker's
+            // survivors before they are projected.
+            collector.late_full = hydrate_in;
+            // a next clause that reads this breaker's rows only until its k-th
+            // distinct value of one column
+            if where_.is_none() && !proj.distinct && proj.skip.is_none() && proj.limit.is_none() {
+                collector.downstream_distinct = downstream_distinct_limit(graph, params, proj, &rest[1..])?;
+            }
+            // An aggregating breaker over one label scan: the whole stage on
+            // the workers, each over its share of the seeds.
+            let consts = constant_names_at(clauses, split, consts_in);
+            let make = || {
+                StreamProjector::new(graph, proj, params, plan.deferred.clone(), consts.clone())
+            };
+            let on_workers = !stage_dead
+                && heavy.is_none()
+                && parallel_aggregate_stage(graph, prefix, &plan, &input, params, &mut collector, &make)?;
+            // A creator's newest messages, paged from the date index.
+            let paged = !on_workers
+                && !stage_dead
+                && heavy.is_none()
+                && creator_date_page_stage(graph, prefix, &plan, &input, params, proj, &mut collector)?;
+            // Else folded where the workers make its rows, when they make
+            // them — through the projection the breaker projects (its heavy
+            // items already evaluated by those workers).
+            let route = if on_workers || paged || stage_dead {
+                None
+            } else {
+                fold_stage_route(graph, prefix, &plan, input.len(), &mut collector)?
+            };
+            if let Some(route) = route {
+                let fold_proj = heavy.as_ref().map_or(proj, |(p, _)| p);
+                let make_fold = || {
+                    StreamProjector::new(graph, fold_proj, params, plan.deferred.clone(), consts.clone())
+                };
+                drive_stage_folding(graph, prefix, &plan, input, params, route, &mut collector, &make_fold)?;
+            } else if !on_workers && !paged {
+                drive_stage_rows(
                     graph,
                     prefix,
-                    &plan.seeds,
                     &plan,
-                    &caches,
-                    row,
+                    if stage_dead { Vec::new() } else { input },
                     params,
                     &mut |r| collector.push(r),
-                ) {
-                    Err(RunError::Saturated) => break, // the LIMIT is full
-                    other => other?,
-                }
+                )?;
             }
             let mut rows = collector.finish()?.into_rows()?;
             if let Some(w) = where_ {
                 rows = filter_rows(graph, rows, w, params)?;
             }
-            stream_stage(graph, &rest[1..], rows, params, &late_full)
+            {
+                let next = constants_established_by(&rest[0]);
+                stream_stage(graph, &rest[1..], rows, params, &late_full, &next, out_demand)
+            }
         }
         _ => unreachable!("streamable() requires a concluding RETURN"),
     }
+}
+
+/// The groups at `keep`, in `keep`'s order; the rest are freed on the
+/// executor's workers when there are many — a million groups' rows are
+/// millions of allocations to free on one thread.
+fn take_selected_groups(graph: &Graph, groups: Vec<AggGroup>, keep: &[usize]) -> Vec<AggGroup> {
+    let mut slots: Vec<Option<AggGroup>> = groups.into_iter().map(Some).collect();
+    let kept: Vec<AggGroup> = keep.iter().filter_map(|&i| slots[i].take()).collect();
+    free_on_workers(graph, slots);
+    kept
+}
+
+/// Free `items` on the executor's workers, a contiguous run each, when there
+/// are enough of them to pay for the dispatch; else here.
+fn free_on_workers<T: Send>(graph: &Graph, items: Vec<T>) {
+    const FREE_SPLIT_MIN: usize = 65_536;
+    match graph.exec().filter(|e| e.width() > 1) {
+        Some(exec) if items.len() >= FREE_SPLIT_MIN => {
+            let per = items.len().div_ceil(exec.width()).max(1);
+            let mut rest = items.into_iter().peekable();
+            let mut runs: Vec<std::sync::Mutex<Option<Vec<T>>>> = Vec::new();
+            while rest.peek().is_some() {
+                runs.push(std::sync::Mutex::new(Some(rest.by_ref().take(per).collect())));
+            }
+            exec.for_each(runs.len(), &|i| {
+                drop(runs[i].lock().unwrap_or_else(|e| e.into_inner()).take());
+            });
+        }
+        _ => drop(items),
+    }
+}
+
+/// The column and `k` of the clause after a breaker when it reads the
+/// breaker's rows in order only until `k` distinct values of one of its
+/// columns: `WITH DISTINCT <column> [AS alias] LIMIT k`, with no WHERE, ORDER
+/// BY or SKIP (`StreamProjector::downstream_distinct`).
+fn downstream_distinct_limit(
+    graph: &Graph,
+    params: &BTreeMap<String, Value>,
+    proj: &Projection,
+    after: &[Clause],
+) -> Result<Option<(String, usize)>, RunError> {
+    let Some(Clause::With {
+        proj: next,
+        where_: None,
+    }) = after.first()
+    else {
+        return Ok(None);
+    };
+    if !next.distinct
+        || next.star
+        || next.items.len() != 1
+        || !next.order.is_empty()
+        || next.skip.is_some()
+    {
+        return Ok(None);
+    }
+    let Expr::Var(c) = &next.items[0].expr else {
+        return Ok(None);
+    };
+    let named = proj.items.iter().enumerate().any(|(i, it)| {
+        it.alias
+            .clone()
+            .or_else(|| it.text.clone())
+            .unwrap_or_else(|| column_name(&it.expr, i))
+            == *c
+    });
+    if !named {
+        return Ok(None);
+    }
+    let Some(limit) = eval_count(graph, next.limit.as_ref(), params, "LIMIT")? else {
+        return Ok(None);
+    };
+    Ok(Some((c.clone(), limit)))
 }
 
 /// Per-clause memo of an INDEPENDENT single-node scan, one slot per clause
@@ -8329,7 +14412,7 @@ fn independent_single_node<'a>(pattern: &'a Pattern, row: &Row) -> Option<MemoSc
         return None;
     }
     let path = &pattern.paths[0];
-    if path.shortest || path.var.is_some() || !path.hops.is_empty() {
+    if path.shortest.is_some() || path.var.is_some() || !path.hops.is_empty() {
         return None;
     }
     let var = path.start.var.as_deref()?;
@@ -8430,7 +14513,7 @@ fn constant_count_stage(
         return Ok(None);
     }
     let path = &pattern.paths[0];
-    if path.var.is_some() || path.shortest {
+    if path.var.is_some() || path.shortest.is_some() {
         return Ok(None);
     }
     // The pattern's own variables. A bound start is a lookup, not a
@@ -8729,7 +14812,9 @@ fn drive(
                             }
                         }
                         if any {
-                            counted!("interp.clause scan memo declined for a declared correlated key");
+                            counted!(
+                                "interp.clause scan memo declined for a declared correlated key"
+                            );
                         }
                         any
                     }
@@ -8982,6 +15067,29 @@ fn drive(
             }
             Ok(())
         }
+        Clause::CallSubquery { query, .. } => {
+            // Same join the interpreter loop performs, one row at a time so
+            // the caller streams: the subquery runs seeded by this row, and
+            // each of its rows is that row plus the subquery's columns. A
+            // subquery returning NO columns is a filter-free unit — the row
+            // passes through once, not zero times.
+            let _out = plan
+                .call_out
+                .get(&clause_ix)
+                .map(|d| CallOutputDemand::set(query, d.clone()));
+            let sub = run_query_seeded(graph, query, params, row.clone())?;
+            if sub.columns.is_empty() {
+                return drive(graph, rest, rest_seeds, plan, caches, row, params, sink);
+            }
+            for sub_row in &sub.rows {
+                let mut r = row.clone();
+                for (c, v) in sub.columns.iter().zip(sub_row) {
+                    r.insert(c.clone(), v.clone());
+                }
+                drive(graph, rest, rest_seeds, plan, caches, r, params, sink)?;
+            }
+            Ok(())
+        }
         Clause::Unwind { expr, alias } => match eval_expr(graph, expr, &row, params)? {
             Value::Null => Ok(()),
             Value::List(items) => {
@@ -8997,7 +15105,7 @@ fn drive(
                 } else {
                     row.clone()
                 };
-                for item in items {
+                for item in (items).iter().cloned() {
                     let mut r = carry.clone();
                     r.insert(alias.clone(), item);
                     drive(graph, rest, rest_seeds, plan, caches, r, params, sink)?;
@@ -9053,6 +15161,107 @@ fn drive(
 /// a correlated seed, the end var bound to a node in `row`. The reversed
 /// path swaps the endpoints and flips the rel direction; the same
 /// variables bind to the same nodes, discovered from the other end.
+/// What driving `path` from its (bound) START would expand, in rows —
+/// `None` when it cannot be priced without paying for the answer.
+///
+/// A path with BOTH ends bound can be walked from either end for the same
+/// answer, and the two costs are not close. SNB BI16's optional leg —
+/// `(person1)-[:KNOWS]-(person2)<-[:HAS_CREATOR]-(message2)-[:HAS_TAG]->(tag)`
+/// with `person1` AND `tag` bound — drove from `person1`: 139 friends, each
+/// of their ~370 messages, 14,293,280 expansions per parameter to produce 90
+/// people. That tag's ENTIRE inbound adjacency is 13,512 edges. Measured at
+/// SF3: 93 s against 11 s, same answer, inside a 228 s query.
+///
+/// THE FIRST HOP IS MEASURED, THE REST ARE AVERAGES. The bound end is a
+/// concrete node, so its own fan-out is read from the resident adjacency
+/// table (`adjacent_slim_len_hint`, which declines rather than building one —
+/// a memoised degree probe would build a whole-store degree table for a cold
+/// type, which is a real cost paid to guess at one). Past it the estimate is
+/// the maintained counts' average degree, `type_edge_count / label nodes`,
+/// answered from `Stats` in O(1).
+///
+/// A HOP THAT LANDS ON THE OPPOSITE BOUND END COSTS 1, not its fan-out: the
+/// far node is already known, so the hop is an edge-existence test
+/// (`interp.expansion read only the edges to a known peer`), not an
+/// expansion. Getting this wrong inverts the decision — BI16's last hop from
+/// `Message` to `Tag` averages 3.6 at SF3, which prices the runaway direction
+/// BELOW the cheap one, and a first-hop-only comparison (139 against 13,512)
+/// inverts it for the same reason: the explosion is at hop TWO.
+///
+/// REJECTED, MEASURED: extending this to an end that is merely CONSTRAINED.
+///
+/// The rule below turns a path around when its far end is already a concrete
+/// node. The obvious extension is an end that is only cheap to FIND — a node
+/// carrying a property map, which `Seed::IndexEq` can probe — and SNB BI16 at
+/// SF10 looked like the case for it. Written start-first it costs 110 s for
+/// 391 rows; written tag-first the identical query costs 1 s.
+///
+/// Reversing the pattern does NOT reproduce that. Built, wired and measured on
+/// the SF10 corpus: the turn fires (its counter says so) and the query still
+/// takes 115 s against 112 s before. The 110x gap belongs to something the
+/// hand-written order unlocks further down — a columnar recogniser claims the
+/// tag-first spelling and never sees the reversed AST — not to the direction
+/// of the walk. BI16 stayed killed at 900 s in three separate A/Bs.
+///
+/// Recorded here because the reasoning is sound and the conclusion is not, and
+/// the next person to notice that 110x will reach for exactly this.
+///
+/// A path whose START and END are unbound but some interior node IS bound in
+/// the row, split at the first such node into two paths that both START
+/// there: the prefix reversed (bound node back to the start) and the suffix as
+/// written. `None` when the split cannot be exact.
+///
+/// The two halves are matched one after the other on the same row, so every
+/// variable binds to what one walk of the whole path would bind. What a split
+/// could lose is the ISOMORPHISM between the halves — one walk keeps a
+/// relationship from being used twice along the path, two walks do not — so
+/// the split is taken only when no relationship type of the prefix can occur
+/// in the suffix (every hop typed, the two type sets disjoint). The prefix
+/// must be fixed-length, which `reverse_path` requires; the suffix is not
+/// turned round and may hold a variable-length hop. A named path or a
+/// `shortestPath` keeps its single walk.
+fn split_at_bound_interior(path: &PathPattern, row: &Row) -> Option<(PathPattern, PathPattern)> {
+    if path.var.is_some() || path.shortest.is_some() || path.hops.len() < 2 {
+        return None;
+    }
+    let bound = |n: &NodePattern| {
+        n.var
+            .as_ref()
+            .is_some_and(|v| matches!(row.get(v), Some(Value::Node { .. })))
+    };
+    if bound(&path.start) || bound(&path.hops[path.hops.len() - 1].1) {
+        return None; // an end is bound: the end rules already drive from it
+    }
+    // node k is `hops[k - 1].1`, for k in 1..hops.len() (interior only)
+    let k = (1..path.hops.len()).find(|&k| bound(&path.hops[k - 1].1))?;
+    let (pre, suf) = path.hops.split_at(k);
+    if pre.iter().any(|(r, _)| r.length.is_some()) {
+        return None;
+    }
+    if path.hops.iter().any(|(r, _)| r.types.is_empty()) {
+        return None;
+    }
+    if pre
+        .iter()
+        .any(|(a, _)| suf.iter().any(|(b, _)| a.types.iter().any(|t| b.types.contains(t))))
+    {
+        return None;
+    }
+    let prefix = PathPattern {
+        var: None,
+        shortest: None,
+        start: path.start.clone(),
+        hops: pre.to_vec(),
+    };
+    let suffix = PathPattern {
+        var: None,
+        shortest: None,
+        start: path.hops[k - 1].1.clone(),
+        hops: suf.to_vec(),
+    };
+    Some((reverse_path(&prefix), suffix))
+}
+
 fn reverse_bound_end_path(path: &PathPattern, row: &Row) -> Option<PathPattern> {
     // A path whose START is unbound but whose LAST node IS bound in the
     // incoming row drives from the wrong end: the unbound start seeds a full
@@ -9062,8 +15271,12 @@ fn reverse_bound_end_path(path: &PathPattern, row: &Row) -> Option<PathPattern> 
     // generalises the single-hop hydrate reversal to N hops — LDBC SNB IC5's
     // `(friend)<-[:HAS_CREATOR]-(post)<-[:CONTAINER_OF]-(forum)` with `forum`
     // bound scanned every Person once per forum, 76 s on a 200-person graph.
-    if path.shortest || path.var.is_some() || path.hops.is_empty() {
-        return None; // a path variable's trail order would change under reversal
+    // A NAMED path is reversible: its trail comes back in reversed order and
+    // `restore_reversed_bindings` turns it round again before anything reads
+    // it. `shortestPath` stays excluded — its choice among equal-length
+    // candidates depends on the direction of the search.
+    if path.shortest.is_some() || path.hops.is_empty() {
+        return None;
     }
     // The start must be genuinely unbound (a bound start already drives right).
     if let Some(v) = &path.start.var {
@@ -9071,11 +15284,15 @@ fn reverse_bound_end_path(path: &PathPattern, row: &Row) -> Option<PathPattern> 
             return None;
         }
     }
-    // Every hop must be fixed-length; a variable-length hop's reversal (which
-    // depends on the min/max being symmetric per intermediate) is not modelled.
-    if path.hops.iter().any(|(rel, _)| rel.length.is_some()) {
-        return None;
-    }
+    // A VARIABLE-LENGTH hop reverses cleanly: a walk of length k from `a` to
+    // `b` is a walk of length k from `b` to `a` over the same edges, so each
+    // hop keeps its own min/max and only the ORDER of the list its variable
+    // binds changes — which `restore_reversed_bindings` undoes.
+    //
+    // MEASURED, FinBench tcr2's shape: `p=(other:Account)-[:transfer*1..3]->
+    // (account)` with `account` bound and `other` not. Forward it seeds from
+    // every account — 13,993 store gets on a 2,000-account fixture — against
+    // 9 reversed, and it ran into a 600 s ceiling at SF10.
     // The LAST node must be bound to a concrete node. (An intermediate-only
     // bound node is a rarer shape left to the forward path.)
     let (_, last) = path.hops.last().expect("non-empty checked above");
@@ -9086,7 +15303,819 @@ fn reverse_bound_end_path(path: &PathPattern, row: &Row) -> Option<PathPattern> 
     if !last_bound {
         return None;
     }
-    Some(reverse_path(path))
+    // `reverse_path` drops the path variable, deliberately: its other callers
+    // never restore order, and a named path bound REVERSED would be a silent
+    // wrong answer where an unbound one is a loud error. This caller DOES
+    // restore (`restore_reversed_bindings`), so it alone carries the name.
+    let mut rev = reverse_path(path);
+    rev.var = path.var.clone();
+    Some(rev)
+}
+
+/// Put back what reversing `orig` turned round in a matched row.
+///
+/// Matching a path REVERSED yields the same nodes and edges in the opposite
+/// order, and two bindings expose that order: the path variable itself (a
+/// trail `[node, rel, node, …]`, read by `nodes(p)` / `relationships(p)`) and
+/// the LIST a variable-length hop's relationship variable binds. Both are
+/// reversed back here so the row is exactly what the forward walk would have
+/// produced. A fixed-length hop's variable binds ONE edge and is unaffected.
+fn restore_reversed_bindings(row: &mut Row, orig: &PathPattern) {
+    let flip = |v: &mut Value| match v {
+        Value::Path(l) | Value::List(l) => {
+            let mut items: Vec<Value> = l.iter().cloned().collect();
+            items.reverse();
+            *l = items.into();
+        }
+        _ => {}
+    };
+    if let Some(name) = &orig.var {
+        if let Some(v) = row.get_mut(name) {
+            flip(v);
+        }
+    }
+    for (rel, _) in &orig.hops {
+        if rel.length.is_some() {
+            if let Some(name) = &rel.var {
+                if let Some(v) = row.get_mut(name) {
+                    flip(v);
+                }
+            }
+        }
+    }
+}
+
+/// Whether reversing `orig` leaves anything order-sensitive in the row.
+fn reversal_needs_restore(orig: &PathPattern) -> bool {
+    orig.var.is_some()
+        || orig
+            .hops
+            .iter()
+            .any(|(rel, _)| rel.length.is_some() && rel.var.is_some())
+}
+
+/// The ids a pattern comprehension's own filter pins its START variable to,
+/// when every branch of that filter pins it.
+///
+/// SNB Interactive IC14 weights each relationship of a path by counting
+/// message exchanges between its endpoints:
+///
+/// ```cypher
+/// [(a:Person)<-[:HAS_CREATOR]-(:Comment)-[:REPLY_OF]->(:Post)-[:HAS_CREATOR]->(b:Person)
+///  WHERE (a.id = startNode(r).id AND b.id = endNode(r).id) OR (…reversed…) | 1.0]
+/// ```
+///
+/// `a` and `b` are FRESH PATTERN VARIABLES, tied to the path's endpoints only
+/// by an id-equality `WHERE`. So neither end is bound, and the comprehension
+/// enumerates every `Person<-Comment->Post->Person` path IN THE GRAPH, once
+/// per relationship in the path. Measured at SF3: over 300 s, 55.7 GiB peak,
+/// against Neo4j's 1 s at SF10.
+///
+/// # Why a superset is safe
+///
+/// The caller still applies the filter to every row this produces. So an
+/// answer that is too WIDE costs time and changes nothing, and only one that
+/// is too NARROW could lose a match. Hence the rule: EVERY disjunct must pin
+/// the key, on the same key, or this declines. A branch that leaves the start
+/// free admits any start, and no id set can stand for it.
+///
+/// The pinning expressions are evaluated against the OUTER scope, and must not
+/// read anything the pattern itself binds — a correlated bound would have to
+/// be evaluated per match, which is the enumeration this exists to avoid.
+fn comprehension_start_ids(
+    graph: &Graph,
+    path: &PathPattern,
+    filter: Option<&Expr>,
+    scope: &engram_cypher::Scope<'_>,
+    seed: &Row,
+    // The pins are evaluated with the SAME hooks the comprehension itself
+    // runs under. Without them `startNode(r).id` — IC14's actual pin — fails
+    // to evaluate and the extraction declines: measured as `eval-failed`,
+    // while the identical filter written with plain property reads pinned
+    // fine. A graph-aware function in a pin is not exotic; it is the case
+    // this exists for.
+    hooks: Option<&dyn engram_cypher::GraphHooks>,
+) -> Option<Vec<u64>> {
+    // AN ALREADY-BOUND ENDPOINT BEATS ANY INDEX SEEK, so decline when the
+    // pattern has one.
+    //
+    // This fired where it HURT before the guard existed:
+    // `size([(w:KMWorkItem)-[:BELONGS_TO_PROJECT]->(p) WHERE w.status = 'open'
+    // | w.title])` has `p` bound by the outer row, so the walk is one project's
+    // adjacency — but `w.status = 'open'` pins the start, and seeding from
+    // every open work item in the graph instead cost 144,000 full node
+    // materialisations for the same answer. An existing test caught it on a
+    // counter, not on the rows.
+    //
+    // IC14 keeps the optimisation because neither of its endpoints is bound:
+    // `a` and `b` are fresh variables the filter constrains by id.
+    let bound_endpoint = std::iter::once(&path.start)
+        .chain(path.hops.iter().map(|(_, n)| n))
+        .any(|n| n.var.as_ref().is_some_and(|v| seed.contains_key(v)));
+    if bound_endpoint {
+        return None;
+    }
+    let var = path.start.var.as_ref()?;
+    let [label] = path.start.labels.as_slice() else {
+        return None; // the probe is label-scoped
+    };
+    let f = filter?;
+    // names the PATTERN binds; a pin that reads one of them is correlated
+    let mut inner: Vec<String> = Vec::new();
+    if let Some(v) = path.start.var.as_ref() {
+        inner.push(v.clone());
+    }
+    for (rel, node) in &path.hops {
+        if let Some(v) = &rel.var {
+            inner.push(v.clone());
+        }
+        if let Some(v) = &node.var {
+            inner.push(v.clone());
+        }
+    }
+
+    let mut disj: Vec<&Expr> = Vec::new();
+    fn split_or<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+        match e {
+            Expr::Or(a, b) => {
+                split_or(a, out);
+                split_or(b, out);
+            }
+            other => out.push(other),
+        }
+    }
+    split_or(f, &mut disj);
+
+    let mut key: Option<String> = None;
+    let mut vals: Vec<Value> = Vec::new();
+    for d in disj {
+        let mut conj: Vec<Expr> = Vec::new();
+        conjuncts_of(d, &mut conj);
+        // this branch must pin `var.<key>` to something the outer scope knows
+        let mut pinned = false;
+        for c in &conj {
+            let Expr::Bin(engram_cypher::BinOp::Eq, l, r) = c else {
+                continue;
+            };
+            let (k, e) = match (l.as_ref(), r.as_ref()) {
+                (Expr::Prop(base, k), other) | (other, Expr::Prop(base, k)) if matches!(base.as_ref(), Expr::Var(v) if v == var) => {
+                    (k.clone(), other)
+                }
+                _ => continue,
+            };
+            if key.as_ref().is_some_and(|prev| *prev != k) {
+                return None; // two branches pin DIFFERENT keys
+            }
+            if e.has_subquery() {
+                continue;
+            }
+            let mut fv = Vec::new();
+            free_vars_of(e, &mut fv);
+            if fv.iter().any(|v| inner.contains(v)) {
+                continue; // correlated with the pattern's own bindings
+            }
+            let v = match engram_cypher::eval_with(e, scope, hooks) {
+                Ok(v) => v,
+                Err(_) => {
+                    continue;
+                }
+            };
+            if matches!(v, Value::Null) {
+                continue;
+            }
+            key = Some(k);
+            vals.push(v);
+            pinned = true;
+            break;
+        }
+        if !pinned {
+            return None; // a branch that leaves the start free
+        }
+    }
+    let key = key?;
+    if vals.is_empty() {
+        return None;
+    }
+
+    let mut ids: Vec<u64> = Vec::new();
+    for v in &vals {
+        let found = graph
+            .index_probe_eq_scoped(&key, v, None, Some(label))
+            .ok()
+            .flatten()?;
+        ids.extend(found.iter().copied());
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    counted!("interp.comprehension start pinned by its own filter");
+    Some(ids)
+}
+
+/// A comprehension's filter with every term that reads nothing the pattern
+/// binds evaluated ONCE, against the seed row, and read back from a synthetic
+/// parameter on every match. `None` when nothing was lifted.
+///
+/// SNB Interactive IC14's weight terms test
+/// `(a.id = startNode(r).id AND b.id = endNode(r).id) OR (…reversed…)` on every
+/// match of `(a)<-[:HAS_CREATOR]-(:Comment)-[:REPLY_OF]->(:Post)-[:HAS_CREATOR]->(b)`.
+/// `r` is the OUTER relationship, so `startNode(r).id` is one number for the
+/// whole comprehension — and each evaluation materialised that node in full:
+/// 2.41M store reads for about 560k matches at SF3, most of the query's 29 s.
+/// `comprehension_start_ids` already evaluates the same terms once to PIN the
+/// start; this stops the filter re-deriving them per match.
+///
+/// # What may be lifted
+///
+/// A subtree is lifted only when it is built entirely from kinds whose value
+/// depends on nothing but the variables it names — literals, parameters,
+/// variables, property access, indexing, the operators, and calls other than
+/// `rand()` / `randomUUID()` — and none of those variables is one the pattern
+/// binds. Everything else (CASE, comprehensions, quantifiers, label tests,
+/// pattern predicates, subqueries) is left exactly as written, and so are its
+/// children: `free_vars_of` does not descend into subqueries and
+/// `calls_nondeterministic` does not look inside a CASE, so a rule leaning on
+/// either could lift something that moves. Refusing the kind is the guard.
+///
+/// A term whose one-off evaluation FAILS is left in place, so an error still
+/// surfaces on exactly the rows that evaluate it, as before.
+fn hoist_row_invariants(
+    graph: &Graph,
+    filter: &Expr,
+    inner: &[String],
+    row: &Row,
+    params: &BTreeMap<String, Value>,
+) -> Option<(Expr, BTreeMap<String, Value>)> {
+    let mut lifted: Vec<Value> = Vec::new();
+    let rewritten = hoist_walk(graph, filter, inner, row, params, &mut lifted);
+    if lifted.is_empty() {
+        return None;
+    }
+    let mut with_lifted = params.clone();
+    for (i, v) in lifted.into_iter().enumerate() {
+        with_lifted.insert(hoisted_param(i), v);
+    }
+    counted!("interp.comprehension filter evaluated its row-invariant terms once");
+    Some((rewritten, with_lifted))
+}
+
+/// A parameter name no statement can spell: Cypher parameter names are
+/// identifiers, and this one starts with NUL.
+fn hoisted_param(i: usize) -> String {
+    format!("\u{0}hoisted{i}")
+}
+
+/// Whether `e` is built only from kinds whose value is fixed by the variables
+/// it names (see [`hoist_row_invariants`]).
+fn hoistable_kind(e: &Expr) -> bool {
+    match e {
+        Expr::Null
+        | Expr::Bool(_)
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Str(_)
+        | Expr::Param(_)
+        | Expr::Var(_) => true,
+        Expr::List(xs) => xs.iter().all(hoistable_kind),
+        Expr::Map(kvs) => kvs.iter().all(|(_, v)| hoistable_kind(v)),
+        Expr::Prop(x, _) | Expr::Not(x) | Expr::Neg(x) => hoistable_kind(x),
+        Expr::IsNull { of, .. } => hoistable_kind(of),
+        Expr::Index(a, b)
+        | Expr::Bin(_, a, b)
+        | Expr::And(a, b)
+        | Expr::Or(a, b)
+        | Expr::Xor(a, b)
+        | Expr::In(a, b) => hoistable_kind(a) && hoistable_kind(b),
+        Expr::Call {
+            name, star, args, ..
+        } => {
+            !*star
+                && !matches!(name.as_str(), "rand" | "randomuuid")
+                && !AGG_FNS.contains(&name.as_str())
+                && args.iter().all(hoistable_kind)
+        }
+        _ => false,
+    }
+}
+
+fn hoist_walk(
+    graph: &Graph,
+    e: &Expr,
+    inner: &[String],
+    row: &Row,
+    params: &BTreeMap<String, Value>,
+    lifted: &mut Vec<Value>,
+) -> Expr {
+    // A bare literal, parameter or variable costs no more to read per match
+    // than the lifted parameter would; lifting it gains nothing.
+    let trivial = matches!(
+        e,
+        Expr::Null
+            | Expr::Bool(_)
+            | Expr::Int(_)
+            | Expr::Float(_)
+            | Expr::Str(_)
+            | Expr::Param(_)
+            | Expr::Var(_)
+    );
+    if !trivial && hoistable_kind(e) {
+        let mut reads = Vec::new();
+        free_vars_of(e, &mut reads);
+        if !reads.iter().any(|v| inner.contains(v)) {
+            if let Ok(v) = eval_expr(graph, e, row, params) {
+                let name = hoisted_param(lifted.len());
+                lifted.push(v);
+                return Expr::Param(name);
+            }
+        }
+    }
+    let mut walk = |x: &Expr| hoist_walk(graph, x, inner, row, params, lifted);
+    match e {
+        Expr::Prop(b, k) => Expr::Prop(Box::new(walk(b)), k.clone()),
+        Expr::Index(a, b) => Expr::Index(Box::new(walk(a)), Box::new(walk(b))),
+        Expr::Bin(op, a, b) => Expr::Bin(*op, Box::new(walk(a)), Box::new(walk(b))),
+        Expr::And(a, b) => Expr::And(Box::new(walk(a)), Box::new(walk(b))),
+        Expr::Or(a, b) => Expr::Or(Box::new(walk(a)), Box::new(walk(b))),
+        Expr::Xor(a, b) => Expr::Xor(Box::new(walk(a)), Box::new(walk(b))),
+        Expr::In(a, b) => Expr::In(Box::new(walk(a)), Box::new(walk(b))),
+        Expr::Not(x) => Expr::Not(Box::new(walk(x))),
+        Expr::Neg(x) => Expr::Neg(Box::new(walk(x))),
+        Expr::IsNull { of, negated } => Expr::IsNull {
+            of: Box::new(walk(of)),
+            negated: *negated,
+        },
+        // Everything else — including a CALL, whose arguments are not lifted
+        // one by one — is kept exactly as written (see the doc above).
+        _ => e.clone(),
+    }
+}
+
+/// Reverse a fixed-length path whose BOTH ends are bound, when the far end is
+/// the cheaper one to walk from.
+///
+/// `reverse_bound_end_path` requires the start to be genuinely UNBOUND — a
+/// bound start already drives from something concrete, so it looks fine. But
+/// when BOTH ends are bound the direction still decides the cost, and driving
+/// from the wrong one walks a large adjacency to keep a handful of rows.
+///
+/// SNB BI bi8 is that shape:
+/// `size([(tag)<-[:HAS_TAG]-(message:Message)-[:HAS_CREATOR]->(person) | message])`
+/// with `tag` and `person` both bound, evaluated once per person AND again per
+/// friend. Driven from `tag` it enumerates every message carrying that tag —
+/// tens of thousands at SF3 — to keep the few `person` wrote. Decomposed:
+/// the candidate set costs 45 s and adding this one comprehension took the
+/// query past the 300 s ceiling.
+///
+/// The choice is made on MEASURED FAN-OUT, not on a guess about which end
+/// "looks" selective: `adjacency_fanout_from_table` reads a slice length off
+/// the adjacency table. When either side cannot be probed — no table for that
+/// epoch, an open write transaction, an id past the degree table — this
+/// DECLINES and the existing direction stands, because a reversal chosen on
+/// half the information is a coin toss, and the forward path is at least the
+/// one the author wrote.
+/// How many rows the far half of a middle join may hold before it is judged
+/// too large to keep, and the path walks as it did.
+const MIDDLE_JOIN_BUILD_ROWS: usize = 262_144;
+
+/// One end's far half, grouped by the id of the middle node each row reaches.
+type MiddleGroups = std::collections::BTreeMap<u64, Vec<Row>>;
+
+/// (statement, (path key, end id) -> slot): see `MIDDLE_JOIN`.
+type MiddleMemo = (u64, std::collections::BTreeMap<(usize, u64), MiddleSlot>);
+
+/// One END's far half, grouped by the middle node it reaches.
+enum MiddleSlot {
+    /// Seen this many times, not built: an end that never repeats pays nothing.
+    Seen(u32),
+    Built(std::sync::Arc<MiddleGroups>),
+    /// Built once and over [`MIDDLE_JOIN_BUILD_ROWS`]: walk as before.
+    TooBig,
+}
+
+thread_local! {
+    /// (statement, (path address, end id) -> slot). Per thread, so a parallel
+    /// stage's workers build their own and share nothing; cleared when the
+    /// statement changes and capped, because it is a cache, never an answer.
+    static MIDDLE_JOIN: std::cell::RefCell<MiddleMemo> =
+        const { std::cell::RefCell::new((0, std::collections::BTreeMap::new())) };
+}
+
+/// A BOTH-BOUND PATH WHOSE END REPEATS ACROSS ROWS, answered as a join at its
+/// first interior node: the far half — from the end back to that node — is
+/// walked ONCE per end and grouped by the node it reaches, and each row walks
+/// only its own first hop and looks each neighbour up. `Ok(false)` declines
+/// and nothing has been emitted.
+///
+/// SNB BI bi17's `(forum1)<-[:HAS_MEMBER]->(person2)<-[:HAS_CREATOR]-(comment
+/// :Comment)-[:HAS_TAG]->(tag)` is evaluated per `message1` row, 4,250 at SF3,
+/// with `tag` the same on every one. Either direction of a single walk is
+/// wrong for that: from `forum1` it is every member's every message (the
+/// first-hop rule's choice), from `tag` every tagged message per row (the
+/// whole-path estimate's) — 73M edge probes and 475 s with the estimate on.
+/// What the rows share is the far half: WHO wrote a tagged comment, and which.
+/// Built once, each row is its forum's members looked up in it — 744,159
+/// lookups over the whole statement.
+///
+/// Exact where it engages: the near and far halves are matched by the same
+/// matcher on the same demand, the far one from a row holding only the end,
+/// so its rows are a function of the end alone; no interior node may be bound
+/// or carry a map (either would make them a function of the row); every hop
+/// is typed and fixed-length, and the first hop's types occur nowhere in the
+/// far half, so the one-path relationship isomorphism the split gives up has
+/// nothing to decide. It stays off inside a writing transaction.
+///
+/// It engages only where it can pay: at an end's SECOND sight (a first sight
+/// walks as before), when the start's first hop is not more than four times
+/// the end's (a hub start would be a worse near half than the walk it
+/// replaces), and while the far half stays under [`MIDDLE_JOIN_BUILD_ROWS`].
+#[allow(clippy::too_many_arguments)]
+fn join_at_middle(
+    graph: &Graph,
+    path: &PathPattern,
+    plan: &StagePlan,
+    seed: &Row,
+    params: &BTreeMap<String, Value>,
+    clause_where: Option<&Expr>,
+    sink: RowSink,
+) -> Result<bool, RunError> {
+    let k = path.hops.len();
+    if path.var.is_some() || path.shortest.is_some() || k < 2 {
+        return Ok(false);
+    }
+    // A CLAUSE WHERE THAT READS THE PATH'S INTERIOR PRUNES THE WALK, and the far
+    // half is built without it (it must not depend on the row). SNB BI bi16's
+    // OPTIONAL leg filters `otherMessage1` by date as it walks; built without
+    // that, the far half held every tagged message and bi16 went 69 -> 102 ms
+    // at SF3 on rev69c. A WHERE that reads no interior node cannot prune it:
+    // bi17's is the clause-uniqueness conjuncts over relationship variables,
+    // and declining on those took its middle join away (rev70's first gate).
+    if let Some(w) = clause_where {
+        let mut read = Vec::new();
+        free_vars_of(w, &mut read);
+        if path.hops[..k - 1]
+            .iter()
+            .any(|(_, n)| n.var.as_ref().is_some_and(|v| read.contains(v)))
+        {
+            return Ok(false);
+        }
+    }
+    if path.hops.iter().any(|(r, _)| r.length.is_some() || r.types.is_empty()) {
+        return Ok(false);
+    }
+    if path.hops[..k - 1]
+        .iter()
+        .any(|(_, n)| n.props.is_some() || n.var.as_ref().is_some_and(|v| seed.contains_key(v)))
+    {
+        return Ok(false);
+    }
+    let first = &path.hops[0].0;
+    if path.hops[1..]
+        .iter()
+        .any(|(r, _)| r.types.iter().any(|t| first.types.contains(t)))
+    {
+        return Ok(false);
+    }
+    let end_pat = &path.hops[k - 1].1;
+    let Some(end_var) = end_pat.var.as_ref() else {
+        return Ok(false);
+    };
+    let Some(end_val) = seed.get(end_var) else {
+        return Ok(false);
+    };
+    let Value::Node { id: end_id, .. } = end_val else {
+        return Ok(false);
+    };
+    let end_id = *end_id;
+    let Some(Value::Node { id: start_id, .. }) = path.start.var.as_ref().and_then(|v| seed.get(v)) else {
+        return Ok(false);
+    };
+    if graph.in_txn_with_writes() {
+        return Ok(false);
+    }
+    let degree = |id: u64, rel: &RelPattern, from_end: bool| -> Option<usize> {
+        let dir = match (rel.dir, from_end) {
+            (RelDir::Out, false) | (RelDir::In, true) => Dir::Out,
+            (RelDir::In, false) | (RelDir::Out, true) => Dir::In,
+            (RelDir::Undirected, _) => Dir::Both,
+        };
+        let mut toks = Vec::with_capacity(rel.types.len());
+        for t in &rel.types {
+            toks.push(graph.type_token_peek(t)?);
+        }
+        graph.adjacent_slim_len_hint(id, dir, &Some(toks))
+    };
+    let (Some(near), Some(far)) = (degree(*start_id, first, false), degree(end_id, &path.hops[k - 1].0, true))
+    else {
+        return Ok(false);
+    };
+    if near > far.saturating_mul(4) {
+        return Ok(false);
+    }
+    // KEYED BY CONTENT, NOT ADDRESS. The parallel stage hands its workers
+    // copies of the pattern, a new address per morsel: keyed by address, bi17
+    // at SF3 rebuilt the far half 1,955 times for one tag. Two patterns that
+    // agree on every variable, label, type and direction, and on the
+    // properties the stage binds for each variable, walk to the same rows.
+    let site = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        path.start.var.hash(&mut h);
+        path.start.labels.hash(&mut h);
+        for (r, n) in &path.hops {
+            (r.dir as u8).hash(&mut h);
+            r.types.hash(&mut h);
+            r.var.hash(&mut h);
+            plan.props_for(r.var.as_ref(), &r.props, None).hash(&mut h);
+            n.var.hash(&mut h);
+            n.labels.hash(&mut h);
+            plan.props_for(n.var.as_ref(), &n.props, Some(n.labels.as_slice())).hash(&mut h);
+        }
+        h.finish() as usize
+    };
+    let stmt = current_statement();
+    enum Act {
+        Walk,
+        Build,
+        Use(std::sync::Arc<MiddleGroups>),
+    }
+    let act = MIDDLE_JOIN.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.0 != stmt {
+            m.0 = stmt;
+            m.1.clear();
+        }
+        if m.1.len() >= 1024 {
+            m.1.clear();
+        }
+        let slot = m.1.entry((site, end_id)).or_insert(MiddleSlot::Seen(0));
+        match slot {
+            MiddleSlot::Seen(n) => {
+                *n += 1;
+                if *n >= 2 { Act::Build } else { Act::Walk }
+            }
+            MiddleSlot::Built(memo) => Act::Use(std::sync::Arc::clone(memo)),
+            MiddleSlot::TooBig => Act::Walk,
+        }
+    });
+    let mid_pat = &path.hops[0].1;
+    let mid_var: String = mid_pat.var.clone().unwrap_or_else(|| "__mid".to_string());
+    let memo = match act {
+        Act::Walk => return Ok(false),
+        Act::Use(memo) => memo,
+        Act::Build => {
+            let mut sub = PathPattern {
+                var: None,
+                shortest: None,
+                start: mid_pat.clone(),
+                hops: path.hops[1..].to_vec(),
+            };
+            sub.start.var = Some(mid_var.clone());
+            let far_path = reverse_path(&sub);
+            let mut build_seed = Row::new();
+            build_seed.insert(end_var.clone(), end_val.clone());
+            let mut groups: MiddleGroups = MiddleGroups::new();
+            let mut held = 0usize;
+            let built = match_path_stream_demanding(
+                graph,
+                &far_path,
+                &Seed::Bound,
+                plan,
+                &build_seed,
+                params,
+                None,
+                &far_path.start.props,
+                &mut |mut r| {
+                    held += 1;
+                    if held > MIDDLE_JOIN_BUILD_ROWS {
+                        return Err(RunError::Saturated);
+                    }
+                    let Some(Value::Node { id, .. }) = r.get(&mid_var) else {
+                        return Ok(());
+                    };
+                    let id = *id;
+                    r.remove(end_var);
+                    groups.entry(id).or_default().push(r);
+                    Ok(())
+                },
+            );
+            match built {
+                Ok(()) => {}
+                Err(RunError::Saturated) => {
+                    counted!("interp.middle join declined: its far half is too large");
+                    MIDDLE_JOIN.with(|m| {
+                        m.borrow_mut().1.insert((site, end_id), MiddleSlot::TooBig);
+                    });
+                    return Ok(false);
+                }
+                Err(e) => return Err(e),
+            }
+            counted!("interp.middle join built its far half once for a repeated end");
+            let memo = std::sync::Arc::new(groups);
+            MIDDLE_JOIN.with(|m| {
+                m.borrow_mut()
+                    .1
+                    .insert((site, end_id), MiddleSlot::Built(std::sync::Arc::clone(&memo)));
+            });
+            memo
+        }
+    };
+    counted!("interp.middle join answered a row from its far half");
+    let mut near_pat = mid_pat.clone();
+    near_pat.var = Some(mid_var.clone());
+    let near_path = PathPattern {
+        var: None,
+        shortest: None,
+        start: path.start.clone(),
+        hops: vec![(first.clone(), near_pat)],
+    };
+    let hidden_mid = mid_pat.var.is_none();
+    match_path_stream_demanding(
+        graph,
+        &near_path,
+        &Seed::Bound,
+        plan,
+        seed,
+        params,
+        clause_where,
+        &near_path.start.props,
+        &mut |r| {
+            let Some(Value::Node { id, .. }) = r.get(&mid_var) else {
+                return Ok(());
+            };
+            let Some(halves) = memo.get(id) else {
+                return Ok(());
+            };
+            for h in halves {
+                let mut out = r.clone();
+                for (name, v) in h.iter() {
+                    if name != &mid_var {
+                        out.insert(name.clone(), v.clone());
+                    }
+                }
+                if hidden_mid {
+                    out.remove(&mid_var);
+                }
+                sink(out)?;
+            }
+            Ok(())
+        },
+    )?;
+    Ok(true)
+}
+
+fn reverse_both_bound_path(graph: &Graph, path: &PathPattern, row: &Row) -> Option<PathPattern> {
+    if path.shortest.is_some() || path.var.is_some() || path.hops.is_empty() {
+        return None;
+    }
+    if path.hops.iter().any(|(rel, _)| rel.length.is_some()) {
+        return None;
+    }
+    let bound_id = |n: &NodePattern| match n.var.as_ref().and_then(|v| row.get(v)) {
+        Some(Value::Node { id, .. }) => Some(*id),
+        _ => None,
+    };
+    let start_id = bound_id(&path.start)?;
+    let (_, last) = path.hops.last().expect("non-empty checked above");
+    let end_id = bound_id(last)?;
+
+    // the first hop as seen from the start, and the last hop as seen from the
+    // end (which is the direction a reversed walk would take)
+    let fanout = |id: u64, rel: &RelPattern, from_end: bool| -> Option<u64> {
+        // An UNDIRECTED hop counts BOTH sides, and it must — bi11 closes its
+        // triangle with `(c)-[k3:KNOWS]-(a)`, undirected, so a rule that
+        // declined here would decline on the very query this exists for. The
+        // first version did exactly that, and only the engagement assertion
+        // caught it; every answer test still passed, because declining is
+        // correct, just slow.
+        let dir = match (rel.dir, from_end) {
+            (RelDir::Out, false) | (RelDir::In, true) => Dir::Out,
+            (RelDir::In, false) | (RelDir::Out, true) => Dir::In,
+            (RelDir::Undirected, _) => Dir::Both,
+        };
+        let mut toks = Vec::with_capacity(rel.types.len());
+        for t in &rel.types {
+            toks.push(graph.type_token_peek(t)?);
+        }
+        let types = (!toks.is_empty()).then_some(toks);
+        // `adjacent_slim_len_hint` answers for `Both` as well, which
+        // `adjacency_fanout_from_table` does not; both read the resident table
+        // and both decline when there is none.
+        graph
+            .adjacent_slim_len_hint(id, dir, &types)
+            .map(|n| n as u64)
+    };
+    // ORDER OF WORK, and it is a COST decision about the decision itself.
+    //
+    // The first-hop rule is two probes; the whole-path estimate is a token
+    // peek, a type count and a label count per hop, twice. This function runs
+    // PER ROW — bi8 evaluates `size([(tag)<-[:HAS_TAG]-(m)-[:HAS_CREATOR]->(p)
+    // | m])` once per person AND once per friend — so paying for the estimate
+    // everywhere cost bi8 140 s -> 185 s and bi14 27 s -> 31 s while choosing
+    // exactly the same ends it already chose.
+    //
+    // So: keep the cheap rule where it already fires. It reverses when the far
+    // end's first hop is smaller, which is the common case and was never the
+    // bug. The estimate is needed only where the cheap rule DECLINES — the
+    // written end looks cheaper on its first hop and is not, which is BI16
+    // (139 KNOWS against 13,512 HAS_TAG, then 14.3M against 13,512).
+    // A SINGLE HOP IS ITS OWN COST, so the two probes answer it exactly and
+    // there is nothing further to price (bi11's triangle closure). Taking
+    // this route first also keeps the cheap case cheap: this function runs
+    // PER ROW, and the estimate below is a token peek, a type count and a
+    // label count per hop, twice.
+    if path.hops.len() < 2 {
+        let (first_rel, _) = &path.hops[0];
+        let (last_rel, _) = path.hops.last().expect("non-empty");
+        let from_start = fanout(start_id, first_rel, false)?;
+        let from_end = fanout(end_id, last_rel, true)?;
+        if from_end >= from_start {
+            return None; // already driving from the cheaper end
+        }
+        counted!("interp.pattern reversed to drive from the cheaper bound end");
+        return Some(reverse_path(path));
+    }
+
+    // ONE RULE PER SHAPE, AND EACH MUST BE ANTI-SYMMETRIC.
+    //
+    // A reversal re-enters this function on the reversed path, so a rule that
+    // can prefer A from A and B from B loops for ever. Running the cheap
+    // first-hop rule ahead of the estimate does exactly that: the estimate
+    // reverses the leg, and on re-entry the first-hop probe — which sees the
+    // two ends swapped — reverses it straight back. It is a STACK OVERFLOW,
+    // caught by `the_answer_is_the_same_from_either_end`, not a slow plan.
+    //
+    // Each rule alone is anti-symmetric: it fires only on a STRICT
+    // improvement, so it cannot fire again on its own output. So the shape
+    // picks the rule, and the two never mix.
+    //
+    // A SINGLE hop is its own cost: two probes answer it exactly, there is
+    // nothing further to price, and this is bi11's triangle closure.
+    //
+    // A TWO-hop leg has nothing further to price either. `shape_tails` skips
+    // the first hop and counts the LAST as 1 (it reaches the other bound end,
+    // an existence test), so for two hops the tail is identically 1 and the
+    // estimate is the first-hop comparison again — with a cache lookup per row
+    // and a 4x margin on top. Inside that margin it kept the SLOWER end, and
+    // that is what the lever cost BI8, whose leg
+    // `(tag)<-[:HAS_TAG]-(m)-[:HAS_CREATOR]->(person)` is two hops, evaluated
+    // per person and per friend: at SF10 on one binary, lever off 86.2 / 59.5 s,
+    // lever on 104.7 / 77.0 s (bi8a / bi8b). The estimate earns its keep only
+    // from three hops, where a middle hop's fan-out is real information —
+    // BI16's leg, which cannot complete at SF10 without it. Keyed on the path's
+    // LENGTH, which a reversal preserves, so the rule stays one per shape.
+    if path.hops.len() < 3 || !graph.path_estimate_enabled() {
+        let (first_rel, _) = &path.hops[0];
+        let (last_rel, _) = path.hops.last().expect("non-empty");
+        let from_start = fanout(start_id, first_rel, false)?;
+        let from_end = fanout(end_id, last_rel, true)?;
+        if from_end >= from_start {
+            return None; // already driving from the cheaper end
+        }
+        counted!("interp.pattern reversed to drive from the cheaper bound end");
+        return Some(reverse_path(path));
+    }
+
+    // THE FIRST HOP IS NOT THE COST OF THE PATH. On a single-hop closure it is
+    // the whole story (bi11's triangle), but on a longer leg the explosion is
+    // usually further in, and then the first hop says the OPPOSITE of the
+    // truth: BI16's optional leg leaves `person1` by 139 KNOWS edges and the
+    // tag by 13,512 HAS_TAG edges, so this comparison keeps the end that goes
+    // on to read 14.3M messages instead of the one that reads 13,512. Price
+    // the whole path from each end, and keep the written order when either
+    // side cannot be priced.
+    // AND IT COSTS BI8 WHAT IT SAVES BI16 — see `Graph::set_path_estimate`,
+    // which is why the lever defaults OFF.
+    //
+    // This site runs per partial, and the first hop has to be MEASURED
+    // because an average cannot see this node's own degree. So the estimate
+    // cannot leave the row loop. Both ways round it were measured and both
+    // are worse: caching the DECISION per shape took bi8 past 400 s and gave
+    // bi16's win back (one row's magnitudes do not speak for the next), and
+    // pricing the first hop from the counts loses a reversal the probe gets
+    // right. Only the shape-only TAIL is cached.
+    let tails = shape_tails(graph, path);
+    match (
+        tails
+            .0
+            .and_then(|t| drive_estimate(graph, path, row, false, t)),
+        tails
+            .1
+            .and_then(|t| drive_estimate(graph, path, row, true, t)),
+    ) {
+        (Some(forward), Some(backward)) => {
+            // By a MARGIN: these are averages, so a near-tie is not evidence,
+            // and flipping on one trades this plan's error for another's.
+            if backward.saturating_mul(DRIVE_END_MARGIN) >= forward {
+                counted!("interp.pattern kept its bound end: the other is no cheaper");
+                return None;
+            }
+            counted!("interp.pattern priced the whole path, not its first hop");
+            counted!("interp.pattern reversed to drive from the cheaper bound end");
+            Some(reverse_path(path))
+        }
+        // Undecidable: keep the written order, exactly as this did before the
+        // estimate existed.
+        _ => None,
+    }
 }
 
 /// Turn a fixed-length path end for end: the last node becomes the start, the
@@ -9129,7 +16158,7 @@ fn reverse_path(path: &PathPattern) -> PathPattern {
     }
     PathPattern {
         var: None,
-        shortest: false,
+        shortest: None,
         start: new_start,
         hops: new_hops,
     }
@@ -9180,6 +16209,7 @@ fn reverse_to_selective_end(
     graph: &Graph,
     path: &PathPattern,
     row: &Row,
+    params: &BTreeMap<String, Value>,
 ) -> Option<PathPattern> {
     if !graph.property_seek_enabled() || !graph.selective_anchor_enabled() {
         return None;
@@ -9187,7 +16217,7 @@ fn reverse_to_selective_end(
     // Structural gates, identical to the bound-end reversal: a path variable
     // records node/rel order that reversal flips, and a variable-length hop's
     // reversal is not modelled.
-    if path.shortest || path.var.is_some() || path.hops.is_empty() {
+    if path.shortest.is_some() || path.var.is_some() || path.hops.is_empty() {
         return None;
     }
     if path.hops.iter().any(|(rel, _)| rel.length.is_some()) {
@@ -9219,11 +16249,58 @@ fn reverse_to_selective_end(
             .min()
             .unwrap_or(u64::MAX)
     };
-    if size(last) > size(&path.start) {
-        return None;
+    let start_size = size(&path.start);
+    if size(last) > start_size {
+        // A LARGER LABEL IS NOT A LARGER ANSWER. The guard is about the
+        // fallback: when the seek cannot answer, the reversed walk scans the
+        // end's label. So ask the seek, the same probe the reversed start
+        // makes, with a cap at 1/64th of the start's label: an answer that
+        // small cannot be beaten by scanning the start, and a probe that
+        // declines leaves the written direction. LDBC FinBench tcr9 opens
+        // with `OPTIONAL MATCH (loan1:Loan)-[:deposit]->(mid:Account {id: $id})`
+        // -- 1.4M loans against 2.1M accounts at SF10 -- and scanned every loan
+        // to reach one account: 1.5 s against Neo4j's 5 ms.
+        if !end_seek_answers_within(graph, last, row, params, start_size / 64) {
+            return None;
+        }
+        counted!("interp.path driven from its index-servable end: the seek answered under a larger label");
     }
     sometimes!("interp.path driven from its index-servable end", true);
     Some(reverse_path(path))
+}
+
+/// Whether the index answers the inline equality of `n` (its first map entry,
+/// the key `inline_index_key` names) with at most `cap` candidates: the probe
+/// the reversed walk's start makes, asked before the reversal is taken. A
+/// value that is not a scalar, a probe the index declines or an answer over
+/// `cap` is `false` -- and so is a failed evaluation, which the forward walk
+/// will then raise where it always did.
+fn end_seek_answers_within(
+    graph: &Graph,
+    n: &NodePattern,
+    row: &Row,
+    params: &BTreeMap<String, Value>,
+    cap: u64,
+) -> bool {
+    let Some(Expr::Map(entries)) = &n.props else {
+        return false;
+    };
+    let Some((key, val_expr)) = entries.first() else {
+        return false;
+    };
+    let Ok(v) = eval_expr(graph, val_expr, row, params) else {
+        return false;
+    };
+    if !matches!(v, Value::Int(_) | Value::Float(_) | Value::Str(_)) || cap == 0 {
+        return false;
+    }
+    let cap = usize::try_from(cap).unwrap_or(usize::MAX);
+    let probed = match graph.declared_scope_for(&n.labels, key) {
+        Ok(Some(l)) => graph.index_probe_eq_scoped(key, &v, Some(cap), Some(l.as_str())),
+        Ok(None) => graph.index_probe_eq(key, &v, Some(cap)),
+        Err(_) => return false,
+    };
+    matches!(probed, Ok(Some(ids)) if ids.len() <= cap)
 }
 
 /// Stream a pattern's paths as nested expansions; the WHERE applies after
@@ -9319,6 +16396,70 @@ fn match_path_stream(
 /// against at build) but must still materialise the map's keys, or every
 /// cached candidate would carry Null where the join key should be.
 #[allow(clippy::too_many_arguments)]
+/// The sorted id set a hop end is confined to by a `WHERE v IN <list>`
+/// conjunct, when every element of that list is a NODE.
+///
+/// Narrow for the reason the other membership fast paths are: NODES COMPARE BY
+/// IDENTITY, so a set of ids is exactly what `IN` means over them. A list
+/// holding anything else takes the ordinary scan, because `eq3` coerces Int
+/// against Float, compares DateTimes by instant and recurses into Lists — an
+/// id set would answer a different question.
+///
+/// The haystack must not read anything the path itself binds: it is evaluated
+/// against the SEED row, before the hop runs, so a correlated list would be
+/// evaluated at the wrong time. Only a conjunct of the top-level `AND` chain
+/// is considered — a predicate under `OR` does not constrain the hop at all.
+fn end_set_from_membership(
+    graph: &Graph,
+    node_pat: &NodePattern,
+    clause_where: Option<&Expr>,
+    seed: &Row,
+    params: &BTreeMap<String, Value>,
+) -> Option<std::sync::Arc<Vec<u64>>> {
+    let var = node_pat.var.as_ref()?;
+    let where_ = clause_where?;
+    let mut parts: Vec<Expr> = Vec::new();
+    conjuncts_of(where_, &mut parts);
+    for c in parts {
+        let Expr::In(needle, haystack) = &c else {
+            continue;
+        };
+        if !matches!(needle.as_ref(), Expr::Var(v) if v == var) {
+            continue;
+        }
+        if haystack.has_subquery() {
+            continue;
+        }
+        // evaluated against the seed, so every name it reads must already be
+        // bound there — never a variable this path is about to bind
+        let mut fv = Vec::new();
+        free_vars_of(haystack, &mut fv);
+        if fv.iter().any(|v| !seed.contains_key(v)) {
+            continue;
+        }
+        let Ok(Value::List(items)) = eval_expr(graph, haystack, seed, params) else {
+            continue;
+        };
+        if items.is_empty() {
+            continue;
+        }
+        let mut ids = Vec::with_capacity(items.len());
+        for it in items.iter() {
+            match it {
+                Value::Node { id, .. } => ids.push(*id),
+                // not all nodes: an id set would change the answer
+                _ => return None,
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        counted!("interp.hop end confined by a WHERE membership test");
+        return Some(std::sync::Arc::new(ids));
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
 fn match_path_stream_demanding(
     graph: &Graph,
     path: &PathPattern,
@@ -9330,7 +16471,10 @@ fn match_path_stream_demanding(
     demand_map: &Option<Expr>,
     sink: RowSink,
 ) -> Result<(), RunError> {
-    debug_assert!(!path.shortest, "shortestPath takes the materialising path");
+    debug_assert!(
+        path.shortest.is_none(),
+        "shortestPath takes the materialising path"
+    );
     // Reverse a bound-end single hop FIRST — before the relationship-driven
     // seed, which for `(parent)-[:HAS_ELEMENT]->(n)` with n bound would
     // scan the WHOLE HAS_ELEMENT partition (millions of edges) to find the
@@ -9341,9 +16485,144 @@ fn match_path_stream_demanding(
         .var
         .as_ref()
         .is_some_and(|v| seed.contains_key(v));
+    // BOTH ENDS BOUND: the direction still decides the cost, and until this
+    // nothing chose it.
+    //
+    // `reverse_bound_end_path` below fires only when the start is UNBOUND — a
+    // bound start already drives from something concrete, so it looks settled.
+    // But SNB BI bi11 closes a triangle with `(c)-[k3:KNOWS]-(a)`, both bound,
+    // and walking `c`'s ~47 KNOWS edges per row to look for one `a` is the
+    // whole query: decomposed at SF3, the first two legs cost 8 s warm, adding
+    // the third took it to 182 s, and adding this closure took it past the
+    // 300 s ceiling — against Neo4j's 6 s for all of it.
+    //
+    // Same rule as the comprehension form: choose on MEASURED fan-out, and
+    // decline when either side cannot be probed. One reversal is terminal —
+    // the reversed path drives from the smaller side, so the check cannot fire
+    // again on it.
+    if start_pre_bound && graph.hop_reversal_enabled() {
+        // The statement's first-hop WHERE memo keeps its precedence: it is
+        // tuned for the legs it answers (SNB BI bi16's), and a middle join
+        // there would replace it. Where it has nothing to say, an end that
+        // repeats across rows is answered by its far half once, then lookups.
+        let side = memo_orientation(graph, path, clause_where, seed);
+        if matches!(side, MemoSide::Neither)
+            && join_at_middle(graph, path, plan, seed, params, clause_where, &mut *sink)?
+        {
+            return Ok(());
+        }
+        let turned = match side {
+            MemoSide::Here => None,
+            MemoSide::There(rev) => Some(rev),
+            MemoSide::Neither => reverse_both_bound_path(graph, path, seed),
+        };
+        if let Some(rev) = turned {
+            sometimes!("interp.hop reversed to its cheaper bound end", true);
+            return match_path_stream_demanding(
+                graph,
+                &rev,
+                &Seed::Bound,
+                plan,
+                seed,
+                params,
+                clause_where,
+                &rev.start.props,
+                sink,
+            );
+        }
+    }
     if !start_pre_bound && graph.hop_reversal_enabled() {
+        // A parallel aggregation worker whose stage turns its first path
+        // round never takes its share, and would drive the whole stage for
+        // nothing: stop it here, and its driver drives the stage serially.
+        // `parallel_aggregate_stage` asks these same questions first, so
+        // this only fires if the two ever disagree.
+        let pending_share = || SEED_SHARE.with(|r| r.borrow().is_some());
+        let split = split_at_bound_interior(path, seed);
+        if pending_share()
+            && (split.is_some()
+                || reverse_bound_end_path(path, seed).is_some()
+                || reverse_to_selective_end(graph, path, seed, params).is_some())
+        {
+            counted!("interp.parallel aggregation worker stopped: its path was turned round");
+            return Err(RunError::Semantic(
+                "a parallel aggregation share was not taken".into(),
+            ));
+        }
+        // A BOUND NODE INSIDE THE PATH drives it, as a bound end does.
+        //
+        // `reverse_bound_end_path` turns a path round when its END is bound;
+        // one bound in the MIDDLE was seeded from the unbound start by a label
+        // scan, with the bound node only pinning a hop's far end. SNB BI bi17
+        // binds `message1` from the tag and then matches `(person1:Person)
+        // <-[:HAS_CREATOR]-(message1)-[:REPLY_OF*0..]->(post1)<-[:CONTAINER_OF]
+        // -(forum1)`: every Person scanned per message, 12.5M edge probes and
+        // 78 s at SF3 for 4,250 rows that each have one creator and one post.
+        // Walked from the bound node both ways — the prefix reversed, then the
+        // suffix as written — it is the rows' own degree.
+        if let Some((prefix, suffix)) = split {
+            counted!("interp.path driven both ways from its bound interior node");
+            return match_path_stream_demanding(
+                graph,
+                &prefix,
+                &Seed::Bound,
+                plan,
+                seed,
+                params,
+                clause_where,
+                &prefix.start.props,
+                &mut |r| {
+                    match_path_stream_demanding(
+                        graph,
+                        &suffix,
+                        &Seed::Bound,
+                        plan,
+                        &r,
+                        params,
+                        clause_where,
+                        &suffix.start.props,
+                        sink,
+                    )
+                },
+            );
+        }
+        if pending_share()
+            && (reverse_bound_end_path(path, seed).is_some()
+                || reverse_to_selective_end(graph, path, seed, params).is_some())
+        {
+            counted!("interp.parallel aggregation worker stopped: its path was turned round");
+            return Err(RunError::Semantic(
+                "a parallel aggregation share was not taken".into(),
+            ));
+        }
         if let Some(rev) = reverse_bound_end_path(path, seed) {
             sometimes!("interp.hop driven from its bound end", true);
+            // A COUNT as well as the coverage event. `sometimes!` records an
+            // event tag and not a count, so this planner decision was invisible
+            // to every counter-based check — a test asking "did this path run
+            // reversed?" read zero whether it did or not.
+            counted!("interp.hop driven from its bound end");
+            if reversal_needs_restore(path) {
+                // The reversed walk emits its trail and any variable-length
+                // relationship list in reverse order; turn each row round
+                // before it reaches the sink, so nothing downstream can tell
+                // which end the walk started from.
+                let mut restoring = |mut r: Row| {
+                    restore_reversed_bindings(&mut r, path);
+                    sink(r)
+                };
+                return match_path_stream_demanding(
+                    graph,
+                    &rev,
+                    &Seed::Bound,
+                    plan,
+                    seed,
+                    params,
+                    clause_where,
+                    &rev.start.props,
+                    &mut restoring,
+                );
+            }
             return match_path_stream_demanding(
                 graph,
                 &rev,
@@ -9365,7 +16644,7 @@ fn match_path_stream_demanding(
         // The new seed is computed from the REVERSED start, not inherited: the
         // incoming `seed_plan` describes the original start, and reusing it
         // would seed the new plan from the wrong node's predicate.
-        if let Some(rev) = reverse_to_selective_end(graph, path, seed) {
+        if let Some(rev) = reverse_to_selective_end(graph, path, seed, params) {
             let key = inline_index_key(&rev.start)
                 .expect("reverse_to_selective_end requires an inline map on the new start");
             let label_fallback = if rev.start.labels.is_empty() {
@@ -9405,6 +16684,12 @@ fn match_path_stream_demanding(
         return rel_driven_stream(graph, path, plan, seed, params, sink);
     }
     let want_trail = path.var.is_some();
+    // A trail whose nodes no clause reads (`bare_trail_paths`) binds them
+    // bare, and its start is bound to what the stage demands of it alone.
+    let bare_trail = path.var.as_ref().is_some_and(|v| plan.bare_trails.contains(v));
+    if bare_trail {
+        counted!("interp.path walked with a bare trail: nothing reads its nodes");
+    }
     // Frontier-BFS eligibility: a lone bounded `*1..n` hop, no path/rel variable
     // and no rel-property test, whose end node the breaker consumes DISTINCT-
     // only. When all hold, the hop runs set-at-a-time over a visited set.
@@ -9425,37 +16710,155 @@ fn match_path_stream_demanding(
     // so — like the peer nodes, which `expand_var_length` materialises in FULL —
     // the start node must carry all its properties, not just the demand set
     // (which is empty for an ANONYMOUS start, dropping `nodes(p)[0]`'s props).
-    // Without a path variable the narrower demand set still stands.
-    let start_set = if want_trail {
+    // Without a path variable, or with a bare trail, the narrower demand set
+    // still stands.
+    let start_set = if want_trail && !bare_trail {
         None
     } else {
-        plan.props_for(path.start.var.as_ref(), demand_map)
+        plan.props_for(path.start.var.as_ref(), demand_map, None)
     };
+    // THE SET A LEAN START MAY BE BUILT FROM, AND THE LABELS IT MUST CARRY. A
+    // start bound from the label's columns — or bare, when nothing of it is
+    // demanded — carried the PATTERN's labels only, so a later clause that
+    // tested it for another label (`WITH a:Odd`) read false for every one of
+    // them: 0 of 30 in `a_label_scan_seed_nothing_reads_is_bound_bare`, and
+    // SNB BI bi1's `message:Comment AS isComment` on its `:Message` scan. The
+    // labels a clause TESTS are known by name, so a lean start carries each of
+    // them its membership says it has; only a demand for the WHOLE label set
+    // (`labels(a)`) reads the record. `start_set` stays as it is for those
+    // record reads.
+    let (lean_set, extra_labels): (Option<std::collections::BTreeSet<String>>, Vec<String>) =
+        match path.start.var.as_ref().and_then(|v| plan.demands.get(&label_demand_key(v))) {
+            Some(VarDemand::Full) => {
+                counted!("interp.seed start read from its record: a later clause reads every label");
+                (None, Vec::new())
+            }
+            Some(VarDemand::Props(tested)) => (
+                start_set.clone(),
+                tested
+                    .iter()
+                    .filter(|l| !path.start.labels.contains(l))
+                    .cloned()
+                    .collect(),
+            ),
+            None => (start_set.clone(), Vec::new()),
+        };
     let hop_sets: Vec<Option<std::collections::BTreeSet<String>>> = path
         .hops
         .iter()
-        .map(|(_, node_pat)| plan.props_for(node_pat.var.as_ref(), &node_pat.props))
+        .map(|(_, node_pat)| {
+            plan.props_for(
+                node_pat.var.as_ref(),
+                &node_pat.props,
+                Some(&node_pat.labels),
+            )
+        })
         .collect();
     // Fix 73: per hop, a presence-only relationship variable binds lean and
     // a var-free one-key map on a declared key resolves once (memoised on
     // the graph, so every row of the stage shares the set).
     let mut hop_lean: Vec<HopLeanPlan> = Vec::with_capacity(path.hops.len());
     for (rel_pat, node_pat) in &path.hops {
-        let rel_lean = rel_pat.var.is_some()
-            && !want_trail
-            && matches!(
-                plan.props_for(rel_pat.var.as_ref(), &rel_pat.props),
-                Some(ref s) if s.is_empty()
-            );
-        let resolved = if !want_trail
-            && node_pat.var.as_ref().is_none_or(|v| !seed.contains_key(v))
-        {
+        // Fix 103: a relationship read BY PROPERTY binds lean as well, its
+        // properties by a projected record read per edge.
+        let rel_lean: Option<std::collections::BTreeSet<String>> =
+            if rel_pat.var.is_some() && !want_trail {
+                plan.props_for(rel_pat.var.as_ref(), &rel_pat.props, None)
+            } else {
+                None
+            };
+        // A FAR END ALREADY BOUND IN THE SEED IS A ONE-ELEMENT END SET.
+        //
+        // `resolve_constant_end` answers for an end the SEED does not carry —
+        // an inline map an index can serve. When the seed DOES carry it the
+        // hop can only complete at that one id, and saying so lets the
+        // expansion cut the adjacency row to it (`edges_to_peer_slim`) instead
+        // of reading every neighbour and comparing. bi11's triangle closure
+        // `(c)-[k3:KNOWS]-(a)` is that shape, and it costs more than 120 s at
+        // SF3 against Neo4j's 6 s for the whole query.
+        //
+        // A SELF-LOOP PATTERN IS EXCLUDED. `(u)-[:S]->(u)` names the same
+        // variable at both ends and has its own matching rule; pinning the end
+        // to `u`'s own id cut the row in a way that rule does not expect, and
+        // `MATCH (u:B), (v:A)<-[:R]-(u:A)-[:S]->(u) RETURN count(*)` answered
+        // 0 where the interpreter answers 1. A randomised pipeline-vs-
+        // interpreter differential caught it; no hand-written case would have.
+        let self_loop = node_pat.var.is_some() && node_pat.var == path.start.var;
+        // AND ONLY A BARE END. `bind_resolved_end` treats a resolved set as
+        // PROOF OF THE LABEL AND THE MAP — true for `resolve_constant_end`,
+        // which produced the set by seeking that label and key, and false for
+        // a seed binding, which proves only the id. A pinned `(u:A)` whose
+        // seed bound `u` as `(u:B)` would be asserting a label nobody checked.
+        // A randomised pipeline-vs-interpreter differential found this and the
+        // self-loop case within minutes of each other; neither was a shape I
+        // would have written by hand.
+        let bare_end = node_pat.labels.is_empty() && node_pat.props.is_none();
+        let seed_bound_end = (!want_trail && !self_loop && bare_end)
+            .then(|| match node_pat.var.as_ref().and_then(|v| seed.get(v)) {
+                Some(Value::Node { id, .. }) => Some(*id),
+                _ => None,
+            })
+            .flatten();
+        let resolved = if let Some(id) = seed_bound_end {
+            counted!("interp.hop end pinned to the id the seed already carries");
+            Some((
+                std::sync::Arc::new(vec![id]),
+                plan.props_for(node_pat.var.as_ref(), &None, Some(&node_pat.labels)),
+            ))
+        } else if !want_trail && node_pat.var.as_ref().is_none_or(|v| !seed.contains_key(v)) {
             resolve_constant_end(graph, node_pat, params)?
-                .map(|ids| (ids, plan.props_for(node_pat.var.as_ref(), &None)))
+                // A HOP END CONSTRAINED BY `x IN <list of nodes>` IS A
+                // RESOLVED END SET TOO.
+                //
+                // `resolve_constant_end` reads an INLINE MAP — `(:Forum {id:
+                // $f})` — and the end-set skip below then drops a peer outside
+                // it BEFORE building its frame. But a membership constraint
+                // usually arrives in a `WHERE`, not an inline map, and then
+                // the whole fan-out was materialised and filtered afterwards.
+                //
+                // SNB BI bi4 is that shape: `(person)<-[:HAS_MEMBER]-(topForum2
+                // :Forum)` with `topForum2 IN topForums`. Decomposed at SF3,
+                // adding that hop took the query from 41 s to 248 s (four
+                // runs), and filtering the rows afterwards never helped —
+                // measured three times, once per attempt: the `Arc` change,
+                // the `IN` hoist and the `WITH` pushdown all act on rows that
+                // ALREADY EXIST, and the cost is bringing them into existence.
+                //
+                // This is where the constraint has to land, and it only
+                // reaches here because the pushdown moved the predicate onto
+                // the `MATCH` — which is why that rewrite, measured as no win
+                // on its own, is a prerequisite rather than dead weight.
+                .or_else(|| end_set_from_membership(graph, node_pat, clause_where, seed, params))
+                .map(|ids| {
+                    (
+                        ids,
+                        plan.props_for(node_pat.var.as_ref(), &None, Some(&node_pat.labels)),
+                    )
+                })
         } else {
             None
         };
         hop_lean.push((rel_lean, resolved));
+    }
+    let early = if graph.rel_predicate_pushdown_enabled() {
+        early_hop_filters(path, clause_where, seed)
+    } else {
+        Vec::new()
+    };
+    // The first hop's WHERE survivors, remembered for the statement.
+    let mut memo_key = None;
+    if let Some(key) = hop0_memo_key(graph, path, clause_where, seed, &early, &hop_lean) {
+        match hop0_memo_lookup(&key) {
+            Some(ids) => {
+                counted!("interp.hop end served from the statement's memo of its WHERE survivors");
+                let (_, node_pat) = &path.hops[0];
+                hop_lean[0].1 = Some((
+                    ids,
+                    plan.props_for(node_pat.var.as_ref(), &None, Some(&node_pat.labels)),
+                ));
+            }
+            None => memo_key = Some(key),
+        }
     }
     let start_bound = path.start.var.as_ref().and_then(|v| seed.get(v)).cloned();
     let handle_start = |cand: Value, sink: RowSink| -> Result<(), RunError> {
@@ -9476,18 +16879,32 @@ fn match_path_stream_demanding(
             used: Vec::new(),
             trail: if want_trail { vec![cand] } else { Vec::new() },
         };
-        hops_stream(
+        let rec = memo_key.as_ref().map(|_| std::cell::RefCell::new(Vec::new()));
+        let out = hops_stream(
             graph,
             path,
             &hop_sets,
             &hop_lean,
+            &early,
+            rec.as_ref(),
             want_trail,
+            bare_trail,
             frontier_ok,
             0,
             partial,
             params,
             sink,
-        )
+        );
+        // Stored only after a COMPLETE hop-0 expansion: an early stop is
+        // `Err(Saturated)`, and a partial set would silently drop matches for
+        // every later row.
+        if let (Ok(()), Some(key), Some(rec)) = (&out, memo_key, rec) {
+            let mut ids = rec.into_inner();
+            ids.sort_unstable();
+            ids.dedup();
+            hop0_memo_store(key, std::sync::Arc::new(ids));
+        }
+        out
     };
     // Fix 64: a bound start with no inline map to test is the row's own
     // value — the executor's rule since fix 51, never applied here. The
@@ -9498,14 +16915,15 @@ fn match_path_stream_demanding(
     // (n)-[:PERFORMED_BY]->(a) RETURN properties(n), a.title …`) re-read
     // every track IN FULL for the OPTIONAL hop: 1,668 full decodes for 834
     // rows. Kept on the re-read: a path variable (its trail wants the whole
-    // node), a demand map (the clause-scan memo's stripped path), and a
-    // pattern label the bound node does not list — a lean binding carries
-    // only its own pattern's labels, and the re-read has them all.
+    // node) unless the trail is bare, a demand map (the clause-scan memo's
+    // stripped path), and a pattern label the bound node does not list — a
+    // lean binding carries only its own pattern's labels, and the re-read has
+    // them all.
     let reuse_bound = match &start_bound {
         Some(Value::Node { labels, .. }) => {
             path.start.props.is_none()
                 && demand_map.is_none()
-                && !want_trail
+                && (!want_trail || bare_trail)
                 && path.start.labels.iter().all(|l| labels.contains(l))
         }
         _ => false,
@@ -9549,6 +16967,59 @@ fn match_path_stream_demanding(
             // only when it beats the label scan (as `IndexEq` does). The
             // probe returns ids across all labels carrying the value, so the
             // pattern's labels/props/WHERE still run per candidate.
+            // A TEXT seek, when a trigram index is declared and answers fewer
+            // ids than the label holds. The candidates are a SUPERSET and the
+            // clause's WHERE re-checks each one, so a wrong answer here is
+            // impossible in the direction that matters — the index can only
+            // cost time, never correctness.
+            if let Seed::TextMatch {
+                prop,
+                query,
+                label,
+                label_fallback,
+            } = seed_plan
+            {
+                let fallback =
+                    label_fallback.and_then(|ix| path.start.labels.get(ix).map(String::as_str));
+                if let Some(ids) = graph.trigram_probe_scoped(
+                    prop,
+                    query,
+                    Some(crate::PROPERTY_SEEK_MAX_PROBE),
+                    label,
+                ) {
+                    if graph.property_seek_wins(fallback, ids.len()) {
+                        // COUNTED, NOT `sometimes!`. The columnar lane serves
+                        // the shapes the sweep issues, so the INTERPRETER's
+                        // seed winning is not a state that workload reaches;
+                        // `the_index_actually_answers_rather_than_quietly_declining`
+                        // proves the probe reachable on both lanes.
+                        counted!("interp.seed sought a trigram index");
+                        match lean_starts_from_columns(
+                            graph,
+                            &ids,
+                            &path.start,
+                            lean_set.as_ref(),
+                            &extra_labels,
+                            params,
+                        )? {
+                            Some(starts) => {
+                                for n in starts {
+                                    handle_start(n, sink)?;
+                                }
+                            }
+                            None => {
+                                for id in ids {
+                                    if let Some(n) = mat_node(graph, id, start_set.as_ref())? {
+                                        handle_start(n, sink)?;
+                                    }
+                                }
+                            }
+                        }
+                        return Ok(());
+                    }
+                }
+                // Declined, or the label scan is smaller: fall through to it.
+            }
             if let Seed::PropEq {
                 prop,
                 values,
@@ -9592,7 +17063,14 @@ fn match_path_stream_demanding(
                     if use_index {
                         seed_chose_later(winner);
                         sometimes!("interp.seed sought a property index", true);
-                        match lean_starts_from_columns(graph, &ids, &path.start, start_set.as_ref(), params)? {
+                        match lean_starts_from_columns(
+                            graph,
+                            &ids,
+                            &path.start,
+                            lean_set.as_ref(),
+                            &extra_labels,
+                            params,
+                        )? {
                             Some(starts) => {
                                 for n in starts {
                                     handle_start(n, sink)?;
@@ -9630,7 +17108,8 @@ fn match_path_stream_demanding(
                 let cands: Vec<(String, Vec<Value>)> = {
                     let mut c = Vec::new();
                     for (k, v) in seek_candidates(graph, path, clause_where, seed, params)? {
-                        if k == *key || graph.declared_scope_for(&path.start.labels, &k)?.is_some() {
+                        if k == *key || graph.declared_scope_for(&path.start.labels, &k)?.is_some()
+                        {
                             c.push((k, v));
                         }
                     }
@@ -9669,7 +17148,9 @@ fn match_path_stream_demanding(
                         let fallback_cap: Option<usize> = label_fallback
                             .and_then(|ix| path.start.labels.get(ix))
                             .map(|l| graph.count_label_nodes(l) as usize + 1);
-                        probed = match graph.declared_scope_for(&path.start.labels, key)?.as_deref()
+                        probed = match graph
+                            .declared_scope_for(&path.start.labels, key)?
+                            .as_deref()
                         {
                             Some(l) => {
                                 counted!("interp.seed probed a declared scoped index");
@@ -9687,8 +17168,8 @@ fn match_path_stream_demanding(
                     }
                 }
                 if let Some((winner, ids)) = probed {
-                    let label = label_fallback
-                        .and_then(|ix| path.start.labels.get(ix).map(String::as_str));
+                    let label =
+                        label_fallback.and_then(|ix| path.start.labels.get(ix).map(String::as_str));
                     let use_index = match label {
                         Some(l) => graph.count_label_nodes(l) >= ids.len() as u64,
                         None => true,
@@ -9696,7 +17177,14 @@ fn match_path_stream_demanding(
                     if use_index {
                         seed_chose_later(winner);
                         sometimes!("interp.seed probed a range index", true);
-                        match lean_starts_from_columns(graph, &ids, &path.start, start_set.as_ref(), params)? {
+                        match lean_starts_from_columns(
+                            graph,
+                            &ids,
+                            &path.start,
+                            lean_set.as_ref(),
+                            &extra_labels,
+                            params,
+                        )? {
                             Some(starts) => {
                                 for n in starts {
                                     handle_start(n, sink)?;
@@ -9752,7 +17240,14 @@ fn match_path_stream_demanding(
                     ids.retain(|id| graph.members_contains(&members, *id));
                 }
                 counted!("interp.seed driven from an existence probe's constant end");
-                match lean_starts_from_columns(graph, &ids, &path.start, start_set.as_ref(), params)? {
+                match lean_starts_from_columns(
+                    graph,
+                    &ids,
+                    &path.start,
+                    lean_set.as_ref(),
+                    &extra_labels,
+                    params,
+                )? {
                     Some(starts) => {
                         for n in starts {
                             handle_start(n, sink)?;
@@ -9784,6 +17279,20 @@ fn match_path_stream_demanding(
                 } => path.start.labels.get(*ix).map(String::as_str),
                 _ => path.start.labels.first().map(String::as_str),
             };
+            // A PARALLEL AGGREGATION WORKER'S SHARE of this scan
+            // (`parallel_aggregate_stage`): the ids its driver cut from this
+            // label's members, in their order. Taken once — by this, the
+            // stage's first scan — and only when it is THIS label's: a scan
+            // of another (a path turned around) leaves it for the driver to
+            // find unused, and the stage is driven serially instead.
+            let share: Option<std::sync::Arc<Vec<u64>>> = SEED_SHARE.with(|r| {
+                let mut r = r.borrow_mut();
+                let mine = matches!((r.as_ref(), label), (Some((l, _)), Some(this)) if l == this);
+                if mine { r.take().map(|(_, ids)| ids) } else { None }
+            });
+            if share.is_some() {
+                counted!("interp.seed scan took a parallel aggregation's share");
+            }
             // The column-filtered seed: the WHERE conjuncts reading only the
             // start variable are evaluated from columns first, and only the
             // survivors are materialised (sound prefilter — the full WHERE
@@ -9828,7 +17337,23 @@ fn match_path_stream_demanding(
                     if let Some(ids) =
                         crate::batch::filter_ids(graph, &path.start.labels, sv, &pred, params)?
                     {
-                        match lean_starts_from_columns(graph, &ids, &path.start, start_set.as_ref(), params)? {
+                        let ids = match &share {
+                            Some(share) => std::sync::Arc::new(
+                                ids.iter()
+                                    .copied()
+                                    .filter(|id| share.binary_search(id).is_ok())
+                                    .collect::<Vec<u64>>(),
+                            ),
+                            None => ids,
+                        };
+                        match lean_starts_from_columns(
+                            graph,
+                            &ids,
+                            &path.start,
+                            lean_set.as_ref(),
+                            &extra_labels,
+                            params,
+                        )? {
                             Some(starts) => {
                                 for n in starts {
                                     handle_start(n, sink)?;
@@ -9857,6 +17382,9 @@ fn match_path_stream_demanding(
             };
             if let Some(cap) = seed_cap {
                 let mut ids = graph.nodes_by_label(label)?;
+                if let Some(share) = &share {
+                    ids.retain(|id| share.binary_search(id).is_ok());
+                }
                 if ids.len() > cap {
                     ids.truncate(cap);
                 }
@@ -9880,24 +17408,596 @@ fn match_path_stream_demanding(
             // done right — the label's own columns, span-bounded and
             // byte-budgeted, gathered by member otherwise, and kept in the
             // property-column cache for the next statement.
-            let ids = graph.nodes_by_label(label)?;
-            match lean_starts_from_columns(graph, &ids, &path.start, start_set.as_ref(), params)? {
+            let ids = match &share {
+                Some(share) => share.to_vec(),
+                None => graph.nodes_by_label(label)?,
+            };
+            // A seed whose path runs on for several hops is EXPENSIVE: SNB BI
+            // bi4's prefix walks each of its 111 countries out to ~45k
+            // memberships, one core for the whole stage, because 111 seeds sat
+            // under the split floor that keeps cheap seed sets serial.
+            let heavy_seeds = path.hops.len() >= 2;
+            match lean_starts_from_columns(
+                graph,
+                &ids,
+                &path.start,
+                lean_set.as_ref(),
+                &extra_labels,
+                params,
+            )? {
                 Some(starts) => {
-                    for n in starts {
-                        handle_start(n, sink)?;
-                    }
+                    drive_seeds(graph, plan, starts, heavy_seeds, &handle_start, sink)
                 }
-                None => {
-                    for id in ids {
-                        if let Some(n) = mat_node(graph, id, start_set.as_ref())? {
-                            handle_start(n, sink)?;
-                        }
+                None => drive_seed_ids(
+                    graph,
+                    plan,
+                    &ids,
+                    start_set.as_ref(),
+                    heavy_seeds,
+                    &handle_start,
+                    sink,
+                ),
+            }
+        }
+    }
+}
+
+thread_local! {
+    /// A parallel aggregation worker's share of its stage's seed scan: the
+    /// label, and the member ids it drives (`parallel_aggregate_stage`).
+    static SEED_SHARE: std::cell::RefCell<Option<(String, std::sync::Arc<Vec<u64>>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A STAGE THAT PAGES ONE CREATOR'S NEWEST MESSAGES, FROM THE DATE INDEX.
+///
+/// `MATCH (:Person {id: $p})<-[:HAS_CREATOR]-(message) WITH message, … ORDER BY
+/// message.creationDate DESC, message.id ASC LIMIT k` — SNB Interactive IS2 —
+/// walked all of the person's ~5,900 messages to keep ten: 25–46 ms against
+/// Neo4j's 9. The per-creator date index IC2 and IC3 build holds a creator's
+/// messages in exactly that order (date DESC, id ASC), so the stage is fed
+/// only the entries that can reach the page: every entry dated at or after
+/// the page's last one (ties at the boundary included), in index order,
+/// through the stage's OWN projector — which still orders and pages them, so
+/// the answer is the full walk's.
+///
+/// Only when the index is already built (it is never built for this — a
+/// build costs seconds), holds EVERY one of the creator's messages (its entry
+/// count equals the creator's edge count: no message without an orderable
+/// date), all of one date class, and each entry's tie-breaking id is the
+/// message's own `id`; and only for a one-hop, WHERE-less first MATCH from a
+/// start the row binds or one index probe resolves to one node.
+fn creator_date_page_stage<'a>(
+    graph: &'a Graph,
+    prefix: &[Clause],
+    plan: &StagePlan,
+    input: &[Row],
+    params: &BTreeMap<String, Value>,
+    proj: &Projection,
+    collector: &mut StreamProjector<'a>,
+) -> Result<bool, RunError> {
+    if input.len() != 1 || graph.in_txn_with_writes() || proj.distinct || proj.star {
+        return Ok(false);
+    }
+    let [Clause::Match {
+        optional: false,
+        pattern,
+        where_: None,
+        ..
+    }] = prefix
+    else {
+        return Ok(false);
+    };
+    let [path] = pattern.paths.as_slice() else {
+        return Ok(false);
+    };
+    let [(rel, end)] = path.hops.as_slice() else {
+        return Ok(false);
+    };
+    if path.var.is_some()
+        || path.shortest.is_some()
+        || rel.var.is_some()
+        || rel.props.is_some()
+        || rel.length.is_some()
+        || rel.types.len() != 1
+        || !matches!(rel.dir, RelDir::In)
+        || end.props.is_some()
+    {
+        return Ok(false);
+    }
+    let Some(m) = end.var.as_deref() else {
+        return Ok(false);
+    };
+    if input[0].contains_key(m) || proj.items.iter().any(|it| contains_aggregate(&it.expr)) {
+        return Ok(false);
+    }
+    // ORDER BY m.<date> DESC, m.id ASC — spelled directly or through an alias
+    let key_prop = |o: &engram_cypher::stmt::OrderItem| -> Option<String> {
+        let e = match &o.expr {
+            Expr::Var(a) => proj
+                .items
+                .iter()
+                .find(|it| it.alias.as_deref() == Some(a.as_str()))
+                .map_or(&o.expr, |it| &it.expr),
+            e => e,
+        };
+        match e {
+            Expr::Prop(b, p) if matches!(b.as_ref(), Expr::Var(v) if v == m) => Some(p.clone()),
+            _ => None,
+        }
+    };
+    let [by_date, by_id] = proj.order.as_slice() else {
+        return Ok(false);
+    };
+    let (Some(date_prop), Some(id_prop)) = (key_prop(by_date), key_prop(by_id)) else {
+        return Ok(false);
+    };
+    if !by_date.desc || by_id.desc || id_prop != "id" {
+        return Ok(false);
+    }
+    let Some(limit) = eval_count(graph, proj.limit.as_ref(), params, "LIMIT")? else {
+        return Ok(false);
+    };
+    let skip = eval_count(graph, proj.skip.as_ref(), params, "SKIP")?.unwrap_or(0);
+    // the creator: bound in the row, or one node an index probe finds
+    let creator = match path.start.var.as_ref().and_then(|v| input[0].get(v)) {
+        Some(Value::Node { id, .. }) => *id,
+        Some(_) => return Ok(false),
+        None => {
+            let (Some(Expr::Map(entries)), [label]) = (&path.start.props, path.start.labels.as_slice())
+            else {
+                return Ok(false);
+            };
+            let [(k, e)] = entries.as_slice() else {
+                return Ok(false);
+            };
+            let mut fv = Vec::new();
+            free_vars_of(e, &mut fv);
+            if !fv.is_empty() || e.has_subquery() {
+                return Ok(false);
+            }
+            let v = eval_expr(graph, e, &input[0], params)?;
+            match graph.index_probe_in_scoped(k, std::slice::from_ref(&v), Some(2), Some(label)) {
+                Ok(Some(ids)) if ids.len() == 1 => ids[0],
+                _ => return Ok(false),
+            }
+        }
+    };
+    let Some(start) = mat_node(graph, creator, None)? else {
+        return Ok(false);
+    };
+    if !node_satisfies(graph, &start, &path.start, &input[0], params)? {
+        return Ok(false);
+    }
+    let key: crate::CreatorMsgsKey = (end.labels.clone(), date_prop, rel.types.clone());
+    let Some(index) = graph.creator_msgs_get(&key) else {
+        return Ok(false);
+    };
+    let members = if end.labels.is_empty() {
+        None
+    } else {
+        Some(graph.members_all(&end.labels).map_err(RunError::Graph)?)
+    };
+    let admits = |id: u64| members.as_ref().is_none_or(|mv| mv.contains(id));
+    let entries: Vec<&(engram_store::IndexKey, i64, u64)> = index
+        .by_creator
+        .get(&creator)
+        .map(|list| list.iter().filter(|(_, _, n)| admits(*n)).collect())
+        .unwrap_or_default();
+    // EVERY message of the creator is in the index, of one date class
+    let tokens = graph.type_tokens_peek(&rel.types);
+    let mut edges = 0usize;
+    graph.adjacent_slim_for_each(creator, Dir::In, &tokens, |e| {
+        if admits(e.peer) {
+            edges += 1;
+        }
+    });
+    if edges != entries.len() {
+        counted!("interp.creator date page declined: a message the index does not hold");
+        return Ok(false);
+    }
+    if let (Some(first), Some(last)) = (entries.first(), entries.last()) {
+        if first.0.class() != last.0.class() {
+            return Ok(false);
+        }
+    }
+    let need = skip.saturating_add(limit);
+    let take = if need == 0 || entries.len() <= need {
+        entries.len()
+    } else {
+        let boundary = &entries[need - 1].0;
+        need + entries[need..].iter().take_while(|(d, _, _)| d == boundary).count()
+    };
+    let m_var = m.to_string();
+    let m_props = plan.props_for(Some(&m_var), &None, Some(end.labels.as_slice()));
+    let mut rows = Vec::with_capacity(take);
+    for (_, mid, node) in &entries[..take] {
+        let Some(bound) = mat_node(graph, *node, m_props.as_ref())? else {
+            return Ok(false);
+        };
+        // the index's tie-break is the message's own id
+        let own = match &bound {
+            Value::Node { props, .. } => props.get("id"),
+            _ => None,
+        };
+        if own != Some(&Value::Int(*mid)) {
+            return Ok(false);
+        }
+        let mut row = input[0].clone();
+        if let Some(v) = &path.start.var {
+            row.insert(v.clone(), start.clone());
+        }
+        row.insert(m.to_string(), bound);
+        rows.push(row);
+    }
+    counted!("interp.stage paged a creator's newest messages from the date index");
+    for row in rows {
+        collector.push(row)?;
+    }
+    Ok(true)
+}
+
+/// A share's partial projector, or the error that stopped it.
+type PartialSlot<'a> = std::sync::Mutex<Option<Result<StreamProjector<'a>, RunError>>>;
+
+/// A STAGE AGGREGATED ON THE WORKERS.
+///
+/// The seed split (`drive_seeds`) runs a stage's MATCH on the workers and
+/// hands every row back to the ONE thread that drains them into the
+/// breaker's projector — its WHERE, its grouping and its folds all serial.
+/// SNB BI bi4's prefix groups 4,982,242 memberships into 1,228,730
+/// `(country, forum)` groups: 3.1 s of walk on forty workers, then a 6 s
+/// drain on one (measured with phase timers on the build).
+///
+/// Here each worker drives the whole stage over ITS SHARE of the seed label —
+/// a run of consecutive member ids — into its own projector, and the
+/// partials merge into the stage's in share order. The serial drive visits
+/// the seeds in that same order, so each group's first row, and every value
+/// a fold keeps in arrival order (`collect`, a min or max tie, a buffered
+/// percentile), are the serial run's own (`SiteAcc::merge`).
+///
+/// Only where that is exact and bounded: one input row; a first clause that
+/// is a MATCH whose seed is a label scan of a label one node of the path
+/// carries; an aggregating breaker whose folds merge exactly (`merge_ready`:
+/// no DISTINCT, no float sum or average) and which GROUPS BY the seed node
+/// itself, so every group lies in one share and the partials together hold
+/// what the serial projector would. A worker whose scan was not its share
+/// sends the whole stage back to the serial drive.
+#[allow(clippy::too_many_arguments)]
+fn parallel_aggregate_stage<'a>(
+    graph: &'a Graph,
+    prefix: &[Clause],
+    plan: &StagePlan,
+    input: &[Row],
+    params: &'a BTreeMap<String, Value>,
+    collector: &mut StreamProjector<'a>,
+    make: &(dyn Fn() -> Result<StreamProjector<'a>, RunError> + Sync),
+) -> Result<bool, RunError> {
+    let Some(exec) = graph.exec().filter(|e| e.width() > 1) else {
+        return Ok(false);
+    };
+    if graph.in_txn() || input.len() != 1 || plan.seed_cap.is_some() {
+        return Ok(false);
+    }
+    let Some(Clause::Match {
+        optional: false,
+        pattern,
+        ..
+    }) = prefix.first()
+    else {
+        return Ok(false);
+    };
+    let Some(Seed::Label(ix)) = plan.seeds.first().and_then(|s| s.first()) else {
+        return Ok(false);
+    };
+    let Some(path) = pattern.paths.first() else {
+        return Ok(false);
+    };
+    let (Some(label), Some(seed_var)) = (path.start.labels.get(*ix), path.start.var.as_deref())
+    else {
+        return Ok(false);
+    };
+    if input[0].contains_key(seed_var) {
+        return Ok(false);
+    }
+    // A path the matcher turns round to drive from its other end — bound in
+    // the row, or named by an inline map the index serves (SNB BI bi2's
+    // `(:TagClass {name: $tagClass})`) — never reaches the label scan a share
+    // is cut from. Asked here exactly as `match_path_stream_demanding` asks
+    // it, before any worker drives the whole stage for nothing: bi2 went
+    // from 1.4 s to 9 s when forty workers each did, and then the serial
+    // drive did it again.
+    if graph.hop_reversal_enabled()
+        && (reverse_bound_end_path(path, &input[0]).is_some()
+            || reverse_to_selective_end(graph, path, &input[0], params).is_some())
+    {
+        return Ok(false);
+    }
+    let carrying = std::iter::once(&path.start)
+        .chain(path.hops.iter().map(|(_, n)| n))
+        .filter(|n| n.labels.iter().any(|l| l == label))
+        .count();
+    if carrying != 1 || !collector.merge_ready(seed_var)? {
+        return Ok(false);
+    }
+    let ids = graph.nodes_by_label(Some(label.as_str()))?;
+    let heavy = path.hops.len() >= 2;
+    if ids.len() < 2 || !(heavy || ids.len() >= graph.parallel_min_rows()) {
+        return Ok(false);
+    }
+    // SEVERAL shares per worker, handed out from the executor's cursor: a
+    // seed's cost is not uniform. SNB BI bi4's 111 countries carry 3,187,138
+    // prefix rows at SF3, 30% of them in two adjacent countries (493,242 and
+    // 464,388). One share of three countries per worker put both in one
+    // share, and the stage ran 8.2 s on forty workers against 21.2 s on one.
+    // The partials' groups are disjoint and the merge walks each once, in
+    // share order, so more shares cost the merge nothing.
+    let per = ids.len().div_ceil(exec.width() * MORSELS_PER_WORKER).max(1);
+    let shares: Vec<&[u64]> = ids.chunks(per).collect();
+    let slots: Vec<PartialSlot<'a>> = shares.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    let unused = std::sync::atomic::AtomicBool::new(false);
+    exec.for_each(shares.len(), &|m| {
+        let run = || -> Result<StreamProjector<'a>, RunError> {
+            let mut part = make()?;
+            // NaN keys never equal: each partial numbers its own apart
+            part.nan_nonce = (m as u64 + 1) << 40;
+            part.seen_base = (m as u64 + 1) << 40;
+            SEED_SHARE.with(|r| {
+                *r.borrow_mut() = Some((label.clone(), std::sync::Arc::new(shares[m].to_vec())))
+            });
+            let caches: Vec<std::cell::RefCell<MemoSlot>> = (0..prefix.len())
+                .map(|_| std::cell::RefCell::new(MemoSlot::Untouched))
+                .collect();
+            let driven = drive(
+                graph,
+                prefix,
+                &plan.seeds,
+                plan,
+                &caches,
+                input[0].clone(),
+                params,
+                &mut |r| part.push(r),
+            );
+            if SEED_SHARE.with(|r| r.borrow_mut().take()).is_some() {
+                unused.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            driven?;
+            // its index is dead now the share is driven: free it here, on
+            // the worker (`merge_disjoint` never reads it)
+            part.drop_group_index();
+            Ok(part)
+        };
+        let out = run();
+        *slots[m].lock().unwrap_or_else(|e| e.into_inner()) = Some(out);
+    });
+    if unused.load(std::sync::atomic::Ordering::Relaxed) {
+        counted!("interp.parallel aggregation declined: a worker's scan was not its share");
+        return Ok(false);
+    }
+    counted!("interp.stage aggregated its seed shares on the workers");
+    for slot in slots {
+        let part = slot
+            .into_inner()
+            .unwrap_or_else(|e| e.into_inner())
+            .expect("every share ran")?;
+        collector.merge_disjoint(part);
+    }
+    Ok(true)
+}
+
+/// Split a SEED SCAN across the morsel executor.
+///
+/// # Why this exists beside `drive_stage_rows`
+///
+/// That function splits a stage's INPUT ROWS, which is the right unit when a
+/// stage has many. It is useless when a stage has ONE -- and a first-stage
+/// `MATCH` always does, because its input is the single empty seed row. Every
+/// bit of such a stage's cost is inside that one row's expansion, and the gate
+/// `input.len() >= parallel_min_rows()` declines it by construction.
+///
+/// MEASURED, on SNB BI at SF3 2026-09-21: bi17 carries no `WITH` at all, so it
+/// is one stage driven by one row, and it overran a 900 s ceiling pinned at
+/// exactly 1.00 load on a 40-core pod. bi12's expensive stage is the same
+/// shape; its single parallel drive landed on the trivial final aggregation
+/// while the stage doing the work ran serial.
+///
+/// So the unit split here is the SEED, not the row.
+///
+/// # What makes this safe
+///
+/// `handle_start` captures only shared references -- the graph, the pattern,
+/// the seed row, the params, the hop sets -- and takes its sink as a
+/// parameter. It has no per-drive mutable state of its own, which is why this
+/// needs none of the per-morsel clause memos `drive_stage_rows` carries.
+///
+/// The merge discipline is that function's, unchanged: each morsel fills a
+/// LOCAL buffer, the buffers reach the one sink IN MORSEL ORDER, and a
+/// `Saturated` from the sink stops the drain. The collector sees the rows it
+/// would have seen, in the order it would have seen them.
+fn drive_seeds(
+    graph: &Graph,
+    plan: &StagePlan,
+    starts: Vec<Value>,
+    heavy: bool,
+    handle_start: &(dyn Fn(Value, RowSink) -> Result<(), RunError> + Sync),
+    sink: RowSink,
+) -> Result<(), RunError> {
+    let Some(exec) = seed_exec(graph, plan, starts.len(), heavy) else {
+        for n in starts {
+            handle_start(n, sink)?;
+        }
+        return Ok(());
+    };
+    counted!("interp.seed scan driven in parallel");
+    let width = exec.width();
+    // WINDOW the seeds, exactly as `drive_stage_rows` windows its input rows
+    // and for the same reason its comment gives: the serial path streams each
+    // row to the sink as it is produced, so buffering a whole drive's output
+    // to win a core trades one resource for another.
+    //
+    // MEASURED, and this is not a precaution. The first cut of this function
+    // buffered EVERY morsel's full output before draining any of it. On bi17
+    // at SF3 that took the pod from one pinned core to ~25 -- and then
+    // OOM-KILLED it against a 140 GiB ceiling, because a single seed's
+    // expansion is unbounded and there were as many of them in flight as
+    // there were seeds. The CPU gap closed and a memory cliff opened.
+    // The window GROWS over seeds whose rows are cheap (`DriveWindow`).
+    let mut sizer = DriveWindow::new();
+    let mut start = 0;
+    while start < starts.len() {
+        let end = (start + sizer.size(width)).min(starts.len());
+        let window = &starts[start..end];
+        start = end;
+        let per = window.len().div_ceil(width).max(1);
+        let morsels: Vec<&[Value]> = window.chunks(per).collect();
+        let slots: Vec<std::sync::Mutex<Result<Vec<Row>, RunError>>> = morsels
+            .iter()
+            .map(|_| std::sync::Mutex::new(Ok(Vec::new())))
+            .collect();
+        exec.for_each(morsels.len(), &|i| {
+            let mut out: Vec<Row> = Vec::new();
+            let mut err: Option<RunError> = None;
+            for n in morsels[i] {
+                match handle_start(n.clone(), &mut |r| {
+                    out.push(r);
+                    Ok(())
+                }) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        err = Some(e);
+                        break;
                     }
                 }
             }
-            Ok(())
+            let mut slot = slots[i].lock().unwrap_or_else(|e| e.into_inner());
+            *slot = match err {
+                Some(e) => Err(e),
+                None => Ok(out),
+            };
+        });
+        let produced = drain_seed_slots(slots, sink)?;
+        if sizer.observe(window.len(), produced) {
+            counted!("interp.seed window grew: its rows were cheap");
         }
     }
+    Ok(())
+}
+
+/// As [`drive_seeds`], for the branch that materialises each node by id.
+#[allow(clippy::too_many_arguments)]
+fn drive_seed_ids(
+    graph: &Graph,
+    plan: &StagePlan,
+    ids: &[u64],
+    start_set: Option<&std::collections::BTreeSet<String>>,
+    heavy: bool,
+    handle_start: &(dyn Fn(Value, RowSink) -> Result<(), RunError> + Sync),
+    sink: RowSink,
+) -> Result<(), RunError> {
+    let Some(exec) = seed_exec(graph, plan, ids.len(), heavy) else {
+        for id in ids {
+            if let Some(n) = mat_node(graph, *id, start_set)? {
+                handle_start(n, sink)?;
+            }
+        }
+        return Ok(());
+    };
+    counted!("interp.seed scan driven in parallel");
+    let width = exec.width();
+    // Windowed for the reason given in `drive_seeds`, and grown as it is.
+    let mut sizer = DriveWindow::new();
+    let mut start = 0;
+    while start < ids.len() {
+        let end = (start + sizer.size(width)).min(ids.len());
+        let window = &ids[start..end];
+        start = end;
+        let per = window.len().div_ceil(width).max(1);
+        let morsels: Vec<&[u64]> = window.chunks(per).collect();
+        let slots: Vec<std::sync::Mutex<Result<Vec<Row>, RunError>>> = morsels
+            .iter()
+            .map(|_| std::sync::Mutex::new(Ok(Vec::new())))
+            .collect();
+        exec.for_each(morsels.len(), &|i| {
+            let mut out: Vec<Row> = Vec::new();
+            let mut err: Option<RunError> = None;
+            for id in morsels[i] {
+                // The materialisation is part of the morsel's work. Doing it
+                // serially first would leave the expensive half split and the
+                // cheap half not, and would buffer every node before any hop ran.
+                match mat_node(graph, *id, start_set) {
+                    Ok(None) => continue,
+                    Ok(Some(n)) => match handle_start(n, &mut |r| {
+                        out.push(r);
+                        Ok(())
+                    }) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            err = Some(e);
+                            break;
+                        }
+                    },
+                    Err(e) => {
+                        err = Some(e);
+                        break;
+                    }
+                }
+            }
+            let mut slot = slots[i].lock().unwrap_or_else(|e| e.into_inner());
+            *slot = match err {
+                Some(e) => Err(e),
+                None => Ok(out),
+            };
+        });
+        let produced = drain_seed_slots(slots, sink)?;
+        if sizer.observe(window.len(), produced) {
+            counted!("interp.seed window grew: its rows were cheap");
+        }
+    }
+    Ok(())
+}
+
+/// The eligibility gate, shared by both seed drivers.
+///
+/// The same four conditions `drive_stage_rows` applies, for the same reasons --
+/// including `in_txn`, which is NOT a precaution: `scoped_exec`'s module docs
+/// record that a transaction's overlays and its OCC read-set are THREAD-LOCAL,
+/// so a worker would read a stale graph and its reads would never reach the
+/// read-set. The only difference is what is counted: seeds, not rows.
+fn seed_exec(
+    graph: &Graph,
+    plan: &StagePlan,
+    n: usize,
+    // Each seed walks several hops (`heavy_seeds`): a handful of them is
+    // already worth a worker each, where a handful of CHEAP seeds would pay
+    // more to split than to run.
+    heavy: bool,
+) -> Option<std::sync::Arc<dyn crate::scoped_exec::ScopedExec>> {
+    graph
+        .exec()
+        .filter(|e| e.width() > 1)
+        .filter(|_| n >= graph.parallel_min_rows() || (heavy && n >= 2))
+        .filter(|_| !graph.in_txn())
+        .filter(|_| plan.seed_cap.is_none())
+}
+
+/// Merge per-morsel buffers into the one sink, in morsel order, and say how
+/// many rows the window produced — what `DriveWindow` sizes the next one by.
+fn drain_seed_slots(
+    slots: Vec<std::sync::Mutex<Result<Vec<Row>, RunError>>>,
+    sink: RowSink,
+) -> Result<usize, RunError> {
+    let mut produced = 0usize;
+    for slot in slots {
+        let part = slot.into_inner().unwrap_or_else(|e| e.into_inner())?;
+        produced += part.len();
+        for r in part {
+            match sink(r) {
+                Err(RunError::Saturated) => return Ok(produced),
+                other => other?,
+            }
+        }
+    }
+    Ok(produced)
 }
 
 /// Drive a single unconstrained-start hop from the relationship partition:
@@ -9919,8 +18019,8 @@ fn rel_driven_stream(
     } else {
         Some(rel_pat.types.clone())
     };
-    let start_set = plan.props_for(path.start.var.as_ref(), &None);
-    let end_set = plan.props_for(end_pat.var.as_ref(), &end_pat.props);
+    let start_set = plan.props_for(path.start.var.as_ref(), &None, None);
+    let end_set = plan.props_for(end_pat.var.as_ref(), &end_pat.props, Some(&end_pat.labels));
     let end_constrained = !end_pat.labels.is_empty() || end_pat.props.is_some();
     let end_bound: Option<u64> = end_pat.var.as_ref().and_then(|v| match seed.get(v) {
         Some(Value::Node { id, .. }) => Some(*id),
@@ -10023,9 +18123,310 @@ fn rel_driven_stream(
 /// Fix 73: per hop of a streamed path, the relationship variable's
 /// presence-only flag and the end's resolved set + residual demand.
 type HopLeanPlan = (
-    bool,
-    Option<(std::sync::Arc<Vec<u64>>, Option<std::collections::BTreeSet<String>>)>,
+    // Fix 73 / fix 103: the relationship variable's demanded properties —
+    // `Some(empty)` binds it lean from the adjacency entry, `Some(props)`
+    // adds a projected record read per edge, `None` keeps the full walk.
+    Option<std::collections::BTreeSet<String>>,
+    Option<(
+        std::sync::Arc<Vec<u64>>,
+        Option<std::collections::BTreeSet<String>>,
+    )>,
 );
+
+/// Which end of a both-ends-bound leg the statement's first-hop memo already
+/// answers (see `hop0_memo_key`).
+///
+/// The whole-path estimate prices a leg from its degrees and cannot see the
+/// memo. On SNB BI bi16 at SF10 that kept 558 of 787 row-decisions on the
+/// `person1` end — a person with few friends LOOKS cheaper than a tag with
+/// 15,680 messages — while the tag end, after the first row, costs only the
+/// ~309 messages the memo holds. Those 558 rows are where 36M message fetches
+/// went (rev8: 424 / 354 s with the memo serving 227 rows).
+///
+/// The rule is ordered so it cannot loop: a memo for the CURRENT orientation
+/// keeps it (and a reversal re-enters on the reversed path, which then hits
+/// here); only if there is none does a memo for the OTHER orientation turn
+/// it; with neither, the estimate decides exactly as before.
+///
+/// Narrow on purpose, because it runs per row: three or more hops (the
+/// estimate's own domain — a two-hop leg is decided by first hops) and a
+/// WHERE (with none there is no first-hop test, so no memo). SNB BI bi8's
+/// two-hop comprehension, which runs per person AND per friend, never enters.
+enum MemoSide {
+    Here,
+    There(PathPattern),
+    Neither,
+}
+
+fn memo_orientation(
+    graph: &Graph,
+    path: &PathPattern,
+    clause_where: Option<&Expr>,
+    seed: &Row,
+) -> MemoSide {
+    if clause_where.is_none()
+        || path.hops.len() < 3
+        || path.var.is_some()
+        || path.shortest.is_some()
+        || !graph.rel_predicate_pushdown_enabled()
+        || path.hops.iter().any(|(rel, _)| rel.length.is_some())
+    {
+        return MemoSide::Neither;
+    }
+    let key = |p: &PathPattern| -> Option<Hop0Key> {
+        let early = early_hop_filters(p, clause_where, seed);
+        hop0_memo_key(graph, p, clause_where, seed, &early, &[])
+    };
+    let here = key(path);
+    if here.as_ref().and_then(hop0_memo_lookup).is_some() {
+        return MemoSide::Here;
+    }
+    let rev = reverse_path(path);
+    let there = key(&rev);
+    if there.as_ref().and_then(hop0_memo_lookup).is_some() {
+        counted!("interp.pattern turned to the end its statement memo already answers");
+        return MemoSide::There(rev);
+    }
+    // SEED THE MEMO. No row has walked from either end yet. When exactly ONE
+    // end can be memoised, every row after this one will find that end nearly
+    // free, so take it for this row too unless it is plainly worse: within 4x
+    // of the other end on the whole-path estimate. Without this, bi16 at SF10
+    // with the estimate lever off walks EVERY row from `person1` (the first-hop
+    // rule sees 224 KNOWS edges against 15,680 tagged messages) and never
+    // seeds the memo at all: 900 s timeout, where seeded it answers in 43 s.
+    // The worst a single-row statement can pay is that 4x, on one row.
+    // Decided from the same two numbers whichever way the leg is written, so
+    // the choice cannot flip on re-entry.
+    if here.is_some() != there.is_some() {
+        let tails = shape_tails(graph, path);
+        let forward = tails.0.and_then(|t| drive_estimate(graph, path, seed, false, t));
+        let backward = tails.1.and_then(|t| drive_estimate(graph, path, seed, true, t));
+        if let (Some(forward), Some(backward)) = (forward, backward) {
+            if here.is_some() {
+                if forward <= backward.saturating_mul(DRIVE_END_MARGIN) {
+                    counted!("interp.pattern kept the end its first-hop memo can answer");
+                    return MemoSide::Here;
+                }
+            } else if backward <= forward.saturating_mul(DRIVE_END_MARGIN) {
+                counted!("interp.pattern turned to the end its first-hop memo can answer");
+                return MemoSide::There(rev);
+            }
+        }
+    }
+    MemoSide::Neither
+}
+
+/// The statement-scoped memo of a first hop's WHERE survivors.
+///
+/// SNB BI bi16 walks `(tag)<-[:HAS_TAG]-(message2)…` ONCE PER ROW, and every
+/// row asks the same question of the same messages: is this one on the date?
+/// With `early_hop_filters` the answer stops the walk at `message2`, but the
+/// tag's messages were still fetched and tested again for each of ~600 rows —
+/// 39.7M refusals at SF10, on one core, which is where bi16's time went once
+/// the edge probes were gone (40.3M -> 553k probes bought only 11-14 %).
+///
+/// When the first hop's conjuncts read NOTHING but that hop's own node (and
+/// parameters, which are fixed for the statement), whether a given node passes
+/// cannot depend on the row. So the set of nodes that passed, from a given
+/// bound start, is a fact about the statement's snapshot, and every later row
+/// with the same start can take it as the hop's resolved end set — skipping
+/// every node outside it BEFORE it is materialised.
+///
+/// Conditions, each a way this could be wrong:
+/// - inside a STATEMENT (generation non-zero), with no buffered writes — a
+///   write in the same statement could change the adjacency or the property;
+/// - the start is BOUND to a node (it is the memo's key);
+/// - the first hop is fixed-length with no inline property map on the
+///   relationship or the end node (a map could read the row), no trail, and
+///   its end is not bound by the row;
+/// - no other resolved end set already applies;
+/// - every conjunct tested at that hop reads only that hop's node and
+///   variables the row already binds — whose VALUES are part of the key.
+///
+/// The survivors are recorded where the conjuncts pass (`hops_stream`, hop 1)
+/// — not from finished rows, which would miss a survivor that fails a LATER
+/// hop for this row but not for the next.
+type Hop0Key = (u64, u64, usize, u64);
+
+fn hop0_memo_key(
+    graph: &Graph,
+    path: &PathPattern,
+    clause_where: Option<&Expr>,
+    seed: &Row,
+    early: &[Vec<Expr>],
+    hop_lean: &[HopLeanPlan],
+) -> Option<Hop0Key> {
+    let generation = statement_gen();
+    if generation == 0 || graph.in_txn_with_writes() || path.var.is_some() {
+        return None;
+    }
+    let conds = early.first().filter(|c| !c.is_empty())?;
+    let (rel_pat, node_pat) = path.hops.first()?;
+    if rel_pat.length.is_some() || rel_pat.props.is_some() || node_pat.props.is_some() {
+        return None;
+    }
+    let node_var = node_pat.var.as_deref()?;
+    if seed.contains_key(node_var) || rel_pat.var.as_deref().is_some_and(|v| seed.contains_key(v)) {
+        return None;
+    }
+    if hop_lean.first().is_some_and(|(_, resolved)| resolved.is_some()) {
+        return None;
+    }
+    // A conjunct may also read variables the ROW already binds — bi16's date is
+    // `paramDateX`, carried into its CALL subquery from an outer UNWIND, not a
+    // parameter. Their VALUES join the key, so rows that agree on them share the
+    // survivors and a row that differs gets its own entry. A NaN takes a fresh
+    // nonce in the canonical key, so it never matches and never reuses.
+    let mut row_vars: Vec<String> = Vec::new();
+    for c in conds {
+        let mut fv = Vec::new();
+        free_vars_of(c, &mut fv);
+        for v in fv {
+            if v.as_str() == node_var {
+                continue;
+            }
+            if !seed.contains_key(v.as_str()) {
+                return None;
+            }
+            if !row_vars.contains(&v) {
+                row_vars.push(v);
+            }
+        }
+    }
+    row_vars.sort_unstable();
+    let row_values: Vec<Value> = row_vars.iter().filter_map(|v| seed.get(v.as_str()).cloned()).collect();
+    let mut nonce = 0u64;
+    let row_key = agg_key_of(&row_values, &mut nonce);
+    let start = match path.start.var.as_ref().and_then(|v| seed.get(v)) {
+        Some(Value::Node { id, .. }) => *id,
+        _ => return None,
+    };
+    let where_addr = clause_where? as *const Expr as usize;
+    // The path by CONTENT, not address: a both-ends-bound leg is turned round
+    // by `reverse_path` per row, so each row brings a fresh allocation — and
+    // an address can also be REUSED by a different pattern (§27's bug).
+    let shape = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        path.start.var.hash(&mut h);
+        path.start.labels.hash(&mut h);
+        for (rel, node) in &path.hops {
+            (rel.dir as u8).hash(&mut h);
+            rel.types.hash(&mut h);
+            rel.var.hash(&mut h);
+            rel.length.map(|l| (l.min, l.max)).hash(&mut h);
+            node.var.hash(&mut h);
+            node.labels.hash(&mut h);
+            node.props.is_some().hash(&mut h);
+        }
+        row_vars.hash(&mut h);
+        row_key.hash(&mut h);
+        h.finish()
+    };
+    Some((generation, shape, where_addr, start))
+}
+
+thread_local! {
+    static HOP0_MEMO: std::cell::RefCell<Vec<(Hop0Key, std::sync::Arc<Vec<u64>>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn hop0_memo_lookup(key: &Hop0Key) -> Option<std::sync::Arc<Vec<u64>>> {
+    HOP0_MEMO.with(|m| {
+        m.borrow()
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| std::sync::Arc::clone(v))
+    })
+}
+
+fn hop0_memo_store(key: Hop0Key, ids: std::sync::Arc<Vec<u64>>) {
+    HOP0_MEMO.with(|m| {
+        let mut m = m.borrow_mut();
+        // entries from an older statement can never match again
+        m.retain(|(k, _)| k.0 == key.0);
+        if m.len() >= 64 {
+            m.clear();
+        }
+        m.push((key, ids));
+    });
+}
+
+/// Per hop, the WHERE conjuncts that first become decidable once that hop has
+/// bound its node -- so a partial path that already fails one stops THERE,
+/// instead of being walked to the end and dropped by the WHERE afterwards.
+///
+/// SNB BI bi16 at SF10 is the case. Its optional leg, driven from the tag, is
+/// `(tag)<-[:HAS_TAG]-(message2)-[:HAS_CREATOR]->(person2)-[:KNOWS]-(person1)`
+/// with `WHERE date(message2.creationDate) = date($date)`. The tag has 15,680
+/// messages and 309 fall on the date, but every one of the 15,680 was walked
+/// on to its creator and a KNOWS probe before the date was looked at -- per
+/// row, for 300 rows a side: 40M edge probes in the first 13 minutes, on the
+/// way to the ceiling.
+///
+/// WHY IT CANNOT CHANGE AN ANSWER. A row survives the WHERE only if every
+/// conjunct is TRUE, and a conjunct's value depends only on the variables it
+/// reads. Once those are bound they are never rebound further along the path,
+/// so its value on the partial is its value on the finished row. The WHERE is
+/// left in place and still runs on every finished row; this only removes rows
+/// it would remove. An OPTIONAL MATCH is safe for the same reason: the set of
+/// paths that SURVIVE is unchanged, and the null row is emitted exactly when
+/// that set is empty.
+///
+/// Deliberately narrow:
+/// - a conjunct of the top-level AND chain only; one under OR constrains
+///   nothing on its own;
+/// - no subquery (it may read state the partial row does not model) and no
+///   non-deterministic call, which would be evaluated twice;
+/// - it must read the node bound at THAT hop, so it was not decidable
+///   earlier, and must not be decidable only at the LAST hop, where the WHERE
+///   already runs on the finished row;
+/// - a variable-length hop's relationship list never counts as bound, so a
+///   predicate over it stays with `lift_rel_predicates`, which owns that case.
+fn early_hop_filters(path: &PathPattern, clause_where: Option<&Expr>, seed: &Row) -> Vec<Vec<Expr>> {
+    let Some(w) = clause_where else {
+        return Vec::new();
+    };
+    let k = path.hops.len();
+    if k < 2 {
+        return Vec::new();
+    }
+    let mut parts: Vec<Expr> = Vec::new();
+    conjuncts_of(w, &mut parts);
+    let mut out: Vec<Vec<Expr>> = vec![Vec::new(); k];
+    let mut any = false;
+    for c in parts {
+        if c.has_subquery() || calls_nondeterministic(&c) {
+            continue;
+        }
+        let mut fv = Vec::new();
+        free_vars_of(&c, &mut fv);
+        if fv.is_empty() {
+            continue;
+        }
+        let bound_by = |h: usize, v: &str| -> bool {
+            seed.contains_key(v)
+                || path.start.var.as_deref() == Some(v)
+                || path.hops[..=h].iter().any(|(rel, node)| {
+                    node.var.as_deref() == Some(v)
+                        || (rel.length.is_none() && rel.var.as_deref() == Some(v))
+                })
+        };
+        for (h, at_hop) in out.iter_mut().enumerate().take(k - 1) {
+            if fv.iter().all(|v| bound_by(h, v.as_str())) {
+                let node_var = path.hops[h].1.var.as_deref();
+                if node_var.is_some_and(|nv| {
+                    !seed.contains_key(nv) && fv.iter().any(|v| v.as_str() == nv)
+                }) {
+                    at_hop.push(c.clone());
+                    any = true;
+                }
+                break;
+            }
+        }
+    }
+    if any { out } else { Vec::new() }
+}
 
 #[allow(clippy::too_many_arguments)]
 fn hops_stream(
@@ -10033,17 +18434,46 @@ fn hops_stream(
     path: &PathPattern,
     hop_sets: &[Option<std::collections::BTreeSet<String>>],
     hop_lean: &[HopLeanPlan],
+    early: &[Vec<Expr>],
+    recorder: Option<&std::cell::RefCell<Vec<u64>>>,
     want_trail: bool,
+    // The trail's nodes are bound bare (`bare_trail_paths`).
+    bare_trail: bool,
     frontier: bool,
     hop: usize,
     partial: Partial,
     params: &BTreeMap<String, Value>,
     sink: RowSink,
 ) -> Result<(), RunError> {
+    // The WHERE conjuncts that became decidable at the hop just taken (see
+    // `early_hop_filters`). Only a TRUE keeps walking; FALSE and NULL both
+    // mean the finished row would fail the WHERE. An evaluation ERROR keeps
+    // walking, so the WHERE -- still applied to the finished row -- decides and
+    // raises exactly as it did before.
+    if hop > 0 {
+        if let Some(conds) = early.get(hop - 1) {
+            for c in conds {
+                match eval_expr(graph, c, &partial.row, params) {
+                    Ok(Value::Bool(true)) | Err(_) => {}
+                    Ok(_) => {
+                        counted!("interp.hop end refused by its WHERE before the next hop");
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        // the first hop's end PASSED its conjuncts: remember it for the rows
+        // after this one (see `hop0_survivor_memo`)
+        if hop == 1 {
+            if let Some(r) = recorder {
+                r.borrow_mut().push(partial.at);
+            }
+        }
+    }
     if hop == path.hops.len() {
         let mut row = partial.row;
         if let Some(v) = &path.var {
-            row.insert(v.clone(), Value::Path(partial.trail.clone()));
+            row.insert(v.clone(), Value::Path((partial.trail.clone()).into()));
         }
         return sink(row);
     }
@@ -10082,7 +18512,10 @@ fn hops_stream(
                     path,
                     hop_sets,
                     hop_lean,
+                    early,
+                    recorder,
                     want_trail,
+                    bare_trail,
                     false,
                     hop + 1,
                     p2,
@@ -10093,8 +18526,8 @@ fn hops_stream(
         );
     }
     let (rel_lean, resolved) = match hop_lean.get(hop) {
-        Some((lean, r)) => (*lean, r.as_ref()),
-        None => (false, None),
+        Some((lean, r)) => (lean.as_ref(), r.as_ref()),
+        None => (None, None),
     };
     expand_var_length(
         graph,
@@ -10107,17 +18540,22 @@ fn hops_stream(
         max,
         params,
         want_trail,
+        bare_trail,
         hop_sets.get(hop).and_then(|o| o.as_ref()),
         rel_lean,
         resolved.map(|(ids, _)| ids.as_slice()),
         resolved.and_then(|(_, props)| props.as_ref()),
+        None,
         &mut |p2| {
             hops_stream(
                 graph,
                 path,
                 hop_sets,
                 hop_lean,
+                early,
+                recorder,
                 want_trail,
+                bare_trail,
                 false,
                 hop + 1,
                 p2,
@@ -10146,6 +18584,15 @@ struct StreamProjector<'a> {
     /// Early drop bound for plain LIMIT (no order, no distinct): rows past
     /// skip+limit can never appear in the output.
     plain_cap: Option<usize>,
+    /// DISTINCT with a LIMIT and no ORDER BY: the output is the first
+    /// skip+limit DISTINCT rows in arrival order, so rows are deduplicated as
+    /// they arrive (by `project_tail`'s own canonical key) and the producer
+    /// stops once that many are held. Buffered whole until finish, SNB BI
+    /// bi4's `WITH DISTINCT forum AS topForum LIMIT 100` hydrated every one
+    /// of the groups it was handed to keep a hundred.
+    distinct_cap: Option<usize>,
+    distinct_seen: std::collections::BTreeSet<Vec<u8>>,
+    distinct_nonce: u64,
     /// Top-k bound for ORDER BY … LIMIT (no distinct): the buffer holds
     /// the skip+limit smallest under the sort, kept sorted by
     /// (order keys, arrival) so ties resolve EXACTLY as the stable full
@@ -10157,10 +18604,23 @@ struct StreamProjector<'a> {
     /// Late projection: output-only properties per MATCH-bound variable, bound
     /// lean and re-materialised for the k survivors only. Empty = off.
     deferred: BTreeMap<String, std::collections::BTreeSet<String>>,
+    /// Variables PROVEN to hold one value for every input row, so a grouping
+    /// item reading one of them cannot split groups and need not be serialised
+    /// into the key. See `const_key_positions`.
+    const_vars: Vec<String>,
+    /// Positions in the grouping key that `const_vars` proves constant.
+    /// Resolved with the items; empty until then.
+    const_key: Vec<bool>,
     /// The top-k when late-projecting: holds the ROW (its expensive props
     /// unbound), not the projected output — the winners are projected at
     /// finish, after their deferred properties are fetched.
     topk_late: Vec<(Vec<Value>, u64, Row)>,
+    /// Fix 91: a top-k whose every ORDER BY expression reads the input row
+    /// alone (decided once, at `resolve_items`) keys its rows on the late
+    /// heap and projects the survivors only, deferral or not — the
+    /// conversation listing projected five properties of each of 1,122
+    /// conversations to keep fifty.
+    keys_from_row: bool,
     /// Late FULL materialisation (fix 27): input-row variables the previous
     /// stage bound LEAN (only this projection's ORDER BY / property reads)
     /// because this top-k RETURN is the only clause after it and outputs
@@ -10179,6 +18639,31 @@ struct StreamProjector<'a> {
     /// The per-projector NaN nonce: no two NaNs ever share a key.
     nan_nonce: u64,
     groups: Vec<AggGroup>,
+    /// The ONE node variable every keyed grouping item reads, when there is
+    /// one (decided at `resolve_items`). Within a statement a node's key
+    /// values are a function of the node, so the group its first row found BY
+    /// VALUE is its group for every later row: `key_node_groups` memoises that
+    /// by node id, and the key is not re-evaluated and re-encoded per row.
+    /// Grouping stays by value — two nodes with equal keys still share a group,
+    /// because each one's first row finds it through `group_index`. SNB BI bi9
+    /// grouped 4.8M rows by `person.id, person.firstName, person.lastName`:
+    /// three reads and an encoded key per ROW, for a key that changes per
+    /// PERSON.
+    key_node_var: Option<String>,
+    key_node_groups: std::collections::BTreeMap<u64, usize>,
+    /// Where this projector's DISTINCT seen sets number their NaNs from
+    /// (`DistinctSeen::number_nans_from`): 0 for a projector alone, a range
+    /// of its own for each partial merged into another, as `nan_nonce` is.
+    seen_base: u64,
+    /// Whether `group_index` holds every group: false once groups arrive by
+    /// `merge_disjoint` (or the index is dropped), after which the projector
+    /// takes no further row or partial — it would miss the group.
+    index_complete: bool,
+    /// The clause after this breaker reads its rows in order only until the
+    /// `k`-th distinct value of one column — `WITH DISTINCT <column> LIMIT k`
+    /// (`downstream_distinct_limit`) — so the finish keeps only the groups up
+    /// to that row (`preselect_for_distinct_limit`).
+    downstream_distinct: Option<(String, usize)>,
 }
 
 pub(crate) enum AggItem {
@@ -10207,12 +18692,70 @@ pub(crate) enum SiteAcc {
     /// (123 s measured). The push order is the fold's iteration order, so
     /// sums, averages, min/max ties and collect order are byte-identical.
     Stream {
-        distinct: Option<(std::collections::BTreeSet<Vec<u8>>, u64)>,
+        distinct: Option<DistinctSeen>,
         state: AggState,
     },
     /// Any aggregate the streaming states do not model — behaviour today,
     /// unchanged: buffer, then fold through `fold_aggregate_values`.
     Values(Vec<Value>),
+}
+
+/// A DISTINCT aggregate's seen set, by the CANONICAL key (`agg_key`). A node's
+/// canonical key is its id under its own tag, so nodes are kept as ids — the
+/// same set, with no key encoded or allocated per row. SNB BI bi9 folds
+/// `count(DISTINCT post)` and `count(DISTINCT reply)` over 4.8M rows, and
+/// the byte key per value per row was a large share of its serial fold.
+/// Every other value keeps the byte key; the two sets cannot share a member,
+/// since the tags differ.
+pub(crate) struct DistinctSeen {
+    keys: std::collections::BTreeSet<Vec<u8>>,
+    nonce: u64,
+    nodes: std::collections::BTreeSet<u64>,
+    /// Relationships likewise: a relationship's canonical key is its id under
+    /// its own tag. SNB BI bi6 folds `count(DISTINCT like)` over 8,318,446
+    /// rows into one projector — a byte key allocated and set-inserted per
+    /// row, most of 12.8 s of serial fold.
+    rels: std::collections::BTreeSet<u64>,
+}
+
+impl DistinctSeen {
+    pub(crate) fn new() -> DistinctSeen {
+        DistinctSeen {
+            keys: std::collections::BTreeSet::new(),
+            nonce: 0,
+            nodes: std::collections::BTreeSet::new(),
+            rels: std::collections::BTreeSet::new(),
+        }
+    }
+
+    /// Number this set's NaNs from `base` (`StreamProjector::seen_base`): a
+    /// partial fold's NaNs then never meet another partial's when the two
+    /// are merged (`absorb`), as no two NaNs meet within one fold.
+    pub(crate) fn number_nans_from(&mut self, base: u64) {
+        self.nonce = base;
+    }
+
+    /// Take a LATER partial's seen set into this one (`SiteAcc::merge`): how
+    /// many of its values this one had not seen — what a DISTINCT count over
+    /// the two adds to this one's.
+    pub(crate) fn absorb(&mut self, mut later: DistinctSeen) -> usize {
+        let before = self.nodes.len() + self.rels.len() + self.keys.len();
+        self.nodes.append(&mut later.nodes);
+        self.rels.append(&mut later.rels);
+        self.keys.append(&mut later.keys);
+        self.nodes.len() + self.rels.len() + self.keys.len() - before
+    }
+
+    /// Whether `v` is new to the set.
+    pub(crate) fn insert(&mut self, v: &Value) -> bool {
+        match v {
+            Value::Node { id, .. } => self.nodes.insert(*id),
+            Value::Rel { id, .. } => self.rels.insert(*id),
+            other => self
+                .keys
+                .insert(agg_key_of(std::slice::from_ref(other), &mut self.nonce)),
+        }
+    }
 }
 
 pub(crate) enum AggState {
@@ -10222,16 +18765,302 @@ pub(crate) enum AggState {
         int: i64,
         float: f64,
         any_float: bool,
+        /// The least and greatest running integer total this fold has held
+        /// (0 before the first value): what a partial fold of a LATER share
+        /// needs to say whether the serial order would have overflowed
+        /// inside it (`SiteAcc::merge_in_order`).
+        lo: i64,
+        hi: i64,
+        /// A PARTIAL fold's float addends, kept in arrival order instead of
+        /// added (`SiteAcc::defer_floats`): float addition does not
+        /// associate, so partials merged in share order append these, and
+        /// the finish adds them from 0.0 in the serial order — the serial
+        /// fold's sum, bit for bit. `None` in a fold of its own.
+        floats: Option<Vec<f64>>,
     },
     Avg {
         total: f64,
         n: u64,
+        /// As `Sum`'s `floats`: a partial fold's addends, in arrival order.
+        addends: Option<Vec<f64>>,
     },
     Min(Option<Value>),
     Max(Option<Value>),
 }
 
 impl SiteAcc {
+    /// Whether a partial of this site merges into another EXACTLY
+    /// (`parallel_aggregate_stage`, `fold_rows_parallel`): a count, a
+    /// collect, a min or max — DISTINCT or not: seen sets merge by union, each
+    /// partial numbering its NaNs in its own range (`seen_base`) — or a
+    /// buffered fold; never a sum or an average (float addition does not
+    /// associate, and a partial cannot see an integer total overflow the
+    /// serial order would raise).
+    pub(crate) fn merges_exactly(site: &AggSite) -> bool {
+        matches!(
+            SiteAcc::for_site(site),
+            SiteAcc::CountStar(_)
+                | SiteAcc::Values(_)
+                | SiteAcc::Stream {
+                    state: AggState::Count(_)
+                        | AggState::Collect(_)
+                        | AggState::Min(_)
+                        | AggState::Max(_),
+                    ..
+                }
+        )
+    }
+
+    /// Whether a partial of this site CAN merge into another in share order
+    /// (`batch::parallel_stage_fold`, whose partials defer their float
+    /// additions — [`SiteAcc::defer_floats`]): a count, a collect, a min or
+    /// max, a buffered fold, a sum or an average — never a DISTINCT. A sum's
+    /// merge still refuses, at run time, an integer total the serial order
+    /// would overflow ([`SiteAcc::merge_in_order`]).
+    pub(crate) fn merges_in_order(site: &AggSite) -> bool {
+        matches!(
+            SiteAcc::for_site(site),
+            SiteAcc::CountStar(_)
+                | SiteAcc::Values(_)
+                | SiteAcc::Stream {
+                    distinct: None,
+                    state: AggState::Count(_)
+                        | AggState::Collect(_)
+                        | AggState::Min(_)
+                        | AggState::Max(_)
+                        | AggState::Sum { .. }
+                        | AggState::Avg { .. },
+                }
+        )
+    }
+
+    /// The value this accumulator will finish to, where reading it costs no
+    /// more than a copy — a count, a sum it has added itself, a min or max —
+    /// without finishing it (`preselect_for_distinct_limit`). `None` for any
+    /// other: a collect, an average, a buffered fold, a sum of deferred
+    /// float addends.
+    pub(crate) fn peek(&self) -> Option<Value> {
+        match self {
+            SiteAcc::CountStar(n) => Some(Value::Int(*n)),
+            SiteAcc::Stream { state, .. } => match state {
+                AggState::Count(n) => Some(Value::Int(*n)),
+                AggState::Sum {
+                    int,
+                    float,
+                    any_float,
+                    floats: None,
+                    ..
+                } => Some(if *any_float {
+                    Value::Float(*float + *int as f64)
+                } else {
+                    Value::Int(*int)
+                }),
+                AggState::Min(v) | AggState::Max(v) => Some(v.clone().unwrap_or(Value::Null)),
+                _ => None,
+            },
+            SiteAcc::Values(_) => None,
+        }
+    }
+
+    /// Make this a PARTIAL fold's accumulator: a sum or an average keeps its
+    /// float addends in arrival order instead of adding them (see
+    /// `AggState::Sum`'s `floats`).
+    pub(crate) fn defer_floats(&mut self) {
+        match self {
+            SiteAcc::Stream {
+                state: AggState::Sum { floats, .. },
+                ..
+            } => *floats = Some(Vec::new()),
+            SiteAcc::Stream {
+                state: AggState::Avg { addends, .. },
+                ..
+            } => *addends = Some(Vec::new()),
+            _ => {}
+        }
+    }
+
+    /// [`SiteAcc::merge`], and a SUM or an AVERAGE of partial folds (their
+    /// float addends deferred — [`SiteAcc::defer_floats`]): the later
+    /// partial's addends follow this one's, in the serial order. `Ok(false)`
+    /// — the caller folds on one thread instead — where the merged value
+    /// would not be the serial fold's: an integer running total the serial
+    /// order would take past i64 inside the later partial (the serial fold
+    /// raises there, and each partial knows only its own running totals,
+    /// `lo` and `hi`: an earlier total `P` and a later partial whose totals
+    /// spanned `[lo, hi]` put the serial order's in `[P + lo, P + hi]` for
+    /// that stretch, both ends reached, so the check is exact); and float
+    /// sums that were ADDED rather than deferred, which do not associate.
+    pub(crate) fn merge_in_order(&mut self, later: SiteAcc) -> Result<bool, RunError> {
+        match (self, later) {
+            (
+                SiteAcc::Stream {
+                    distinct: None,
+                    state:
+                        AggState::Sum {
+                            int,
+                            float,
+                            any_float,
+                            lo,
+                            hi,
+                            floats,
+                        },
+                },
+                SiteAcc::Stream {
+                    distinct: None,
+                    state:
+                        AggState::Sum {
+                            int: b,
+                            float: fb,
+                            any_float: xb,
+                            lo: lb,
+                            hi: hb,
+                            floats: later_floats,
+                        },
+                },
+            ) => {
+                match (floats.as_mut(), later_floats) {
+                    (Some(kept), Some(more)) => kept.extend(more),
+                    // added, not deferred: only a side that summed no float
+                    // is the 0.0 the serial fold starts the other's from
+                    (None, None) if !(*any_float && xb) => {
+                        if xb {
+                            *float = fb;
+                        }
+                    }
+                    _ => return Ok(false),
+                }
+                let base = i128::from(*int);
+                let (low, high) = (base + i128::from(lb), base + i128::from(hb));
+                if low < i128::from(i64::MIN) || high > i128::from(i64::MAX) {
+                    return Ok(false);
+                }
+                // Inside i64: every narrowing below is exact (the later
+                // partial's own total lies within its running range).
+                *lo = (*lo).min(low as i64);
+                *hi = (*hi).max(high as i64);
+                *int = (base + i128::from(b)) as i64;
+                *any_float |= xb;
+                Ok(true)
+            }
+            (
+                SiteAcc::Stream {
+                    distinct: None,
+                    state: AggState::Avg { n, addends, .. },
+                },
+                SiteAcc::Stream {
+                    distinct: None,
+                    state:
+                        AggState::Avg {
+                            n: later_n,
+                            addends: later_addends,
+                            ..
+                        },
+                },
+            ) => match (addends.as_mut(), later_addends) {
+                (Some(kept), Some(more)) => {
+                    kept.extend(more);
+                    *n += later_n;
+                    Ok(true)
+                }
+                _ => Ok(false),
+            },
+            (acc, later) => acc.merge(later).map(|()| true),
+        }
+    }
+
+    /// Fold a LATER partial's accumulator into this one — what pushing its
+    /// values after this one's would have made: counts add, collected and
+    /// buffered values append in order, and a min or max moves only for a
+    /// strictly better value (so a tie keeps the earlier, as the fold does).
+    pub(crate) fn merge(&mut self, later: SiteAcc) -> Result<(), RunError> {
+        match (self, later) {
+            (SiteAcc::CountStar(a), SiteAcc::CountStar(b)) => *a += b,
+            (SiteAcc::Values(a), SiteAcc::Values(b)) => a.extend(b),
+            // A DISTINCT fold: the later partial's values that this one has
+            // not seen are the ones the serial fold would have kept — counted,
+            // or collected in the later partial's arrival order. A min or max
+            // is what it is without DISTINCT.
+            (
+                SiteAcc::Stream {
+                    distinct: Some(seen),
+                    state: a,
+                },
+                SiteAcc::Stream {
+                    distinct: Some(later_seen),
+                    state: b,
+                },
+            ) => match (a, b) {
+                (AggState::Count(x), AggState::Count(_)) => *x += seen.absorb(later_seen) as i64,
+                (AggState::Collect(x), AggState::Collect(y)) => {
+                    for v in y {
+                        if seen.insert(&v) {
+                            x.push(v);
+                        }
+                    }
+                }
+                (AggState::Min(x), AggState::Min(y)) => {
+                    if let Some(y) = y {
+                        if x.as_ref().is_none_or(|b| minmax_cmp(&y, b) == std::cmp::Ordering::Less) {
+                            *x = Some(y);
+                        }
+                    }
+                }
+                (AggState::Max(x), AggState::Max(y)) => {
+                    if let Some(y) = y {
+                        if x.as_ref().is_none_or(|b| minmax_cmp(&y, b) == std::cmp::Ordering::Greater)
+                        {
+                            *x = Some(y);
+                        }
+                    }
+                }
+                _ => {
+                    return Err(RunError::Semantic(
+                        "two aggregate states that cannot merge".into(),
+                    ));
+                }
+            },
+            (
+                SiteAcc::Stream {
+                    distinct: None,
+                    state: a,
+                },
+                SiteAcc::Stream {
+                    distinct: None,
+                    state: b,
+                },
+            ) => match (a, b) {
+                (AggState::Count(x), AggState::Count(y)) => *x += y,
+                (AggState::Collect(x), AggState::Collect(y)) => x.extend(y),
+                (AggState::Min(x), AggState::Min(y)) => {
+                    if let Some(y) = y {
+                        if x.as_ref().is_none_or(|b| minmax_cmp(&y, b) == std::cmp::Ordering::Less) {
+                            *x = Some(y);
+                        }
+                    }
+                }
+                (AggState::Max(x), AggState::Max(y)) => {
+                    if let Some(y) = y {
+                        if x.as_ref().is_none_or(|b| minmax_cmp(&y, b) == std::cmp::Ordering::Greater)
+                        {
+                            *x = Some(y);
+                        }
+                    }
+                }
+                _ => {
+                    return Err(RunError::Semantic(
+                        "two aggregate states that cannot merge".into(),
+                    ));
+                }
+            },
+            _ => {
+                return Err(RunError::Semantic(
+                    "two aggregate accumulators that cannot merge".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Fold one site value in — `None` for a star site — exactly as the
     /// projector's group loop does (null inputs skipped, DISTINCT by the
     /// canonical key).
@@ -10241,9 +19070,7 @@ impl SiteAcc {
             (SiteAcc::Stream { distinct, state }, Some(v)) => {
                 if !matches!(v, Value::Null) {
                     let keep = match distinct {
-                        Some((seen, nonce)) => {
-                            seen.insert(agg_key_of(std::slice::from_ref(&v), nonce))
-                        }
+                        Some(seen) => seen.insert(&v),
                         None => true,
                     };
                     if keep {
@@ -10259,6 +19086,32 @@ impl SiteAcc {
             (SiteAcc::Stream { .. } | SiteAcc::Values(_), None) => {
                 unreachable!("non-star site has a value")
             }
+        }
+        Ok(())
+    }
+
+    /// [`SiteAcc::push`] for a value BORROWED from the row: a `count` —
+    /// DISTINCT or not — needs the value's presence and identity, not a copy,
+    /// so it is cloned only for a state that keeps it.
+    pub(crate) fn push_ref(&mut self, v: &Value) -> Result<(), RunError> {
+        if matches!(v, Value::Null) {
+            return Ok(());
+        }
+        match self {
+            SiteAcc::Stream { distinct, state } => {
+                let keep = match distinct {
+                    Some(seen) => seen.insert(v),
+                    None => true,
+                };
+                if keep {
+                    match state {
+                        AggState::Count(n) => *n += 1,
+                        other => other.push(v.clone())?,
+                    }
+                }
+            }
+            SiteAcc::Values(vals) => vals.push(v.clone()),
+            SiteAcc::CountStar(_) => unreachable!("a star site has no value"),
         }
         Ok(())
     }
@@ -10286,6 +19139,61 @@ impl SiteAcc {
 
     /// The accumulator for a site. Star is CountStar; the six modelled
     /// functions stream; anything else keeps the buffering fallback.
+    /// Fix 107: whether this site folds a row seen `times` times EXACTLY by
+    /// one weighted push — a `count(*)`, a DISTINCT site (a repeated value
+    /// changes nothing), a non-DISTINCT `count`, a `min` or a `max`. A
+    /// `collect` (its encounter order), a `sum` or an `avg` (the order the
+    /// values add in) and every buffered site keep the per-row fold.
+    pub(crate) fn folds_multiplicity(&self) -> bool {
+        match self {
+            SiteAcc::CountStar(_) => true,
+            SiteAcc::Stream {
+                distinct: Some(_), ..
+            } => true,
+            SiteAcc::Stream {
+                distinct: None,
+                state,
+            } => matches!(
+                state,
+                AggState::Count(_) | AggState::Min(_) | AggState::Max(_)
+            ),
+            SiteAcc::Values(_) => false,
+        }
+    }
+
+    /// Fold one site value seen `times` times (fix 107; `folds_multiplicity`
+    /// must hold): a `count(*)` adds `times`, a non-DISTINCT `count` adds
+    /// `times` for a non-null value, and a DISTINCT site or a min/max pushes
+    /// the value once. `Ok(false)` = a count that would leave `i64`.
+    pub(crate) fn push_times(&mut self, v: Option<Value>, times: i64) -> Result<bool, RunError> {
+        let counted = match self {
+            SiteAcc::CountStar(n) => {
+                let Some(next) = n.checked_add(times) else {
+                    return Ok(false);
+                };
+                *n = next;
+                true
+            }
+            SiteAcc::Stream {
+                distinct: None,
+                state: AggState::Count(n),
+            } => {
+                if matches!(v, Some(ref val) if !matches!(val, Value::Null)) {
+                    let Some(next) = n.checked_add(times) else {
+                        return Ok(false);
+                    };
+                    *n = next;
+                }
+                true
+            }
+            _ => false,
+        };
+        if !counted {
+            self.push(v)?;
+        }
+        Ok(true)
+    }
+
     pub(crate) fn for_site(site: &AggSite) -> SiteAcc {
         if site.star {
             return SiteAcc::CountStar(0);
@@ -10297,21 +19205,39 @@ impl SiteAcc {
                 int: 0,
                 float: 0.0,
                 any_float: false,
+                lo: 0,
+                hi: 0,
+                floats: None,
             },
-            "avg" => AggState::Avg { total: 0.0, n: 0 },
+            "avg" => AggState::Avg {
+                total: 0.0,
+                n: 0,
+                addends: None,
+            },
             "min" => AggState::Min(None),
             "max" => AggState::Max(None),
             _ => return SiteAcc::Values(Vec::new()),
         };
         SiteAcc::Stream {
             distinct: if site.distinct {
-                Some((std::collections::BTreeSet::new(), 0))
+                Some(DistinctSeen::new())
             } else {
                 None
             },
             state,
         }
     }
+}
+
+/// Float addends added from +0.0 in their order: the serial fold's sum of
+/// them, bit for bit — its running `float` starts at +0.0 too, so this is
+/// spelled out rather than left to an iterator's choice of starting value.
+fn add_in_order(addends: &[f64]) -> f64 {
+    let mut total = 0.0;
+    for a in addends {
+        total += a;
+    }
+    total
 }
 
 impl AggState {
@@ -10325,15 +19251,23 @@ impl AggState {
                 int,
                 float,
                 any_float,
+                lo,
+                hi,
+                floats,
             } => match v {
                 Value::Int(i) => {
                     *int = int
                         .checked_add(i)
                         .ok_or(RunError::Eval(EvalError::Overflow("sum")))?;
+                    *lo = (*lo).min(*int);
+                    *hi = (*hi).max(*int);
                 }
                 Value::Float(f) => {
                     *any_float = true;
-                    *float += f;
+                    match floats {
+                        Some(kept) => kept.push(f),
+                        None => *float += f,
+                    }
                 }
                 other => {
                     return Err(RunError::Semantic(format!(
@@ -10342,16 +19276,20 @@ impl AggState {
                     )));
                 }
             },
-            AggState::Avg { total, n } => {
-                match v {
-                    Value::Int(i) => *total += i as f64,
-                    Value::Float(f) => *total += f,
+            AggState::Avg { total, n, addends } => {
+                let a = match v {
+                    Value::Int(i) => i as f64,
+                    Value::Float(f) => f,
                     other => {
                         return Err(RunError::Semantic(format!(
                             "avg() over a {}",
                             other.type_name()
                         )));
                     }
+                };
+                match addends {
+                    Some(kept) => kept.push(a),
+                    None => *total += a,
                 }
                 *n += 1;
             }
@@ -10382,19 +19320,24 @@ impl AggState {
     fn finish(self) -> Value {
         match self {
             AggState::Count(n) => Value::Int(n),
-            AggState::Collect(vals) => Value::List(vals),
+            AggState::Collect(vals) => Value::List((vals).into()),
             AggState::Sum {
                 int,
                 float,
                 any_float,
+                floats,
+                ..
             } => {
+                // a partial's addends, added from 0.0 in the serial order
+                let float = floats.map_or(float, |kept| add_in_order(&kept));
                 if any_float {
                     Value::Float(float + int as f64)
                 } else {
                     Value::Int(int)
                 }
             }
-            AggState::Avg { total, n } => {
+            AggState::Avg { total, n, addends } => {
+                let total = addends.map_or(total, |kept| add_in_order(&kept));
                 if n == 0 {
                     Value::Null
                 } else {
@@ -10406,12 +19349,143 @@ impl AggState {
     }
 }
 
+/// Names PROVEN to hold the same value for every row reaching `clauses[at]`.
+///
+/// The only fact claimed here, and it is a strong one: a `WITH` whose items
+/// ALL aggregate — `WITH collect(x) AS xs`, `WITH count(*) AS n, collect(y) AS
+/// ys` — has no grouping key, so it emits EXACTLY ONE ROW. Every name it binds
+/// therefore has one value downstream, until something rebinds it.
+///
+/// Anything that can rebind or multiply rows ends the claim: a later WITH /
+/// RETURN that re-projects the name, an UNWIND or MATCH that binds it again.
+/// Note that a row-MULTIPLYING clause (a MATCH fanning one row into many) does
+/// NOT end it — the value is copied into every row it produces, which is
+/// exactly the case this exists to serve.
+///
+/// `seed` carries names an EARLIER STAGE established. That matters because the
+/// stage splitter cuts at the first breaker `WITH`, so the aggregation that
+/// makes a name constant is usually in the PREVIOUS stage and invisible to this
+/// clause slice — the first version of this analysis missed every real case for
+/// exactly that reason.
+/// Whether `c` carries an expression this liveness prune must not look past.
+///
+/// `clause_mentions` does not descend into a subquery, so a name read ONLY
+/// inside `EXISTS { ... }` / `COUNT { ... }` looks unused. Dropping it on that
+/// basis is wrong, and the TCK caught it: three "Nested existential subquery"
+/// cases returned 4 rows where 1 was expected. Conservative by construction —
+/// any clause shape not modelled here answers TRUE.
+fn clause_may_hide_reads(c: &Clause) -> bool {
+    fn proj_has(p: &engram_cypher::stmt::Projection) -> bool {
+        p.items.iter().any(|it| it.expr.has_subquery())
+            || p.order.iter().any(|o| o.expr.has_subquery())
+    }
+    match c {
+        Clause::Match {
+            pattern, where_, ..
+        } => {
+            where_.as_ref().is_some_and(|w| w.has_subquery())
+                || pattern.paths.iter().any(|path| {
+                    std::iter::once(&path.start.props)
+                        .chain(path.hops.iter().flat_map(|(r, n)| [&r.props, &n.props]))
+                        .flatten()
+                        .any(|e| e.has_subquery())
+                })
+        }
+        Clause::With { proj, where_ } => {
+            proj_has(proj) || where_.as_ref().is_some_and(|w| w.has_subquery())
+        }
+        Clause::Return { proj } => proj_has(proj),
+        Clause::Unwind { expr, .. } => expr.has_subquery(),
+        // Not modelled: assume it reads what this walk cannot see.
+        _ => true,
+    }
+}
+
+/// The names `c` makes CONSTANT downstream: an aggregating `WITH` with no
+/// grouping item emits exactly one row, so everything it binds has one value.
+fn constants_established_by(c: &Clause) -> Vec<String> {
+    let Clause::With { proj, .. } = c else {
+        return Vec::new();
+    };
+    if proj.star
+        || proj.items.is_empty()
+        || !proj.items.iter().all(|it| contains_aggregate(&it.expr))
+    {
+        return Vec::new();
+    }
+    proj.items
+        .iter()
+        .filter_map(|it| {
+            it.alias.clone().or_else(|| match &it.expr {
+                Expr::Var(v) => Some(v.clone()),
+                _ => None,
+            })
+        })
+        .collect()
+}
+
+fn constant_names_at(clauses: &[Clause], at: usize, seed: &[String]) -> Vec<String> {
+    let mut consts: Vec<String> = seed.to_vec();
+    for c in clauses.iter().take(at) {
+        match c {
+            Clause::With { proj, .. } => {
+                // rebinding clears, then a no-key aggregation re-establishes
+                let names: Vec<String> = proj
+                    .items
+                    .iter()
+                    .filter_map(|it| {
+                        it.alias.clone().or_else(|| match &it.expr {
+                            Expr::Var(v) => Some(v.clone()),
+                            _ => None,
+                        })
+                    })
+                    .collect();
+                consts.retain(|v| !names.contains(v));
+                if !proj.star
+                    && !proj.items.is_empty()
+                    && proj.items.iter().all(|it| contains_aggregate(&it.expr))
+                {
+                    consts.extend(names);
+                }
+            }
+            Clause::Unwind { alias, .. } => consts.retain(|v| v != alias),
+            Clause::Match { pattern, .. } | Clause::Create { pattern } => {
+                for p in &pattern.paths {
+                    for v in path_vars(p) {
+                        consts.retain(|x| *x != v);
+                    }
+                }
+            }
+            Clause::Merge { path, .. } => {
+                for v in path_vars(path) {
+                    consts.retain(|x| *x != v);
+                }
+            }
+            Clause::CallProcedure { yields, .. } => {
+                for (n, a) in yields {
+                    let bound = a.clone().unwrap_or_else(|| n.clone());
+                    consts.retain(|x| *x != bound);
+                }
+            }
+            // Anything this walker does not model ends every claim rather than
+            // risk one: a wrong "constant" merges groups that must stay apart.
+            Clause::Return { .. }
+            | Clause::Set { .. }
+            | Clause::Remove { .. }
+            | Clause::Delete { .. } => {}
+            _ => consts.clear(),
+        }
+    }
+    consts
+}
+
 impl<'a> StreamProjector<'a> {
     fn new(
         graph: &'a Graph,
         proj: &'a Projection,
         params: &'a BTreeMap<String, Value>,
         deferred: BTreeMap<String, std::collections::BTreeSet<String>>,
+        const_vars: Vec<String>,
     ) -> Result<Self, RunError> {
         let aggregating = proj.items.iter().any(|it| contains_aggregate(&it.expr));
         let plain_cap =
@@ -10430,6 +19504,14 @@ impl<'a> StreamProjector<'a> {
             } else {
                 None
             };
+        let distinct_cap =
+            if !aggregating && proj.order.is_empty() && proj.distinct && proj.limit.is_some() {
+                let skip = eval_count(graph, proj.skip.as_ref(), params, "SKIP")?.unwrap_or(0);
+                let limit = eval_count(graph, proj.limit.as_ref(), params, "LIMIT")?.unwrap_or(0);
+                Some(skip + limit)
+            } else {
+                None
+            };
         let mut me = StreamProjector {
             graph,
             params,
@@ -10437,9 +19519,15 @@ impl<'a> StreamProjector<'a> {
             items: None,
             columns: Vec::new(),
             aggregating,
+            const_vars,
+            const_key: Vec::new(),
             buf: Vec::new(),
             plain_cap,
+            distinct_cap,
+            distinct_seen: std::collections::BTreeSet::new(),
+            distinct_nonce: 0,
             topk_cap,
+            keys_from_row: false,
             arrivals: 0,
             topk: Vec::new(),
             deferred,
@@ -10451,6 +19539,11 @@ impl<'a> StreamProjector<'a> {
             group_index: BTreeMap::new(),
             nan_nonce: 0,
             groups: Vec::new(),
+            key_node_var: None,
+            key_node_groups: std::collections::BTreeMap::new(),
+            seen_base: 0,
+            index_complete: true,
+            downstream_distinct: None,
         };
         if !proj.star {
             me.resolve_items(&Row::new())?;
@@ -10486,7 +19579,9 @@ impl<'a> StreamProjector<'a> {
                 if let Some(ix) = self.columns.iter().position(|c| c == fv) {
                     let same = match &items[ix].1 {
                         Expr::Var(v) => v == fv,
-                        Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("properties") => {
+                        Expr::Call { name, args, .. }
+                            if name.eq_ignore_ascii_case("properties") =>
+                        {
                             matches!(args.as_slice(), [Expr::Var(v)] if v == fv)
                         }
                         _ => false,
@@ -10502,6 +19597,28 @@ impl<'a> StreamProjector<'a> {
         }
         counted!("interp.top-k key read from the lean row");
         Ok(Some(key))
+    }
+
+    /// Materialise every DEFERRED property set into the row's carried node
+    /// (the projected read merged over the lean binding) — a survivor's
+    /// late properties, exactly as the late top-k path does it.
+    fn hydrate_deferred(&self, row: &mut Row) -> Result<(), RunError> {
+        for (var, props) in &self.deferred {
+            if let Some(Value::Node {
+                id, props: bound, ..
+            }) = row.get_mut(var)
+            {
+                let nid = *id;
+                if let Some(Value::Node { props: fp, .. }) =
+                    self.graph.node_projected(nid, props)?
+                {
+                    for (pk, pv) in fp {
+                        bound.insert(pk, pv);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Replace every late-full carry in the row with its FULL node. The
@@ -10563,8 +19680,68 @@ impl<'a> StreamProjector<'a> {
                         site_range: start..self.sites.len(),
                     });
                 } else {
+                    // A GROUPING ITEM THAT CANNOT SPLIT GROUPS IS NOT KEYED.
+                    //
+                    // `agg_key_of` serialises every key value PER ROW. When a
+                    // key is a large collected list that is the same for every
+                    // row, that is O(rows x list) to produce keys that are all
+                    // identical: SNB BI's bi10 carries a 17,743-node list
+                    // across 22,842 rows, and `WITH near, collect(b) AS far`
+                    // did not finish in 180 s at SF3 while the same query's two
+                    // variable-length expansions took 1 s and 0 s. Neo4j
+                    // answers the whole query in 0 s, and this shape is LDBC's
+                    // own text, not a rewrite of it.
+                    //
+                    // Sound because `const_vars` holds only names bound by an
+                    // upstream aggregating WITH with NO grouping items, which
+                    // yields EXACTLY ONE ROW — so the value cannot differ
+                    // between rows and cannot separate two groups. The emitted
+                    // value is unaffected either way: a Key item is
+                    // re-evaluated from the group's TEMPLATE row at finish.
+                    let is_const = matches!(e, Expr::Var(v) if self.const_vars.contains(v));
+                    if is_const {
+                        counted!("interp.constant grouping key left out of the key");
+                    }
+                    self.const_key.push(is_const);
                     self.agg_items.push(AggItem::Key);
                 }
+            }
+            // The node memo's precondition (see `key_node_var`): every KEYED
+            // grouping item reads one and the same variable, calls nothing
+            // nondeterministic, and holds no subquery (`free_vars` does not
+            // see into one, so a variable it reads could vary unseen).
+            let mut one: Option<String> = None;
+            let mut fits = true;
+            let mut ki = 0usize;
+            for ((_, e), kind) in items.iter().zip(&self.agg_items) {
+                if !matches!(kind, AggItem::Key) {
+                    continue;
+                }
+                let is_const = self.const_key.get(ki).copied().unwrap_or(false);
+                ki += 1;
+                if is_const {
+                    continue;
+                }
+                let mut fv = Vec::new();
+                free_vars_of(e, &mut fv);
+                fv.sort();
+                fv.dedup();
+                if fv.len() != 1 || calls_nondeterministic(e) || e.has_subquery() {
+                    fits = false;
+                    break;
+                }
+                match &one {
+                    None => one = Some(fv[0].clone()),
+                    Some(v) if *v == fv[0] => {}
+                    Some(_) => {
+                        fits = false;
+                        break;
+                    }
+                }
+            }
+            if fits && one.is_some() {
+                counted!("interp.agg groups memoised by their one key node");
+                self.key_node_var = one;
             }
             // An ORDER BY key may itself aggregate (`ORDER BY $p + avg(x)`) —
             // lift its aggregates to sites so they are computed over the group.
@@ -10580,6 +19757,264 @@ impl<'a> StreamProjector<'a> {
             }
         }
         self.items = Some(items);
+        self.keys_from_row = self.topk_cap.is_some() && self.order_keys_read_the_row();
+        Ok(())
+    }
+
+    /// Fix 91: whether every ORDER BY expression reads the input row alone —
+    /// the static half of `order_key_direct`'s rule, decided once (the items
+    /// resolve before any row arrives): a free variable is either not an
+    /// output column, or a column whose item is the variable itself (or
+    /// `properties(var)` under its own name). Then the key over the row is
+    /// the key over the projected scope, and the rows can be keyed before
+    /// any item is projected; `order_key_direct` still checks per row that
+    /// the row holds the variable, and projects the row when it does not.
+    fn order_keys_read_the_row(&self) -> bool {
+        if self.proj.order.is_empty() || self.aggregating {
+            return false;
+        }
+        let items = self.items.as_ref().expect("resolved");
+        for o in &self.proj.order {
+            let mut fvs = Vec::new();
+            free_vars_of(&o.expr, &mut fvs);
+            for fv in &fvs {
+                if let Some(ix) = self.columns.iter().position(|c| c == fv) {
+                    let same = match &items[ix].1 {
+                        Expr::Var(v) => v == fv,
+                        Expr::Call { name, args, .. }
+                            if name.eq_ignore_ascii_case("properties") =>
+                        {
+                            matches!(args.as_slice(), [Expr::Var(v)] if v == fv)
+                        }
+                        _ => false,
+                    };
+                    if !same {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// The groups, in this breaker's order, that a downstream `WITH DISTINCT
+    /// <col> LIMIT k` reads: sorted by the ORDER BY — ties by first-seen
+    /// order, as the stable sort leaves them — up to the one holding the k-th
+    /// distinct value of `col`, found by selecting a growing head of the
+    /// order rather than sorting every group. Each key must read the group's
+    /// template alone (a grouping variable's value or property), or be an
+    /// aggregate item whose value a copy reads (`SiteAcc::peek`), so that it
+    /// is exactly the key the finish would sort on; anything else declines
+    /// (`None`), and the finish sorts every group as it always did.
+    fn preselect_for_distinct_limit(
+        &self,
+        groups: &[AggGroup],
+        items: &[(String, Expr)],
+        col: &str,
+        k: usize,
+    ) -> Result<Option<Vec<usize>>, RunError> {
+        enum Key<'e> {
+            Template(&'e Expr),
+            Site(usize),
+        }
+        let Some(ci) = self.columns.iter().rposition(|c| c == col) else {
+            return Ok(None);
+        };
+        if !matches!(self.agg_items.get(ci), Some(AggItem::Key)) {
+            return Ok(None);
+        }
+        let col_expr = &items[ci].1;
+        let order = &self.proj.order;
+        let mut keys_of: Vec<Key<'_>> = Vec::with_capacity(order.len());
+        for (oi, o) in order.iter().enumerate() {
+            if matches!(self.order_agg.get(oi), Some(Some(_))) || o.expr.has_subquery() {
+                return Ok(None);
+            }
+            // an output column by name: a grouping item's template value, or
+            // an aggregate item that IS its aggregate
+            if let Expr::Var(v) = &o.expr {
+                if let Some(ix) = self.columns.iter().rposition(|c| c == v) {
+                    match &self.agg_items[ix] {
+                        AggItem::Key => keys_of.push(Key::Template(&items[ix].1)),
+                        AggItem::Agg {
+                            rewritten,
+                            site_range,
+                        } if site_range.len() == 1
+                            && matches!(rewritten, Expr::Param(p) if *p == format!("__agg{}", site_range.start)) =>
+                        {
+                            keys_of.push(Key::Site(site_range.start));
+                        }
+                        AggItem::Agg { .. } => return Ok(None),
+                    }
+                    continue;
+                }
+            }
+            // an expression over grouping variables the template binds under
+            // the same names as their output columns
+            let mut fv = Vec::new();
+            free_vars_of(&o.expr, &mut fv);
+            if fv.is_empty() {
+                return Ok(None);
+            }
+            for v in &fv {
+                let Some(ix) = self.columns.iter().rposition(|c| c == v) else {
+                    return Ok(None);
+                };
+                if !matches!(&self.agg_items[ix], AggItem::Key)
+                    || !matches!(&items[ix].1, Expr::Var(x) if x == v)
+                {
+                    return Ok(None);
+                }
+            }
+            keys_of.push(Key::Template(&o.expr));
+        }
+        if k == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let n = groups.len();
+        let mut keys: Vec<Vec<Value>> = Vec::with_capacity(n);
+        for g in groups {
+            let mut kv = Vec::with_capacity(keys_of.len());
+            for key in &keys_of {
+                kv.push(match key {
+                    Key::Template(e) => eval_expr(self.graph, e, &g.template, self.params)?,
+                    Key::Site(i) => match g.accs.get(*i).and_then(SiteAcc::peek) {
+                        Some(v) => v,
+                        None => return Ok(None),
+                    },
+                });
+            }
+            keys.push(kv);
+        }
+        let by_order =
+            |a: &usize, b: &usize| cmp_order_keys(order, &keys[*a], &keys[*b]).then(a.cmp(b));
+        let mut head = k.saturating_mul(4).max(64).min(n);
+        loop {
+            let mut idx: Vec<usize> = (0..n).collect();
+            if head < n {
+                idx.select_nth_unstable_by(head - 1, by_order);
+                idx.truncate(head);
+            }
+            idx.sort_by(by_order);
+            let mut nonce = 0u64;
+            let mut seen = std::collections::BTreeSet::new();
+            let mut last = None;
+            for (pos, &gi) in idx.iter().enumerate() {
+                let v = eval_expr(self.graph, col_expr, &groups[gi].template, self.params)?;
+                if seen.insert(agg_key_of(std::slice::from_ref(&v), &mut nonce)) && seen.len() == k {
+                    last = Some(pos);
+                    break;
+                }
+            }
+            match last {
+                Some(pos) => {
+                    idx.truncate(pos + 1);
+                    return Ok(Some(idx));
+                }
+                // fewer than k distinct values in every group: all of them
+                None if head >= n => return Ok(Some(idx)),
+                None => head = head.saturating_mul(4).min(n),
+            }
+        }
+    }
+
+    /// Whether this AGGREGATING projector can take partials exactly: every
+    /// fold merges exactly, and nothing is hydrated or deferred before it
+    /// projects. Resolves the items (a non-star projection reads no row to
+    /// do it).
+    fn merge_ready_rows(&mut self) -> Result<bool, RunError> {
+        if !self.aggregating
+            || self.proj.star
+            || !self.late_full.is_empty()
+            || !self.deferred.is_empty()
+            || !self.groups.is_empty()
+        {
+            return Ok(false);
+        }
+        if self.items.is_none() {
+            self.resolve_items(&Row::new())?;
+        }
+        Ok(self.sites.iter().all(SiteAcc::merges_exactly))
+    }
+
+    /// [`StreamProjector::merge_ready_rows`], and BOUNDED for
+    /// `parallel_aggregate_stage`, whose partials all live until the stage
+    /// ends: one grouping key is the bare seed node, so each group lies in
+    /// one share.
+    /// Drop the group index and the node memo — a partial's, once its share
+    /// is driven: `merge_disjoint` needs neither, and freeing them on the
+    /// worker spreads the deallocation over the workers.
+    fn drop_group_index(&mut self) {
+        self.group_index = BTreeMap::new();
+        self.key_node_groups = std::collections::BTreeMap::new();
+        self.index_complete = false;
+    }
+
+    /// Append a LATER share's partial whose groups no earlier partial holds —
+    /// `parallel_aggregate_stage`'s, each group keyed by its share's seed
+    /// node (`merge_ready`) — in its own first-seen order, where
+    /// `merge_partial` would place them, with no index lookup or insert per
+    /// group. The stage's projector is only FINISHED after these merges, and
+    /// the index serves nothing but further rows: SNB BI bi4's 111 partials
+    /// hold 1,228,730 groups, and inserting their keys cost 1.2-1.4 s on one
+    /// thread (probe106). A projector merged this way refuses a further row
+    /// or keyed merge rather than miss a group (`index_complete`).
+    fn merge_disjoint(&mut self, later: StreamProjector<'a>) {
+        self.groups.extend(later.groups);
+        self.index_complete = false;
+    }
+
+    fn merge_ready(&mut self, seed_var: &str) -> Result<bool, RunError> {
+        if !self.merge_ready_rows()? {
+            return Ok(false);
+        }
+        let items = self.items.as_ref().expect("resolved");
+        Ok(items
+            .iter()
+            .zip(&self.agg_items)
+            .any(|((_, e), k)| matches!(k, AggItem::Key) && matches!(e, Expr::Var(v) if v == seed_var)))
+    }
+
+    /// Merge a LATER share's partial projector (`parallel_aggregate_stage`):
+    /// its groups in their first-seen order, each into the group of the same
+    /// canonical key — or appended, its first row the group's template, as
+    /// the serial fold would have found it.
+    fn merge_partial(&mut self, later: StreamProjector<'a>) -> Result<(), RunError> {
+        if !self.index_complete || !later.index_complete {
+            return Err(RunError::Semantic(
+                "internal: a grouping without its index was merged by key".into(),
+            ));
+        }
+        let StreamProjector {
+            groups,
+            group_index,
+            ..
+        } = later;
+        let mut keys: Vec<Option<Vec<u8>>> = vec![None; groups.len()];
+        for (k, gi) in group_index {
+            if let Some(slot) = keys.get_mut(gi) {
+                *slot = Some(k);
+            }
+        }
+        for (g, key) in groups.into_iter().zip(keys) {
+            let Some(key) = key else {
+                return Err(RunError::Semantic(
+                    "a partial aggregate group without its key".into(),
+                ));
+            };
+            match self.group_index.get(&key) {
+                Some(&i) => {
+                    for (a, b) in self.groups[i].accs.iter_mut().zip(g.accs) {
+                        a.merge(b)?;
+                    }
+                }
+                None => {
+                    self.groups.push(g);
+                    self.group_index.insert(key, self.groups.len() - 1);
+                    budget_check(self.graph, self.groups.len())?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -10598,12 +20033,17 @@ impl<'a> StreamProjector<'a> {
                     return Err(RunError::Saturated);
                 }
             }
-            if self.defers() {
+            if self.distinct_cap.is_some_and(|cap| self.buf.len() >= cap) {
+                counted!("interp.distinct limit stopped the producer");
+                return Err(RunError::Saturated);
+            }
+            if self.defers() || self.keys_from_row {
                 if let Some(cap) = self.topk_cap {
                     // Late projection: the expensive props are unbound, so the
                     // key is computed on the lean row (cheap; deferred props
                     // read as null but the key never uses them) and the ROW is
-                    // kept for the winners to project at finish.
+                    // kept for the winners to project at finish. Fix 91: the
+                    // same for any top-k whose keys read the row alone.
                     let key = match self.order_key_direct(&row)? {
                         Some(k) => k,
                         None => {
@@ -10660,74 +20100,120 @@ impl<'a> StreamProjector<'a> {
                 }
                 return Ok(());
             }
+            if self.distinct_cap.is_some()
+                && !self
+                    .distinct_seen
+                    .insert(agg_key_of(&out, &mut self.distinct_nonce))
+            {
+                return Ok(()); // a repeat: `project_tail` would drop it
+            }
             self.buf.push((out, key));
             budget_check(self.graph, self.buf.len())?;
             return Ok(());
         }
-        // Aggregating: group key from the non-aggregate items, per-site
-        // argument values folded incrementally.
-        let items = self.items.as_ref().expect("resolved");
-        let mut key = Vec::new();
-        for ((_, e), kind) in items.iter().zip(&self.agg_items) {
-            if matches!(kind, AggItem::Key) {
-                key.push(eval_expr(self.graph, e, &row, self.params)?);
-            }
+        if !self.index_complete {
+            return Err(RunError::Semantic(
+                "internal: a grouping merged without its index was given another row".into(),
+            ));
         }
-        // Per-site argument values for THIS row (before the row moves).
-        let mut site_vals: Vec<Option<Value>> = Vec::with_capacity(self.sites.len());
-        for site in &self.sites {
-            if site.star {
-                site_vals.push(None);
-            } else {
-                let arg = site.args.first().ok_or_else(|| {
-                    RunError::Semantic(format!("{}() needs an argument", site.name))
-                })?;
-                let v = eval_expr(self.graph, arg, &row, self.params)?;
-                site_vals.push(Some(v));
-            }
-        }
-        // Find or create the group by the CANONICAL key — Neo4j's measured
-        // equivalence (numerics unify, NaN never does), one encoding shared
-        // with every DISTINCT in the engine. The first-seen value tuple
+        // Aggregating: the row's group, then each site's argument folded in.
+        //
+        // THE GROUP. Through the node memo when every keyed item reads one
+        // node (`key_node_var`) and this row's node has been seen before;
+        // otherwise by the CANONICAL key — Neo4j's measured equivalence
+        // (numerics unify, NaN never does), one encoding shared with every
+        // DISTINCT in the engine — and the memo learns it. The first-seen row
         // stays as the group's representative, exactly as Neo4j returns it.
-        let ser = agg_key_of(&key, &mut self.nan_nonce);
-        let gi = if let Some(&i) = self.group_index.get(&ser) {
-            i
-        } else {
-            let accs = self.sites.iter().map(SiteAcc::for_site).collect();
-            self.groups.push(AggGroup {
-                template: row,
-                accs,
-            });
-            self.group_index.insert(ser, self.groups.len() - 1);
-            budget_check(self.graph, self.groups.len())?;
-            self.groups.len() - 1
-        };
-        let g = &mut self.groups[gi];
-        for (acc, v) in g.accs.iter_mut().zip(site_vals) {
-            match (acc, v) {
-                (SiteAcc::CountStar(n), _) => *n += 1,
-                (SiteAcc::Stream { distinct, state }, Some(v)) => {
-                    if !matches!(v, Value::Null) {
-                        let keep = match distinct {
-                            Some((seen, nonce)) => {
-                                seen.insert(agg_key_of(std::slice::from_ref(&v), nonce))
-                            }
-                            None => true,
+        let memo_id = self.key_node_var.as_ref().and_then(|v| match row.get(v) {
+            Some(Value::Node { id, .. }) => Some(*id),
+            _ => None,
+        });
+        let known = memo_id.and_then(|id| self.key_node_groups.get(&id).copied());
+        let (gi, row) = match known {
+            Some(gi) => (gi, Some(row)),
+            None => {
+                let items = self.items.as_ref().expect("resolved");
+                // The canonical key, encoded as each item is read — the bytes
+                // `agg_key_of` makes of the evaluated items — with a bare
+                // variable encoded where it lies in the row rather than
+                // cloned out of it first: bi4 groups ~2M rows by two nodes,
+                // two Node clones a row for an encoding of two ids.
+                let mut ser = Vec::new();
+                let mut ki = 0usize;
+                for ((_, e), kind) in items.iter().zip(&self.agg_items) {
+                    if matches!(kind, AggItem::Key) {
+                        let skip = self.const_key.get(ki).copied().unwrap_or(false);
+                        ki += 1;
+                        if skip {
+                            continue;
+                        }
+                        let bare = match e {
+                            Expr::Var(name) => row.get(name),
+                            _ => None,
                         };
-                        if keep {
-                            state.push(v)?;
+                        match bare {
+                            Some(v) => agg_key(v, &mut self.nan_nonce, &mut ser),
+                            None => {
+                                let v = eval_expr(self.graph, e, &row, self.params)?;
+                                agg_key(&v, &mut self.nan_nonce, &mut ser);
+                            }
                         }
                     }
                 }
-                (SiteAcc::Values(vals), Some(v)) => {
-                    if !matches!(v, Value::Null) {
-                        vals.push(v);
+                let (gi, row) = if let Some(&i) = self.group_index.get(&ser) {
+                    (i, Some(row))
+                } else {
+                    let mut accs: Vec<SiteAcc> = self.sites.iter().map(SiteAcc::for_site).collect();
+                    if self.seen_base != 0 {
+                        for acc in &mut accs {
+                            if let SiteAcc::Stream {
+                                distinct: Some(seen),
+                                ..
+                            } = acc
+                            {
+                                seen.number_nans_from(self.seen_base);
+                            }
+                        }
                     }
+                    self.groups.push(AggGroup {
+                        template: row,
+                        accs,
+                    });
+                    self.group_index.insert(ser, self.groups.len() - 1);
+                    budget_check(self.graph, self.groups.len())?;
+                    (self.groups.len() - 1, None)
+                };
+                if let Some(id) = memo_id {
+                    self.key_node_groups.insert(id, gi);
                 }
-                (SiteAcc::Stream { .. } | SiteAcc::Values(_), None) => {
-                    unreachable!("non-star site has a value")
+                (gi, row)
+            }
+        };
+        // THE SITES, read from this row — or from the template it just
+        // became. A bare variable is read in place: `count(DISTINCT post)`
+        // needs the node's identity, not a copy of it per row.
+        let AggGroup { template, accs } = &mut self.groups[gi];
+        let src: &Row = match &row {
+            Some(r) => r,
+            None => template,
+        };
+        for (acc, site) in accs.iter_mut().zip(&self.sites) {
+            if site.star {
+                if let SiteAcc::CountStar(n) = acc {
+                    *n += 1;
                 }
+                continue;
+            }
+            let arg = site.args.first().ok_or_else(|| {
+                RunError::Semantic(format!("{}() needs an argument", site.name))
+            })?;
+            let in_place = match arg {
+                Expr::Var(name) => src.get(name),
+                _ => None,
+            };
+            match in_place {
+                Some(v) => acc.push_ref(v)?,
+                None => acc.push(Some(eval_expr(self.graph, arg, src, self.params)?))?,
             }
         }
         Ok(())
@@ -10742,9 +20228,17 @@ impl<'a> StreamProjector<'a> {
         let items = self.items.take().expect("resolved");
         if !self.aggregating {
             if self.topk_cap.is_some() {
-                if self.defers() {
+                if self.defers() || self.keys_from_row {
                     // Late projection: materialise the deferred properties for
                     // the k survivors only, then project and page them.
+                    // Fix 91: counted when the keying kept fewer rows than
+                    // it saw — a page that keeps every row saved nothing.
+                    if self.keys_from_row
+                        && !self.defers()
+                        && self.topk_cap.is_some_and(|cap| self.arrivals > cap as u64)
+                    {
+                        counted!("interp.top-k keyed its rows and projected the survivors alone");
+                    }
                     let mut late = std::mem::take(&mut self.topk_late);
                     topk_sort(&mut late, &self.proj.order);
                     if !late.is_empty() && !self.deferred.is_empty() {
@@ -10769,11 +20263,13 @@ impl<'a> StreamProjector<'a> {
                             }
                         }
                         self.hydrate_late_full(&mut row)?;
-                        let (out, _k) = project_row_values(
+                        // The heap's key is the row's key (fix 91: not
+                        // recomputed for the survivors — no order given).
+                        let (out, _) = project_row_values(
                             self.graph,
                             &items,
                             &self.columns,
-                            &self.proj.order,
+                            &[],
                             row,
                             self.params,
                         )?;
@@ -10832,9 +20328,205 @@ impl<'a> StreamProjector<'a> {
                 accs,
             });
         }
-        let mut out_rows = Vec::with_capacity(self.groups.len());
-        let mut order_keys = Vec::with_capacity(self.groups.len());
-        for g in self.groups {
+        // Fix 99: a grouping top-k whose keys carry DEFERRED properties
+        // orders its groups by the keys' bound properties first, keeps the
+        // page (`skip + limit`, the tail re-sorts stably and pages exactly),
+        // hydrates the kept groups' keys, and projects those alone — the
+        // rest never read a deferred property. Only when every ORDER BY
+        // key reads the group's template (no aggregate key); else every
+        // group is hydrated before it is projected, as it always was.
+        let mut groups = std::mem::take(&mut self.groups);
+        // A DOWNSTREAM `WITH DISTINCT <column> LIMIT k` reads this breaker's
+        // rows in order and stops at its k-th distinct value; the groups after
+        // that row were sorted, projected into rows, handed on and freed
+        // unread. SNB BI bi4's prefix finishes 1,228,730 groups for a `WITH
+        // DISTINCT forum AS topForum LIMIT 100` that reads a few hundred of
+        // them: 3.7 s of sort and rows, and 2.75 s of the next stage taking and
+        // freeing the rest (probe106). Only those groups are kept now.
+        if self.deferred.is_empty() && self.late_full.is_empty() {
+            if let Some((col, k)) = self.downstream_distinct.clone() {
+                if let Some(keep) = self.preselect_for_distinct_limit(&groups, &items, &col, k)? {
+                    groups = take_selected_groups(self.graph, groups, &keep);
+                    counted!("interp.grouping kept only the groups a downstream DISTINCT LIMIT reads");
+                }
+            }
+        }
+        if !self.deferred.is_empty() {
+            let pageable = !self.proj.order.is_empty()
+                && self.proj.limit.is_some()
+                && self.order_agg.iter().all(|o| o.is_none())
+                && self.proj.order.iter().all(|o| {
+                    let mut fv = Vec::new();
+                    free_vars_of(&o.expr, &mut fv);
+                    !fv.is_empty()
+                        && fv.iter().all(|v| {
+                            !self.columns.contains(v)
+                                || items
+                                    .iter()
+                                    .any(|(n, e)| n == v && matches!(e, Expr::Var(x) if x == v))
+                        })
+                });
+            if pageable {
+                let skip = eval_count(self.graph, self.proj.skip.as_ref(), self.params, "SKIP")?
+                    .unwrap_or(0);
+                let limit = eval_count(self.graph, self.proj.limit.as_ref(), self.params, "LIMIT")?
+                    .unwrap_or(0);
+                let mut keyed: Vec<(usize, Vec<Value>)> = Vec::with_capacity(groups.len());
+                for (gi, g) in groups.iter().enumerate() {
+                    let mut k = Vec::with_capacity(self.proj.order.len());
+                    for o in &self.proj.order {
+                        k.push(eval_expr(self.graph, &o.expr, &g.template, self.params)?);
+                    }
+                    keyed.push((gi, k));
+                }
+                keyed.sort_by(|a, b| cmp_order_keys(&self.proj.order, &a.1, &b.1));
+                keyed.truncate(skip.saturating_add(limit));
+                let mut kept: Vec<Option<AggGroup>> = groups.into_iter().map(Some).collect();
+                let mut page = Vec::with_capacity(keyed.len());
+                for (gi, _) in keyed {
+                    if let Some(g) = kept[gi].take() {
+                        page.push(g);
+                    }
+                }
+                groups = page;
+                counted!("interp.grouping top-k hydrated its page's keys alone");
+            }
+            for g in groups.iter_mut() {
+                self.hydrate_deferred(&mut g.template)?;
+            }
+        }
+        let mut out_rows = Vec::with_capacity(groups.len());
+        let mut order_keys = Vec::with_capacity(groups.len());
+        // Fix 105: at finish an aggregate item is its REWRITTEN form — the
+        // aggregate a `$__aggN` hole — so what it still reads of a key is
+        // judged on that, not on the `count(t)` (or the folded `COUNT {}`
+        // subquery) that named the key per row.
+        let finish_items: Vec<(String, Expr)> = items
+            .iter()
+            .zip(&self.agg_items)
+            .map(|((n, e), k)| match k {
+                AggItem::Agg { rewritten, .. } => (n.clone(), rewritten.clone()),
+                AggItem::Key => (n.clone(), e.clone()),
+            })
+            .collect();
+        // WHAT DOES NOT CHANGE FROM GROUP TO GROUP, DECIDED ONCE.
+        //
+        // Every group re-derived it: which ORDER BY keys read the template
+        // alone, each key's rewrite over the projection and the columns it
+        // reads, which items may be taken from the template — and cloned the
+        // statement's parameters, with a freshly formatted `__aggN` name, for
+        // every aggregate item. SNB BI bi4's prefix finishes 1,228,730
+        // `(country, forum)` groups; that work was most of the ~9 s its
+        // ORDER BY cost over the grouping. Only a key's reads being PRESENT
+        // in the template varies (a group's first row), so that alone is
+        // still asked per group — the rest is exactly the per-group rule.
+        let order = &self.proj.order;
+        let key_fvs: Vec<Vec<String>> = order
+            .iter()
+            .map(|o| {
+                let mut v = Vec::new();
+                free_vars_of(&o.expr, &mut v);
+                v
+            })
+            .collect();
+        // `order_expr_reads_the_row(.., columns_only)` with its row test left
+        // for the group
+        let key_static: Vec<bool> = order
+            .iter()
+            .enumerate()
+            .map(|(oi, o)| {
+                !matches!(self.order_agg.get(oi), Some(Some(_)))
+                    && !o.expr.has_subquery()
+                    && key_fvs[oi].iter().all(|fv| {
+                        match self.columns.iter().position(|c| c == fv) {
+                            None => false,
+                            Some(ix) => match &items[ix].1 {
+                                Expr::Var(v) => v == fv,
+                                Expr::Call { name, args, .. }
+                                    if name.eq_ignore_ascii_case("properties") =>
+                                {
+                                    matches!(args.as_slice(), [Expr::Var(v)] if v == fv)
+                                }
+                                _ => false,
+                            },
+                        }
+                    })
+            })
+            .collect();
+        let key_item: Vec<Option<usize>> = order
+            .iter()
+            .map(|o| items.iter().position(|(_, e)| *e == o.expr))
+            .collect();
+        let key_rw: Vec<Expr> = order
+            .iter()
+            .map(|o| rewrite_order_over_projection(&o.expr, &items))
+            .collect();
+        // a key that IS an output column reads it from the row being built —
+        // what the scope row would hold under that name (the last column so
+        // named, as the scope row's insert keeps)
+        let key_rw_col: Vec<Option<usize>> = key_rw
+            .iter()
+            .map(|rw| match rw {
+                Expr::Var(c) => self.columns.iter().rposition(|x| x == c),
+                _ => None,
+            })
+            .collect();
+        let key_reads: Vec<Vec<String>> = order
+            .iter()
+            .enumerate()
+            .map(|(oi, _)| {
+                let mut v = Vec::new();
+                match self.order_agg.get(oi) {
+                    Some(Some((rewritten, _))) => free_vars_of(rewritten, &mut v),
+                    _ => free_vars_of(&key_rw[oi], &mut v),
+                }
+                v
+            })
+            .collect();
+        let take_done: Vec<Option<(&str, bool)>> = (0..items.len())
+            .map(|i| takeable_var(i, &finish_items, order, true))
+            .collect();
+        let take_open: Vec<Option<(&str, bool)>> = (0..items.len())
+            .map(|i| takeable_var(i, &finish_items, order, false))
+            .collect();
+        // an aggregate item that IS its aggregate (`count(p) AS n`) is the
+        // site's value
+        let agg_site: Vec<Option<usize>> = self
+            .agg_items
+            .iter()
+            .map(|k| match k {
+                AggItem::Agg {
+                    rewritten,
+                    site_range,
+                } if site_range.len() == 1
+                    && matches!(rewritten, Expr::Param(p) if *p == format!("__agg{}", site_range.start)) =>
+                {
+                    Some(site_range.start)
+                }
+                _ => None,
+            })
+            .collect();
+        // the rest read `$__aggN` holes: ONE parameter map, its holes
+        // overwritten per group, where each item cloned the whole map
+        let agg_names: Vec<String> = (0..self.sites.len()).map(|g| format!("__agg{g}")).collect();
+        let mut agg_params: Option<BTreeMap<String, Value>> = None;
+        let fill = |params: &mut Option<BTreeMap<String, Value>>,
+                    range: std::ops::Range<usize>,
+                    computed: &[Value]| {
+            let p = params.get_or_insert_with(|| {
+                let mut p = self.params.clone();
+                for n in &agg_names {
+                    p.insert(n.clone(), Value::Null);
+                }
+                p
+            });
+            for global in range {
+                if let Some(slot) = p.get_mut(agg_names[global].as_str()) {
+                    *slot = computed[global].clone();
+                }
+            }
+        };
+        for g in groups {
             // Fold every site's accumulator through the ONE shared
             // implementation of the aggregate semantics.
             let mut computed: Vec<Value> = Vec::with_capacity(self.sites.len());
@@ -10845,49 +20537,127 @@ impl<'a> StreamProjector<'a> {
                     SiteAcc::Values(vals) => fold_site(self.graph, site, vals, self.params)?,
                 });
             }
+            let mut template = g.template;
+            // Fix 105: an ORDER BY key that reads the group's template alone
+            // — a projected column that IS the key variable (or its
+            // `properties`), never an aggregating key — is evaluated over
+            // the template before the items, so a whole-node key is not
+            // cloned into a scope row for it. `RETURN p, count(t) … ORDER
+            // BY p.updatedAt DESC` cloned each project twice per group.
+            let direct: Vec<bool> = (0..order.len())
+                .map(|oi| key_static[oi] && key_fvs[oi].iter().all(|fv| template.contains_key(fv)))
+                .collect();
+            let mut okey: Vec<Option<Value>> = Vec::with_capacity(direct.len());
+            for (oi, o) in self.proj.order.iter().enumerate() {
+                okey.push(if direct[oi] {
+                    Some(eval_expr(self.graph, &o.expr, &template, self.params)?)
+                } else {
+                    None
+                });
+            }
+            let keys_done = direct.iter().all(|d| *d);
+            if keys_done && !direct.is_empty() {
+                counted!("interp.projection ordered by keys read from its row");
+            }
             let mut out = Vec::with_capacity(items.len());
-            for ((_, e), kind) in items.iter().zip(&self.agg_items) {
+            for (i, ((_, e), kind)) in items.iter().zip(&self.agg_items).enumerate() {
                 match kind {
                     AggItem::Key => {
-                        out.push(eval_expr(self.graph, e, &g.template, self.params)?);
+                        // Fix 105: a bare key nothing else reads is TAKEN
+                        // from the template, never cloned.
+                        let takeable = if keys_done { take_done[i] } else { take_open[i] };
+                        if let Some((v, props)) = takeable {
+                            match template.remove(v) {
+                                Some(Value::Node { props: m, .. })
+                                | Some(Value::Rel { props: m, .. })
+                                    if props =>
+                                {
+                                    counted!(
+                                        "interp.projection took a properties map out of its row"
+                                    );
+                                    out.push(Value::Map(m));
+                                    continue;
+                                }
+                                Some(Value::Map(m)) if props => {
+                                    counted!(
+                                        "interp.projection took a properties map out of its row"
+                                    );
+                                    out.push(Value::Map(m));
+                                    continue;
+                                }
+                                Some(val) if !props => {
+                                    counted!("interp.projection took a whole value out of its row");
+                                    out.push(val);
+                                    continue;
+                                }
+                                Some(other) => {
+                                    template.insert(v.to_string(), other);
+                                }
+                                None => {}
+                            }
+                        }
+                        out.push(eval_expr(self.graph, e, &template, self.params)?);
                     }
                     AggItem::Agg {
                         rewritten,
                         site_range,
                     } => {
-                        let mut p = self.params.clone();
-                        for (local, global) in site_range.clone().enumerate() {
-                            p.insert(format!("__agg{global}"), computed[global].clone());
-                            let _ = local;
+                        if let Some(global) = agg_site[i] {
+                            out.push(computed[global].clone());
+                            continue;
                         }
-                        out.push(eval_expr(self.graph, rewritten, &g.template, &p)?);
+                        fill(&mut agg_params, site_range.clone(), &computed);
+                        let p = agg_params.as_ref().expect("filled");
+                        out.push(eval_expr(self.graph, rewritten, &template, p)?);
                     }
                 }
             }
-            // ORDER BY: projected scope first, grouping expression by
-            // structural match second — the materialising path's exact rule.
-            let mut scope_row = Row::new();
-            for (c, v) in self.columns.iter().zip(&out) {
-                scope_row.insert(c.clone(), v.clone());
-            }
-            let mut okey = Vec::new();
-            for (oi, o) in self.proj.order.iter().enumerate() {
-                if let Some(Some((rewritten, range))) = self.order_agg.get(oi) {
-                    // An aggregating ORDER BY key: substitute the group's site
-                    // values for its `$__aggN` holes, then evaluate.
-                    let mut p = self.params.clone();
-                    for global in range.clone() {
-                        p.insert(format!("__agg{global}"), computed[global].clone());
+            // The remaining keys: projected scope first, grouping expression
+            // by structural match second — the materialising path's exact
+            // rule — over the columns those keys read.
+            let mut okey_out: Vec<Value> = Vec::with_capacity(direct.len());
+            if keys_done {
+                okey_out.extend(okey.into_iter().map(|k| k.expect("a direct key")));
+            } else {
+                // The scope row, only when a key still evaluates over it.
+                let scoped = (0..order.len()).any(|oi| {
+                    !direct[oi]
+                        && (matches!(self.order_agg.get(oi), Some(Some(_)))
+                            || (key_item[oi].is_none() && key_rw_col[oi].is_none()))
+                });
+                let mut scope_row = Row::new();
+                if scoped {
+                    let mut reads: Vec<&String> = Vec::new();
+                    for oi in 0..order.len() {
+                        if !direct[oi] {
+                            reads.extend(key_reads[oi].iter());
+                        }
                     }
-                    okey.push(eval_expr(self.graph, rewritten, &scope_row, &p)?);
-                } else if let Some(j) = items.iter().position(|(_, e)| *e == o.expr) {
-                    okey.push(out[j].clone());
-                } else {
-                    let rw = rewrite_order_over_projection(&o.expr, &items);
-                    okey.push(eval_expr(self.graph, &rw, &scope_row, self.params)?);
+                    for (c, v) in self.columns.iter().zip(&out) {
+                        if reads.contains(&c) {
+                            scope_row.insert(c.clone(), v.clone());
+                        }
+                    }
+                }
+                for oi in 0..order.len() {
+                    if let Some(k) = okey[oi].take() {
+                        okey_out.push(k);
+                    } else if let Some(Some((rewritten, range))) = self.order_agg.get(oi) {
+                        // An aggregating ORDER BY key: substitute the group's
+                        // site values for its `$__aggN` holes, then evaluate.
+                        fill(&mut agg_params, range.clone(), &computed);
+                        let p = agg_params.as_ref().expect("filled");
+                        okey_out.push(eval_expr(self.graph, rewritten, &scope_row, p)?);
+                    } else if let Some(j) = key_item[oi] {
+                        okey_out.push(out[j].clone());
+                    } else if let Some(j) = key_rw_col[oi] {
+                        okey_out.push(out[j].clone());
+                    } else {
+                        okey_out.push(eval_expr(self.graph, &key_rw[oi], &scope_row, self.params)?);
+                    }
                 }
             }
-            order_keys.push(okey);
+            order_keys.push(okey_out);
             out_rows.push(out);
         }
         project_tail(
@@ -10930,7 +20700,7 @@ fn exec_create_path(
     // OUTGOING (openCypher); a bare CREATE still requires an explicit direction.
     merge_create: bool,
 ) -> Result<(), RunError> {
-    if path.shortest {
+    if path.shortest.is_some() {
         return Err(RunError::Semantic("CREATE cannot take shortestPath".into()));
     }
     // A STANDALONE node pattern (no relationships) that names an already-bound
@@ -10989,7 +20759,7 @@ fn exec_create_path(
         at = dst;
     }
     if let Some(v) = &path.var {
-        row.insert(v.clone(), Value::Path(trail));
+        row.insert(v.clone(), Value::Path((trail).into()));
     }
     Ok(())
 }
@@ -11722,6 +21492,8 @@ fn project(
             out_rows.push(out);
         }
     } else {
+        let mut rows = rows;
+        heavy_items_in_parallel(graph, &mut items, &mut rows, params)?;
         for row in rows {
             let (out, key) = project_row_values(graph, &items, &columns, &proj.order, row, params)?;
             order_keys.push(key);
@@ -11730,6 +21502,91 @@ fn project(
     }
 
     project_tail(graph, proj, params, columns, out_rows, order_keys)
+}
+
+/// A materialised projection's HEAVY items — a pattern comprehension, a
+/// subquery: a walk per row (`heavy_projection`'s kind) — evaluated over its
+/// rows on the morsel executor, each row's values put under hidden columns
+/// the items then read. The rows are all here, so nothing is evaluated that
+/// the loop below would not have evaluated.
+///
+/// SNB Interactive IC14 never streams (`allShortestPaths`), and its weights —
+/// four comprehensions per relationship on each of 42 paths at SF3, each a
+/// pinned walk of ~20 ms — ran one row after another on a 40-core server:
+/// ~1.8 s against Neo4j's 1.3. A transaction's overlays and read set are
+/// thread-local, so one keeps the loop.
+fn heavy_items_in_parallel(
+    graph: &Graph,
+    items: &mut [(String, Expr)],
+    rows: &mut [Row],
+    params: &BTreeMap<String, Value>,
+) -> Result<(), RunError> {
+    if rows.len() < 2 || graph.in_txn() {
+        return Ok(());
+    }
+    let Some(exec) = graph.exec().filter(|e| e.width() > 1) else {
+        return Ok(());
+    };
+    let heavy: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, e))| e.has_subquery() && !calls_nondeterministic(e))
+        .map(|(i, _)| i)
+        .collect();
+    if heavy.is_empty() {
+        return Ok(());
+    }
+    counted!("interp.projection evaluated its heavy items on the morsel executor");
+    let exprs: Vec<Expr> = heavy.iter().map(|&i| items[i].1.clone()).collect();
+    let evaluated: Vec<Vec<Value>> = {
+        let view: &[Row] = rows;
+        let per = view
+            .len()
+            .div_ceil(exec.width() * MORSELS_PER_WORKER)
+            .max(1);
+        let morsels: Vec<&[Row]> = view.chunks(per).collect();
+        let slots: Vec<std::sync::Mutex<Result<Vec<Vec<Value>>, RunError>>> = morsels
+            .iter()
+            .map(|_| std::sync::Mutex::new(Ok(Vec::new())))
+            .collect();
+        exec.for_each(morsels.len(), &|m| {
+            let mut out: Vec<Vec<Value>> = Vec::with_capacity(morsels[m].len());
+            let mut err: Option<RunError> = None;
+            'rows: for row in morsels[m] {
+                let mut vals = Vec::with_capacity(exprs.len());
+                for e in &exprs {
+                    match eval_expr(graph, e, row, params) {
+                        Ok(v) => vals.push(v),
+                        Err(e) => {
+                            err = Some(e);
+                            break 'rows;
+                        }
+                    }
+                }
+                out.push(vals);
+            }
+            let mut slot = slots[m].lock().unwrap_or_else(|e| e.into_inner());
+            *slot = match err {
+                Some(e) => Err(e),
+                None => Ok(out),
+            };
+        });
+        // in morsel order — so the first error in row order is the one raised
+        let mut all = Vec::with_capacity(view.len());
+        for slot in slots {
+            all.extend(slot.into_inner().unwrap_or_else(|e| e.into_inner())?);
+        }
+        all
+    };
+    for (row, vals) in rows.iter_mut().zip(evaluated) {
+        for (&i, v) in heavy.iter().zip(vals) {
+            row.insert(format!("\u{0}pre{i}"), v);
+        }
+    }
+    for &i in &heavy {
+        items[i].1 = Expr::Var(format!("\u{0}pre{i}"));
+    }
+    Ok(())
 }
 
 /// Evaluate one row's projected values and ORDER BY key — shared by the
@@ -11742,19 +21599,165 @@ fn project_row_values(
     row: Row,
     params: &BTreeMap<String, Value>,
 ) -> Result<(Vec<Value>, Vec<Value>), RunError> {
+    // Fix 105: ORDER BY keys that read the row alone (fix 91's rule: every
+    // free variable is a non-column, or a column whose item is the variable
+    // itself or `properties(var)` under its own name) are evaluated over
+    // the row FIRST — no scope row, no clone of a whole-node column into
+    // one: `RETURN p ORDER BY p.updatedAt DESC` cloned each project twice
+    // (7.5 of 14.7 µs per project on the hop-listing bench).
+    let keys_direct = !order.is_empty()
+        && order
+            .iter()
+            .all(|o| order_expr_reads_the_row(&o.expr, items, columns, &row, false));
+    let mut key = Vec::with_capacity(order.len());
+    if keys_direct {
+        for o in order {
+            key.push(eval_expr(graph, &o.expr, &row, params)?);
+        }
+        counted!("interp.projection ordered by keys read from its row");
+    }
+    let keys_done = order.is_empty() || keys_direct;
     let mut out = Vec::with_capacity(items.len());
-    for (_, e) in items {
-        out.push(eval_expr(graph, e, &row, params)?);
+    let mut row = row;
+    for i in 0..items.len() {
+        // Fix 97 / fix 105: a bare `v` or `properties(v)` item that nothing
+        // else reads is TAKEN out of the row — the evaluator would clone the
+        // whole node or its map. The keys, if they read `v`, are done (or
+        // read it under the item's own alias, which the scope row shadows
+        // exactly as before).
+        if let Some((v, props)) = takeable_var(i, items, order, keys_done) {
+            match row.remove(v) {
+                Some(Value::Node { props: m, .. }) | Some(Value::Rel { props: m, .. }) if props => {
+                    counted!("interp.projection took a properties map out of its row");
+                    out.push(Value::Map(m));
+                    continue;
+                }
+                Some(Value::Map(m)) if props => {
+                    counted!("interp.projection took a properties map out of its row");
+                    out.push(Value::Map(m));
+                    continue;
+                }
+                Some(val) if !props => {
+                    counted!("interp.projection took a whole value out of its row");
+                    out.push(val);
+                    continue;
+                }
+                Some(other) => {
+                    row.insert(v.to_string(), other); // evaluated as written
+                }
+                None => {}
+            }
+        }
+        out.push(eval_expr(graph, &items[i].1, &row, params)?);
+    }
+    if keys_done {
+        return Ok((out, key));
+    }
+    // The projected scope: only the columns the keys read (fix 97).
+    let mut order_reads: Vec<String> = Vec::new();
+    for o in order {
+        free_vars_of(&o.expr, &mut order_reads);
     }
     let mut scope_row = row;
     for (c, v) in columns.iter().zip(&out) {
-        scope_row.insert(c.clone(), v.clone());
+        if order_reads.iter().any(|x| x == c) {
+            scope_row.insert(c.clone(), v.clone());
+        }
     }
-    let mut key = Vec::new();
     for o in order {
         key.push(eval_expr(graph, &o.expr, &scope_row, params)?);
     }
     Ok((out, key))
+}
+
+/// Fix 105: whether an ORDER BY expression evaluates over the INPUT row (or
+/// a group's template) to the value it has over the projected scope — fix
+/// 91's rule: every free variable the row holds is either not an output
+/// column, or a column whose item is the variable itself (or
+/// `properties(var)` under its own name). `columns_only` (the aggregating
+/// projection, whose ORDER BY may name projected columns alone) refuses a
+/// non-column variable. Never for a subquery.
+fn order_expr_reads_the_row(
+    expr: &Expr,
+    items: &[(String, Expr)],
+    columns: &[String],
+    row: &Row,
+    columns_only: bool,
+) -> bool {
+    if expr.has_subquery() {
+        return false;
+    }
+    let mut fvs = Vec::new();
+    free_vars_of(expr, &mut fvs);
+    fvs.iter().all(|fv| {
+        if !row.contains_key(fv) {
+            return false;
+        }
+        match columns.iter().position(|c| c == fv) {
+            None => !columns_only,
+            Some(ix) => match &items[ix].1 {
+                Expr::Var(v) => v == fv,
+                Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("properties") => {
+                    matches!(args.as_slice(), [Expr::Var(v)] if v == fv)
+                }
+                _ => false,
+            },
+        }
+    })
+}
+
+/// Fix 105: the variable a bare item (`RETURN p`) or a `properties(p)`
+/// item may TAKE out of its row, with whether it is the map — `None` when
+/// another item reads the variable (a subquery names it in its pattern,
+/// which no expression walk reports: it counts as a read), or when an
+/// ORDER BY key still to be evaluated reads it under a name the item does
+/// not shadow.
+fn takeable_var<'a>(
+    i: usize,
+    items: &'a [(String, Expr)],
+    order: &[engram_cypher::stmt::OrderItem],
+    keys_done: bool,
+) -> Option<(&'a str, bool)> {
+    let (name, e) = &items[i];
+    let (v, props) = match e {
+        Expr::Var(v) => (v.as_str(), false),
+        other => (properties_of_var(other)?, true),
+    };
+    let reads = |x: &Expr| {
+        if x.has_subquery() {
+            return true;
+        }
+        let mut fv = Vec::new();
+        free_vars_of(x, &mut fv);
+        fv.iter().any(|f| f == v)
+    };
+    if items
+        .iter()
+        .enumerate()
+        .any(|(j, (_, other))| j != i && reads(other))
+    {
+        return None;
+    }
+    if !keys_done && order.iter().any(|o| reads(&o.expr)) && name != v {
+        return None;
+    }
+    Some((v, props))
+}
+
+/// `properties(v)` — the variable — or `None`.
+fn properties_of_var(e: &Expr) -> Option<&str> {
+    match e {
+        Expr::Call {
+            name,
+            distinct: false,
+            star: false,
+            args,
+        } if name.eq_ignore_ascii_case("properties") => match args.as_slice() {
+            [Expr::Var(v)] => Some(v.as_str()),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// DISTINCT, ORDER BY, SKIP, LIMIT over projected value rows — the one
@@ -11787,7 +21790,13 @@ fn project_tail(
     if !proj.order.is_empty() {
         let mut idx: Vec<usize> = (0..out_rows.len()).collect();
         idx.sort_by(|&a, &b| cmp_order_keys(&proj.order, &order_keys[a], &order_keys[b]));
-        out_rows = idx.into_iter().map(|i| out_rows[i].clone()).collect();
+        // Fix 105: the permutation MOVES each row into its place — it cloned
+        // every output row (a whole node per row of an ordered listing).
+        let mut slots: Vec<Option<Vec<Value>>> = out_rows.into_iter().map(Some).collect();
+        out_rows = idx
+            .into_iter()
+            .map(|i| slots[i].take().expect("each index exactly once"))
+            .collect();
     }
 
     let skip = eval_count(graph, proj.skip.as_ref(), params, "SKIP")?;
@@ -12091,7 +22100,8 @@ fn group_key_prop_only(e: &Expr, var: &str, props: &mut BTreeSet<String>) -> boo
                     if path.var.as_deref() == Some(var) {
                         return false;
                     }
-                    let nodes = std::iter::once(&path.start).chain(path.hops.iter().map(|(_, n)| n));
+                    let nodes =
+                        std::iter::once(&path.start).chain(path.hops.iter().map(|(_, n)| n));
                     for n in nodes {
                         if n.var.as_deref() == Some(var) && n.props.is_some() {
                             return false;
@@ -12287,12 +22297,7 @@ fn gather_group_key_columns(
             // over the budget.
             let labels = var_labels.get(vi).and_then(|l| l.as_deref());
             let Some(cols) = crate::pipeline::load_var_columns_labelled(
-                graph,
-                kinds[vi],
-                &distinct,
-                &props[gi],
-                labels,
-                params,
+                graph, kinds[vi], &distinct, &props[gi], labels, params,
             )?
             else {
                 return Ok(None);
@@ -12650,35 +22655,34 @@ pub(crate) fn run_agg_with(
     // reads p's property off the output column)`.
     // Fix 80: this tail IS an aggregation, so the RETURN need not be a
     // top-k — every output row is a group, hydrated once.
-    let late_full: Vec<(String, BTreeSet<String>)> = if graph.late_projection_enabled()
-        && late_full_after_aggregation_shape(return_proj)
-    {
-        with_proj
-            .items
-            .iter()
-            .enumerate()
-            .filter_map(|(i, it)| {
-                let name = it
-                    .alias
-                    .clone()
-                    .or_else(|| it.text.clone())
-                    .unwrap_or_else(|| column_name(&it.expr, i));
-                // A bare carry of a grouping var (`WITH p …`, not an alias
-                // and not an expression) whose later reads admit it.
-                let carried = matches!(&it.expr, Expr::Var(v) if *v == name)
-                    && post_where.is_none_or(|w| {
-                        let mut ps = BTreeSet::new();
-                        group_key_prop_only(w, &name, &mut ps)
-                    });
-                if !carried {
-                    return None;
-                }
-                late_full_reads(return_proj, &name).map(|props| (name, props))
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let late_full: Vec<(String, BTreeSet<String>)> =
+        if graph.late_projection_enabled() && late_full_after_aggregation_shape(return_proj) {
+            with_proj
+                .items
+                .iter()
+                .enumerate()
+                .filter_map(|(i, it)| {
+                    let name = it
+                        .alias
+                        .clone()
+                        .or_else(|| it.text.clone())
+                        .unwrap_or_else(|| column_name(&it.expr, i));
+                    // A bare carry of a grouping var (`WITH p …`, not an alias
+                    // and not an expression) whose later reads admit it.
+                    let carried = matches!(&it.expr, Expr::Var(v) if *v == name)
+                        && post_where.is_none_or(|w| {
+                            let mut ps = BTreeSet::new();
+                            group_key_prop_only(w, &name, &mut ps)
+                        });
+                    if !carried {
+                        return None;
+                    }
+                    late_full_reads(return_proj, &name).map(|props| (name, props))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
     let late_names: Vec<&String> = late_full.iter().map(|(n, _)| n).collect();
     // The alias reads as direct property reads of the carry, so the gather
     // below sees them (it scans `later` for `p.<prop>` only).
@@ -13242,7 +23246,7 @@ fn agg_key(v: &Value, nan_nonce: &mut u64, out: &mut Vec<u8>) {
         Value::List(items) => {
             out.push(6);
             out.extend_from_slice(&(items.len() as u64).to_be_bytes());
-            for it in items {
+            for it in (items).iter() {
                 agg_key(it, nan_nonce, out);
             }
         }
@@ -13252,7 +23256,7 @@ fn agg_key(v: &Value, nan_nonce: &mut u64, out: &mut Vec<u8>) {
         Value::Path(items) => {
             out.push(16);
             out.extend_from_slice(&(items.len() as u64).to_be_bytes());
-            for it in items {
+            for it in (items).iter() {
                 agg_key(it, nan_nonce, out);
             }
         }
@@ -13352,7 +23356,7 @@ fn fold_aggregate_values(
     }
     Ok(match name {
         "count" => Value::Int(values.len() as i64),
-        "collect" => Value::List(values),
+        "collect" => Value::List((values).into()),
         "sum" => {
             let mut int_sum: i64 = 0;
             let mut float_sum = 0.0;
@@ -13538,8 +23542,74 @@ fn fold_site(
     fold_aggregate_values(&site.name, site.distinct, vals)
 }
 
-// ─── Procedures — the census's two, implemented; everything else refuses ────
+// ─── Procedures — dispatched from the catalogue, not from a chain of names ──
+//
+// Every procedure the engine implements is declared once in `engram-proc`,
+// and this is where the declaration meets its body. The chain of `if name ==`
+// that used to live here decided three things by spelling — whether the
+// procedure existed, what it yielded, and whether it could mutate — and each
+// of the three was maintained in a different place. Now `lookup` answers the
+// first, `sig.outputs` the second, and `sig.mode` the third.
+//
+// THE BODIES PRODUCE ROWS; THEY DO NOT BIND THEM. Binding a `YIELD` list and
+// applying a trailing `WHERE` is the same work for every procedure and lives
+// in `crate::procbind`, which is why adding a procedure here is a catalogue
+// entry and a `produce` closure rather than a fourth copy of a nested loop.
 
+/// The columns a `CALL` contributes, and the enforcement of Cypher's `YIELD`
+/// rule.
+///
+/// **`YIELD` MAY BE OMITTED ONLY WHEN THE `CALL` IS THE FINAL CLAUSE.** In
+/// that position the procedure's declared output columns become the result
+/// columns, in declaration order. Anywhere else a `YIELD` is required, and
+/// this is where that is refused.
+///
+/// The rule is Neo4j's and openCypher's, and the reason to keep it rather than
+/// bind the outputs implicitly everywhere is variable capture: `CALL p()`
+/// followed by `MATCH (score)` would silently bind `score` from the procedure
+/// in a query that never named it, and the failure would look like a wrong
+/// answer rather than an error. A user who wants the columns in scope writes
+/// the `YIELD`, and says so.
+fn procedure_result_columns(
+    name: &str,
+    yields: &[(String, Option<String>)],
+    is_last: bool,
+) -> Result<Vec<String>, RunError> {
+    if !yields.is_empty() {
+        return Ok(yields
+            .iter()
+            .map(|(field, alias)| alias.clone().unwrap_or_else(|| field.clone()))
+            .collect());
+    }
+    // THE UNKNOWN-NAME CHECK COMES FIRST, and the order is load-bearing.
+    //
+    // A driver switches on the error VARIANT: `Unsupported` maps to
+    // `Neo.ClientError.Statement.NotSupported` and tells it to fall back,
+    // where a semantic error does not. Refusing `CALL db.nosuchthing() RETURN 1`
+    // for its missing YIELD would report the wrong one of its two problems and
+    // change the status code a client sees, so the name is settled before the
+    // clause position is.
+    let Some(sig) = engram_proc::lookup(name) else {
+        // `call_procedure` produces the `Unsupported` this deserves. Returning
+        // no columns rather than a second, differently-worded refusal keeps ONE
+        // diagnostic for one mistake.
+        return Ok(Vec::new());
+    };
+    if !is_last {
+        sometimes!(
+            "interp.a CALL without YIELD was refused for not being last",
+            true
+        );
+        counted!("interp.procedure refused: YIELD required");
+        return Err(RunError::Semantic(format!(
+            "`{}`: YIELD is required when CALL is not the last clause of a query",
+            sig.display
+        )));
+    }
+    Ok(sig.outputs.iter().map(|c| c.name.to_string()).collect())
+}
+
+/// Run a procedure call, producing one set of rows per input row.
 fn call_procedure(
     graph: &Graph,
     name: &str,
@@ -13549,62 +23619,88 @@ fn call_procedure(
     rows: Vec<Row>,
     params: &BTreeMap<String, Value>,
 ) -> Result<Vec<Row>, RunError> {
-    // ── Introspection procedures (R-5): what a driver or tool asks on
-    // connect. Each yields catalog rows per INPUT row, exactly as the data
-    // procedures do, so `CALL db.labels() YIELD label WHERE … RETURN …`
-    // composes the same way.
-    if let Some(rows_out) = introspect_procedure(graph, name, args, yields, where_, &rows, params)?
-    {
-        return Ok(rows_out);
-    }
-    if name == "engram.checkpoint" {
-        return checkpoint_procedure(graph, args, yields, where_, rows, params);
-    }
-    let is_vector = name == "db.index.vector.querynodes";
-    let is_fulltext = name == "db.index.fulltext.querynodes";
-    if !is_vector && !is_fulltext {
+    let Some(sig) = engram_proc::lookup(name) else {
         sometimes!("interp.refused an unsupported construct", true);
+        counted!("interp.procedure refused: unknown name");
+        // The variant matters as much as the message: drivers switch on
+        // `Unsupported` to decide whether to fall back, so an unknown
+        // procedure must keep saying "unsupported" and not become a new
+        // "unknown" the callers have never seen.
         return Err(RunError::Unsupported(format!("procedure `{name}`")));
-    }
-    // Both yield (node, score).
-    let bindings: Vec<(String, String)> = if yields.is_empty() {
-        vec![
-            ("node".into(), "node".into()),
-            ("score".into(), "score".into()),
-        ]
-    } else {
-        let mut out = Vec::new();
-        for (field, alias) in yields {
-            if field != "node" && field != "score" {
-                return Err(RunError::Semantic(format!(
-                    "`{name}` does not yield `{field}` (node, score)"
-                )));
-            }
-            out.push((
-                field.clone(),
-                alias.clone().unwrap_or_else(|| field.clone()),
-            ));
-        }
-        out
     };
-    let mut out = Vec::new();
-    for row in rows {
+    if !sig.accepts_arity(args.len()) {
+        return Err(RunError::Semantic(format!(
+            "{} takes {} arguments, got {}",
+            sig.call_shape(),
+            if sig.required_args() == sig.args.len() {
+                sig.args.len().to_string()
+            } else {
+                format!("{} to {}", sig.required_args(), sig.args.len())
+            },
+            args.len()
+        )));
+    }
+    let bindings = resolve_bindings(sig, yields)?;
+    counted!("interp.procedure dispatched from the registry");
+    if yields.is_empty() {
+        counted!("interp.procedure yielded its default signature");
+    }
+    match sig.name {
+        "db.labels" | "db.relationshiptypes" | "db.propertykeys" | "dbms.components" => {
+            introspect_procedure(graph, sig, &bindings, where_, &rows, params)
+        }
+        "db.awaitindexes" => await_indexes_procedure(graph, &bindings, where_, &rows, params),
+        "engram.checkpoint" => checkpoint_procedure(graph, &bindings, where_, &rows, params),
+        "db.index.vector.querynodes" | "db.index.fulltext.querynodes" => {
+            index_query_procedure(graph, sig, args, &bindings, where_, &rows, params)
+        }
+        n if n.starts_with("engram.algo.") => {
+            algo_procedure(graph, n, args, &bindings, where_, &rows, params)
+        }
+        // UNREACHABLE BY CONSTRUCTION, and an error rather than a panic
+        // anyway. A name in the catalogue with no body here is a mistake made
+        // at compile time, but a database that panics on it is a worse
+        // outcome than one that refuses it.
+        // UNREACHABLE BY CONSTRUCTION — a catalogue entry with no body here is
+        // a mistake made at compile time, and the sortedness test enumerates
+        // the catalogue. Deliberately NOT a `sometimes!`: a declared event that
+        // no run can reach fails the coverage floor for ever, and "this state
+        // is unreachable" is the opposite of the claim a `sometimes!` makes.
+        other => Err(RunError::Unsupported(format!(
+            "procedure `{other}` is declared but not implemented"
+        ))),
+    }
+}
+
+/// `db.index.vector.queryNodes(name, k, query)` and
+/// `db.index.fulltext.queryNodes(name, query)` — the two data procedures.
+///
+/// Both yield `(node, score)`, and that two-column shape is FIXED: production
+/// call sites bind it, and `YIELD` does not force a caller to take a column it
+/// did not ask for. Widening it would break every one of them, so anything
+/// with more to say gets a new procedure rather than a wider tuple here.
+fn index_query_procedure(
+    graph: &Graph,
+    sig: &engram_proc::ProcedureSignature,
+    args: &[Expr],
+    bindings: &[Binding],
+    where_: Option<&Expr>,
+    rows: &[Row],
+    params: &BTreeMap<String, Value>,
+) -> Result<Vec<Row>, RunError> {
+    let is_vector = sig.name == "db.index.vector.querynodes";
+    emit_procedure_rows(graph, rows, bindings, where_, params, |row| {
         let hits = if is_vector {
-            if args.len() != 3 {
-                return Err(RunError::Semantic(
-                    "db.index.vector.queryNodes(name, k, query) takes 3 arguments".into(),
-                ));
-            }
-            let Value::Str(index) = eval_expr(graph, &args[0], &row, params)? else {
+            let Value::Str(index) = eval_expr(graph, &args[0], row, params)? else {
                 return Err(RunError::Semantic("the index name must be a string".into()));
             };
-            let Value::Int(k) = eval_expr(graph, &args[1], &row, params)? else {
+            let Value::Int(k) = eval_expr(graph, &args[1], row, params)? else {
                 return Err(RunError::Semantic("k must be an integer".into()));
             };
-            let q = match eval_expr(graph, &args[2], &row, params)? {
+            let q = match eval_expr(graph, &args[2], row, params)? {
                 Value::List(items) => {
                     let mut v = Vec::with_capacity(items.len());
-                    for i in items {
+                    for i in (items).iter().cloned() {
                         match i {
                             Value::Float(f) => v.push(f),
                             Value::Int(n) => v.push(n as f64),
@@ -13627,206 +23723,313 @@ fn call_procedure(
             };
             graph.vector_query(&index, k.max(0) as usize, &q)?.0
         } else {
-            if args.len() != 2 {
-                return Err(RunError::Semantic(
-                    "db.index.fulltext.queryNodes(name, query) takes 2 arguments".into(),
-                ));
-            }
-            let Value::Str(index) = eval_expr(graph, &args[0], &row, params)? else {
+            let Value::Str(index) = eval_expr(graph, &args[0], row, params)? else {
                 return Err(RunError::Semantic("the index name must be a string".into()));
             };
-            let Value::Str(q) = eval_expr(graph, &args[1], &row, params)? else {
+            let Value::Str(q) = eval_expr(graph, &args[1], row, params)? else {
                 return Err(RunError::Semantic("the query must be a string".into()));
             };
             graph.fulltext_query(&index, &q)?
         };
-        for (node, score) in hits {
-            let mut r = row.clone();
-            for (field, alias) in &bindings {
-                let v = if field == "node" {
-                    node.clone()
-                } else {
-                    Value::Float(score)
-                };
-                r.insert(alias.clone(), v);
-            }
-            if let Some(w) = where_ {
-                let v = eval_expr(graph, w, &r, params)?;
-                if v.truth() != Some(Truth::True) {
-                    continue;
-                }
-            }
-            out.push(r);
-        }
-    }
-    Ok(out)
+        Ok(hits
+            .into_iter()
+            .map(|(node, score)| ProcRow(vec![("node", node), ("score", Value::Float(score))]))
+            .collect())
+    })
 }
 
 /// `CALL engram.checkpoint() YIELD spilled, segments, resident, tail` — make
 /// the paged store durable NOW and say what is on disk. Runs the server's
 /// hook (see [`Graph::set_checkpoint_hook`]); refused where none is
 /// installed, because "durable" is not something to answer on a store whose
-/// durability lives elsewhere. Yields one row per INPUT row, as the other
-/// procedures do, so `CALL engram.checkpoint() YIELD tail RETURN tail`
-/// composes the same way.
+/// durability lives elsewhere.
 fn checkpoint_procedure(
     graph: &Graph,
-    args: &[Expr],
-    yields: &[(String, Option<String>)],
+    bindings: &[Binding],
     where_: Option<&Expr>,
-    rows: Vec<Row>,
+    rows: &[Row],
     params: &BTreeMap<String, Value>,
 ) -> Result<Vec<Row>, RunError> {
-    if !args.is_empty() {
-        return Err(RunError::Semantic("`engram.checkpoint` takes no arguments".into()));
-    }
     let Some(hook) = graph.checkpoint_hook() else {
-        sometimes!("interp.checkpoint refused: no paged store behind this graph", true);
+        sometimes!(
+            "interp.checkpoint refused: no paged store behind this graph",
+            true
+        );
         return Err(RunError::Semantic(
             "engram.checkpoint: this graph is not served from a paged store; nothing here \
              decides durability"
                 .into(),
         ));
     };
-    const FIELDS: [&str; 4] = ["spilled", "segments", "resident", "tail"];
-    let bindings: Vec<(String, String)> = if yields.is_empty() {
-        FIELDS.iter().map(|f| (f.to_string(), f.to_string())).collect()
-    } else {
-        let mut out = Vec::new();
-        for (field, alias) in yields {
-            if !FIELDS.contains(&field.as_str()) {
-                return Err(RunError::Semantic(format!(
-                    "`engram.checkpoint` does not yield `{field}` ({})",
-                    FIELDS.join(", ")
-                )));
-            }
-            out.push((field.clone(), alias.clone().unwrap_or_else(|| field.clone())));
-        }
-        out
-    };
     let report = hook().map_err(|e| RunError::Semantic(format!("engram.checkpoint: {e}")))?;
     counted!("interp.checkpoint ran");
-    let values = |f: &str| -> Value {
-        Value::Int(match f {
-            "spilled" => report.spilled as i64,
-            "segments" => report.segments as i64,
-            "resident" => report.resident as i64,
-            _ => report.tail as i64,
-        })
-    };
-    let mut out = Vec::new();
-    for row in rows {
-        let mut r = row.clone();
-        for (field, alias) in &bindings {
-            r.insert(alias.clone(), values(field));
-        }
-        if let Some(w) = where_ {
-            let v = eval_expr(graph, w, &r, params)?;
-            if v.truth() != Some(Truth::True) {
-                continue;
-            }
-        }
-        out.push(r);
-    }
-    Ok(out)
+    emit_procedure_rows(graph, rows, bindings, where_, params, |_row| {
+        Ok(vec![ProcRow(vec![
+            ("spilled", Value::Int(report.spilled as i64)),
+            ("segments", Value::Int(report.segments as i64)),
+            ("resident", Value::Int(report.resident as i64)),
+            ("tail", Value::Int(report.tail as i64)),
+        ])])
+    })
 }
 
-/// The introspection procedures a driver or tool calls on connect —
-/// `db.labels`, `db.relationshipTypes`, `dbms.components` — answered from the
-/// maintained stats and the crate version, no scans. Returns `None` for any
-/// other name so `call_procedure` continues to its data procedures and its
-/// refusal. Names arrive LOWERCASED (the parser's rule for callables); yield
-/// FIELD names are identifiers and keep their case, so the Neo4j spellings
-/// (`relationshipType`) are matched exactly.
-fn introspect_procedure(
+/// `CALL db.awaitIndexes()` — returns true, immediately.
+///
+/// A driver calls this on connect and expects to block until index builds
+/// finish. **HERE THERE IS NOTHING TO AWAIT**: an index is built single-flight
+/// on the read path that first needs it, not by a background job, so no build
+/// is ever outstanding between statements. Answering `true` is therefore
+/// honest rather than a stub — and the timeout argument is accepted and
+/// ignored for the same reason, which the catalogue's description says out
+/// loud so nobody reads the `true` as a promise that a job completed.
+fn await_indexes_procedure(
     graph: &Graph,
-    name: &str,
-    args: &[Expr],
-    yields: &[(String, Option<String>)],
+    bindings: &[Binding],
     where_: Option<&Expr>,
     rows: &[Row],
     params: &BTreeMap<String, Value>,
-) -> Result<Option<Vec<Row>>, RunError> {
-    // (default yield field, the catalog rows as (field value sets)).
-    let catalog: Vec<Vec<(&str, Value)>> = match name {
+) -> Result<Vec<Row>, RunError> {
+    counted!("interp.awaitIndexes answered immediately");
+    emit_procedure_rows(graph, rows, bindings, where_, params, |_row| {
+        Ok(vec![ProcRow(vec![("ok", Value::Bool(true))])])
+    })
+}
+
+/// The introspection procedures a driver or tool calls on connect —
+/// `db.labels`, `db.relationshipTypes`, `db.propertyKeys`, `dbms.components` —
+/// answered from the maintained stats and the crate version, no scans.
+///
+/// Names arrive LOWERCASED (the parser's rule for callables); yield FIELD
+/// names are identifiers and keep their case, so the Neo4j spellings
+/// (`relationshipType`) are matched exactly. The field names come from the
+/// catalogue now rather than from the first catalog row, which is what used to
+/// need a hand-maintained fallback list for the case where a database had no
+/// labels at all.
+fn introspect_procedure(
+    graph: &Graph,
+    sig: &engram_proc::ProcedureSignature,
+    bindings: &[Binding],
+    where_: Option<&Expr>,
+    rows: &[Row],
+    params: &BTreeMap<String, Value>,
+) -> Result<Vec<Row>, RunError> {
+    let catalog: Vec<ProcRow> = match sig.name {
         "db.labels" => graph
             .label_histogram()
             .map_err(RunError::Graph)?
             .into_iter()
-            .map(|(l, _)| vec![("label", Value::Str(l))])
+            .map(|(l, _)| ProcRow(vec![("label", Value::Str(l))]))
             .collect(),
         "db.relationshiptypes" => graph
             .rel_type_histogram()
             .map_err(RunError::Graph)?
             .into_iter()
-            .map(|(t, _)| vec![("relationshipType", Value::Str(t))])
+            .map(|(t, _)| ProcRow(vec![("relationshipType", Value::Str(t))]))
             .collect(),
         "db.propertykeys" => graph
             .property_key_names()
             .map_err(RunError::Graph)?
             .into_iter()
-            .map(|k| vec![("propertyKey", Value::Str(k))])
+            .map(|k| ProcRow(vec![("propertyKey", Value::Str(k))]))
             .collect(),
-        "dbms.components" => vec![vec![
+        _ => vec![ProcRow(vec![
             ("name", Value::Str("Engram".into())),
             (
                 "versions",
-                Value::List(vec![Value::Str(env!("CARGO_PKG_VERSION").into())]),
+                Value::List((vec![Value::Str(env!("CARGO_PKG_VERSION").into())]).into()),
             ),
             ("edition", Value::Str("engram".into())),
-        ]],
-        _ => return Ok(None),
+        ])],
     };
-    if !args.is_empty() {
-        return Err(RunError::Semantic(format!("`{name}` takes no arguments")));
+    // The catalog is the same for every input row, so it is built once and
+    // cloned per row rather than recomputed — `label_histogram` is a scan of
+    // the maintained stats, not free.
+    emit_procedure_rows(graph, rows, bindings, where_, params, |_row| {
+        Ok(catalog
+            .iter()
+            .map(|r| ProcRow(r.0.clone()))
+            .collect::<Vec<_>>())
+    })
+}
+
+/// A top-level WHERE conjunct of the shape `<var>.<prop> <op> '<literal>'`,
+/// where `op` is one of the four string predicates and a TRIGRAM index is
+/// declared over that property for one of the start's labels.
+///
+/// A pattern carrying a VARIABLE declines: the condition would have to be
+/// derived per row, and a seed is chosen once for the whole clause. Guessing
+/// at a shape here is exactly what the house rules forbid.
+fn text_seek_candidate(
+    graph: &Graph,
+    path: &PathPattern,
+    clause_where: Option<&Expr>,
+) -> Option<(String, engram_store::trigram::TrigramQuery, String)> {
+    // The cheap gate first — see `text_query_for`.
+    if !graph.any_trigram_index() {
+        return None;
     }
-    let fields: Vec<&str> = catalog.first().map_or_else(
-        || match name {
-            "db.labels" => vec!["label"],
-            "db.relationshiptypes" => vec!["relationshipType"],
-            "db.propertykeys" => vec!["propertyKey"],
-            _ => vec!["name", "versions", "edition"],
-        },
-        |row| row.iter().map(|(f, _)| *f).collect(),
-    );
-    let bindings: Vec<(String, String)> = if yields.is_empty() {
-        fields.iter().map(|f| (f.to_string(), f.to_string())).collect()
-    } else {
-        let mut out = Vec::new();
-        for (field, alias) in yields {
-            if !fields.contains(&field.as_str()) {
-                return Err(RunError::Semantic(format!(
-                    "`{name}` does not yield `{field}` ({})",
-                    fields.join(", ")
-                )));
-            }
-            out.push((
-                field.clone(),
-                alias.clone().unwrap_or_else(|| field.clone()),
-            ));
-        }
-        out
-    };
-    let mut out = Vec::new();
-    for row in rows {
-        for entry in &catalog {
-            let mut r = row.clone();
-            for (field, alias) in &bindings {
-                let v = entry
-                    .iter()
-                    .find(|(f, _)| f == field)
-                    .map(|(_, v)| v.clone())
-                    .expect("yield fields validated against the catalog");
-                r.insert(alias.clone(), v);
-            }
-            if let Some(w) = where_ {
-                let v = eval_expr(graph, w, &r, params)?;
-                if v.truth() != Some(Truth::True) {
-                    continue;
-                }
-            }
-            out.push(r);
-        }
+    let where_ = clause_where?;
+    let var = path.start.var.as_deref()?;
+    if path.start.labels.is_empty() {
+        return None;
     }
-    Ok(Some(out))
+    for (prop, op, text) in prop_text_candidates(Some(where_), var) {
+        let Some(label) = graph.declared_trigram_for(&path.start.labels, &prop) else {
+            continue;
+        };
+        let Some(q) = text_query_for(op, &text) else {
+            continue;
+        };
+        return Some((prop, q, label));
+    }
+    None
+}
+
+/// Carry a trigram condition across the crate boundary.
+///
+/// The two enums are structurally identical and deliberately separate:
+/// `engram-store` sits below `engram-cypher` and cannot name its types. This
+/// is the one place that has both in scope.
+fn to_store_query(
+    q: &engram_cypher::regex::prefilter::TrigramQuery,
+) -> engram_store::trigram::TrigramQuery {
+    use engram_cypher::regex::prefilter::TrigramQuery as Q;
+    use engram_store::trigram::{Trigram, TrigramQuery as S};
+    match q {
+        Q::All => S::All,
+        Q::None => S::None,
+        Q::Lit(t) => S::Lit(Trigram(t.0, t.1, t.2)),
+        Q::And(qs) => S::And(qs.iter().map(to_store_query).collect()),
+        Q::Or(qs) => S::Or(qs.iter().map(to_store_query).collect()),
+    }
+}
+
+/// `engram.algo.*` — the graph algorithm surface.
+///
+/// The rows are produced ONCE and replayed per input row. An algorithm is not
+/// a per-row lookup: running PageRank once for every row of a preceding MATCH
+/// would compute the same answer over and over, and the cost is measured in
+/// seconds rather than microseconds.
+fn algo_procedure(
+    graph: &Graph,
+    name: &str,
+    args: &[Expr],
+    bindings: &[Binding],
+    where_: Option<&Expr>,
+    rows: &[Row],
+    params: &BTreeMap<String, Value>,
+) -> Result<Vec<Row>, RunError> {
+    // What the statement actually binds. A stream row carries the vertex's
+    // whole node, which costs a store get and a full record decode per vertex
+    // — 24,328 of them on the SF3 friendship graph — and `YIELD depth RETURN
+    // count(*)` never reads one.
+    let wants_node = bindings.iter().any(|b| b.field == "node");
+
+    // THE CONFIGURATION IS EVALUATED PER ROW, AND THE RUN SHARED PER DISTINCT
+    // CONFIGURATION.
+    //
+    // It used to be evaluated against the FIRST row only and that one result
+    // replayed for every row — correct for a constant config, and a silent
+    // wrong answer for `CALL engram.algo.sssp.stream({sourceNode: id(p)})`
+    // after a MATCH binding several `p`: every source was answered with the
+    // first one's distances. SNB BI19 at SF3 returned no rows because its
+    // first source was an isolated person, so every source "reached" only
+    // itself. Keying the shared run on the evaluated configuration keeps the
+    // property the replay existed for — a constant config runs once — and
+    // gives a row-dependent one its own run.
+    // ONE slot, not a map: a row-dependent config (a source per row) would
+    // otherwise hold every source's whole-graph result at once.
+    let mut last: Option<(Option<Value>, std::rc::Rc<Vec<_>>)> = None;
+    emit_procedure_rows(graph, rows, bindings, where_, params, |row| {
+        let config = match args.first() {
+            Some(e) => Some(eval_expr(graph, e, row, params)?),
+            None => None,
+        };
+        let produced = match &last {
+            Some((c, p)) if *c == config => {
+                counted!("interp.algorithm run shared by rows with the same configuration");
+                std::rc::Rc::clone(p)
+            }
+            _ => {
+                let p = std::rc::Rc::new(
+                    graph
+                        .algo_procedure(name, config.as_ref(), wants_node)
+                        .map_err(RunError::Semantic)?,
+                );
+                last = Some((config, std::rc::Rc::clone(&p)));
+                p
+            }
+        };
+        Ok(produced
+            .iter()
+            .map(|r| ProcRow(r.clone()))
+            .collect::<Vec<_>>())
+    })
+}
+
+#[cfg(test)]
+mod shape_tails_tests {
+    use super::*;
+    use engram_key::{Namespace, Realm};
+    use engram_store::Store;
+
+    fn path_of(src: &str) -> PathPattern {
+        let Query::Single(q) = engram_cypher::parse_statement(src).expect("parse") else {
+            panic!("expected a single query");
+        };
+        for c in q.clauses {
+            if let Clause::Match { pattern, .. } = c {
+                return pattern.paths.into_iter().next().expect("a path");
+            }
+        }
+        panic!("no MATCH in `{src}`");
+    }
+
+    /// `shape_tails` caches per thread. Its key used to be the pattern's
+    /// ADDRESS plus each hop's COUNT of types and labels — and bi16's optional
+    /// leg has the same counts as its own reversal, so a pattern written into
+    /// the same memory as an earlier one was handed that one's prices. This
+    /// puts the second pattern in the SAME variable, so the address is reused
+    /// by construction rather than by the allocator's whim.
+    #[test]
+    fn a_pattern_at_a_reused_address_is_priced_as_itself() {
+        let g = Graph::new(Store::new(), Realm(1), Namespace(1));
+        for q in [
+            "UNWIND range(0, 99) AS i CREATE (:Person {id: i})",
+            "UNWIND range(0, 99) AS i UNWIND range(1, 10) AS d \
+             MATCH (a:Person {id: i}), (b:Person {id: (i + d) % 100}) CREATE (a)-[:KNOWS]->(b)",
+            "UNWIND range(0, 3999) AS m MATCH (p:Person {id: m % 100}) \
+             CREATE (p)<-[:HAS_CREATOR]-(:Message {id: m})",
+            "CREATE (:Tag {name: 't'})",
+            "MATCH (m:Message), (t:Tag) WHERE m.id % 50 = 0 CREATE (m)-[:HAS_TAG]->(t)",
+        ] {
+            let s = engram_cypher::parse_any(q).expect("parse");
+            crate::run_stmt(&g, &s, BTreeMap::new()).expect("run");
+        }
+        let forward = path_of(
+            "MATCH (p)-[:KNOWS]-(p2:Person)<-[:HAS_CREATOR]-(m:Message)-[:HAS_TAG]->(t) RETURN 1",
+        );
+        let reversed = path_of(
+            "MATCH (t)<-[:HAS_TAG]-(m:Message)-[:HAS_CREATOR]->(p2:Person)-[:KNOWS]-(p) RETURN 1",
+        );
+        // what each is worth when priced from a clean cache
+        let honest_reversed = {
+            let fresh = reversed.clone();
+            shape_tails(&g, &fresh)
+        };
+
+        let mut slot = forward.clone();
+        let first = shape_tails(&g, &slot);
+        slot = reversed.clone(); // same address, same per-hop counts
+        let second = shape_tails(&g, &slot);
+
+        assert_ne!(
+            first, honest_reversed,
+            "the fixture must make the two spellings price differently, or this proves nothing"
+        );
+        assert_eq!(
+            second, honest_reversed,
+            "a pattern at a reused address was priced with the previous pattern's tails"
+        );
+    }
 }
