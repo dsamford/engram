@@ -136,7 +136,9 @@ fn the_catalogue_carries_the_full_interactive_workload() {
     assert_eq!(
         c.len(),
         21,
-        "expected all 21 statements to carry cypher text -- IC1-14 and IS1-7.          IC14 carried none until the published v1 text was added; extracted          {}: {:?}",
+        "expected all 21 statements to carry cypher text -- IC1-14 and IS1-7. \
+         IC14 carried none until the published v1 text was added; extracted \
+         {}: {:?}",
         c.len(),
         c.iter().map(|(n, _, _)| n).collect::<Vec<_>>()
     );
@@ -146,7 +148,8 @@ fn the_catalogue_carries_the_full_interactive_workload() {
     for name in ["IC7", "IC10", "IC14"] {
         assert!(
             c.iter().any(|(n, t, _)| n == name && t.contains("MATCH")),
-            "{name} is recorded as absent in the coverage plan but is present              and written here"
+            "{name} is recorded as absent in the coverage plan but is present \
+             and written here"
         );
     }
     // IC14 carries the v1 text specifically. `allShortestPaths` and the 1.0 /
@@ -159,7 +162,8 @@ fn the_catalogue_carries_the_full_interactive_workload() {
         .unwrap_or_default();
     assert!(
         ic14.contains("allShortestPaths") && ic14.contains("0.5"),
-        "IC14 must carry the V1 text -- all shortest paths, float reply          weights -- not v2's single cheapest path: {ic14:?}"
+        "IC14 must carry the V1 text -- all shortest paths, float reply \
+         weights -- not v2's single cheapest path: {ic14:?}"
     );
 }
 

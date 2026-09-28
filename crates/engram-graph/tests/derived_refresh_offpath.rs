@@ -302,11 +302,13 @@ fn the_demoted_pass_rebuilds_nothing_at_all() {
     assert_eq!(
         (r.adjacency_rebuilt, r.adjacency_repaired),
         (0, 0),
-        "the demoted pass neither rebuilds nor repairs a change set past the          cost gate: {r:?}"
+        "the demoted pass neither rebuilds nor repairs a change set past the \
+         cost gate: {r:?}"
     );
     assert_eq!(
         r.adjacency_deferred, 2,
-        "and it must SAY it deferred both — a table it declined to rebuild is          reported, never dropped from the report: {r:?}"
+        "and it must SAY it deferred both — a table it declined to rebuild is \
+         reported, never dropped from the report: {r:?}"
     );
     // The reader still gets a table, so the demotion moved the work rather
     // than removing it.

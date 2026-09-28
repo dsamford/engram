@@ -115,7 +115,8 @@ fn the_marker_traces_only_where_the_operator_permits_it() {
     assert_eq!(get(&c, IGNORED), 1, "{c:?}");
     assert!(
         get(&c, ENGINE_WORK) > 0,
-        "the statement's engine work landed in the caller's trace, so it ran          untraced: {c:?}"
+        "the statement's engine work landed in the caller's trace, so it ran \
+         untraced: {c:?}"
     );
 
     // Permitted: traced.

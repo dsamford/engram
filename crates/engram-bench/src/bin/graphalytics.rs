@@ -576,7 +576,9 @@ are not what this benchmark validates."
         .or_else(|| read_properties(&dir, &name))
         .unwrap_or_else(|| {
             eprintln!(
-                "[graphalytics] no params.json in {} and no {name}.properties —                  every kernel parameter would be empty, so refusing rather than                  issuing statements with holes in them",
+                "[graphalytics] no params.json in {} and no {name}.properties — \
+                 every kernel parameter would be empty, so refusing rather than \
+                 issuing statements with holes in them",
                 dir.display()
             );
             std::process::exit(2);

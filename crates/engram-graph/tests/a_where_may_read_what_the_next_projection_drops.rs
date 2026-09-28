@@ -30,7 +30,8 @@ fn graph() -> Graph {
     let g = Graph::new(Store::new(), Realm(1), Namespace(1));
     run(
         &g,
-        "CREATE (a:P {id:1}), (b:P {id:2}), (m:M {id:10}),          (m)-[:HAS_CREATOR]->(a), (b)-[:LIKES]->(m)",
+        "CREATE (a:P {id:1}), (b:P {id:2}), (m:M {id:10}), \
+         (m)-[:HAS_CREATOR]->(a), (b)-[:LIKES]->(m)",
     );
     g
 }
@@ -55,10 +56,15 @@ fn a_predicate_may_read_a_collection_the_grouping_drops() {
     assert_eq!(
         one_int(
             &g,
-            "MATCH (p:P) WITH p WITH collect(p) AS ps UNWIND ps AS one              OPTIONAL MATCH (one)<-[:HAS_CREATOR]-(m:M)<-[:LIKES]-(l:P)              WHERE l IN ps              WITH one, count(l) AS n              RETURN count(*)"
+            "MATCH (p:P) WITH p WITH collect(p) AS ps UNWIND ps AS one \
+             OPTIONAL MATCH (one)<-[:HAS_CREATOR]-(m:M)<-[:LIKES]-(l:P) \
+             WHERE l IN ps \
+             WITH one, count(l) AS n \
+             RETURN count(*)"
         ),
         2,
-        "two people go in and two rows come out; this raised `variable `ps` is          not in scope`"
+        "two people go in and two rows come out; this raised `variable `ps` is \
+         not in scope`"
     );
 }
 
@@ -71,7 +77,11 @@ fn the_same_holds_for_a_plain_MATCH_and_for_a_scalar() {
     assert_eq!(
         one_int(
             &g,
-            "MATCH (p:P) WITH p WITH collect(p) AS ps UNWIND ps AS one              MATCH (one)<-[:HAS_CREATOR]-(m:M)<-[:LIKES]-(l:P)              WHERE l IN ps              WITH one, count(l) AS n              RETURN count(*)"
+            "MATCH (p:P) WITH p WITH collect(p) AS ps UNWIND ps AS one \
+             MATCH (one)<-[:HAS_CREATOR]-(m:M)<-[:LIKES]-(l:P) \
+             WHERE l IN ps \
+             WITH one, count(l) AS n \
+             RETURN count(*)"
         ),
         1,
         "a plain MATCH keeps only the person who has a liked message"
@@ -79,7 +89,12 @@ fn the_same_holds_for_a_plain_MATCH_and_for_a_scalar() {
     assert_eq!(
         one_int(
             &g,
-            "MATCH (p:P) WITH p WITH collect(p) AS ps, count(p) AS k              UNWIND ps AS one              OPTIONAL MATCH (one)<-[:HAS_CREATOR]-(m:M)<-[:LIKES]-(l:P)              WHERE l.id < k              WITH one, count(l) AS n              RETURN count(*)"
+            "MATCH (p:P) WITH p WITH collect(p) AS ps, count(p) AS k \
+             UNWIND ps AS one \
+             OPTIONAL MATCH (one)<-[:HAS_CREATOR]-(m:M)<-[:LIKES]-(l:P) \
+             WHERE l.id < k \
+             WITH one, count(l) AS n \
+             RETURN count(*)"
         ),
         2,
         "a SCALAR sibling the grouping drops fails the same way a list does"
@@ -98,7 +113,11 @@ fn the_count_fold_still_claims_the_shape_it_exists_for() {
     assert_eq!(
         one_int(
             &g,
-            "MATCH (p:P)              OPTIONAL MATCH (p)<-[:HAS_CREATOR]-(m:M)              WHERE m.id > 0              WITH p, count(m) AS c              RETURN sum(c)"
+            "MATCH (p:P) \
+             OPTIONAL MATCH (p)<-[:HAS_CREATOR]-(m:M) \
+             WHERE m.id > 0 \
+             WITH p, count(m) AS c \
+             RETURN sum(c)"
         ),
         1,
         "one message has a creator"
@@ -113,7 +132,11 @@ fn a_predicate_reading_a_kept_key_still_folds_and_answers() {
     assert_eq!(
         one_int(
             &g,
-            "MATCH (p:P) WITH p WITH collect(p) AS ps UNWIND ps AS one              OPTIONAL MATCH (one)<-[:HAS_CREATOR]-(m:M)<-[:LIKES]-(l:P)              WHERE l IN ps              WITH one, ps, count(l) AS n              RETURN count(*)"
+            "MATCH (p:P) WITH p WITH collect(p) AS ps UNWIND ps AS one \
+             OPTIONAL MATCH (one)<-[:HAS_CREATOR]-(m:M)<-[:LIKES]-(l:P) \
+             WHERE l IN ps \
+             WITH one, ps, count(l) AS n \
+             RETURN count(*)"
         ),
         2,
         "`ps` is a grouping key here, so the fold may keep the WHERE"

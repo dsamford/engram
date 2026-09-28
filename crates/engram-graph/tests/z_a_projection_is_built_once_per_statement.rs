@@ -99,7 +99,9 @@ fn a_transaction_WITH_BUFFERED_WRITES_does_not_reuse_a_projection() {
     run_query(&g, &w, BTreeMap::new()).expect("the write runs");
 
     let q = format!(
-        "MATCH (a:P) WHERE a.id < 4 MATCH (b:P) WHERE b.id > 36          CALL engram.algo.kshortestpaths.stream({{{PROJ}, sourceNode: id(a),          targetNode: id(b), k: 1}}) YIELD totalCost RETURN count(*) AS n"
+        "MATCH (a:P) WHERE a.id < 4 MATCH (b:P) WHERE b.id > 36 \
+         CALL engram.algo.kshortestpaths.stream({{{PROJ}, sourceNode: id(a), \
+         targetNode: id(b), k: 1}}) YIELD totalCost RETURN count(*) AS n"
     );
     let c = counters(&g, &q);
     g.commit_txn().expect("commit");

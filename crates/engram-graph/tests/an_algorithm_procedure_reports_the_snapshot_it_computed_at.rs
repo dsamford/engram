@@ -380,7 +380,8 @@ fn every_algorithm_is_reachable_in_every_mode() {
         .unwrap_or_else(|e| panic!("`{name}` is catalogued but not callable: {e:?}"));
         assert!(
             !r.rows.is_empty(),
-            "`{name}` answered no rows — a catalogued procedure that returns nothing is              indistinguishable from one with no body",
+            "`{name}` answered no rows — a catalogued procedure that returns nothing is \
+             indistinguishable from one with no body",
         );
     }
     // THE VACUITY GUARD. Driving from the catalogue means a filter that
@@ -388,7 +389,9 @@ fn every_algorithm_is_reachable_in_every_mode() {
     // test was already failing in.
     assert!(
         seen >= 40,
-        "only {seen} algorithm/mode pairs were exercised; the catalogue holds eleven          algorithms in four modes, so a count this low means the filter above stopped          matching",
+        "only {seen} algorithm/mode pairs were exercised; the catalogue holds eleven \
+         algorithms in four modes, so a count this low means the filter above stopped \
+         matching",
     );
 }
 

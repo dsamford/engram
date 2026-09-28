@@ -196,7 +196,8 @@ fn the_endpoints_may_be_matched_inside_the_pattern_not_bound_before_it() {
     let g = fixture();
     let r = rows(
         &g,
-        "MATCH p = allShortestPaths((a:N {name:'a'})-[:R*0..]-(z:N {name:'z'}))          RETURN length(p) AS l",
+        "MATCH p = allShortestPaths((a:N {name:'a'})-[:R*0..]-(z:N {name:'z'})) \
+         RETURN length(p) AS l",
     );
     assert_eq!(r.len(), 3, "the three tied routes, unbound ends: {r:?}");
     for row in &r {
@@ -207,7 +208,8 @@ fn the_endpoints_may_be_matched_inside_the_pattern_not_bound_before_it() {
         let g = fixture();
         rows(
             &g,
-            "MATCH p = allShortestPaths((a:N {name:'a'})-[:R*0..]-(z:N {name:'z'}))              RETURN length(p) AS l",
+            "MATCH p = allShortestPaths((a:N {name:'a'})-[:R*0..]-(z:N {name:'z'})) \
+             RETURN length(p) AS l",
         )
     })
     .1;

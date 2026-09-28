@@ -381,9 +381,9 @@ fn main() -> std::io::Result<()> {
     // open reports that properly with the OS error attached, so a failed
     // `read_dir` falls through rather than inventing a second diagnostic for
     // one fault.
-    if let Some(dir) = data_dir.as_ref()
-        && let Ok(rd) = std::fs::read_dir(dir)
-    {
+    // One `if let` over a pair rather than a let chain: the MSRV (1.85)
+    // predates let chains.
+    if let Some((dir, Ok(rd))) = data_dir.as_ref().map(|d| (d, std::fs::read_dir(d))) {
         let mut segs: Vec<String> = rd
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
@@ -493,7 +493,8 @@ fn main() -> std::io::Result<()> {
     if args.iter().any(|a| a == "--no-tail-copyout") {
         cfg.tail_span_copyout = false;
         eprintln!(
-            "[engram-server] tail span copy-out OFF: span reads hold every tail              shard latch for the whole merge, excluding writers (the A/B arm)"
+            "[engram-server] tail span copy-out OFF: span reads hold every tail \
+             shard latch for the whole merge, excluding writers (the A/B arm)"
         );
     }
     if args.iter().any(|a| a == "--no-lazy-stale-serve") {
@@ -754,7 +755,9 @@ fn main() -> std::io::Result<()> {
     if args.iter().any(|a| a == "--precision-locking") {
         cfg.precision_locking = true;
         eprintln!(
-            "[engram-server] precision locking ON: phantoms are closed, and              statements that would previously have committed over one now abort              and retry"
+            "[engram-server] precision locking ON: phantoms are closed, and \
+             statements that would previously have committed over one now abort \
+             and retry"
         );
     }
     if let Some(n) = num_of(["--compact-every", "--compact-every"]) {
@@ -775,7 +778,8 @@ fn main() -> std::io::Result<()> {
         // spare. Off, the next reader pays the rebuild instead.
         cfg.derived_refresh = false;
         eprintln!(
-            "[engram-server] derived refresh OFF: readers pay their own rebuild —              this is the A/B baseline, not a production setting"
+            "[engram-server] derived refresh OFF: readers pay their own rebuild — \
+             this is the A/B baseline, not a production setting"
         );
     }
     if let Some(n) = num_of(["--refresh-after-writes", "--refresh-after-writes"]) {

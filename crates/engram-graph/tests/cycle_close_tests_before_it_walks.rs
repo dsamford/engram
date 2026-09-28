@@ -111,12 +111,14 @@ fn the_closing_hop_skips_the_walk_when_no_edge_exists() {
     // walk-based close is caught here rather than in a p50.
     assert_eq!(
         skipped, 0,
-        "a `semijoin` close fired for a count-only triangle; this shape takes          the count fold, whose close is already `edge_count_slim(..) > 0`"
+        "a `semijoin` close fired for a count-only triangle; this shape takes \
+         the count fold, whose close is already `edge_count_slim(..) > 0`"
     );
     assert_eq!(
         c("interp.pipeline count fold"),
         1,
-        "the count fold must be the path that answers this — the whole finding          is that its close is already an existence test"
+        "the count fold must be the path that answers this — the whole finding \
+         is that its close is already an existence test"
     );
 
     // EXACTNESS. The short circuit may only remove work. Same fixture, same

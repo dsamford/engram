@@ -333,7 +333,7 @@ impl TrigramIndex {
     ///
     /// This is the quantity DEEP-COPIED by every catch-up (`with_changes`
     /// begins `self.clone()`), which is why it must stay bounded by a small
-    /// constant rather than by a fraction of the base. See [`FOLD_AT`].
+    /// constant rather than by a fraction of the base. See `FOLD_AT`.
     #[must_use]
     pub fn overlay_len(&self) -> usize {
         self.added.len()

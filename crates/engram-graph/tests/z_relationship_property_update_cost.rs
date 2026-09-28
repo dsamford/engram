@@ -55,7 +55,8 @@ fn graph_with(n: usize) -> Graph {
     ddl(
         &g,
         &format!(
-            "UNWIND range(0, {}) AS i MATCH (a:P {{id: i}}), (b:P {{id: i + 1}})              CREATE (a)-[:T {{w: 40.0}}]->(b)",
+            "UNWIND range(0, {}) AS i MATCH (a:P {{id: i}}), (b:P {{id: i + 1}}) \
+             CREATE (a)-[:T {{w: 40.0}}]->(b)",
             n - 2
         ),
     );

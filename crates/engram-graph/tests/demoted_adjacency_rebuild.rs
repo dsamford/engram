@@ -220,15 +220,18 @@ fn a_reader_is_kept_off_the_full_span_rebuild_by_admission() {
     let (open_built, open_answers) = arm(false);
 
     eprintln!(
-        "[reader admission] full-span rebuilds on the reader's thread:          {gated_built} gated, {open_built} open"
+        "[reader admission] full-span rebuilds on the reader's thread: \
+         {gated_built} gated, {open_built} open"
     );
     assert!(
         open_built > 0,
-        "the UNGATED arm must actually rebuild on the reader's thread, or the          gated arm's zero proves nothing: {open_built}"
+        "the UNGATED arm must actually rebuild on the reader's thread, or the \
+         gated arm's zero proves nothing: {open_built}"
     );
     assert_eq!(
         gated_built, 0,
-        "a reader with a stale snapshot it cannot repair must DECLINE, not walk          the whole span on its query thread"
+        "a reader with a stale snapshot it cannot repair must DECLINE, not walk \
+         the whole span on its query thread"
     );
     assert!(
         gated_answers.iter().any(|(_, p)| !p.is_empty()),
@@ -236,6 +239,7 @@ fn a_reader_is_kept_off_the_full_span_rebuild_by_admission() {
     );
     assert_eq!(
         gated_answers, open_answers,
-        "and declining must change no answer: the direct span walk is the same          truth the table would have been built from"
+        "and declining must change no answer: the direct span walk is the same \
+         truth the table would have been built from"
     );
 }

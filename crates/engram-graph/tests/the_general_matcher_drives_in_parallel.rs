@@ -213,7 +213,8 @@ fn a_limit_keeps_the_serial_path_and_agrees() {
 #[test]
 fn a_var_length_hop_agrees() {
     differential(
-        "MATCH (a:P) WHERE a.id < 10 WITH DISTINCT a          MATCH (a)-[:K*1..2]->(c:P) RETURN count(DISTINCT c) AS n",
+        "MATCH (a:P) WHERE a.id < 10 WITH DISTINCT a \
+         MATCH (a)-[:K*1..2]->(c:P) RETURN count(DISTINCT c) AS n",
     );
 }
 
@@ -240,7 +241,9 @@ fn every_eligible_stage_parallelises_not_just_the_first() {
     let g = corpus(200, 8);
     g.set_parallel_min_rows(2);
     g.set_exec(Some(std::sync::Arc::new(TestExec { width: 4 })));
-    let src = "MATCH (a:P)-[:K]-(b:P) WHERE a.id < b.id WITH DISTINCT a, b                MATCH (b)-[:K]-(c:P) WHERE b.id < c.id WITH DISTINCT a, b, c                RETURN count(*) AS n";
+    let src = "MATCH (a:P)-[:K]-(b:P) WHERE a.id < b.id WITH DISTINCT a, b \
+               MATCH (b)-[:K]-(c:P) WHERE b.id < c.id WITH DISTINCT a, b, c \
+               RETURN count(*) AS n";
     let (r, t) = engram_observe::with_trace(|| run(&g, src));
     g.set_exec(None);
     let fired = t
@@ -250,7 +253,8 @@ fn every_eligible_stage_parallelises_not_just_the_first() {
         .unwrap_or(0);
     assert!(
         fired >= 2,
-        "both the WITH-terminated and the RETURN-terminated stage must go          parallel, got {fired}: {:?}",
+        "both the WITH-terminated and the RETURN-terminated stage must go \
+         parallel, got {fired}: {:?}",
         t.counters()
     );
     assert!(matches!(r[0][0], Value::Int(n) if n > 0), "{r:?}");

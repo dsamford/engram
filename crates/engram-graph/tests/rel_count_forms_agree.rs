@@ -82,7 +82,8 @@ fn both(g: &Graph) -> (i64, i64) {
 /// construction, which is why the harness's own query shape is pinned by a
 /// test rather than trusted because it compiled.
 fn both_in_one_statement(g: &Graph) -> (i64, i64) {
-    let src = "MATCH ()-[r:T]->() WITH count(r) AS bare                MATCH (a)-[q:T]->(b) RETURN bare, count(q) AS bound";
+    let src = "MATCH ()-[r:T]->() WITH count(r) AS bare \
+               MATCH (a)-[q:T]->(b) RETURN bare, count(q) AS bound";
     let stmt = parse_statement(src).unwrap_or_else(|e| panic!("parse: {e}"));
     let r = run_query(g, &stmt, BTreeMap::new()).unwrap_or_else(|e| panic!("run: {e:?}"));
     let row = r.rows.first().expect("the check must return a row");

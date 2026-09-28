@@ -147,7 +147,7 @@ RETURN name, versions, edition
 
 ```text
 name     versions     edition
-Engram   ["0.2.0"]    engram
+Engram   ["0.2.1"]    engram
 ```
 
 If that returns, the wire, the parser, the interpreter and the procedure

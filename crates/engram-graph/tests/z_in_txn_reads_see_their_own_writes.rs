@@ -109,7 +109,8 @@ fn a_node_DELETED_in_this_statement_is_not_matched_afterwards() {
         // and the test would then assert about an empty result rather than
         // about the delete -- which is how the first cut of this case passed
         // for the wrong reason.
-        "MATCH (z:Z) DELETE z WITH count(*) AS gone          OPTIONAL MATCH (x:Z) RETURN gone, count(x) AS left_over",
+        "MATCH (z:Z) DELETE z WITH count(*) AS gone \
+         OPTIONAL MATCH (x:Z) RETURN gone, count(x) AS left_over",
     );
     assert_eq!(out.len(), 1);
     assert_eq!(

@@ -85,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "engram-bench"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "engram-bolt",
  "engram-cypher",
@@ -100,7 +100,7 @@ dependencies = [
 
 [[package]]
 name = "engram-blob"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "blake3",
  "engram-crypto",
@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "engram-bolt"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "engram-cypher",
  "engram-graph",
@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "engram-crypto"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "engram-key",
  "engram-observe",
@@ -133,7 +133,7 @@ dependencies = [
 
 [[package]]
 name = "engram-cypher"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "engram-observe",
  "engram-proc",
@@ -145,7 +145,7 @@ dependencies = [
 
 [[package]]
 name = "engram-exec"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "engram-key",
  "engram-observe",
@@ -155,7 +155,7 @@ dependencies = [
 
 [[package]]
 name = "engram-graph"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arc-swap",
  "blake3",
@@ -169,14 +169,14 @@ dependencies = [
 
 [[package]]
 name = "engram-key"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "engram-observe",
 ]
 
 [[package]]
 name = "engram-log"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "blake3",
  "engram-key",
@@ -185,7 +185,7 @@ dependencies = [
 
 [[package]]
 name = "engram-objstore"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "blake3",
  "engram-crypto",
@@ -196,15 +196,15 @@ dependencies = [
 
 [[package]]
 name = "engram-observe"
-version = "0.2.0"
+version = "0.2.1"
 
 [[package]]
 name = "engram-proc"
-version = "0.2.0"
+version = "0.2.1"
 
 [[package]]
 name = "engram-runtime"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "engram-observe",
  "tokio",
@@ -212,7 +212,7 @@ dependencies = [
 
 [[package]]
 name = "engram-server"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "engram-bolt",
  "engram-cypher",
@@ -226,7 +226,7 @@ dependencies = [
 
 [[package]]
 name = "engram-sim"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "engram-blob",
  "engram-bolt",
@@ -244,7 +244,7 @@ dependencies = [
 
 [[package]]
 name = "engram-store"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arc-swap",
  "blake3",
@@ -256,7 +256,7 @@ dependencies = [
 
 [[package]]
 name = "engram-tck"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "engram-cypher",
  "engram-graph",
@@ -541,4 +541,4 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
 name = "xtask"
-version = "0.2.0"
+version = "0.2.1"

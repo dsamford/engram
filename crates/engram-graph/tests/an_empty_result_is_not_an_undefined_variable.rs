@@ -46,7 +46,11 @@ fn a_where_over_an_empty_intermediate_result_returns_no_rows_not_an_error() {
     let g = graph();
     let r = run(
         &g,
-        "MATCH (p:P) WHERE p.id > 1000          WITH collect(p) AS ps          UNWIND ps AS one          OPTIONAL MATCH (one)-[:KNOWS]-(o:P) WHERE o IN ps          RETURN count(*) AS n",
+        "MATCH (p:P) WHERE p.id > 1000 \
+         WITH collect(p) AS ps \
+         UNWIND ps AS one \
+         OPTIONAL MATCH (one)-[:KNOWS]-(o:P) WHERE o IN ps \
+         RETURN count(*) AS n",
     );
     assert_eq!(
         r.rows.len(),
@@ -69,7 +73,11 @@ fn the_same_query_still_answers_when_the_result_is_NOT_empty() {
     let g = graph();
     let r = run(
         &g,
-        "MATCH (p:P) WHERE p.id > 0          WITH collect(p) AS ps          UNWIND ps AS one          OPTIONAL MATCH (one)-[:KNOWS]-(o:P) WHERE o IN ps          RETURN count(*) AS n",
+        "MATCH (p:P) WHERE p.id > 0 \
+         WITH collect(p) AS ps \
+         UNWIND ps AS one \
+         OPTIONAL MATCH (one)-[:KNOWS]-(o:P) WHERE o IN ps \
+         RETURN count(*) AS n",
     );
     assert_eq!(
         r.rows[0].first(),

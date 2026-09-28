@@ -581,7 +581,10 @@ impl SidecarReader {
             // exactly like one that was never written — the server warms slowly
             // and nothing says why. That cost a pod run to diagnose.
             eprintln!(
-                "[engram-graph] derived sidecar REFUSED: it describes sealed set                  {:#018x}, the store has {:#018x}. A segment was added, removed or                  re-merged since it was written, so it names rows this store does                  not have — the structures are rebuilt.",
+                "[engram-graph] derived sidecar REFUSED: it describes sealed set \
+                 {:#018x}, the store has {:#018x}. A segment was added, removed or \
+                 re-merged since it was written, so it names rows this store does \
+                 not have — the structures are rebuilt.",
                 file_sealed_id, sealed_id
             );
             // The sealed set moved: a segment was added, removed or re-merged.

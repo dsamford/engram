@@ -258,7 +258,8 @@ fn PageRank_matches_the_published_expected_output() {
     let g = pr_graph();
     let got = by_vid(
         &g,
-        "engram.algo.pagerank.stream({nodeLabels: ['V'], relationshipTypes: ['E'],          dampingFactor: 0.85, maxIterations: 14, graphalytics: true})",
+        "engram.algo.pagerank.stream({nodeLabels: ['V'], relationshipTypes: ['E'], \
+         dampingFactor: 0.85, maxIterations: 14, graphalytics: true})",
         "score",
     );
     let mut worst = 0.0f64;
@@ -275,7 +276,8 @@ fn PageRank_matches_the_published_expected_output() {
     // Graphalytics validates PageRank by EPSILON, not exact equality.
     assert!(
         worst < 1e-6,
-        "PageRank must match LDBC's published scores within 1e-6; worst          divergence {worst} at vertex {worst_at}"
+        "PageRank must match LDBC's published scores within 1e-6; worst \
+         divergence {worst} at vertex {worst_at}"
     );
 }
 
@@ -299,7 +301,8 @@ fn SSSP_matches_the_published_expected_output() {
     }
     let got = by_vid(
         &g,
-        "engram.algo.sssp.stream({nodeLabels: ['V'], relationshipTypes: ['E'],          sourceNode: 1, relationshipWeightProperty: 'weight', graphalytics: true})",
+        "engram.algo.sssp.stream({nodeLabels: ['V'], relationshipTypes: ['E'], \
+         sourceNode: 1, relationshipWeightProperty: 'weight', graphalytics: true})",
         "distance",
     );
     let mut mismatched = Vec::new();
@@ -312,7 +315,8 @@ fn SSSP_matches_the_published_expected_output() {
     }
     assert!(
         mismatched.is_empty(),
-        "SSSP must match LDBC's published distances, including `Infinity` for          the unreachable vertex 9: {mismatched:?}"
+        "SSSP must match LDBC's published distances, including `Infinity` for \
+         the unreachable vertex 9: {mismatched:?}"
     );
 }
 
@@ -344,7 +348,10 @@ fn graphalytics_pagerank_runs_every_round_it_was_asked_for() {
         let r = run(
             &g,
             &format!(
-                "CALL engram.algo.pagerank.stats({{nodeLabels: ['V'],                  relationshipTypes: ['E'], dampingFactor: 0.85,                  maxIterations: 20, graphalytics: {conformant}}})                  YIELD iterations RETURN iterations"
+                "CALL engram.algo.pagerank.stats({{nodeLabels: ['V'], \
+                 relationshipTypes: ['E'], dampingFactor: 0.85, \
+                 maxIterations: 20, graphalytics: {conformant}}}) \
+                 YIELD iterations RETURN iterations"
             ),
         );
         match r.rows.first().and_then(|row| row.first()) {
@@ -355,11 +362,14 @@ fn graphalytics_pagerank_runs_every_round_it_was_asked_for() {
     let conformant = iters(true);
     assert_eq!(
         conformant, 20,
-        "under `graphalytics: true` PageRank must run all 20 rounds; it ran          {conformant}, so the convergence break is still firing"
+        "under `graphalytics: true` PageRank must run all 20 rounds; it ran \
+         {conformant}, so the convergence break is still firing"
     );
     let default = iters(false);
     assert!(
         default < 20,
-        "the DEFAULT must still converge early on a graph that settles -- it          ran {default} of 20, so this fixture cannot tell the modes apart and          proves nothing about the gate"
+        "the DEFAULT must still converge early on a graph that settles -- it \
+         ran {default} of 20, so this fixture cannot tell the modes apart and \
+         proves nothing about the gate"
     );
 }

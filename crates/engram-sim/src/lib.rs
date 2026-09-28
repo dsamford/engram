@@ -2821,6 +2821,62 @@ pub fn run_seed(seed: u64) -> RunReport {
                 Ok(r) if reply_tags(&r) == vec![0x70] => {}
                 other => violations.push(format!("rollback did not succeed: {other:?}")),
             }
+            // Re-authentication in place (5.1+): LOGOFF inside an open
+            // transaction must roll it back, so the next principal on this
+            // connection can neither see nor commit the previous one's write
+            // (security plan §2.8). Asserted, not only reached.
+            if srv.version() >= (5, 1) {
+                let _ = srv.feed(&msg(0x11, vec![empty_map()]));
+                let _ = srv.feed(&msg(
+                    0x10,
+                    vec![sval("CREATE (:SimLogoff)".to_string()), empty_map(), empty_map()],
+                ));
+                let mut pull = std::collections::BTreeMap::new();
+                pull.insert("n".to_string(), Value::Int(-1));
+                let _ = srv.feed(&msg(0x3F, vec![Pack::Value(Value::Map(pull.clone()))]));
+                match srv.feed(&msg(0x6B, vec![])) {
+                    Ok(r) if reply_tags(&r) == vec![0x70] => {}
+                    other => violations.push(format!("LOGOFF did not succeed: {other:?}")),
+                }
+                let _ = srv.feed(&msg(0x6A, vec![empty_map()]));
+                let _ = srv.feed(&msg(0x12, vec![empty_map()]));
+                let mut bytes = msg(
+                    0x10,
+                    vec![
+                        sval("MATCH (s:SimLogoff) RETURN count(s) AS c".to_string()),
+                        empty_map(),
+                        empty_map(),
+                    ],
+                );
+                bytes.extend(msg(0x3F, vec![Pack::Value(Value::Map(pull))]));
+                let counted = srv.feed(&bytes).ok().and_then(|r| {
+                    let mut at = 0usize;
+                    let mut payload: Vec<u8> = Vec::new();
+                    while at + 2 <= r.len() {
+                        let size = u16::from_be_bytes(r[at..at + 2].try_into().ok()?) as usize;
+                        at += 2;
+                        if size == 0 {
+                            if let Ok(Pack::Struct { tag: 0x71, fields }) =
+                                Decoder::new(&payload).decode()
+                            {
+                                if let Some(Pack::Value(Value::List(row))) = fields.first() {
+                                    return row.first().cloned();
+                                }
+                            }
+                            payload.clear();
+                            continue;
+                        }
+                        payload.extend_from_slice(r.get(at..at + size)?);
+                        at += size;
+                    }
+                    None
+                });
+                if counted != Some(Value::Int(0)) {
+                    violations.push(format!(
+                        "a write buffered before LOGOFF survived it: count {counted:?}"
+                    ));
+                }
+            }
         }
 
         // ── The overlay refusals ────────────────────────────────────────

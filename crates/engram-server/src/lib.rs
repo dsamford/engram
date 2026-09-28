@@ -1247,7 +1247,8 @@ pub fn resolve_memory_max(explicit_mb: Option<usize>) -> (Option<u64>, String) {
             (
                 Some(ceiling),
                 format!(
-                    "{} MiB ({source}), queueing above {MEMORY_HIGH_WATER_PCT}% and                      resuming below {MEMORY_LOW_WATER_PCT}%",
+                    "{} MiB ({source}), queueing above {MEMORY_HIGH_WATER_PCT}% and \
+                     resuming below {MEMORY_LOW_WATER_PCT}%",
                     ceiling / (1024 * 1024)
                 ),
             )
@@ -1322,7 +1323,10 @@ pub fn spawn_memory_governor(ceiling: Option<u64>, queue_wait_ms: u64) {
     // So probe ONCE, here, and refuse to be quiet about it.
     if process_rss_bytes().is_none() {
         eprintln!(
-            "[engram-server] WARNING: a memory ceiling was configured but this              process cannot read its own resident set (no /proc/self/statm). The              ceiling CANNOT be enforced and no statement will ever be queued.              Run with --memory-max-mb 0 to say so deliberately."
+            "[engram-server] WARNING: a memory ceiling was configured but this \
+             process cannot read its own resident set (no /proc/self/statm). The \
+             ceiling CANNOT be enforced and no statement will ever be queued. \
+             Run with --memory-max-mb 0 to say so deliberately."
         );
         return;
     }
@@ -1341,13 +1345,15 @@ pub fn spawn_memory_governor(ceiling: Option<u64>, queue_wait_ms: u64) {
                         if now {
                             engram_graph::interp::MEMORY_PRESSURE_ENTRIES.fetch_add(1, Relaxed);
                             eprintln!(
-                                "[engram-server] memory ceiling reached at {} MiB of {} MiB                                  — queueing new statements",
+                                "[engram-server] memory ceiling reached at {} MiB of {} MiB \
+                                 — queueing new statements",
                                 rss / (1024 * 1024),
                                 ceiling / (1024 * 1024)
                             );
                         } else {
                             eprintln!(
-                                "[engram-server] memory back to {} MiB of {} MiB —                                  admitting again",
+                                "[engram-server] memory back to {} MiB of {} MiB — \
+                                 admitting again",
                                 rss / (1024 * 1024),
                                 ceiling / (1024 * 1024)
                             );
@@ -1747,7 +1753,8 @@ pub fn run_server_with_config(
                         .unwrap_or(width);
                     set_parallel_slots(slots);
                     eprintln!(
-                        "[engram-server] query parallelism ON: width {width},                          global slot budget {slots}"
+                        "[engram-server] query parallelism ON: width {width}, \
+                         global slot budget {slots}"
                     );
                     g.set_exec(Some(Arc::new(ThreadScopeExec { width })));
                     g.set_parallel_expand(true);
@@ -2205,7 +2212,8 @@ pub fn run_server_with_config(
                             }
                             if wrote > 0 {
                                 eprintln!(
-                                    "[engram-server] persisted the derived bases for                                      {wrote} graph(s)"
+                                    "[engram-server] persisted the derived bases for \
+                                     {wrote} graph(s)"
                                 );
                             }
                         }
@@ -2866,7 +2874,8 @@ pub fn run_server_with_config(
                                         + 1;
                                     if n <= 5 || n % 1000 == 0 {
                                         eprintln!(
-                                            "[engram-server] connection {id} refused at the                                              wire and dropped (#{n}): {e}"
+                                            "[engram-server] connection {id} refused at the \
+                                             wire and dropped (#{n}): {e}"
                                         );
                                     }
                                     sessions.remove(&id);
@@ -3482,7 +3491,8 @@ mod bounded_parallel_pool {
         let unbounded = peak_concurrency(STATEMENTS * WIDTH, STATEMENTS, WIDTH, 96);
         assert!(
             bounded <= STATEMENTS + WIDTH,
-            "bounded run reached {bounded} concurrent bodies, above the              statements-plus-budget ceiling of {}",
+            "bounded run reached {bounded} concurrent bodies, above the \
+             statements-plus-budget ceiling of {}",
             STATEMENTS + WIDTH
         );
         assert!(

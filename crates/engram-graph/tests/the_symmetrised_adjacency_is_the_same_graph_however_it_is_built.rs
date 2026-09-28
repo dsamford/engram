@@ -108,7 +108,8 @@ fn LCC_is_unchanged_by_how_the_adjacency_is_stored() {
         vec![
             "1.000000", "1.000000", "0.333333", "0.000000", "0.000000", "0.000000"
         ],
-        "LCC changed. Captured before the symmetrised adjacency was rebuilt in          CSR; a representation change must not move a coefficient."
+        "LCC changed. Captured before the symmetrised adjacency was rebuilt in \
+         CSR; a representation change must not move a coefficient."
     );
 }
 
@@ -123,7 +124,9 @@ fn CDLP_is_unchanged_by_how_the_adjacency_is_stored() {
     assert_eq!(
         floats(&r),
         vec!["1", "1", "1", "1", "4", "5"],
-        "CDLP changed. The reciprocal pair 3<->4 is the edge whose handling is          at issue: it must be symmetrised the SAME way after the rebuild,          whatever the spec says it ought to be."
+        "CDLP changed. The reciprocal pair 3<->4 is the edge whose handling is \
+         at issue: it must be symmetrised the SAME way after the rebuild, \
+         whatever the spec says it ought to be."
     );
 }
 
@@ -138,6 +141,7 @@ fn Louvain_is_unchanged_by_how_the_adjacency_is_stored() {
     assert_eq!(
         floats(&r),
         vec!["1", "1", "1", "1", "4", "4"],
-        "Louvain changed. It shares `undirected` with LCC and CDLP, so it is          the third thing a rebuild can silently move."
+        "Louvain changed. It shares `undirected` with LCC and CDLP, so it is \
+         the third thing a rebuild can silently move."
     );
 }

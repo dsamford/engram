@@ -95,8 +95,11 @@ fn discovery_by_query(query: &str, name: &str) -> Option<Discovery> {
     Some(match (query, name) {
         // `id` is the Person who OWNS the accounts the query walks from.
         ("tcr2" | "tcr5" | "tcr12", "id") => Discovery {
-            pick: "MATCH (p:Person)-[:own]->(:Account)-[:transfer]-()                    WITH p, count(*) AS d                    RETURN p.id AS v ORDER BY d DESC, p.id ASC LIMIT 1",
-            count: "MATCH (p:Person {id: $v})-[:own]->(a:Account)-[:transfer]-()                     RETURN count(*) AS n",
+            pick: "MATCH (p:Person)-[:own]->(:Account)-[:transfer]-() \
+                   WITH p, count(*) AS d \
+                   RETURN p.id AS v ORDER BY d DESC, p.id ASC LIMIT 1",
+            count: "MATCH (p:Person {id: $v})-[:own]->(a:Account)-[:transfer]-() \
+                    RETURN count(*) AS n",
             unit: "transfer(s) on an owned account",
             ldbc: "",
             // A CARDINALITY, so `--pick p95` can apply. Without one this always
@@ -106,7 +109,8 @@ fn discovery_by_query(query: &str, name: &str) -> Option<Discovery> {
         },
         // `id` is a Loan, and it must have a deposit to walk from.
         ("tcr8", "id") => Discovery {
-            pick: "MATCH (l:Loan)-[:deposit]->(:Account) WITH l, count(*) AS d                    RETURN l.id AS v ORDER BY d DESC, l.id ASC LIMIT 1",
+            pick: "MATCH (l:Loan)-[:deposit]->(:Account) WITH l, count(*) AS d \
+                   RETURN l.id AS v ORDER BY d DESC, l.id ASC LIMIT 1",
             count: "MATCH (l:Loan {id: $v})-[:deposit]->(a) RETURN count(a) AS n",
             unit: "deposit(s)",
             ldbc: "",
@@ -118,7 +122,10 @@ fn discovery_by_query(query: &str, name: &str) -> Option<Discovery> {
         // TRANSFERS, a different relationship type entirely, so the account it
         // picked had nothing withdrawn into it and tcr6 returned zero rows.
         ("tcr6", "id") => Discovery {
-            pick: "MATCH (a:Account)<-[:withdraw]-(mid:Account)<-[:transfer]-(:Account)                    WITH a, mid, count(*) AS t WHERE t > 3                    WITH a, count(DISTINCT mid) AS d                    RETURN a.id AS v ORDER BY d DESC, a.id ASC LIMIT 1",
+            pick: "MATCH (a:Account)<-[:withdraw]-(mid:Account)<-[:transfer]-(:Account) \
+                   WITH a, mid, count(*) AS t WHERE t > 3 \
+                   WITH a, count(DISTINCT mid) AS d \
+                   RETURN a.id AS v ORDER BY d DESC, a.id ASC LIMIT 1",
             count: "MATCH (a:Account {id: $v})<-[:withdraw]-(mid:Account) RETURN count(DISTINCT mid) AS n",
             unit: "account(s) withdrawing into it",
             ldbc: "",
@@ -132,8 +139,11 @@ fn discovery_by_query(query: &str, name: &str) -> Option<Discovery> {
         // at least a length-1 path, whose single timestamp trivially passes
         // the query's strictly-increasing check.
         ("tcr1", "id") => Discovery {
-            pick: "MATCH (m:Medium {isBlocked: true})-[:signIn]->(x:Account)<-[:transfer]-(a:Account)                    WITH a, count(DISTINCT x) AS d                    RETURN a.id AS v ORDER BY d DESC, a.id ASC LIMIT 1",
-            count: "MATCH (a:Account {id: $v})-[:transfer]->(x:Account)<-[:signIn]-(:Medium {isBlocked: true})                     RETURN count(DISTINCT x) AS n",
+            pick: "MATCH (m:Medium {isBlocked: true})-[:signIn]->(x:Account)<-[:transfer]-(a:Account) \
+                   WITH a, count(DISTINCT x) AS d \
+                   RETURN a.id AS v ORDER BY d DESC, a.id ASC LIMIT 1",
+            count: "MATCH (a:Account {id: $v})-[:transfer]->(x:Account)<-[:signIn]-(:Medium {isBlocked: true}) \
+                    RETURN count(DISTINCT x) AS n",
             unit: "account(s) one transfer away that a BLOCKED medium signs in to",
             ldbc: "",
             card: "",
@@ -151,15 +161,25 @@ fn discovery_by_query(query: &str, name: &str) -> Option<Discovery> {
         // every 3-cycle over tens of millions of transfers is the expensive
         // thing a DISCOVERY must not become.
         ("tcr4", "id1") => Discovery {
-            pick: "MATCH (s:Account)-[:transfer]->() WITH s, count(*) AS deg                    ORDER BY deg DESC, s.id ASC LIMIT 50                    MATCH (s)-[:transfer]->(d:Account)-[:transfer]->(o:Account)-[:transfer]->(s)                    WITH s, d, count(DISTINCT o) AS n                    RETURN s.id AS v ORDER BY n DESC, s.id ASC, d.id ASC LIMIT 1",
-            count: "MATCH (s:Account {id: $v})-[:transfer]->(:Account)-[:transfer]->(o:Account)-[:transfer]->(s)                     RETURN count(DISTINCT o) AS n",
+            pick: "MATCH (s:Account)-[:transfer]->() WITH s, count(*) AS deg \
+                   ORDER BY deg DESC, s.id ASC LIMIT 50 \
+                   MATCH (s)-[:transfer]->(d:Account)-[:transfer]->(o:Account)-[:transfer]->(s) \
+                   WITH s, d, count(DISTINCT o) AS n \
+                   RETURN s.id AS v ORDER BY n DESC, s.id ASC, d.id ASC LIMIT 1",
+            count: "MATCH (s:Account {id: $v})-[:transfer]->(:Account)-[:transfer]->(o:Account)-[:transfer]->(s) \
+                    RETURN count(DISTINCT o) AS n",
             unit: "account(s) closing a transfer triangle through id1",
             ldbc: "",
             card: "",
         },
         ("tcr4", "id2") => Discovery {
-            pick: "MATCH (s:Account)-[:transfer]->() WITH s, count(*) AS deg                    ORDER BY deg DESC, s.id ASC LIMIT 50                    MATCH (s)-[:transfer]->(d:Account)-[:transfer]->(o:Account)-[:transfer]->(s)                    WITH s, d, count(DISTINCT o) AS n                    RETURN d.id AS v ORDER BY n DESC, s.id ASC, d.id ASC LIMIT 1",
-            count: "MATCH (d:Account {id: $v})-[:transfer]->(o:Account)-[:transfer]->(s:Account)-[:transfer]->(d)                     RETURN count(DISTINCT o) AS n",
+            pick: "MATCH (s:Account)-[:transfer]->() WITH s, count(*) AS deg \
+                   ORDER BY deg DESC, s.id ASC LIMIT 50 \
+                   MATCH (s)-[:transfer]->(d:Account)-[:transfer]->(o:Account)-[:transfer]->(s) \
+                   WITH s, d, count(DISTINCT o) AS n \
+                   RETURN d.id AS v ORDER BY n DESC, s.id ASC, d.id ASC LIMIT 1",
+            count: "MATCH (d:Account {id: $v})-[:transfer]->(o:Account)-[:transfer]->(s:Account)-[:transfer]->(d) \
+                    RETURN count(DISTINCT o) AS n",
             unit: "account(s) on a transfer triangle through id2",
             ldbc: "",
             card: "",
@@ -324,22 +344,34 @@ fn discovery(name: &str) -> Option<Discovery> {
         // The window bounds are placed a quarter in from each end, so
         // `startDate < endDate` and both sit inside the corpus.
         "date" | "datetime" | "creationDate" => Discovery {
-            pick: "MATCH (m:Message) WITH min(m.creationDate) AS lo, max(m.creationDate) AS hi                    RETURN toString(datetime({epochMillis:                    (lo.epochMillis + hi.epochMillis) / 2})) AS v",
-            count: "MATCH (m:Message)                     WITH sum(CASE WHEN m.creationDate < $v THEN 1 ELSE 0 END) AS below,                          sum(CASE WHEN m.creationDate >= $v THEN 1 ELSE 0 END) AS above                     RETURN CASE WHEN below < above THEN below ELSE above END AS n",
+            pick: "MATCH (m:Message) WITH min(m.creationDate) AS lo, max(m.creationDate) AS hi \
+                   RETURN toString(datetime({epochMillis: \
+                   (lo.epochMillis + hi.epochMillis) / 2})) AS v",
+            count: "MATCH (m:Message) \
+                    WITH sum(CASE WHEN m.creationDate < $v THEN 1 ELSE 0 END) AS below,                          sum(CASE WHEN m.creationDate >= $v THEN 1 ELSE 0 END) AS above \
+                    RETURN CASE WHEN below < above THEN below ELSE above END AS n",
             unit: "message(s) on the thinner side of the cutoff",
             ldbc: "",
             card: "",
         },
         "startDate" | "minDate" => Discovery {
-            pick: "MATCH (m:Message) WITH min(m.creationDate) AS lo, max(m.creationDate) AS hi                    RETURN toString(datetime({epochMillis:                    (3 * lo.epochMillis + hi.epochMillis) / 4})) AS v",
-            count: "MATCH (m:Message)                     WITH sum(CASE WHEN m.creationDate < $v THEN 1 ELSE 0 END) AS below,                          sum(CASE WHEN m.creationDate >= $v THEN 1 ELSE 0 END) AS above                     RETURN CASE WHEN below < above THEN below ELSE above END AS n",
+            pick: "MATCH (m:Message) WITH min(m.creationDate) AS lo, max(m.creationDate) AS hi \
+                   RETURN toString(datetime({epochMillis: \
+                   (3 * lo.epochMillis + hi.epochMillis) / 4})) AS v",
+            count: "MATCH (m:Message) \
+                    WITH sum(CASE WHEN m.creationDate < $v THEN 1 ELSE 0 END) AS below,                          sum(CASE WHEN m.creationDate >= $v THEN 1 ELSE 0 END) AS above \
+                    RETURN CASE WHEN below < above THEN below ELSE above END AS n",
             unit: "message(s) on the thinner side of it",
             ldbc: "",
             card: "",
         },
         "endDate" | "maxDate" => Discovery {
-            pick: "MATCH (m:Message) WITH min(m.creationDate) AS lo, max(m.creationDate) AS hi                    RETURN toString(datetime({epochMillis:                    (lo.epochMillis + 3 * hi.epochMillis) / 4})) AS v",
-            count: "MATCH (m:Message)                     WITH sum(CASE WHEN m.creationDate <= $v THEN 1 ELSE 0 END) AS below,                          sum(CASE WHEN m.creationDate > $v THEN 1 ELSE 0 END) AS above                     RETURN CASE WHEN below < above THEN below ELSE above END AS n",
+            pick: "MATCH (m:Message) WITH min(m.creationDate) AS lo, max(m.creationDate) AS hi \
+                   RETURN toString(datetime({epochMillis: \
+                   (lo.epochMillis + 3 * hi.epochMillis) / 4})) AS v",
+            count: "MATCH (m:Message) \
+                    WITH sum(CASE WHEN m.creationDate <= $v THEN 1 ELSE 0 END) AS below,                          sum(CASE WHEN m.creationDate > $v THEN 1 ELSE 0 END) AS above \
+                    RETURN CASE WHEN below < above THEN below ELSE above END AS n",
             unit: "message(s) on the thinner side of it",
             ldbc: "",
             card: "",
@@ -353,7 +385,8 @@ fn discovery(name: &str) -> Option<Discovery> {
             // through `Cell`, which carries only Int/Text/Null -- so a Date
             // would land as its DEBUG form, `Date(15259)`, and neither bind
             // nor coerce. ISO text round trips through the declared type.
-            pick: "MATCH (m:Message) WITH date(m.creationDate) AS d, count(*) AS c                    RETURN toString(d) AS v ORDER BY c DESC, d ASC LIMIT 1",
+            pick: "MATCH (m:Message) WITH date(m.creationDate) AS d, count(*) AS c \
+                   RETURN toString(d) AS v ORDER BY c DESC, d ASC LIMIT 1",
             // `date($v)` because the parameter is a DATETIME (LDBC's own
             // example supplies `datetime('2012-09-16')`), and bi16 itself
             // compares `date(message1.creationDate) = date(paramDateX)`. The
@@ -373,14 +406,18 @@ fn discovery(name: &str) -> Option<Discovery> {
         // itself, and it is why the count is bound and run rather than
         // assumed.
         "languages" => Discovery {
-            pick: "MATCH (p:Post) WHERE p.language IS NOT NULL                    WITH p.language AS l, count(*) AS c                    RETURN l AS v ORDER BY c DESC, l ASC LIMIT 1",
+            pick: "MATCH (p:Post) WHERE p.language IS NOT NULL \
+                   WITH p.language AS l, count(*) AS c \
+                   RETURN l AS v ORDER BY c DESC, l ASC LIMIT 1",
             count: "MATCH (p:Post) WHERE p.language IN $v RETURN count(p) AS n",
             unit: "post(s) in it",
             ldbc: "",
             card: "MATCH (p:Post) WHERE p.language IS NOT NULL RETURN count(DISTINCT p.language) AS n",
         },
         "language" => Discovery {
-            pick: "MATCH (p:Post) WHERE p.language IS NOT NULL                    WITH p.language AS l, count(*) AS c                    RETURN l AS v ORDER BY c DESC, l ASC LIMIT 1",
+            pick: "MATCH (p:Post) WHERE p.language IS NOT NULL \
+                   WITH p.language AS l, count(*) AS c \
+                   RETURN l AS v ORDER BY c DESC, l ASC LIMIT 1",
             count: "MATCH (p:Post) WHERE p.language = $v RETURN count(p) AS n",
             unit: "post(s) in it",
             ldbc: "",
@@ -406,7 +443,8 @@ fn discovery(name: &str) -> Option<Discovery> {
         // `fbgen` mints account ids from 2^62, so the value read here is the
         // corpus's own id and must never be a small integer invented by hand.
         "id" | "id1" | "id2" | "accountId" => Discovery {
-            pick: "MATCH (a:Account)-[:transfer]-() WITH a, count(*) AS d                    RETURN a.id AS v ORDER BY d DESC, a.id ASC LIMIT 1",
+            pick: "MATCH (a:Account)-[:transfer]-() WITH a, count(*) AS d \
+                   RETURN a.id AS v ORDER BY d DESC, a.id ASC LIMIT 1",
             count: "MATCH (a:Account {id: $v})-[:transfer]-(o) RETURN count(o) AS n",
             unit: "transfer(s)",
             ldbc: "",
@@ -415,14 +453,16 @@ fn discovery(name: &str) -> Option<Discovery> {
         // tcr10 compares two investors, so `pid1`/`pid2` must be DIFFERENT
         // people -- `pair_rank` gives the second the next-ranked value.
         "pid" | "pid1" | "pid2" | "personIdFb" => Discovery {
-            pick: "MATCH (p:Person)-[:invest]->() WITH p, count(*) AS d                    RETURN p.id AS v ORDER BY d DESC, p.id ASC LIMIT 1",
+            pick: "MATCH (p:Person)-[:invest]->() WITH p, count(*) AS d \
+                   RETURN p.id AS v ORDER BY d DESC, p.id ASC LIMIT 1",
             count: "MATCH (p:Person {id: $v})-[:invest]->(c) RETURN count(c) AS n",
             unit: "investment(s)",
             ldbc: "",
             card: "",
         },
         "cid" | "companyId" => Discovery {
-            pick: "MATCH (c:Company)-[:own]->(:Account) WITH c, count(*) AS d                    RETURN c.id AS v ORDER BY d DESC, c.id ASC LIMIT 1",
+            pick: "MATCH (c:Company)-[:own]->(:Account) WITH c, count(*) AS d \
+                   RETURN c.id AS v ORDER BY d DESC, c.id ASC LIMIT 1",
             count: "MATCH (c:Company {id: $v})-[:own]->(a) RETURN count(a) AS n",
             unit: "owned account(s)",
             ldbc: "",
@@ -559,8 +599,10 @@ fn adapt(d: Discovery, epoch_ms: bool) -> Discovery {
         // Integer division by 86,400,000 buckets by day, and the value
         // returned is the day's first millisecond.
         return Discovery {
-            pick: "MATCH (m:Message) WITH (m.creationDate / 86400000) * 86400000 AS d,                    count(*) AS c RETURN d AS v ORDER BY c DESC, d ASC LIMIT 1",
-            count: "MATCH (m:Message) WHERE m.creationDate >= $v                     AND m.creationDate < $v + 86400000 RETURN count(m) AS n",
+            pick: "MATCH (m:Message) WITH (m.creationDate / 86400000) * 86400000 AS d, \
+                   count(*) AS c RETURN d AS v ORDER BY c DESC, d ASC LIMIT 1",
+            count: "MATCH (m:Message) WHERE m.creationDate >= $v \
+                    AND m.creationDate < $v + 86400000 RETURN count(m) AS n",
             unit: d.unit,
             ldbc: "",
             card: d.card,
@@ -579,14 +621,19 @@ fn adapt(d: Discovery, epoch_ms: bool) -> Discovery {
             (1, 1)
         };
         let pick = format!(
-            "MATCH (m:Message) WITH min(m.creationDate) AS lo, max(m.creationDate) AS hi              RETURN ({a} * lo + {b} * hi) / {} AS v",
+            "MATCH (m:Message) WITH min(m.creationDate) AS lo, max(m.creationDate) AS hi \
+             RETURN ({a} * lo + {b} * hi) / {} AS v",
             a + b
         );
         // The same two-sided count, so a degenerate cutoff is still refused.
         let count = if d.count.contains("m.creationDate <= $v") {
-            "MATCH (m:Message)              WITH sum(CASE WHEN m.creationDate <= $v THEN 1 ELSE 0 END) AS below,                   sum(CASE WHEN m.creationDate > $v THEN 1 ELSE 0 END) AS above              RETURN CASE WHEN below < above THEN below ELSE above END AS n"
+            "MATCH (m:Message) \
+             WITH sum(CASE WHEN m.creationDate <= $v THEN 1 ELSE 0 END) AS below,                   sum(CASE WHEN m.creationDate > $v THEN 1 ELSE 0 END) AS above \
+             RETURN CASE WHEN below < above THEN below ELSE above END AS n"
         } else {
-            "MATCH (m:Message)              WITH sum(CASE WHEN m.creationDate < $v THEN 1 ELSE 0 END) AS below,                   sum(CASE WHEN m.creationDate >= $v THEN 1 ELSE 0 END) AS above              RETURN CASE WHEN below < above THEN below ELSE above END AS n"
+            "MATCH (m:Message) \
+             WITH sum(CASE WHEN m.creationDate < $v THEN 1 ELSE 0 END) AS below,                   sum(CASE WHEN m.creationDate >= $v THEN 1 ELSE 0 END) AS above \
+             RETURN CASE WHEN below < above THEN below ELSE above END AS n"
         };
         return Discovery {
             pick: Box::leak(pick.into_boxed_str()),
@@ -894,7 +941,8 @@ compared with a published LDBC figure."
                     Ok(v) => v,
                     Err(e) => {
                         refusals.push(format!(
-                            "{key}.{}: the corpus yielded `{value}`, which does not coerce to                              its declared type {}: {e}",
+                            "{key}.{}: the corpus yielded `{value}`, which does not coerce to \
+                             its declared type {}: {e}",
                             spec.name, spec.ty
                         ));
                         continue;
@@ -963,7 +1011,8 @@ compared with a published LDBC figure."
                             vals.insert(format!("{}@ldbc", spec.name), l);
                         }
                         Ok(None) => refusals.push(format!(
-                            "{key}.{}: the corpus carries no LDBC id (sourceId) for this                              entity, so a cross-engine parameter file cannot be built from it",
+                            "{key}.{}: the corpus carries no LDBC id (sourceId) for this \
+                             entity, so a cross-engine parameter file cannot be built from it",
                             spec.name
                         )),
                         Err(e) => refusals.push(format!(

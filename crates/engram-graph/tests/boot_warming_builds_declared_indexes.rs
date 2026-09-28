@@ -112,7 +112,8 @@ fn warming_builds_a_view_for_every_label() {
 
     assert!(
         built >= 3,
-        "warming built {built} per-label membership view(s); three labels exist.          A 0 here means only the untyped aggregate is warmed."
+        "warming built {built} per-label membership view(s); three labels exist. \
+         A 0 here means only the untyped aggregate is warmed."
     );
 }
 

@@ -89,15 +89,21 @@ fn main() {
     for (name, sub) in [
         (
             "events-half",
-            "MATCH (country:Country)              OPTIONAL MATCH (e:GeopoliticalEvent)                WHERE coalesce(e.eventTime, e.startAt) >= 1750000000000                  AND (exists((e)-[:OCCURS_IN]->(country)) OR e.regionId = country.iso3)              RETURN country.iso3 AS iso3, count(DISTINCT e) AS geoEvents LIMIT 10",
+            "MATCH (country:Country) \
+             OPTIONAL MATCH (e:GeopoliticalEvent)                WHERE coalesce(e.eventTime, e.startAt) >= 1750000000000                  AND (exists((e)-[:OCCURS_IN]->(country)) OR e.regionId = country.iso3) \
+             RETURN country.iso3 AS iso3, count(DISTINCT e) AS geoEvents LIMIT 10",
         ),
         (
             "sanctions-half",
-            "MATCH (country:Country)              OPTIONAL MATCH (s:Sanction) WHERE s.targetCountryIso3 = country.iso3              RETURN country.iso3 AS iso3, count(DISTINCT s) AS sanctions LIMIT 10",
+            "MATCH (country:Country) \
+             OPTIONAL MATCH (s:Sanction) WHERE s.targetCountryIso3 = country.iso3 \
+             RETURN country.iso3 AS iso3, count(DISTINCT s) AS sanctions LIMIT 10",
         ),
         (
             "events-no-exists",
-            "MATCH (country:Country)              OPTIONAL MATCH (e:GeopoliticalEvent)                WHERE coalesce(e.eventTime, e.startAt) >= 1750000000000                  AND e.regionId = country.iso3              RETURN country.iso3 AS iso3, count(DISTINCT e) AS geoEvents LIMIT 10",
+            "MATCH (country:Country) \
+             OPTIONAL MATCH (e:GeopoliticalEvent)                WHERE coalesce(e.eventTime, e.startAt) >= 1750000000000                  AND e.regionId = country.iso3 \
+             RETURN country.iso3 AS iso3, count(DISTINCT e) AS geoEvents LIMIT 10",
         ),
     ] {
         let q = parse_statement(sub).expect("parse");

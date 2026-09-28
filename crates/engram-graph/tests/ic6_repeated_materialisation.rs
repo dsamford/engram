@@ -142,16 +142,19 @@ fn report_the_repeat_factor_on_an_ic6_shaped_query() {
     );
     assert_eq!(
         total, 0,
-        "REFUTED, and pinned: the shape materialises no node records at all, so          there is no repeated decode for a per-statement memo to remove"
+        "REFUTED, and pinned: the shape materialises no node records at all, so \
+         there is no repeated decode for a per-statement memo to remove"
     );
     assert_eq!(
         c("interp.pipeline aggregate native-key group-by"),
         1,
-        "it is served by the pipelined columnar aggregate — the PATH the          refutation rests on, so it is asserted rather than assumed"
+        "it is served by the pipelined columnar aggregate — the PATH the \
+         refutation rests on, so it is asserted rather than assumed"
     );
     assert!(
         c("store.column scans") > 0 && c("graph.column visits already in id order") > 0,
-        "and `t.name` is gathered from a COLUMN in id order rather than decoded          per row: {} column scans, {} in-order visits",
+        "and `t.name` is gathered from a COLUMN in id order rather than decoded \
+         per row: {} column scans, {} in-order visits",
         c("store.column scans"),
         c("graph.column visits already in id order")
     );

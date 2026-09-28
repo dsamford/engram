@@ -810,7 +810,9 @@ impl Graph {
             Err(crate::derived_sidecar::SidecarRefusal::Unreadable(why)) => {
                 counted!("graph.derived sidecar refused: unreadable");
                 eprintln!(
-                    "[engram-graph] derived sidecar REFUSED: present but unreadable ({why}) — an                      older version, or a file this writer did not finish. The structures are                      rebuilt, and the next quiescent tick writes a current one."
+                    "[engram-graph] derived sidecar REFUSED: present but unreadable ({why}) — an \
+                     older version, or a file this writer did not finish. The structures are \
+                     rebuilt, and the next quiescent tick writes a current one."
                 );
                 return 0;
             }
@@ -836,7 +838,10 @@ impl Graph {
                 true
             );
             eprintln!(
-                "[engram-graph] derived sidecar REFUSED: the store's clock is {now}, above the                  sidecar's stamp {}. It covers the segments it was written from and nothing                  above them, and at open there is no change log to carry the difference — so                  the structures are rebuilt.",
+                "[engram-graph] derived sidecar REFUSED: the store's clock is {now}, above the \
+                 sidecar's stamp {}. It covers the segments it was written from and nothing \
+                 above them, and at open there is no change log to carry the difference — so \
+                 the structures are rebuilt.",
                 reader.stamp()
             );
             return 0;
@@ -901,7 +906,8 @@ impl Graph {
                     // the vintage refusal is.
                     counted!("graph.derived sidecar refused: record");
                     eprintln!(
-                        "[engram-graph] derived sidecar record {i} of {total} REFUSED (corrupt or                          malformed); {adopted} adopted before it, the rest are rebuilt on first use."
+                        "[engram-graph] derived sidecar record {i} of {total} REFUSED (corrupt or \
+                         malformed); {adopted} adopted before it, the rest are rebuilt on first use."
                     );
                     whole = false;
                     break;
@@ -926,7 +932,8 @@ impl Graph {
         }
         if adopted > 0 {
             eprintln!(
-                "[engram-graph] adopted {adopted} derived structure(s) holding {} MB (sparse row                  directories + entries)",
+                "[engram-graph] adopted {adopted} derived structure(s) holding {} MB (sparse row \
+                 directories + entries)",
                 held / (1024 * 1024)
             );
         }

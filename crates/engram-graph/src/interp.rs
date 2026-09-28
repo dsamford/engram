@@ -1043,7 +1043,10 @@ fn memory_admit() -> Result<(), RunError> {
     MEMORY_REFUSALS.fetch_add(1, Relaxed);
     sometimes!("interp.memory ceiling refused a statement", true);
     Err(RunError::Semantic(format!(
-        "memory ceiling reached: the process holds {} MiB of a {} MiB ceiling. The          statement waited {waited_ms} ms for memory to come back and it did not, so          the pressure is not statements that will drain. The server is still serving          — this is a limit, not a crash",
+        "memory ceiling reached: the process holds {} MiB of a {} MiB ceiling. The \
+         statement waited {waited_ms} ms for memory to come back and it did not, so \
+         the pressure is not statements that will drain. The server is still serving \
+         — this is a limit, not a crash",
         MEMORY_RSS_MB.load(Relaxed),
         MEMORY_MAX_MB.load(Relaxed)
     )))

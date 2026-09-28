@@ -107,10 +107,13 @@ fn ddl(g: &Graph, src: &str) {
     run_stmt(g, &parse_any(src).expect("parse ddl"), BTreeMap::new()).expect("ddl");
 }
 
+/// One step of a tenant's build.
+type Step = Box<dyn Fn(&Graph)>;
+
 /// The build, as a list of steps, so two tenants can be built INTERLEAVED on one
 /// store — commit timestamps and id allocation alternate between them, the way a
 /// shared server's would.
-fn build_steps(t: Tenant) -> Vec<Box<dyn Fn(&Graph)>> {
+fn build_steps(t: Tenant) -> Vec<Step> {
     let Tenant {
         tag,
         first,

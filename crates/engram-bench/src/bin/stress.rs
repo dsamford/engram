@@ -714,7 +714,10 @@ fn render_algo(shape: &Shape, key: u64, space: u64) -> String {
         "algo-wcc" => "CALL engram.algo.wcc.stream({nodeLabels: ['Stress'],              relationshipTypes: ['LINK', 'SLINK']}) YIELD componentId RETURN count(componentId) AS c"
             .to_string(),
         "algo-kshortest" => format!(
-            "MATCH (a:Stress {{k: {key}}}), (b:Stress {{k: {other}}})              CALL engram.algo.kshortestpaths.stream({{nodeLabels: ['Stress'],              relationshipTypes: ['LINK', 'SLINK'], sourceNode: id(a), targetNode: id(b), k: 3}})              YIELD totalCost RETURN count(totalCost) AS c"
+            "MATCH (a:Stress {{k: {key}}}), (b:Stress {{k: {other}}}) \
+             CALL engram.algo.kshortestpaths.stream({{nodeLabels: ['Stress'], \
+             relationshipTypes: ['LINK', 'SLINK'], sourceNode: id(a), targetNode: id(b), k: 3}}) \
+             YIELD totalCost RETURN count(totalCost) AS c"
         ),
         // `stats` over the same projection: the computation without the rows.
         "algo-stats" => "CALL engram.algo.wcc.stats({nodeLabels: ['Stress'],              relationshipTypes: ['LINK', 'SLINK']}) YIELD nodeCount, relationshipCount              RETURN nodeCount"
@@ -723,7 +726,9 @@ fn render_algo(shape: &Shape, key: u64, space: u64) -> String {
         // budget is reached. A fixed key would overwrite in place and the
         // eviction path would never run.
         "algo-mutate" => format!(
-            "CALL engram.algo.degree.mutate({{nodeLabels: ['Stress'],              relationshipTypes: ['LINK', 'SLINK'], mutateKey: 'm{}'}})              YIELD mutateKey RETURN mutateKey",
+            "CALL engram.algo.degree.mutate({{nodeLabels: ['Stress'], \
+             relationshipTypes: ['LINK', 'SLINK'], mutateKey: 'm{}'}}) \
+             YIELD mutateKey RETURN mutateKey",
             key % 32
         ),
         // Read the cache back. `result.list()` and nothing else, deliberately.
@@ -741,14 +746,17 @@ fn render_algo(shape: &Shape, key: u64, space: u64) -> String {
         // while `algo-mutate` is publishing into it and evicting from it,
         // which is the only concurrent reader that path gets.
         "algo-result" => format!(
-            "CALL engram.algo.result.list() YIELD mutateKey, stale              RETURN count(mutateKey) AS c, {}",
+            "CALL engram.algo.result.list() YIELD mutateKey, stale \
+             RETURN count(mutateKey) AS c, {}",
             key % 2
         ),
         // THE ONLY ALGORITHM OPERATION THAT WRITES. A property per projected
         // node, through the ordinary write path, in short transactions —
         // concurrent with the harness's own writers under `algo-mixed`.
         "algo-write" => format!(
-            "CALL engram.algo.degree.write({{nodeLabels: ['Stress'],              relationshipTypes: ['LINK', 'SLINK'], writeProperty: 'deg{}',              writeBatchSize: 256}}) YIELD nodesWritten RETURN nodesWritten",
+            "CALL engram.algo.degree.write({{nodeLabels: ['Stress'], \
+             relationshipTypes: ['LINK', 'SLINK'], writeProperty: 'deg{}', \
+             writeBatchSize: 256}}) YIELD nodesWritten RETURN nodesWritten",
             key % 4
         ),
         "algo-allshortest" => format!(
@@ -839,22 +847,28 @@ fn render_read(ds: Dataset, shape: &Shape, key: u64, space: u64) -> String {
             let person = (key % space.max(1)) + 1;
             match shape.name {
                 "fb-account" => format!(
-                    "MATCH (a:Account {{id: {acct}}})                      RETURN a.accountLevel, a.createTime, a.isBlocked, a.nickname"
+                    "MATCH (a:Account {{id: {acct}}}) \
+                     RETURN a.accountLevel, a.createTime, a.isBlocked, a.nickname"
                 ),
                 "fb-transfer-out" => format!(
-                    "MATCH (a:Account {{id: {acct}}})-[t:transfer]->(b:Account)                      RETURN b.id, t.amount LIMIT 25"
+                    "MATCH (a:Account {{id: {acct}}})-[t:transfer]->(b:Account) \
+                     RETURN b.id, t.amount LIMIT 25"
                 ),
                 "fb-transfer-in" => format!(
-                    "MATCH (a:Account)-[t:transfer]->(b:Account {{id: {acct}}})                      RETURN a.id, t.amount LIMIT 25"
+                    "MATCH (a:Account)-[t:transfer]->(b:Account {{id: {acct}}}) \
+                     RETURN a.id, t.amount LIMIT 25"
                 ),
                 "fb-transfer-2hop" => format!(
-                    "MATCH (a:Account {{id: {acct}}})-[:transfer]->()-[:transfer]->(c:Account)                      RETURN count(DISTINCT c) AS c"
+                    "MATCH (a:Account {{id: {acct}}})-[:transfer]->()-[:transfer]->(c:Account) \
+                     RETURN count(DISTINCT c) AS c"
                 ),
                 "fb-owner" => format!(
-                    "MATCH (p:Person {{id: {person}}})-[:own]->(a:Account)                      RETURN a.id LIMIT 25"
+                    "MATCH (p:Person {{id: {person}}})-[:own]->(a:Account) \
+                     RETURN a.id LIMIT 25"
                 ),
                 "fb-withdraw" => format!(
-                    "MATCH (a:Account {{id: {acct}}})-[w:withdraw]->(b:Account)                      RETURN b.id, w.amount LIMIT 25"
+                    "MATCH (a:Account {{id: {acct}}})-[w:withdraw]->(b:Account) \
+                     RETURN b.id, w.amount LIMIT 25"
                 ),
                 // `count(m)` and not `m.id`: the Medium and Loan property sets
                 // were never probed on the corpus, and a shape that names a
@@ -886,7 +900,8 @@ fn render_read(ds: Dataset, shape: &Shape, key: u64, space: u64) -> String {
                     "MATCH (v:Vertex {{vid: {vid}}})<-[:LINK]-(w) RETURN w.vid LIMIT 25"
                 ),
                 "ga-2hop" => format!(
-                    "MATCH (v:Vertex {{vid: {vid}}})-[:LINK]->()-[:LINK]->(w)                      RETURN count(DISTINCT w) AS c"
+                    "MATCH (v:Vertex {{vid: {vid}}})-[:LINK]->()-[:LINK]->(w) \
+                     RETURN count(DISTINCT w) AS c"
                 ),
                 "ga-degree" => format!(
                     "MATCH (v:Vertex {{vid: {vid}}})-[e:LINK]-() RETURN count(e) AS d"
@@ -894,7 +909,8 @@ fn render_read(ds: Dataset, shape: &Shape, key: u64, space: u64) -> String {
                 // Two neighbours of one vertex that are themselves joined --
                 // the membership test LCC performs per neighbour pair.
                 "ga-triangle-probe" => format!(
-                    "MATCH (v:Vertex {{vid: {vid}}})-[:LINK]-(a)-[:LINK]-(b)-[:LINK]-(v)                      RETURN count(*) AS t"
+                    "MATCH (v:Vertex {{vid: {vid}}})-[:LINK]-(a)-[:LINK]-(b)-[:LINK]-(v) \
+                     RETURN count(*) AS t"
                 ),
                 // The kernels. `graphalytics: true` is NOT passed: this lane
                 // measures the SHIPPED procedure surface under load, and the
@@ -903,9 +919,14 @@ fn render_read(ds: Dataset, shape: &Shape, key: u64, space: u64) -> String {
                 // conformance result taken under the other are two different
                 // measurements and must not be blended.
                 "ga-bfs" => format!(
-                    "MATCH (s:Vertex {{vid: {vid}}})                      CALL engram.algo.bfs.stream({{nodeLabels: ['Vertex'],                      relationshipTypes: ['LINK'], sourceNode: id(s)}})                      YIELD depth RETURN count(depth) AS c"
+                    "MATCH (s:Vertex {{vid: {vid}}}) \
+                     CALL engram.algo.bfs.stream({{nodeLabels: ['Vertex'], \
+                     relationshipTypes: ['LINK'], sourceNode: id(s)}}) \
+                     YIELD depth RETURN count(depth) AS c"
                 ),
-                "ga-wcc" => "CALL engram.algo.wcc.stream({nodeLabels: ['Vertex'],                              relationshipTypes: ['LINK']})                              YIELD componentId RETURN count(DISTINCT componentId) AS c"
+                "ga-wcc" => "CALL engram.algo.wcc.stream({nodeLabels: ['Vertex'], \
+                             relationshipTypes: ['LINK']}) \
+                             YIELD componentId RETURN count(DISTINCT componentId) AS c"
                     .to_string(),
                 other => unreachable!("unknown graphalytics shape {other}"),
             }
@@ -981,14 +1002,16 @@ fn render_write(
             // index and membership churn are identical and only the adjacency
             // invalidation is removed.
             return format!(
-                "CREATE (m:Message:Comment {{id: {}, creationDate: {},                  content: 'stress', length: 6}})",
+                "CREATE (m:Message:Comment {{id: {}, creationDate: {}, \
+                 content: 'stress', length: 6}})",
                 (cid as u64) << 40 | seq,
                 1_400_000_000_000i64 + seq as i64
             );
         }
         WriteKind::NodeOnlyFreshProps => {
             return format!(
-                "CREATE (m:Message:Comment {{mid: {}, mdate: {},                  mtext: 'stress', mlen: 6}})",
+                "CREATE (m:Message:Comment {{mid: {}, mdate: {}, \
+                 mtext: 'stress', mlen: 6}})",
                 (cid as u64) << 40 | seq,
                 1_400_000_000_000i64 + seq as i64
             );
@@ -1042,7 +1065,8 @@ fn render_write(
                 // The edge type stays `STRESSED` so the dangling-edge check
                 // covers this family unchanged, exactly as FinBench's does.
                 Dataset::Graphalytics => format!(
-                    "MATCH (a:Vertex {{vid: {a}}}), (b:Vertex {{vid: {b}}})                      CREATE (a)-[:STRESSED]->(b)"
+                    "MATCH (a:Vertex {{vid: {a}}}), (b:Vertex {{vid: {b}}}) \
+                     CREATE (a)-[:STRESSED]->(b)"
                 ),
                 _ => format!(
                     "MATCH (a:Stress {{k: {a}}}), (b:Stress {{k: {b}}}) CREATE (a)-[:SLINK]->(b)"
@@ -1903,7 +1927,8 @@ profiles:"
             };
             if accounts == 0 {
                 eprintln!(
-                    "[stress] {addr} holds no :Account nodes — the finbench dataset ATTACHES to                      an already-loaded corpus."
+                    "[stress] {addr} holds no :Account nodes — the finbench dataset ATTACHES to \
+                     an already-loaded corpus."
                 );
                 std::process::exit(1);
             }
@@ -1913,7 +1938,9 @@ profiles:"
                 Ok(1) => {}
                 Ok(n) => {
                     eprintln!(
-                        "[stress] {addr}: account id base {FINBENCH_ACCOUNT_ID_BASE} matched {n}                          node(s), expected exactly 1 — this corpus does not use the id scheme                          the harness keys on, so every lookup would miss. Refusing to measure."
+                        "[stress] {addr}: account id base {FINBENCH_ACCOUNT_ID_BASE} matched {n} \
+                         node(s), expected exactly 1 — this corpus does not use the id scheme \
+                         the harness keys on, so every lookup would miss. Refusing to measure."
                     );
                     std::process::exit(1);
                 }
@@ -1924,7 +1951,8 @@ profiles:"
             }
             keys = accounts;
             eprintln!(
-                "[stress] attached to a FinBench corpus at {addr}: {accounts} accounts (probed                  in {:.1}s); id base verified; --keys set from the corpus",
+                "[stress] attached to a FinBench corpus at {addr}: {accounts} accounts (probed \
+                 in {:.1}s); id base verified; --keys set from the corpus",
                 t0.elapsed().as_secs_f64()
             );
         }
@@ -1951,14 +1979,16 @@ profiles:"
             };
             if vertices == 0 {
                 eprintln!(
-                    "[stress] {addr} holds no :Vertex nodes — the graphalytics dataset ATTACHES                      to an already-loaded graph.
+                    "[stress] {addr} holds no :Vertex nodes — the graphalytics dataset ATTACHES \
+                     to an already-loaded graph.
           Convert and load one with:                      ga2jsonl <graph dir> <out> --name G  &&  snbload <out> {addr} --match-on gid"
                 );
                 std::process::exit(1);
             }
             keys = vertices;
             eprintln!(
-                "[stress] attached to a Graphalytics graph at {addr}: {vertices} vertices                  (probed in {:.1}s); --keys set from the graph",
+                "[stress] attached to a Graphalytics graph at {addr}: {vertices} vertices \
+                 (probed in {:.1}s); --keys set from the graph",
                 t0.elapsed().as_secs_f64()
             );
         }
@@ -3527,7 +3557,8 @@ mod writes_address_the_datasets_own_nodes {
                 let want = node_label(ds);
                 assert!(
                     w.contains(&format!(":{want}")),
-                    "{ds:?} writes against a label this corpus does not have —                      it must address `:{want}`, got: {w}"
+                    "{ds:?} writes against a label this corpus does not have — \
+                     it must address `:{want}`, got: {w}"
                 );
             }
         }

@@ -37,19 +37,23 @@ fn is_a_function_predicate_on_a_hop_end_applied_during_the_walk() {
     ddl(&g, "UNWIND range(0, 9) AS i CREATE (:Tag {name: 'T' + toString(i)})");
     ddl(
         &g,
-        "UNWIND range(0, 299) AS i UNWIND range(1, 20) AS d          MATCH (a:Person {id: i}), (b:Person {id: (i + d) % 300}) CREATE (a)-[:KNOWS]->(b)",
+        "UNWIND range(0, 299) AS i UNWIND range(1, 20) AS d \
+         MATCH (a:Person {id: i}), (b:Person {id: (i + d) % 300}) CREATE (a)-[:KNOWS]->(b)",
     );
     ddl(
         &g,
-        "UNWIND range(0, 11999) AS m MATCH (p:Person {id: m % 300})          CREATE (p)<-[:HAS_CREATOR]-(:Message {id: m, day: m % 7,            creationDate: datetime('2011-10-0' + toString(1 + m % 7) + 'T12:00:00Z')})",
+        "UNWIND range(0, 11999) AS m MATCH (p:Person {id: m % 300}) \
+         CREATE (p)<-[:HAS_CREATOR]-(:Message {id: m, day: m % 7,            creationDate: datetime('2011-10-0' + toString(1 + m % 7) + 'T12:00:00Z')})",
     );
     ddl(
         &g,
-        "MATCH (m:Message) WITH m, CASE WHEN m.id % 97 = 0 THEN 'T0' ELSE 'T' + toString(1 + m.id % 9) END AS tn          MATCH (t:Tag {name: tn}) CREATE (m)-[:HAS_TAG]->(t)",
+        "MATCH (m:Message) WITH m, CASE WHEN m.id % 97 = 0 THEN 'T0' ELSE 'T' + toString(1 + m.id % 9) END AS tn \
+         MATCH (t:Tag {name: tn}) CREATE (m)-[:HAS_TAG]->(t)",
     );
     let _ = g.warm();
     g.set_path_estimate(true);
-    let head = "MATCH (tag:Tag {name: 'T0'})<-[:HAS_TAG]-(message1:Message)-[:HAS_CREATOR]->(person1:Person)                 WHERE message1.day = 3 ";
+    let head = "MATCH (tag:Tag {name: 'T0'})<-[:HAS_TAG]-(message1:Message)-[:HAS_CREATOR]->(person1:Person) \
+                WHERE message1.day = 3 ";
     let tail = " WITH person1, count(DISTINCT person2) AS cp2 RETURN person1.id AS p, cp2 ORDER BY p";
     for (label, pred) in [
         ("plain property", "message2.day = 3"),
@@ -151,24 +155,30 @@ fn bi16s_leg_is_walked_from_the_tag_however_it_is_written() {
     ddl(&g, "UNWIND range(0, 9) AS i CREATE (:Tag {name: 'T' + toString(i)})");
     ddl(
         &g,
-        "UNWIND range(0, 299) AS i UNWIND range(1, 20) AS d          MATCH (a:Person {id: i}), (b:Person {id: (i + d) % 300}) CREATE (a)-[:KNOWS]->(b)",
+        "UNWIND range(0, 299) AS i UNWIND range(1, 20) AS d \
+         MATCH (a:Person {id: i}), (b:Person {id: (i + d) % 300}) CREATE (a)-[:KNOWS]->(b)",
     );
     ddl(
         &g,
-        "UNWIND range(0, 11999) AS m MATCH (p:Person {id: m % 300})          CREATE (p)<-[:HAS_CREATOR]-(:Message {id: m, day: m % 7})",
+        "UNWIND range(0, 11999) AS m MATCH (p:Person {id: m % 300}) \
+         CREATE (p)<-[:HAS_CREATOR]-(:Message {id: m, day: m % 7})",
     );
     ddl(
         &g,
-        "MATCH (m:Message) WITH m, CASE WHEN m.id % 97 = 0 THEN 'T0' ELSE 'T' + toString(1 + m.id % 9) END AS tn          MATCH (t:Tag {name: tn}) CREATE (m)-[:HAS_TAG]->(t)",
+        "MATCH (m:Message) WITH m, CASE WHEN m.id % 97 = 0 THEN 'T0' ELSE 'T' + toString(1 + m.id % 9) END AS tn \
+         MATCH (t:Tag {name: tn}) CREATE (m)-[:HAS_TAG]->(t)",
     );
     let _ = g.warm();
     g.set_path_estimate(true);
 
-    let head = "MATCH (tag:Tag {name: 'T0'})<-[:HAS_TAG]-(message1:Message)-[:HAS_CREATOR]->(person1:Person)                 WHERE message1.day = 3 ";
+    let head = "MATCH (tag:Tag {name: 'T0'})<-[:HAS_TAG]-(message1:Message)-[:HAS_CREATOR]->(person1:Person) \
+                WHERE message1.day = 3 ";
     let tail = " WITH person1, count(DISTINCT message1) AS cm, count(DISTINCT person2) AS cp2                 RETURN person1.id AS p, cm, cp2 ORDER BY p";
     let spellings = [
-        "OPTIONAL MATCH (person1)-[:KNOWS]-(person2:Person)<-[:HAS_CREATOR]-(message2:Message)-[:HAS_TAG]->(tag)          WHERE message2.day = 3",
-        "OPTIONAL MATCH (tag)<-[:HAS_TAG]-(message2:Message)-[:HAS_CREATOR]->(person2:Person)-[:KNOWS]-(person1)          WHERE message2.day = 3",
+        "OPTIONAL MATCH (person1)-[:KNOWS]-(person2:Person)<-[:HAS_CREATOR]-(message2:Message)-[:HAS_TAG]->(tag) \
+         WHERE message2.day = 3",
+        "OPTIONAL MATCH (tag)<-[:HAS_TAG]-(message2:Message)-[:HAS_CREATOR]->(person2:Person)-[:KNOWS]-(person1) \
+         WHERE message2.day = 3",
     ];
     // Whether two statements' patterns share an address is the allocator's
     // choice, so one pass of each spelling may or may not collide. Alternating

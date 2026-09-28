@@ -246,7 +246,8 @@ fn the_pipelines_own_anchored_seed_scan_is_STILL_SERIAL() {
     );
     assert!(
         !seed_split_fired(&g, q),
-        "KNOWN GAP: the pipeline's anchored seed scan does not split.          If this now fires, the gap is closed -- delete this test."
+        "KNOWN GAP: the pipeline's anchored seed scan does not split. \
+         If this now fires, the gap is closed -- delete this test."
     );
 }
 

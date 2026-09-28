@@ -85,7 +85,8 @@ fn a_writing_statements_read_set_is_recorded_so_a_narrowing_is_visible() {
     // MERGE keeps full recording regardless.
     assert_eq!(
         len, 400,
-        "the writing statement's read set changed size; a DROP means a lean          bind stopped recording a binding and conflict detection narrowed"
+        "the writing statement's read set changed size; a DROP means a lean \
+         bind stopped recording a binding and conflict detection narrowed"
     );
 }
 

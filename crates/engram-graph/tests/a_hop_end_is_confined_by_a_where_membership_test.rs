@@ -101,7 +101,11 @@ fn it_engages_on_bi4s_shape() {
     g.create_rel(other, "HAS_MEMBER", p, &BTreeMap::new())
         .expect("rel");
 
-    let src = "MATCH (t:Forum) WHERE t.name = 'top1' WITH collect(t) AS tops                UNWIND tops AS t1                MATCH (t1)-[:CONTAINER_OF]->(m:Message)-[:HAS_CREATOR]->(q:Person)<-[:HAS_MEMBER]-(f:Forum)                WHERE f IN tops                RETURN f.name AS name";
+    let src = "MATCH (t:Forum) WHERE t.name = 'top1' WITH collect(t) AS tops \
+               UNWIND tops AS t1 \
+               MATCH (t1)-[:CONTAINER_OF]->(m:Message)-[:HAS_CREATOR]->(q:Person)<-[:HAS_MEMBER]-(f:Forum) \
+               WHERE f IN tops \
+               RETURN f.name AS name";
     let (r, t) = engram_observe::with_trace(|| rows(&g, src));
     assert_eq!(
         names(&r),

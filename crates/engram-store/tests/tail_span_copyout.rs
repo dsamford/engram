@@ -168,7 +168,8 @@ fn the_copy_and_the_borrow_answer_identically_on_a_paged_store() {
     assert_eq!(
         s.segment_count(),
         1,
-        "the fast path needs exactly one sealed segment, or this fixture does          not exercise it"
+        "the fast path needs exactly one sealed segment, or this fixture does \
+         not exercise it"
     );
     for i in 400..460u32 {
         s.put(&pfx(), &key(i), StoredValue::Plain(vec![7]))
@@ -186,12 +187,15 @@ fn the_copy_and_the_borrow_answer_identically_on_a_paged_store() {
 
     assert!(
         borrowed.len() > 300,
-        "the paged fixture must produce rows from BOTH the segment and the          tail, or the guard under test is never exercised: {}",
+        "the paged fixture must produce rows from BOTH the segment and the \
+         tail, or the guard under test is never exercised: {}",
         borrowed.len()
     );
     assert_eq!(
         copied, borrowed,
-        "on a PAGED store the copy must answer exactly what the borrow          answers — this is the arm where the streaming fast path is reachable          and where dropping the tail silently costs rows"
+        "on a PAGED store the copy must answer exactly what the borrow \
+         answers — this is the arm where the streaming fast path is reachable \
+         and where dropping the tail silently costs rows"
     );
 }
 

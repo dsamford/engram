@@ -222,7 +222,9 @@ fn a_parallel_edge_does_not_multiply_the_shortest_path_counts() {
     let s = scores(&g, Dir::Both);
     assert!(
         close(s[1], 0.5) && close(s[2], 0.5),
-        "a parallel edge must not multiply the path counts: p and q still split the tie 0.5          and 0.5, got {} and {}. Roughly 0.33 and 0.67 means the duplicate was counted as a          third route",
+        "a parallel edge must not multiply the path counts: p and q still split the tie 0.5 \
+         and 0.5, got {} and {}. Roughly 0.33 and 0.67 means the duplicate was counted as a \
+         third route",
         s[1],
         s[2],
     );

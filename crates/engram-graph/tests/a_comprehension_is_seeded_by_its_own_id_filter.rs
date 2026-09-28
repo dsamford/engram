@@ -164,7 +164,8 @@ fn branches_pinning_different_keys_decline() {
         rows(
             &g,
             &format!(
-                "RETURN size({PAT}                  WHERE (a.id = 0 AND b.id = 1) OR (a.name = 'p2' AND b.id = 3) | 1]) AS n"
+                "RETURN size({PAT} \
+                 WHERE (a.id = 0 AND b.id = 1) OR (a.name = 'p2' AND b.id = 3) | 1]) AS n"
             ),
         )
     });
@@ -252,7 +253,8 @@ fn ic14s_exact_term_pins_its_start() {
     assert!(
         t.counters()
             .contains_key("interp.comprehension start pinned by its own filter"),
-        "a comprehension nested in a reduce, pinned by a graph-aware function,          must still pin: {:?}",
+        "a comprehension nested in a reduce, pinned by a graph-aware function, \
+         must still pin: {:?}",
         t.counters()
     );
 }

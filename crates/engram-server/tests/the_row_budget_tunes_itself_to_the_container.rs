@@ -32,7 +32,9 @@ fn the_derivation_reproduces_the_constant_it_replaces() {
         let derived = derive_row_budget(gib * GIB);
         assert!(
             (OLD_CONSTANT / 2..=OLD_CONSTANT * 4).contains(&derived),
-            "{gib} GiB derived {derived}, not within a factor of the {OLD_CONSTANT}              this formula claims to generalise — if that is intended, the claim in              `auto_row_budget`'s doc comment is the thing to change, not this bound"
+            "{gib} GiB derived {derived}, not within a factor of the {OLD_CONSTANT} \
+             this formula claims to generalise — if that is intended, the claim in \
+             `auto_row_budget`'s doc comment is the thing to change, not this bound"
         );
     }
     // And the direction is right: the machines the constant was chosen for get
@@ -48,7 +50,8 @@ fn a_160_gib_pod_admits_what_a_20m_constant_refused() {
     let budget = derive_row_budget(160 * GIB);
     assert!(
         budget > 20_000_000,
-        "the whole point is that a large container stops refusing at a small          machine's row count (got {budget})"
+        "the whole point is that a large container stops refusing at a small \
+         machine's row count (got {budget})"
     );
     // ...and it is still a GUARD. A quarter of 160 GiB at 128 B per row.
     assert!(
@@ -92,7 +95,8 @@ fn this_machine_derives_a_usable_budget() {
     assert!(budget >= 1_000_000, "derived {budget} on this host: {why}");
     assert!(
         why.contains("per row"),
-        "the explanation must state the arithmetic, because a refusal hours          later is only traceable if the log said how the number was reached: {why}"
+        "the explanation must state the arithmetic, because a refusal hours \
+         later is only traceable if the log said how the number was reached: {why}"
     );
 }
 

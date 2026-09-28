@@ -295,15 +295,19 @@ fn an_oversized_delta_skips_the_pass_rather_than_truncating_it() {
         engram_store::PHANTOM_CONFLICTS.load(std::sync::atomic::Ordering::Relaxed) - before;
 
     eprintln!(
-        "[precision locking] oversized delta: committed={committed},          predicate aborts={phantoms}"
+        "[precision locking] oversized delta: committed={committed}, \
+         predicate aborts={phantoms}"
     );
     assert_eq!(
         phantoms, 0,
-        "the pass must be SKIPPED — an abort here means it ran anyway and the          cap is not bounding the latched work it was added to bound"
+        "the pass must be SKIPPED — an abort here means it ran anyway and the \
+         cap is not bounding the latched work it was added to bound"
     );
     assert!(
         committed,
-        "and skipping means read-set validation stands alone, which is today's          rule: the transaction commits, the phantom is admitted again, and the          coverage loss is honest rather than hidden"
+        "and skipping means read-set validation stands alone, which is today's \
+         rule: the transaction commits, the phantom is admitted again, and the \
+         coverage loss is honest rather than hidden"
     );
 }
 

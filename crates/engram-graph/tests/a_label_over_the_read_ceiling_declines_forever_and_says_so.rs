@@ -302,7 +302,8 @@ fn e_fix_121_gathers_only_the_hop_s_ends_instead_of_declining() {
 
     assert!(
         count_of(&on, GATHERED) > 0,
-        "the gather never ran, so this test proves nothing about fix 121 — the          fan-out is probably under its floor: {on:?}"
+        "the gather never ran, so this test proves nothing about fix 121 — the \
+         fan-out is probably under its floor: {on:?}"
     );
     assert_eq!(
         count_of(&off, GATHERED),
@@ -326,7 +327,8 @@ fn e_fix_121_gathers_only_the_hop_s_ends_instead_of_declining() {
         count_of(&off, GETS)
     );
     eprintln!(
-        "[fix 121] store gets: {} gathering the hop's ends, {} reading one record per end          (in-memory: no block sharing, so parity here is the expected result)",
+        "[fix 121] store gets: {} gathering the hop's ends, {} reading one record per end \
+         (in-memory: no block sharing, so parity here is the expected result)",
         count_of(&on, GETS),
         count_of(&off, GETS)
     );

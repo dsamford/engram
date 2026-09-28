@@ -1036,7 +1036,8 @@ mod tests {
         );
         assert!(
             detail.unwrap_or_default().contains("300s"),
-            "the refusal has to name the budget that cut it, or the reader              cannot tell a slow probe from a broken one"
+            "the refusal has to name the budget that cut it, or the reader \
+             cannot tell a slow probe from a broken one"
         );
 
         // A non-zero count is unaffected: this is ALREADY how a failed probe
@@ -1047,7 +1048,8 @@ mod tests {
             detail
                 .unwrap_or_default()
                 .contains("existence probe failed"),
-            "a non-zero count keeps its note, so a capped probe is visible in              the report rather than silently absent"
+            "a non-zero count keeps its note, so a capped probe is visible in \
+             the report rather than silently absent"
         );
 
         // And a count that disagrees with --expect still loses, cap or no cap:

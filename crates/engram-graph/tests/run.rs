@@ -1211,7 +1211,8 @@ fn a_replay_after_bulk_ingest_is_consistent_not_partial() {
     assert_eq!(
         r.rows,
         vec![vec![Value::Int(100)]],
-        "replay must hold exactly the logged node, found by LABEL — the          token mint survived and no bulk membership row leaked through"
+        "replay must hold exactly the logged node, found by LABEL — the \
+         token mint survived and no bulk membership row leaked through"
     );
 }
 

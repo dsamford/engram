@@ -352,7 +352,8 @@ fn main() {
             ),
             (
                 "scan+probe+sort+collect (full census)",
-                "MATCH (n) WITH n, count { (n)--() } AS d WITH d ORDER BY d WITH collect(d) AS ds                  RETURN ds[toInteger(size(ds) * 0.50)] AS p50, ds[size(ds) - 1] AS max",
+                "MATCH (n) WITH n, count { (n)--() } AS d WITH d ORDER BY d WITH collect(d) AS ds \
+                 RETURN ds[toInteger(size(ds) * 0.50)] AS p50, ds[size(ds) - 1] AS max",
             ),
             (
                 "probe only via label-less seed, no WITH: count of degrees>0",

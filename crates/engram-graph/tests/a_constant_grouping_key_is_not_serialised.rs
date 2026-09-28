@@ -48,7 +48,9 @@ fn the_bi10_shape_answers_with_the_constant_key_left_out() {
     let g = graph();
     let r = run(
         &g,
-        "MATCH (a:P) WITH collect(a) AS near          MATCH (b:P) WITH near, collect(b) AS far          RETURN size(near), size(far)",
+        "MATCH (a:P) WITH collect(a) AS near \
+         MATCH (b:P) WITH near, collect(b) AS far \
+         RETURN size(near), size(far)",
     );
     let row = r.rows.first().expect("one row");
     assert_eq!(
@@ -93,7 +95,9 @@ fn a_constant_alongside_a_real_key_does_not_collapse_the_real_one() {
     let g = graph();
     let r = run(
         &g,
-        "MATCH (a:P) WITH collect(a) AS near          MATCH (b:P) WITH near, b.g AS grp, count(*) AS n          RETURN grp, n, size(near) ORDER BY grp",
+        "MATCH (a:P) WITH collect(a) AS near \
+         MATCH (b:P) WITH near, b.g AS grp, count(*) AS n \
+         RETURN grp, n, size(near) ORDER BY grp",
     );
     let got: Vec<(i64, i64, i64)> = r
         .rows
@@ -118,7 +122,9 @@ fn a_name_REBOUND_after_the_aggregation_is_no_longer_constant() {
     let g = graph();
     let r = run(
         &g,
-        "MATCH (a:P) WITH collect(a.g) AS gs          UNWIND gs AS gs          WITH gs, count(*) AS n RETURN gs, n ORDER BY gs",
+        "MATCH (a:P) WITH collect(a.g) AS gs \
+         UNWIND gs AS gs \
+         WITH gs, count(*) AS n RETURN gs, n ORDER BY gs",
     );
     let got: Vec<(i64, i64)> = r
         .rows

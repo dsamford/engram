@@ -95,7 +95,7 @@ RETURN name, versions, edition
 
 ```text
 name     versions     edition
-Engram   ["0.2.0"]    engram
+Engram   ["0.2.1"]    engram
 ```
 
 The server also announces itself in `HELLO`'s response as

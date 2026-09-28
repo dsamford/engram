@@ -195,7 +195,8 @@ fn paged_mode_spills_while_serving_drains_the_quiet_tail_and_reopens_in_full() {
     // merged the load's files into fewer by now.)
     assert!(
         max_seq(&dir) > max_seq_at_load,
-        "no segment was spilled after the load phase (max seq {} then and now) —          the drain path never ran",
+        "no segment was spilled after the load phase (max seq {} then and now) — \
+         the drain path never ran",
         max_seq_at_load
     );
 

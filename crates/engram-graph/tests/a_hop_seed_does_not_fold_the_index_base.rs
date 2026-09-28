@@ -125,7 +125,8 @@ fn the_early_seek_decides_which_maintenance_path_a_reader_takes() {
     assert_eq!(
         folds_yes,
         1,
-        "one extra indexed seek should put the reader on the catch-up+fold          path: {:?}",
+        "one extra indexed seek should put the reader on the catch-up+fold \
+         path: {:?}",
         t_yes.counters()
     );
     // The point of the file: EITHER WAY the reader does O(base) work on its
@@ -134,7 +135,8 @@ fn the_early_seek_decides_which_maintenance_path_a_reader_takes() {
     assert_eq!(
         builds_no,
         1,
-        "the control must be REBUILDING, or the claim that both arms pay          O(base) is wrong: {:?}",
+        "the control must be REBUILDING, or the claim that both arms pay \
+         O(base) is wrong: {:?}",
         t_no.counters()
     );
 }

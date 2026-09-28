@@ -247,11 +247,13 @@ fn precision_locking_closes_the_anomaly_narrowing_admits() {
     // narrowing on and precision locking off, T commits.
     assert!(
         verdict(true, false),
-        "the anomaly must still be present with §7 off, or this test is          asserting that something already fixed stays fixed"
+        "the anomaly must still be present with §7 off, or this test is \
+         asserting that something already fixed stays fixed"
     );
     assert!(
         !verdict(true, true),
-        "§7 ON must close it: the changed row satisfies T's predicate, and          predicate validation does not consult the read set narrowing shrank"
+        "§7 ON must close it: the changed row satisfies T's predicate, and \
+         predicate validation does not consult the read set narrowing shrank"
     );
     // And the two levers together must not abort a transaction that neither
     // alone would — the over-abort check, on the arm that ships.
@@ -270,7 +272,9 @@ fn precision_locking_closes_the_anomaly_narrowing_admits() {
     assert!(stmt(&g, "MATCH (n:T {k: 8}) SET n.seen = 9").is_ok());
     assert!(
         g.commit_owned(t).is_ok(),
-        "an unrelated concurrent write is not a phantom, with either lever on          or both — an isolation upgrade that also refuses correct commits is          not the trade this item is making"
+        "an unrelated concurrent write is not a phantom, with either lever on \
+         or both — an isolation upgrade that also refuses correct commits is \
+         not the trade this item is making"
     );
 }
 

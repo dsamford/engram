@@ -485,7 +485,8 @@ mod tests {
             .to_path_buf();
         if !root.join(RULES_FILE).is_file() {
             println!(
-                "skipping: no {RULES_FILE} — this is a published snapshot, not the                  source tree. The gate still refuses to run without rules."
+                "skipping: no {RULES_FILE} — this is a published snapshot, not the \
+                 source tree. The gate still refuses to run without rules."
             );
             return;
         }

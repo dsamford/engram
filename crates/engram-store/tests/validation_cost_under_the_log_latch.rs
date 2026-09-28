@@ -173,7 +173,8 @@ fn concurrent_committers_serialise_on_validation() {
     println!("1 thread : {per_1:.6}s of latched commit per commit");
     println!("4 threads: {per_4:.6}s of latched commit per commit");
     println!(
-        "a commit costs x{:.2} more when 3 other threads are committing          (1.00 = no queueing, ~4.00 = fully serialised)",
+        "a commit costs x{:.2} more when 3 other threads are committing \
+         (1.00 = no queueing, ~4.00 = fully serialised)",
         per_4 / per_1.max(1e-9)
     );
 

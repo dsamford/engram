@@ -729,7 +729,7 @@ impl RangeIndex {
     }
 
     /// EVERY live `(key, body)` pair in key order — the base minus `removed`,
-    /// merged with `added`; [`RangeIndex::live_range`] over the whole key
+    /// merged with `added`; `RangeIndex::live_range` over the whole key
     /// space. What a structure DERIVED from this index reads (the composite
     /// index joins two of these by body), so it sees the overlay resolved
     /// exactly as a query does.

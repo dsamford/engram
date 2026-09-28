@@ -492,7 +492,8 @@ fn a_restamped_sidecar_folds_in_the_overlay() {
         .expect("O/any is published");
     assert!(
         !parts_before.overlay.is_empty(),
-        "the fixture must leave rows in the OVERLAY, or the fold this test          exists to check is never exercised"
+        "the fixture must leave rows in the OVERLAY, or the fold this test \
+         exists to check is never exercised"
     );
 
     assert!(
@@ -513,7 +514,9 @@ fn a_restamped_sidecar_folds_in_the_overlay() {
     assert_eq!(
         answers(&g2),
         live,
-        "and it must answer exactly what the repaired table answered: a fold          that dropped the overlay would answer with the rows as they were          BEFORE the repair, silently"
+        "and it must answer exactly what the repaired table answered: a fold \
+         that dropped the overlay would answer with the rows as they were \
+         BEFORE the repair, silently"
     );
 }
 
@@ -546,7 +549,9 @@ fn an_unchanged_sealed_set_is_not_rewritten() {
     warm(&g);
     assert!(
         g.persist_derived_now(dir.path(), 0),
-        "once the sealed set moves, the sidecar it described is stale and must          be rewritten — a skip that never re-arms would silently stop          persisting for the life of the process"
+        "once the sealed set moves, the sidecar it described is stale and must \
+         be rewritten — a skip that never re-arms would silently stop \
+         persisting for the life of the process"
     );
 }
 
@@ -603,7 +608,9 @@ fn bases_published_after_the_write_are_persisted_by_the_next_tick() {
     warm(&g);
     assert!(
         g.persist_derived_now(dir.path(), 0),
-        "a tick after MORE bases were published must write the fuller file —          keyed on the sealed set alone it never did, and every start rebuilt          what the process had already built"
+        "a tick after MORE bases were published must write the fuller file — \
+         keyed on the sealed set alone it never did, and every start rebuilt \
+         what the process had already built"
     );
     assert!(
         !g.persist_derived_now(dir.path(), 0),
@@ -623,7 +630,8 @@ fn bases_published_after_the_write_are_persisted_by_the_next_tick() {
     );
     assert!(
         adopted > 1,
-        "the restart must adopt the adjacency tables the second write persisted, not the          membership alone: adopted {adopted}"
+        "the restart must adopt the adjacency tables the second write persisted, not the \
+         membership alone: adopted {adopted}"
     );
     assert_eq!(built, 0, "every table the warm wants was adopted");
     assert_eq!(
@@ -661,7 +669,8 @@ fn the_compactions_own_write_records_its_vintage() {
     warm(&g);
     assert!(
         !g.persist_derived_now(dir.path(), 0),
-        "the emit already wrote this vintage — a tick that rewrites it burns          1.69 GB at SF1 to produce a file identical in the only way that matters"
+        "the emit already wrote this vintage — a tick that rewrites it burns \
+         1.69 GB at SF1 to produce a file identical in the only way that matters"
     );
 }
 
@@ -680,7 +689,8 @@ fn a_base_behind_the_clock_is_not_restamped() {
     stmt(&g, "CREATE (:P {id: 500})");
     assert!(
         !g.persist_derived_now(dir.path(), 0),
-        "a graph whose published bases are behind the store's clock must          DECLINE to persist them"
+        "a graph whose published bases are behind the store's clock must \
+         DECLINE to persist them"
     );
 }
 
@@ -717,7 +727,8 @@ fn an_adopted_file_is_not_rewritten_by_the_next_tick() {
     assert!(adopted > 1, "the sidecar must hold several bases: {adopted}");
     assert!(
         !g.persist_derived_now(dir.path(), 0),
-        "the file on disk is what was just adopted; rewriting it is a full          rewrite to produce the same file"
+        "the file on disk is what was just adopted; rewriting it is a full \
+         rewrite to produce the same file"
     );
     // A base the file does not hold: the out-table of type S.
     g.set_degree_table_after(0);
@@ -735,7 +746,8 @@ fn an_adopted_file_is_not_rewritten_by_the_next_tick() {
     assert!(built > 0, "the S table must be built here, or the next assert proves nothing");
     assert!(
         g.persist_derived_now(dir.path(), 0),
-        "a base published after the adoption must still be written: the note          records what the file holds, not a reason never to write again"
+        "a base published after the adoption must still be written: the note \
+         records what the file holds, not a reason never to write again"
     );
     assert!(
         graph_on(&store).adopt_derived_sidecar(dir.path()) > adopted,
@@ -775,7 +787,8 @@ fn a_tick_during_adoption_waits_and_leaves_the_whole_file() {
     assert_eq!(
         finished_mid_adoption,
         Some(false),
-        "a tick that fires after the first record must WAIT for the adoption;          without the lock it wrote the one base published so far over the file"
+        "a tick that fires after the first record must WAIT for the adoption; \
+         without the lock it wrote the one base published so far over the file"
     );
     let wrote = tick.expect("the tick ran").join().expect("the tick thread");
     assert!(

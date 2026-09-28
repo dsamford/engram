@@ -59,17 +59,21 @@ fn a_datetime_property_is_selected_by_a_datetime_comparison() {
     assert_eq!(
         one(
             &g,
-            "MATCH (m:Message) WHERE m.creationDate < datetime('2011-12-01T00:00:00.000')              RETURN count(m)"
+            "MATCH (m:Message) WHERE m.creationDate < datetime('2011-12-01T00:00:00.000') \
+             RETURN count(m)"
         ),
         Value::Int(1),
-        "a Message from 2010 must be selected by `< datetime('2011-12-01')`;          an integer property compares FALSE here and reports zero rows rather          than failing"
+        "a Message from 2010 must be selected by `< datetime('2011-12-01')`; \
+         an integer property compares FALSE here and reports zero rows rather \
+         than failing"
     );
     // And the other side of the comparison, so a property that matched
     // everything would not pass either.
     assert_eq!(
         one(
             &g,
-            "MATCH (m:Message) WHERE m.creationDate > datetime('2011-12-01T00:00:00.000')              RETURN count(m)"
+            "MATCH (m:Message) WHERE m.creationDate > datetime('2011-12-01T00:00:00.000') \
+             RETURN count(m)"
         ),
         Value::Int(0),
         "the comparison must still DISCRIMINATE"
@@ -95,14 +99,17 @@ fn the_accessors_and_arithmetic_BI_needs_all_work_on_it() {
     assert_eq!(
         one(&g, "MATCH (m:Message) RETURN date(m.creationDate)"),
         Value::Date(14_654),
-        "bi16 compares `date(message.creationDate)` against `date(param)`;          2010-02-14 is day 14654"
+        "bi16 compares `date(message.creationDate)` against `date(param)`; \
+         2010-02-14 is day 14654"
     );
     assert_eq!(
         one(
             &g,
-            "MATCH (m:Message) RETURN m.creationDate + duration({hours: 4}) >              datetime('2010-02-14T21:00:00.000')"
+            "MATCH (m:Message) RETURN m.creationDate + duration({hours: 4}) > \
+             datetime('2010-02-14T21:00:00.000')"
         ),
         Value::Bool(true),
-        "bi17 shifts a creationDate by `duration({{hours: $delta}})`;          17:32:10 + 4h is 21:32:10, which is after 21:00"
+        "bi17 shifts a creationDate by `duration({{hours: $delta}})`; \
+         17:32:10 + 4h is 21:32:10, which is after 21:00"
     );
 }

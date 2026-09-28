@@ -279,6 +279,8 @@ fn a_sealed_set_that_moves_with_an_empty_tail_is_re_stamped() {
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
         followed,
-        "the sealed set moved with an empty tail and the sidecar did not follow          — it now names a set the store does not have, and the next boot will          refuse it and rebuild"
+        "the sealed set moved with an empty tail and the sidecar did not follow \
+         — it now names a set the store does not have, and the next boot will \
+         refuse it and rebuild"
     );
 }

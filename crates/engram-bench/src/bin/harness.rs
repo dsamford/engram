@@ -773,7 +773,12 @@ fn run_family(
                         status: "abandoned-upstream".into(),
                         probe: "skipped".into(),
                         detail: Some(format!(
-                            "not measured: `{first}` hit the ceiling and its worker was                              abandoned, so the server may still be computing it. A number                              taken now is not a number for this query. Restart the server                              and re-run from here, or pass --continue-after-timeout to                              measure anyway and have every later row recorded as                              contaminated."
+                            "not measured: `{first}` hit the ceiling and its worker was \
+                             abandoned, so the server may still be computing it. A number \
+                             taken now is not a number for this query. Restart the server \
+                             and re-run from here, or pass --continue-after-timeout to \
+                             measure anyway and have every later row recorded as \
+                             contaminated."
                         )),
                         expected: None,
                         catalogue_status: entry.status.as_str().into(),
@@ -861,7 +866,8 @@ fn run_family(
                     status: "unparameterised".into(),
                     probe: "skipped".into(),
                     detail: Some(
-                        "a `${...}` placeholder survived substitution: the catalogue's text                          names a parameter its own `parameters` block does not declare"
+                        "a `${...}` placeholder survived substitution: the catalogue's text \
+                         names a parameter its own `parameters` block does not declare"
                             .into(),
                     ),
                     expected: None,
@@ -950,7 +956,9 @@ fn run_family(
             if r.status == "timeout" && abandoned.is_none() {
                 abandoned = Some(r.query.clone());
                 eprintln!(
-                    "[harness] {} hit the {}s ceiling. Its worker was abandoned and the                      SERVER MAY STILL BE COMPUTING IT -- every later measurement would                      share the machine with it.{}",
+                    "[harness] {} hit the {}s ceiling. Its worker was abandoned and the \
+                     SERVER MAY STILL BE COMPUTING IT -- every later measurement would \
+                     share the machine with it.{}",
                     r.query,
                     timeout.as_secs(),
                     if continue_after_timeout {
@@ -967,7 +975,8 @@ fn run_family(
                 r.detail = Some(match r.detail.take() {
                     Some(d) => format!("measured while `{first}` was still running: {d}"),
                     None => format!(
-                        "measured while `{first}` was still running on the server, so this                          figure includes contention from a query nobody was waiting for"
+                        "measured while `{first}` was still running on the server, so this \
+                         figure includes contention from a query nobody was waiting for"
                     ),
                 });
             }
@@ -1094,7 +1103,11 @@ fn classify_failure(e: String, enc: engram_bench::params::TemporalEncoding) -> (
         return (
             "corpus-typing".into(),
             format!(
-                "this query applies a temporal function to `creationDate`, which THIS corpus                  stores as an epoch-millisecond integer. No parameter can fix it: the query                  needs a corpus loaded with typed temporals                  (docs/bench/snb-datetime-corpus-build.sh; ldbc-coverage-plan.md 0.3.0).                  Engine said: {e}"
+                "this query applies a temporal function to `creationDate`, which THIS corpus \
+                 stores as an epoch-millisecond integer. No parameter can fix it: the query \
+                 needs a corpus loaded with typed temporals \
+                 (docs/bench/snb-datetime-corpus-build.sh; ldbc-coverage-plan.md 0.3.0). \
+                 Engine said: {e}"
             ),
         );
     }
@@ -1113,7 +1126,12 @@ fn classify_failure(e: String, enc: engram_bench::params::TemporalEncoding) -> (
         return (
             "corpus-typing".into(),
             format!(
-                "this query does ARITHMETIC on a temporal -- subtracting two timestamps, or                  building one from `epochMillis` -- which needs a corpus storing them as                  epoch-millisecond integers. THIS corpus stores typed temporals. No parameter                  can fix it, and the fix is not the same corpus SNB BI needs: the two                  families want opposite typings (ldbc-coverage-plan.md 0.3.0).                  Engine said: {e}"
+                "this query does ARITHMETIC on a temporal -- subtracting two timestamps, or \
+                 building one from `epochMillis` -- which needs a corpus storing them as \
+                 epoch-millisecond integers. THIS corpus stores typed temporals. No parameter \
+                 can fix it, and the fix is not the same corpus SNB BI needs: the two \
+                 families want opposite typings (ldbc-coverage-plan.md 0.3.0). \
+                 Engine said: {e}"
             ),
         );
     }
@@ -1121,7 +1139,9 @@ fn classify_failure(e: String, enc: engram_bench::params::TemporalEncoding) -> (
         return (
             "unimplemented-procedure".into(),
             format!(
-                "the catalogue's text calls a procedure this engine does not implement. That is                  a declared capability gap of the same kind as bi15/19/20's GDS dependency, not                  a failed measurement. Engine said: {e}"
+                "the catalogue's text calls a procedure this engine does not implement. That is \
+                 a declared capability gap of the same kind as bi15/19/20's GDS dependency, not \
+                 a failed measurement. Engine said: {e}"
             ),
         );
     }
@@ -2724,7 +2744,8 @@ like."
                     Some(d) => d,
                     None => {
                         eprintln!(
-                            "[harness] --dialect takes cypher, cypher_engram, cypher_ladybug                              or sql, got `{d}`"
+                            "[harness] --dialect takes cypher, cypher_engram, cypher_ladybug \
+                             or sql, got `{d}`"
                         );
                         std::process::exit(2);
                     }
@@ -3321,7 +3342,8 @@ like."
             let gating = flag(&args, "--baseline").is_some();
             if paths.is_empty() || (paths.len() < 2 && !gating) {
                 eprintln!(
-                    "[harness] report needs at least two result documents,                      or one with --baseline"
+                    "[harness] report needs at least two result documents, \
+                     or one with --baseline"
                 );
                 std::process::exit(2);
             }

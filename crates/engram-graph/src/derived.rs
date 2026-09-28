@@ -1439,7 +1439,8 @@ mod tests {
         assert!(v.contains_with(1_000, 1), "an id in the base");
         assert!(
             matches!(v.base_bits.get(), Some(Some(_))),
-            "the bitmap must have been BUILT — a declined base would take the              binary-search path and this test would compare it with itself"
+            "the bitmap must have been BUILT — a declined base would take the \
+             binary-search path and this test would compare it with itself"
         );
 
         for id in 0..3_000u64 {
@@ -1482,7 +1483,8 @@ mod tests {
         assert!(sparse.contains_with(64, 1));
         assert!(
             matches!(sparse.base_bits.get(), Some(None)),
-            "8 bytes an id is past MEMBERS_BITS_MAX_BYTES_PER_ID — the decision              is taken once and recorded, not re-taken on every probe"
+            "8 bytes an id is past MEMBERS_BITS_MAX_BYTES_PER_ID — the decision \
+             is taken once and recorded, not re-taken on every probe"
         );
         assert!(!sparse.contains_with(65, 1));
 

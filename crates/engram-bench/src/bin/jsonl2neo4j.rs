@@ -571,9 +571,7 @@ fn merge_cols(
                 "{what}: property key {k:?} is not a bare identifier"
             ));
         }
-        if let Value::Str(s) = v
-            && has_line_break(s)
-        {
+        if matches!(v, Value::Str(s) if has_line_break(s)) {
             refuse(&format!(
                 "{what}: property {k} contains a line break; `neo4j-admin` reads \
                  --multiline-fields=false by default, so this row would be split and every \
@@ -717,9 +715,7 @@ fn reconcile(l: &Line, bad: &mut Vec<String>) {
             l.file, l.rows_in, l.rows_out
         ));
     }
-    if let Some(rb) = l.readback
-        && rb != l.rows_out
-    {
+    if let Some(rb) = l.readback.filter(|&rb| rb != l.rows_out) {
         bad.push(format!(
             "{}: {} row(s) written but {} read back from disk — a SHORT WRITE",
             l.file, l.rows_out, rb
@@ -1637,7 +1633,8 @@ mod tests {
         );
         assert_eq!(
             out, "2011-08-17T06:05:40.595Z",
-            "`epoch_seconds` is ALREADY UTC (untag_temporal subtracts the              offset), so the offset must not be applied a second time"
+            "`epoch_seconds` is ALREADY UTC (untag_temporal subtracts the \
+             offset), so the offset must not be applied a second time"
         );
     }
 

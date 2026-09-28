@@ -10,7 +10,7 @@ edition = "2024"
 # all 17 manifests, which means a release bump is 17 edits and a missed one is a
 # crate published at the wrong version — the kind of mistake that is permanent
 # on crates.io.
-version = "0.2.0"
+version = "0.2.1"
 # MIT, per the owner's decision: everything public, no open core.
 #
 # NOTE: the workspace declares the licence; the LICENSE file at the root is what
@@ -49,23 +49,23 @@ rust-version = "1.85"
 # consumer of the published crate resolves.
 #
 # These must move together with `workspace.package.version`.
-engram-observe = { path = "crates/engram-observe", version = "0.2.0" }
-engram-runtime = { path = "crates/engram-runtime", version = "0.2.0" }
-engram-key = { path = "crates/engram-key", version = "0.2.0" }
-engram-store = { path = "crates/engram-store", version = "0.2.0" }
-engram-log = { path = "crates/engram-log", version = "0.2.0" }
-engram-sim = { path = "crates/engram-sim", version = "0.2.0" }
-engram-exec = { path = "crates/engram-exec", version = "0.2.0" }
-engram-crypto = { path = "crates/engram-crypto", version = "0.2.0" }
-engram-objstore = { path = "crates/engram-objstore", version = "0.2.0" }
-engram-blob = { path = "crates/engram-blob", version = "0.2.0" }
-engram-server = { path = "crates/engram-server", version = "0.2.0" }
-engram-bench = { path = "crates/engram-bench", version = "0.2.0" }
-engram-proc = { path = "crates/engram-proc", version = "0.2.0" }
-engram-cypher = { path = "crates/engram-cypher", version = "0.2.0" }
-engram-graph = { path = "crates/engram-graph", version = "0.2.0" }
-engram-bolt = { path = "crates/engram-bolt", version = "0.2.0" }
-engram-tck = { path = "crates/engram-tck", version = "0.2.0" }
+engram-observe = { path = "crates/engram-observe", version = "0.2.1" }
+engram-runtime = { path = "crates/engram-runtime", version = "0.2.1" }
+engram-key = { path = "crates/engram-key", version = "0.2.1" }
+engram-store = { path = "crates/engram-store", version = "0.2.1" }
+engram-log = { path = "crates/engram-log", version = "0.2.1" }
+engram-sim = { path = "crates/engram-sim", version = "0.2.1" }
+engram-exec = { path = "crates/engram-exec", version = "0.2.1" }
+engram-crypto = { path = "crates/engram-crypto", version = "0.2.1" }
+engram-objstore = { path = "crates/engram-objstore", version = "0.2.1" }
+engram-blob = { path = "crates/engram-blob", version = "0.2.1" }
+engram-server = { path = "crates/engram-server", version = "0.2.1" }
+engram-bench = { path = "crates/engram-bench", version = "0.2.1" }
+engram-proc = { path = "crates/engram-proc", version = "0.2.1" }
+engram-cypher = { path = "crates/engram-cypher", version = "0.2.1" }
+engram-graph = { path = "crates/engram-graph", version = "0.2.1" }
+engram-bolt = { path = "crates/engram-bolt", version = "0.2.1" }
+engram-tck = { path = "crates/engram-tck", version = "0.2.1" }
 
 # ── The one-`cc`-invocation purity rule ────────────────────────────────────
 #

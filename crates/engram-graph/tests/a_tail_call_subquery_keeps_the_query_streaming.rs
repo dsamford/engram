@@ -196,7 +196,8 @@ fn the_subquery_sees_the_outer_nodes_properties_not_a_lean_stub() {
     }
     let r = rows(
         &g,
-        "MATCH (n:N) CALL { WITH n RETURN n.v AS y UNION ALL WITH n RETURN n.v * 2 AS y }          RETURN y ORDER BY y",
+        "MATCH (n:N) CALL { WITH n RETURN n.v AS y UNION ALL WITH n RETURN n.v * 2 AS y } \
+         RETURN y ORDER BY y",
     );
     let got: Vec<i64> = r
         .iter()

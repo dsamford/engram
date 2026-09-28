@@ -141,17 +141,23 @@ jobs:
       - name: A battery runs end to end and the regression gate is live
         run: |
           set -euo pipefail
-          cargo build --release -p engram-server -p engram-bench --bin harness
+          # --bin names targets across BOTH packages: without the server's
+          # own, `--bin harness` alone left engram-server unbuilt.
+          cargo build --release -p engram-server --bin engram-server -p engram-bench --bin harness
           STORE="$(mktemp -d)"
           # The fairness stamp must match the ENGINE, not the machine: the
           # harness refuses a run whose stamp contradicts the served width.
-          ENGRAM_QUERY_PARALLELISM=1 ./target/release/engram-server 127.0.0.1:7899             --paged-dir "$STORE" --paged-cache-mb 256 --workers 2             --read-timeout-secs 0 > server.log 2>&1 &
+          ENGRAM_QUERY_PARALLELISM=1 ./target/release/engram-server 127.0.0.1:7899 \
+            --paged-dir "$STORE" --paged-cache-mb 256 --workers 2 \
+            --read-timeout-secs 0 > server.log 2>&1 &
           for _ in $(seq 1 180); do grep -q 'warmed in' server.log && break; sleep 1; done
           grep -q 'warmed in' server.log || { echo "server never warmed"; cat server.log; exit 1; }
           # Describe THIS runner rather than borrowing a rig name it has not
           # earned -- a wrong stamp compares, an absent one does not.
           RIG="ci-runner:gh-hosted:$(nproc):none:$(free -m | awk '/^Mem:/{print $2}')"
-          ./target/release/harness stress 127.0.0.1:7899 balanced 2 5             --writes single --rig "$RIG" --thread-cap 1 --cache-mb 256             --keys 500 --json run.json
+          ./target/release/harness stress 127.0.0.1:7899 balanced 2 5 \
+            --writes single --rig "$RIG" --thread-cap 1 --cache-mb 256 \
+            --keys 500 --json run.json
           # The gate must PASS against itself...
           ./target/release/harness report run.json --baseline run.json
           # ...and must FAIL on an injected regression. A gate nobody has seen

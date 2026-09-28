@@ -2,6 +2,37 @@
 
 All notable changes to Engram. Dates are UTC.
 
+## 0.2.1 — 2026-09-28
+
+A build and CI release. The 0.2.0 tag did not build on its declared minimum
+Rust version, and its public CI was red. Engine behaviour is unchanged, and so
+is every measured figure.
+
+### Fixed
+
+- **Builds on the declared MSRV, Rust 1.85, again.** `engram-server` and the
+  `jsonl2neo4j` converter used `let` chains, which 1.85 does not accept.
+- **The API documentation builds under `-D warnings`.** Seven doc links
+  pointed at private items or at a function that had been renamed.
+- **The simulator's coverage floor holds.** 0.2.0's LOGOFF fix declared the
+  event "bolt.logoff rolled back an open transaction" but shipped without the
+  simulator scenario that reaches it. That scenario is now included: LOGOFF
+  inside an open transaction, then a count showing that the buffered write is
+  gone.
+- **A test that depended on the scheduler.**
+  `an_algorithm_under_a_write_stream_answers_from_one_snapshot` failed on
+  hosted runners when every read ran before the writer's first write. The
+  writer now starts after the first read, and the reader keeps running until
+  it has seen the writes.
+- **The harness smoke job** built the benchmark harness but not the server
+  binary it starts.
+- **Messages with a run of spaces mid-sentence.** 337 wrapped string literals
+  in 66 files had lost their line continuations, so the affected log lines and
+  errors printed a long gap mid-sentence. Examples include the server's
+  memory-ceiling and parallelism notices, the derived-sidecar refusals and the
+  harness errors. The continuations are restored.
+- A `clippy::type_complexity` error in a test.
+
 ## 0.2.0 — 2026-09-28
 
 The release that measured Engram against Neo4j and PostgreSQL on every

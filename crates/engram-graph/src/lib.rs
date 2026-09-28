@@ -499,7 +499,7 @@ pub static ADJ_WALK_OVERLAID: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// epoch — the READER-scaled candidate, and the one the write-rate sweep favours.
 pub static ADJ_WALK_NO_CURRENT_TABLE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
-/// Fell through because the node id exceeded [`DEGREE_TABLE_MAX_ID`]. ALREADY
+/// Fell through because the node id exceeded `DEGREE_TABLE_MAX_ID`. ALREADY
 /// EXCLUDED by measurement (SF10 has 29,987,846 nodes against a 268,435,456
 /// ceiling); counted so the exclusion stays true rather than remembered.
 pub static ADJ_WALK_ID_CEILING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -3804,7 +3804,7 @@ impl Graph {
     }
 
     /// Fix 93 (strategy O4): turn the commit-time re-stamp on. OFF by
-    /// default — see [`Graph::restamp_prop_columns`] for the soundness
+    /// default — see `Graph::restamp_prop_columns` for the soundness
     /// argument it depends on.
     pub fn set_prop_column_restamp(&self, on: bool) {
         self.prop_column_restamp.set(on);
@@ -3821,7 +3821,7 @@ impl Graph {
     }
 
     /// The largest label whose property column may be read whole
-    /// (default [`crate::batch::WHOLE_LABEL_READ_MAX`], 262,144 nodes).
+    /// (default `batch::WHOLE_LABEL_READ_MAX`, 262,144 nodes).
     pub fn set_whole_label_read_max(&self, n: u64) {
         self.whole_label_read_max.set(n);
     }
@@ -6888,7 +6888,7 @@ impl Graph {
         Some(e.col.clone())
     }
 
-    /// Keep a whole-label column a walk assembled (see [`Graph::prop_column`]):
+    /// Keep a whole-label column a walk assembled (see `Graph::prop_column`):
     /// `at` is the stamp read before the gather. Returns whether it was kept.
     /// The property columns the cache is holding, as `(label, prop, presence)`
     /// NAMES rather than tokens — the set a boot would want back.

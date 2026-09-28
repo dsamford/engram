@@ -175,10 +175,12 @@ fn a_hop_label_filter_answers_from_the_overlay_without_materialising_it() {
     assert_eq!(
         c2("derived.members view materialised"),
         1,
-        "and materialising is what it costs: the whole :Message label merged once          for this snapshot, which under a write stream is once per query"
+        "and materialising is what it costs: the whole :Message label merged once \
+         for this snapshot, which under a write stream is once per query"
     );
     assert_eq!(
         arm.rows, res.rows,
-        "the two paths must answer identically: `contains` tests `added` and          `base` minus `removed`, which is exactly the set the merge produces"
+        "the two paths must answer identically: `contains` tests `added` and \
+         `base` minus `removed`, which is exactly the set the merge produces"
     );
 }

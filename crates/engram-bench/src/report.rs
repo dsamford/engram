@@ -2316,7 +2316,7 @@ pub struct Comparable {
     ///
     /// The text form above is compared for equality and never interpreted,
     /// which is right for deciding whether two documents describe the same
-    /// machine and useless for [`narrow_width_note`], which has to relate this
+    /// machine and useless for [`narrow_width`], which has to relate this
     /// figure to a different block's. `None` where the rig is absent, or where
     /// it declares no quota (`cpu_quota_cores: None` — a lane that had the
     /// whole machine, which cannot be under-used by definition).
@@ -2729,7 +2729,12 @@ impl std::fmt::Display for CompareRefusal {
             ),
             CompareRefusal::CatalogueFamilyDigest { family, detail } => write!(
                 f,
-                "these two runs issued different `{family}` statement text, so the row                  between them would compare two catalogues and not two engines: {detail}.                  The file to open is `catalogue/{family}.json` (the `lsqb-stress` family                  lives in `catalogue/statements.json`) — no other family's digest is                  involved, and changing one of them is not what caused this. Re-run the                  older side against the current text, or quote the two numbers separately"
+                "these two runs issued different `{family}` statement text, so the row \
+                 between them would compare two catalogues and not two engines: {detail}. \
+                 The file to open is `catalogue/{family}.json` (the `lsqb-stress` family \
+                 lives in `catalogue/statements.json`) — no other family's digest is \
+                 involved, and changing one of them is not what caused this. Re-run the \
+                 older side against the current text, or quote the two numbers separately"
             ),
             CompareRefusal::NotEnough => {
                 write!(f, "a comparison needs at least two runs")

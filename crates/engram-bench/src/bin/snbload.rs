@@ -663,7 +663,9 @@ impl Group {
         assert_eq!(
             base.len(),
             self.props.len(),
-            "snbload: {} pair(s) against {} property map(s) -- a group that              lost the correspondence would attach properties to the wrong              edges, silently",
+            "snbload: {} pair(s) against {} property map(s) -- a group that \
+             lost the correspondence would attach properties to the wrong \
+             edges, silently",
             base.len(),
             self.props.len()
         );
@@ -1133,11 +1135,15 @@ fn main() {
                 // against, so the back catalogue stays comparable.
                 let stmt = if pairs.has_props() {
                     format!(
-                        "UNWIND [{list}] AS pair                          MATCH (a:{sl} {{{prop}: pair[0]}}), (b:{dl} {{{prop}: pair[1]}})                          CREATE (a)-[r:{t}]->(b) SET r = pair[2]"
+                        "UNWIND [{list}] AS pair \
+                         MATCH (a:{sl} {{{prop}: pair[0]}}), (b:{dl} {{{prop}: pair[1]}}) \
+                         CREATE (a)-[r:{t}]->(b) SET r = pair[2]"
                     )
                 } else {
                     format!(
-                        "UNWIND [{list}] AS pair                          MATCH (a:{sl} {{{prop}: pair[0]}}), (b:{dl} {{{prop}: pair[1]}})                          CREATE (a)-[:{t}]->(b)"
+                        "UNWIND [{list}] AS pair \
+                         MATCH (a:{sl} {{{prop}: pair[0]}}), (b:{dl} {{{prop}: pair[1]}}) \
+                         CREATE (a)-[:{t}]->(b)"
                     )
                 };
                 conn.run(&stmt, "rel create");

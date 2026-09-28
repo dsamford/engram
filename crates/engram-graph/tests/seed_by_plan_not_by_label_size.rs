@@ -180,7 +180,8 @@ fn the_triangle_is_not_rooted_at_the_smallest_label() {
         "both arms must traverse adjacency, or neither plan ran"
     );
     eprintln!(
-        "[q3-shape] work ratio search/greedy = {:.2} (REPORTED, not asserted          — this fixture does not reproduce SF1's ratios)",
+        "[q3-shape] work ratio search/greedy = {:.2} (REPORTED, not asserted \
+         — this fixture does not reproduce SF1's ratios)",
         search_work as f64 / greedy_work as f64
     );
 }

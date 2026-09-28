@@ -87,12 +87,14 @@ fn each_arm_sees_the_same_seed_row() {
     run(&g, "CREATE (:N {v: 10}), (:N {v: 20})");
     let r = run(
         &g,
-        "MATCH (n:N) CALL { WITH n RETURN n.v AS y UNION ALL WITH n RETURN n.v * 2 AS y }          RETURN y ORDER BY y",
+        "MATCH (n:N) CALL { WITH n RETURN n.v AS y UNION ALL WITH n RETURN n.v * 2 AS y } \
+         RETURN y ORDER BY y",
     );
     assert_eq!(
         ints(&r),
         vec![10, 20, 20, 40],
-        "two seed rows x two arms; 20 appears twice because 10*2 and 20 collide          under UNION ALL, which is exactly the duplicate that must survive"
+        "two seed rows x two arms; 20 appears twice because 10*2 and 20 collide \
+         under UNION ALL, which is exactly the duplicate that must survive"
     );
 }
 
@@ -133,7 +135,12 @@ fn the_BI4_shape_adds_back_the_rows_with_no_messages() {
     );
     let r = run(
         &g,
-        "MATCH (f:Forum)          CALL {            WITH f            MATCH (f)-[:HAS_MEMBER]->(p:Person)<-[:HAS_CREATOR]-(m:Message)            RETURN p, count(DISTINCT m) AS messageCount          UNION ALL            WITH f            MATCH (f)-[:HAS_MEMBER]->(p:Person)            RETURN p, 0 AS messageCount          }          RETURN p.id AS personId, sum(messageCount) AS messageCount          ORDER BY personId",
+        "MATCH (f:Forum) \
+         CALL {            WITH f            MATCH (f)-[:HAS_MEMBER]->(p:Person)<-[:HAS_CREATOR]-(m:Message)            RETURN p, count(DISTINCT m) AS messageCount \
+         UNION ALL            WITH f            MATCH (f)-[:HAS_MEMBER]->(p:Person)            RETURN p, 0 AS messageCount \
+         } \
+         RETURN p.id AS personId, sum(messageCount) AS messageCount \
+         ORDER BY personId",
     );
     let got: Vec<(i64, i64)> = r
         .rows

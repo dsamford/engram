@@ -22,7 +22,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use engram_cypher::Value;
 use engram_graph::algo::{AlgoConfig, AlgoValues, Algorithm, ProjectionKey};
@@ -92,8 +92,19 @@ fn a_run_concurrent_with_writes_answers_from_a_single_consistent_snapshot() {
     // reader's work bounded, which makes "did this leak" a question the test
     // can answer instead of a race it can lose.
     const WRITES: u64 = 600;
+    const MIN_RUNS: u64 = 12;
     let writes = Arc::new(AtomicU64::new(0));
     let runs = Arc::new(AtomicU64::new(0));
+    // The writer starts only once the reader has taken its first run, and
+    // says when it has finished. On a two-core CI runner the scheduler ran
+    // all twelve fixed runs before the writer's first write (or the writer
+    // to completion before the first run), and the vacuity guard below
+    // failed on a test that had checked nothing wrong. Ordering the START
+    // and bounding the END by the writer, not by a run count, makes growth
+    // observable on any machine without making the test's cost unbounded:
+    // the writer's budget is still fixed.
+    let go = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
 
     std::thread::scope(|s| {
         // Relationships rather than properties, because only an EDGE change
@@ -102,7 +113,12 @@ fn a_run_concurrent_with_writes_answers_from_a_single_consistent_snapshot() {
         // exercise nothing.
         let wg = Arc::clone(&g);
         let wcount = Arc::clone(&writes);
+        let wgo = Arc::clone(&go);
+        let wdone = Arc::clone(&done);
         s.spawn(move || {
+            while !wgo.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
             for i in 0..WRITES {
                 let mut m = BTreeMap::new();
                 m.insert("k".to_string(), Value::Int(10_000 + i as i64));
@@ -111,13 +127,17 @@ fn a_run_concurrent_with_writes_answers_from_a_single_consistent_snapshot() {
                     wcount.fetch_add(1, Ordering::Relaxed);
                 }
             }
+            wdone.store(true, Ordering::Release);
         });
 
         // The reader, on this thread: run repeatedly and check every answer
         // against itself.
         let mut last_as_of = 0u64;
         let mut sizes: Vec<usize> = Vec::new();
-        for _ in 0..12 {
+        loop {
+            // Read BEFORE the run: a run that starts after the writer has
+            // finished sees every write.
+            let writer_done = done.load(Ordering::Acquire);
             let r = g
                 .algo_run(Algorithm::Wcc, &cfg(), &Exec)
                 .expect("a concurrent run must still answer");
@@ -156,15 +176,25 @@ fn a_run_concurrent_with_writes_answers_from_a_single_consistent_snapshot() {
             );
             last_as_of = r.as_of;
             sizes.push(r.ids.len());
+            // The first run is on the quiet ring; release the writer after it.
+            go.store(true, Ordering::Release);
+            // At least MIN_RUNS, and on until a run has seen the graph grow —
+            // at the latest the run that started after the writer finished.
+            let n = sizes.len() as u64;
+            if n >= MIN_RUNS && (sizes.first() < sizes.last() || writer_done) {
+                break;
+            }
         }
         // THE VACUITY GUARD. Bounding the writer made the test fast enough
         // that it could now finish before the reader's first run, and a test
         // where the writer has already stopped is a test of a quiet graph
-        // wearing a concurrency test's name. The projection must be observed
-        // GROWING across runs, or nothing above was concurrent with anything.
+        // wearing a concurrency test's name. The first run is taken before the
+        // writer is released, so the projection must be observed GROWING
+        // across runs, or the runs did not see the writer's writes at all.
         assert!(
             sizes.first() < sizes.last(),
-            "the projection never grew across {} runs ({:?}) — the writer finished before the              reader started, so this measured a static graph",
+            "the projection never grew across {} runs ({:?}) — the runs did not see the \
+             writer's writes, so this measured a static graph",
             sizes.len(),
             sizes,
         );
@@ -175,11 +205,12 @@ fn a_run_concurrent_with_writes_answers_from_a_single_consistent_snapshot() {
         "the writer never landed a write, so nothing above ran concurrently with anything \
          and this test proves only that the algorithm works on a quiet graph",
     );
-    assert_eq!(runs.load(Ordering::Relaxed), 12);
+    assert!(runs.load(Ordering::Relaxed) >= MIN_RUNS);
     // The corpus is bounded, so the final size is a fact rather than a race.
     assert!(
         g.members(Some("N")).expect("members").iter().count() <= 300 + WRITES as usize,
-        "the graph grew beyond the writer's budget — something other than this test's writer          is creating nodes",
+        "the graph grew beyond the writer's budget — something other than this test's \
+         writer is creating nodes",
     );
 }
 
@@ -208,7 +239,8 @@ fn a_cached_result_keeps_describing_the_snapshot_it_was_computed_at() {
     let before = q(
         "CALL engram.algo.result.stream({mutateKey:'snap'}) YIELD value                     RETURN count(value)",
     );
-    let as_of = q("CALL engram.algo.result.list() YIELD mutateKey, asOf, stale                    RETURN asOf")[0][0]
+    let as_of = q("CALL engram.algo.result.list() YIELD mutateKey, asOf, stale \
+                   RETURN asOf")[0][0]
         .clone();
     assert_eq!(before[0][0], Value::Int(50));
     assert_eq!(
@@ -230,16 +262,19 @@ fn a_cached_result_keeps_describing_the_snapshot_it_was_computed_at() {
         q("CALL engram.algo.result.stream({mutateKey:'snap'}) YIELD value RETURN count(value)")[0]
             [0],
         Value::Int(50),
-        "the cached result grew after 25 writes, so it was RECOMPUTED behind a read rather          than served — which is exactly what `stale` exists to avoid having to do",
+        "the cached result grew after 25 writes, so it was RECOMPUTED behind a read rather \
+         than served — which is exactly what `stale` exists to avoid having to do",
     );
     assert_eq!(
         q("CALL engram.algo.result.list() YIELD asOf RETURN asOf")[0][0],
         as_of,
-        "the cached result's vintage changed, so it is no longer the measurement that was          published under that name",
+        "the cached result's vintage changed, so it is no longer the measurement that was \
+         published under that name",
     );
     assert_eq!(
         q("CALL engram.algo.result.list() YIELD stale RETURN stale")[0][0],
         Value::Bool(true),
-        "after 25 edge writes the cached result must REPORT itself stale rather than the          engine quietly refreshing it",
+        "after 25 edge writes the cached result must REPORT itself stale rather than the \
+         engine quietly refreshing it",
     );
 }

@@ -944,7 +944,8 @@ mod tests {
         let (av, bv) = (a.value.expect("live"), b.value.expect("live"));
         assert!(
             std::sync::Arc::ptr_eq(&av, &bv),
-            "two reads of one key must hand back the SAME allocation — if they              do not, every sealed-segment hit is still copying the record"
+            "two reads of one key must hand back the SAME allocation — if they \
+             do not, every sealed-segment hit is still copying the record"
         );
         assert_eq!(av.len(), 64 * 1024, "and it is the whole value");
         // The segment still holds it too: the reads shared, they did not move.
@@ -971,7 +972,8 @@ mod tests {
             .expect("live");
         assert!(
             std::sync::Arc::ptr_eq(&from_seg, &from_clone),
-            "the compactor's input must share the segment's bytes, not copy a              segment's worth of them"
+            "the compactor's input must share the segment's bytes, not copy a \
+             segment's worth of them"
         );
     }
 

@@ -186,7 +186,8 @@ fn the_triangle_count_matches_a_brute_force_count() {
     assert!(want.iter().sum::<i64>() > 1_000, "the fixture closes few triangles");
     let index: BTreeMap<u64, usize> = ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
     let q = format!(
-        "CALL engram.algo.trianglecount.stream({{{SCOPE}, orientation: 'UNDIRECTED'}})          YIELD node, triangleCount RETURN id(node) AS v, triangleCount AS t"
+        "CALL engram.algo.trianglecount.stream({{{SCOPE}, orientation: 'UNDIRECTED'}}) \
+         YIELD node, triangleCount RETURN id(node) AS v, triangleCount AS t"
     );
     let s = parse_statement(&q).expect("parse");
     g.set_exec(Some(Arc::new(ThreadedExec {

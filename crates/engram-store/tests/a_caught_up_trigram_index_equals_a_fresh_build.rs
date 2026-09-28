@@ -462,13 +462,16 @@ fn a_catch_up_deep_copies_its_overlay_so_the_overlay_must_stay_small() {
             .unwrap_or(0) as usize;
         assert!(
             cur.overlay_len() <= 4_096 + 3_500,
-            "the overlay reached {} entries after {} catch-ups; it is DEEP-COPIED on every              stale read, so it must stay near the fold threshold and not grow with the base              ({base} entries)",
+            "the overlay reached {} entries after {} catch-ups; it is DEEP-COPIED on every \
+             stale read, so it must stay near the fold threshold and not grow with the base \
+             ({base} entries)",
             cur.overlay_len(),
             n + 1,
         );
     }
     assert!(
         folds > 0,
-        "forty catch-ups of ~3,000 pairs each must have folded at least once, or this test          is asserting a bound nothing was pushing against",
+        "forty catch-ups of ~3,000 pairs each must have folded at least once, or this test \
+         is asserting a bound nothing was pushing against",
     );
 }

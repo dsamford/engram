@@ -60,7 +60,8 @@ fn requirement_B_the_same_budget_over_commits_the_container_under_concurrency() 
     let four_share = (per_statement * 4) as f64 / FULLNODE_CEILING as f64;
     assert!(
         four_share > 0.999,
-        "four concurrent statements should account for essentially the whole          ceiling (got {four_share:.4} of it)"
+        "four concurrent statements should account for essentially the whole \
+         ceiling (got {four_share:.4} of it)"
     );
     println!("  4 concurrent statements: {four_share:.4}x the container ceiling — leaving nothing for the paged cache or the 8.5 GB of derived structures");
 

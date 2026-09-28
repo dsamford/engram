@@ -55,7 +55,10 @@ fn a_set_difference_over_nodes_keeps_exactly_the_non_members() {
     let g = graph();
     let r = run(
         &g,
-        "MATCH (a:P) WHERE a.v <= 2 WITH collect(a) AS near          MATCH (b:P) WITH near, collect(b) AS far          WITH [n IN far WHERE NOT n IN near] AS cand          UNWIND cand AS c RETURN c.v ORDER BY c.v",
+        "MATCH (a:P) WHERE a.v <= 2 WITH collect(a) AS near \
+         MATCH (b:P) WITH near, collect(b) AS far \
+         WITH [n IN far WHERE NOT n IN near] AS cand \
+         UNWIND cand AS c RETURN c.v ORDER BY c.v",
     );
     assert_eq!(
         ints(&r),
@@ -70,7 +73,10 @@ fn the_un_negated_form_keeps_exactly_the_members() {
     let g = graph();
     let r = run(
         &g,
-        "MATCH (a:P) WHERE a.v <= 2 WITH collect(a) AS near          MATCH (b:P) WITH near, collect(b) AS far          WITH [n IN far WHERE n IN near] AS keep          UNWIND keep AS c RETURN c.v ORDER BY c.v",
+        "MATCH (a:P) WHERE a.v <= 2 WITH collect(a) AS near \
+         MATCH (b:P) WITH near, collect(b) AS far \
+         WITH [n IN far WHERE n IN near] AS keep \
+         UNWIND keep AS c RETURN c.v ORDER BY c.v",
     );
     assert_eq!(ints(&r), vec![1, 2], "the intersection, not its complement");
 }
@@ -82,7 +88,10 @@ fn an_empty_haystack_keeps_everything_under_negation() {
     let g = graph();
     let r = run(
         &g,
-        "MATCH (a:P) WHERE a.v > 100 WITH collect(a) AS near          MATCH (b:P) WITH near, collect(b) AS far          WITH [n IN far WHERE NOT n IN near] AS cand          UNWIND cand AS c RETURN c.v ORDER BY c.v",
+        "MATCH (a:P) WHERE a.v > 100 WITH collect(a) AS near \
+         MATCH (b:P) WITH near, collect(b) AS far \
+         WITH [n IN far WHERE NOT n IN near] AS cand \
+         UNWIND cand AS c RETURN c.v ORDER BY c.v",
     );
     assert_eq!(ints(&r), vec![1, 2, 3, 4], "nothing is excluded");
 }
@@ -95,7 +104,8 @@ fn a_scalar_list_is_not_hoisted_and_still_answers_by_eq3() {
     let g = Graph::new(Store::new(), Realm(1), Namespace(1));
     let r = run(
         &g,
-        "WITH [1, 2, 3] AS xs, [1.0, 3.0] AS ys          RETURN [x IN xs WHERE NOT x IN ys] AS out",
+        "WITH [1, 2, 3] AS xs, [1.0, 3.0] AS ys \
+         RETURN [x IN xs WHERE NOT x IN ys] AS out",
     );
     let got = r.rows.first().and_then(|row| row.first()).cloned();
     assert_eq!(
@@ -112,7 +122,9 @@ fn a_map_over_the_survivors_still_runs() {
     let g = graph();
     let r = run(
         &g,
-        "MATCH (a:P) WHERE a.v <= 2 WITH collect(a) AS near          MATCH (b:P) WITH near, collect(b) AS far          RETURN [n IN far WHERE NOT n IN near | n.v] AS vs",
+        "MATCH (a:P) WHERE a.v <= 2 WITH collect(a) AS near \
+         MATCH (b:P) WITH near, collect(b) AS far \
+         RETURN [n IN far WHERE NOT n IN near | n.v] AS vs",
     );
     let got = r.rows.first().and_then(|row| row.first()).cloned();
     assert_eq!(

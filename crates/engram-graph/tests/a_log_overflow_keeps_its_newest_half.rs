@@ -211,6 +211,7 @@ fn b_the_idle_sibling_rebuilds_once_on_its_own_next_probe() {
     let resolved = count_of(&c, CAUGHT_UP) + count_of(&c, NOTHING_FOR_LABEL);
     assert!(
         resolved >= 1,
-        "the probe must resolve without rebuilding — caught up, or correctly          found nothing of its own label: {c:?}"
+        "the probe must resolve without rebuilding — caught up, or correctly \
+         found nothing of its own label: {c:?}"
     );
 }
